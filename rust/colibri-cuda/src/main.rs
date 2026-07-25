@@ -3414,9 +3414,44 @@ fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
     if compressed_rows != 2 {
         return Err("short device decode CSA compressed row count drift at position 8".into());
     }
+    stationary_raw_retention_static_check()?;
     println!(
-        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100}}"
+        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100,\"stationary_raw_selection\":\"device+host+miss\",\"stationary_raw_lease\":\"exclusive_take_restore\"}}"
     );
+    Ok(())
+}
+
+fn stationary_raw_retention_static_check() -> Result<(), Box<dyn Error>> {
+    let plans = [(0, 10, 12), (1, 11, 13), (2, 20, 20)]
+        .into_iter()
+        .map(|(layer, raw_device_bytes, raw_host_bytes)| FixedLayerPlan {
+            layer,
+            tensors: Vec::new(),
+            device_bytes: raw_device_bytes + 1,
+            raw_device_bytes,
+            host_bytes: raw_host_bytes + 1,
+            raw_host_bytes,
+            device_saved_ns: 1,
+            host_saved_ns: 1,
+        })
+        .collect::<Vec<_>>();
+    let none_selected = vec![false; plans.len()];
+    let device = select_fixed_cache_layers(&plans, 10, &none_selected, true, true);
+    let host = select_fixed_cache_layers(&plans, 13, &device, false, true);
+    if device != [true, false, false] || host != [false, true, false] {
+        return Err("stationary raw budget selection/miss boundary drift".into());
+    }
+    let mut slot = Some((7_u64, 11_u64));
+    let leased = slot
+        .take()
+        .ok_or("stationary raw ownership self-check could not take its slot")?;
+    if slot.is_some() {
+        return Err("stationary raw ownership slot remained visible during its lease".into());
+    }
+    restore_leased_slot(&mut slot, leased);
+    if slot != Some((7, 11)) {
+        return Err("stationary raw ownership lease failed to restore exactly once".into());
+    }
     Ok(())
 }
 
@@ -4402,6 +4437,34 @@ fn run_real_v4_layer_stationary_prefill(
         })
         .transpose()?;
     let request_started = std::time::Instant::now();
+    let stationary_host_reserve_bytes = fixed_prefetch_max_future_host_bytes
+        .unwrap_or(0)
+        .checked_mul(FIXED_PREFETCH_WINDOW_DEPTH)
+        .and_then(|bytes| bytes.checked_add(usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(strict_audit_arena_bytes))
+        .ok_or("stationary raw host reserve overflow")?;
+    let stationary_layers = manifests
+        .iter()
+        .map(|manifest| manifest.layer)
+        .collect::<Vec<_>>();
+    let mut stationary_raw_retention = device_short_decode
+        .then(|| {
+            FixedLayerCache::stationary_raw_from_env(
+                root,
+                &stationary_layers,
+                device_attention_capacity
+                    .as_ref()
+                    .map_or(0, |plan| plan.required_bytes),
+                stationary_host_reserve_bytes,
+                stream,
+            )
+        })
+        .transpose()?;
     let device_rope_lut_started = std::time::Instant::now();
     let device_rope_lut = device_attention
         .then(|| DeviceRequestRopeLut::new(stream, short_decode_rows))
@@ -4526,7 +4589,7 @@ fn run_real_v4_layer_stationary_prefill(
                     phase_profile.then(|| timeline_elapsed_ns(request_started));
                 let layer_prepare_started = phase_profile.then(std::time::Instant::now);
                 let mut prefetched_current = false;
-                let (runtime, fixed) = if fixed_prefetch {
+                let (runtime, fixed, retention_host, retention_raw_wo_a) = if fixed_prefetch {
                     let consume_start_ns = timeline_elapsed_ns(request_started);
                     let task = prefetch_window
                         .pop_front()
@@ -4569,14 +4632,15 @@ fn run_real_v4_layer_stationary_prefill(
                         );
                     }
                     let h2d_started = std::time::Instant::now();
-                    let (runtime, upload) = if fixed_prefetch_raw_wo_a {
-                        upload_layer_runtime_raw_wo_a(
+                    let (runtime, upload, raw_wo_a) = if fixed_prefetch_raw_wo_a {
+                        let (runtime, upload, raw_wo_a) = upload_layer_runtime_raw_wo_a(
                             root,
                             manifest.layer,
                             &prefetched.host,
                             module,
                             stream,
-                        )?
+                        )?;
+                        (runtime, upload, Some(raw_wo_a))
                     } else {
                         let runtime =
                             upload_layer_runtime(root, manifest.layer, &prefetched.host, stream)?;
@@ -4592,6 +4656,7 @@ fn run_real_v4_layer_stationary_prefill(
                                 cache_status: "prefetched_blocking_h2d",
                                 ..FixedLoadTelemetry::default()
                             },
+                            None,
                         )
                     };
                     let mut telemetry = prefetched.telemetry;
@@ -4605,9 +4670,12 @@ fn run_real_v4_layer_stationary_prefill(
                     telemetry.raw_h2d_ns = upload.raw_h2d_ns;
                     telemetry.raw_h2d_bytes = upload.raw_h2d_bytes;
                     prefetched_current = true;
-                    (runtime, telemetry)
+                    let retention_host = fixed_prefetch_raw_wo_a.then_some(prefetched.host);
+                    (runtime, telemetry, retention_host, raw_wo_a)
                 } else {
-                    load_layer_runtime(root, manifest.layer, token_ids, stream)?
+                    let (runtime, fixed) =
+                        load_layer_runtime(root, manifest.layer, token_ids, stream)?;
+                    (runtime, fixed, None, None)
                 };
                 fixed_source_bytes = fixed_source_bytes.saturating_add(fixed.fixed_source_bytes);
                 fixed_h2d_bytes = fixed_h2d_bytes.saturating_add(fixed.fixed_h2d_bytes);
@@ -5041,7 +5109,21 @@ fn run_real_v4_layer_stationary_prefill(
                     cache.finish_layer(manifest.layer)?;
                 }
                 drop(expert_slots);
-                drop(runtime);
+                if let Some(cache) = stationary_raw_retention.as_mut() {
+                    cache.capture_stationary_raw(
+                        root,
+                        manifest.layer,
+                        retention_host
+                            .ok_or("stationary raw retention lost its prefetched host payload")?,
+                        runtime,
+                        retention_raw_wo_a
+                            .ok_or("stationary raw retention lost its uploaded raw payload")?,
+                        &fixed,
+                        stream,
+                    )?;
+                } else {
+                    drop(runtime);
+                }
                 if fixed_prefetch && manifest_index + 1 < manifests.len() {
                     let next_layer = manifests[manifest_index + 1].layer;
                     let task = prefetch_window
@@ -5217,15 +5299,17 @@ fn run_real_v4_layer_stationary_prefill(
                 let layer_scope_started_ns =
                     phase_profile.then(|| timeline_elapsed_ns(request_started));
                 let layer_prepare_started = phase_profile.then(std::time::Instant::now);
-                let (host, mut fixed) =
-                    load_layer_host_raw_wo_a(root, manifest.layer, &[decode_input_id])?;
-                let (runtime, upload) =
-                    upload_layer_runtime_raw_wo_a(root, manifest.layer, &host, module, stream)?;
-                fixed.fixed_decode_ns = upload.fixed_decode_ns;
-                fixed.fixed_h2d_ns = upload.fixed_h2d_ns;
-                fixed.fixed_h2d_bytes = upload.fixed_h2d_bytes;
-                fixed.raw_h2d_ns = upload.raw_h2d_ns;
-                fixed.raw_h2d_bytes = upload.raw_h2d_bytes;
+                let (runtime_lease, fixed) = stationary_raw_retention
+                    .as_mut()
+                    .ok_or("short device decode lost its request-local fixed retention")?
+                    .access_stationary_raw(
+                        root,
+                        manifest.layer,
+                        &[decode_input_id],
+                        module,
+                        stream,
+                    )?;
+                let runtime = &*runtime_lease;
                 let hash_ids = load_layer_hash_ids(root, manifest.layer, &[decode_input_id])?;
                 let layer_prepare_ns = layer_prepare_started
                     .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
@@ -5327,7 +5411,7 @@ fn run_real_v4_layer_stationary_prefill(
                     .checked_add(fixed.fixed_source_bytes)
                     .ok_or("short device decode fixed source byte overflow")?;
                 short_decode_fixed_h2d_bytes = short_decode_fixed_h2d_bytes
-                    .checked_add(upload.fixed_h2d_bytes)
+                    .checked_add(fixed.fixed_h2d_bytes)
                     .ok_or("short device decode fixed H2D byte overflow")?;
                 short_decode_routed_source_bytes = short_decode_routed_source_bytes
                     .checked_add(run.stage.routed_source_bytes)
@@ -5357,7 +5441,8 @@ fn run_real_v4_layer_stationary_prefill(
                     "kv_rows_before": kv_rows_before,
                     "kv_rows_after": kv_rows_after,
                     "fixed_source_bytes": fixed.fixed_source_bytes,
-                    "fixed_h2d_bytes": upload.fixed_h2d_bytes,
+                    "fixed_h2d_bytes": fixed.fixed_h2d_bytes,
+                    "fixed_cache_status": fixed.cache_status,
                     "routed_source_bytes": run.stage.routed_source_bytes,
                     "routed_h2d_bytes": run.stage.routed_h2d_bytes,
                     "qd4_immutable_cache": false,
@@ -5491,6 +5576,11 @@ fn run_real_v4_layer_stationary_prefill(
             "host_budget_bytes": parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")?,
             "raw_mode": optional_one_flag("COLIBRI_V4_RAW_FIXED_CACHE")?,
         },
+        "stationary_raw_retention": {
+            "layout": STATIONARY_RAW_LAYOUT,
+            "device_budget_bytes": parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?,
+            "host_budget_bytes": parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB")?,
+        },
         "l0_pos0_cutpoint": l0_cutpoint,
         "layer_count": manifests.len(),
         "model_revision": v4_state::REVISION,
@@ -5575,6 +5665,29 @@ fn run_real_v4_layer_stationary_prefill(
                 "routed_h2d_bytes": short_decode_routed_h2d_bytes,
                 "qd4_immutable_cache": false,
                 "semantic_oracle": device_attention_audit.then_some("independent_host_full_layer_oracle").unwrap_or("not_requested"),
+            })),
+            "stationary_raw_retention": stationary_raw_retention.as_ref().map(|cache| serde_json::json!({
+                "scope": "request_local",
+                "model_dir": cache.stationary_model_dir,
+                "model_revision": v4_state::REVISION,
+                "layout": cache.stationary_layout,
+                "device_budget_bytes": cache.device_budget_bytes,
+                "host_budget_bytes": cache.host_budget_bytes,
+                "device_resident_bytes": cache.device_resident_bytes,
+                "host_resident_bytes": cache.host_resident_bytes,
+                "device_entries": cache.raw_device.iter().filter(|entry| entry.is_some()).count(),
+                "host_entries": cache.raw_host.iter().filter(|entry| entry.is_some()).count(),
+                "capture_source_bytes": 0,
+                "capture_h2d_bytes": 0,
+                "capture_d2d_bytes": 0,
+                "device_hits": cache.device_hits,
+                "host_hits": cache.host_hits,
+                "misses": cache.misses,
+                "source_bytes_saved": cache.stationary_source_bytes_saved,
+                "h2d_bytes_saved": cache.stationary_h2d_bytes_saved,
+                "device_hit_temporary_allocation_count": 0,
+                "selection": "static_budgeted_saved_work_per_byte",
+                "eviction": "none_request_local",
             })),
             "routed_qd4_immutable_expert_cache": qd4_immutable_cache.as_ref().map(|cache| serde_json::json!({
                 "route_executions": cache.telemetry.route_executions,
@@ -11382,6 +11495,95 @@ struct FixedLayerCache {
     device_hits: usize,
     host_hits: usize,
     misses: usize,
+    stationary_model_dir: Option<std::path::PathBuf>,
+    stationary_layout: Option<&'static str>,
+    stationary_source_bytes: Vec<usize>,
+    stationary_h2d_bytes: Vec<usize>,
+    stationary_source_bytes_saved: usize,
+    stationary_h2d_bytes_saved: usize,
+}
+
+const STATIONARY_RAW_LAYOUT: &str = "deepseek-v4-pro-layer-stationary-raw-v1";
+const RAW_FIXED_SCRATCH_BYTES: usize = 128 * 1024 * 1024;
+
+fn restore_leased_slot<T>(slot: &mut Option<T>, value: T) {
+    assert!(
+        slot.is_none(),
+        "exclusive fixed-layer cache lease observed an ABA replacement"
+    );
+    *slot = Some(value);
+}
+
+struct StationaryRawLease<'a> {
+    runtime: Option<LoadedLayerRuntime>,
+    device_slot: Option<&'a mut Option<RawLoadedLayerRuntime>>,
+    host_slot: Option<&'a mut Option<RawDecodedLayerHost>>,
+    scratch_slot: Option<&'a mut Option<DeviceBuffer<u16>>>,
+    raw_device: Option<DeviceBuffer<u8>>,
+    raw_host: Option<RawDecodedLayerHost>,
+    scratch: Option<DeviceBuffer<u16>>,
+    resident_bytes: usize,
+    decoded_wo_a_in_scratch: bool,
+}
+
+impl std::ops::Deref for StationaryRawLease<'_> {
+    type Target = LoadedLayerRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.runtime
+            .as_ref()
+            .expect("live stationary raw lease must own a runtime")
+    }
+}
+
+impl Drop for StationaryRawLease<'_> {
+    fn drop(&mut self) {
+        if self.decoded_wo_a_in_scratch {
+            std::mem::swap(
+                &mut self
+                    .runtime
+                    .as_mut()
+                    .expect("stationary raw lease lost its runtime")
+                    .weights
+                    .wo_a,
+                self.scratch
+                    .as_mut()
+                    .expect("stationary raw lease lost its decode scratch"),
+            );
+        }
+        if let Some(slot) = self.scratch_slot.take() {
+            restore_leased_slot(
+                slot,
+                self.scratch
+                    .take()
+                    .expect("stationary raw lease lost its return scratch"),
+            );
+        }
+        if let Some(slot) = self.device_slot.take() {
+            restore_leased_slot(
+                slot,
+                RawLoadedLayerRuntime {
+                    runtime: self
+                        .runtime
+                        .take()
+                        .expect("stationary raw device lease lost its runtime"),
+                    wo_a_raw: self
+                        .raw_device
+                        .take()
+                        .expect("stationary raw device lease lost its raw payload"),
+                    resident_bytes: self.resident_bytes,
+                },
+            );
+        } else if let Some(slot) = self.host_slot.take() {
+            drop(self.runtime.take());
+            restore_leased_slot(
+                slot,
+                self.raw_host
+                    .take()
+                    .expect("stationary raw host lease lost its raw payload"),
+            );
+        }
+    }
 }
 
 fn parse_gib_budget(name: &str) -> Result<usize, Box<dyn Error>> {
@@ -11780,7 +11982,114 @@ fn fixed_layer_plans(
         .collect()
 }
 
+fn stationary_raw_layer_plans(
+    model_dir: &std::path::Path,
+    layers: &[usize],
+) -> Result<Vec<FixedLayerPlan>, Box<dyn Error>> {
+    layers
+        .iter()
+        .map(|&layer| {
+            let (tensors, device_bytes, wo_a_source_bytes) =
+                fixed_layer_tensor_plan(model_dir, layer)?;
+            let raw_device_bytes = device_bytes
+                .checked_sub(wo_a_source_bytes)
+                .ok_or("stationary raw device byte sum overflow")?;
+            let host_bytes = fixed_layer_decoded_host_bytes(layer, device_bytes)?;
+            let raw_host_bytes = host_bytes
+                .checked_sub(wo_a_source_bytes)
+                .ok_or("stationary raw host byte sum overflow")?;
+            // ponytail: prefill capture has no timing baseline yet. Equal benefit
+            // makes the existing selector retain the most layers per byte.
+            Ok(FixedLayerPlan {
+                layer,
+                tensors,
+                device_bytes,
+                raw_device_bytes,
+                host_bytes,
+                raw_host_bytes,
+                device_saved_ns: 1,
+                host_saved_ns: 1,
+            })
+        })
+        .collect()
+}
+
 impl FixedLayerCache {
+    fn stationary_raw_from_env(
+        model_dir: &std::path::Path,
+        layers: &[usize],
+        device_reserve_bytes: usize,
+        host_reserve_bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<Self, Box<dyn Error>> {
+        let requested_device = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?;
+        let requested_host = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB")?;
+        let device_budget_bytes = preflight_cache_budget(
+            requested_device,
+            device_available_bytes()?,
+            device_reserve_bytes.saturating_add(RAW_FIXED_SCRATCH_BYTES),
+            "stationary_raw_device",
+        );
+        let host_budget_bytes = preflight_cache_budget(
+            requested_host,
+            host_available_bytes()?,
+            FIXED_PREFETCH_HOST_HEADROOM_BYTES.saturating_add(host_reserve_bytes),
+            "stationary_raw_host",
+        );
+        let plan = if device_budget_bytes == 0 && host_budget_bytes == 0 {
+            Vec::new()
+        } else {
+            stationary_raw_layer_plans(model_dir, layers)?
+        };
+        let none_selected = vec![false; plan.len()];
+        let device_selected =
+            select_fixed_cache_layers(&plan, device_budget_bytes, &none_selected, true, true);
+        let host_selected =
+            select_fixed_cache_layers(&plan, host_budget_bytes, &device_selected, false, true);
+        let raw_scratch = (device_selected.iter().any(|&selected| selected)
+            || host_selected.iter().any(|&selected| selected))
+        .then(|| {
+            DeviceBuffer::<u16>::zeroed(
+                stream,
+                RAW_FIXED_SCRATCH_BYTES / std::mem::size_of::<u16>(),
+            )
+        })
+        .transpose()?;
+        Ok(Self {
+            plan,
+            device_selected,
+            host_selected,
+            device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_scratch,
+            raw_mode: true,
+            host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            device_budget_bytes,
+            host_budget_bytes,
+            device_resident_bytes: 0,
+            host_resident_bytes: 0,
+            device_hits: 0,
+            host_hits: 0,
+            misses: 0,
+            stationary_model_dir: Some(model_dir.to_owned()),
+            stationary_layout: Some(STATIONARY_RAW_LAYOUT),
+            stationary_source_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+            stationary_h2d_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+            stationary_source_bytes_saved: 0,
+            stationary_h2d_bytes_saved: 0,
+        })
+    }
+
+    fn validate_stationary_key(&self, model_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+        if self.stationary_model_dir.as_deref() != Some(model_dir)
+            || self.stationary_layout != Some(STATIONARY_RAW_LAYOUT)
+        {
+            return Err("stationary raw cache model/layout key mismatch".into());
+        }
+        Ok(())
+    }
+
     fn from_env(
         model_dir: &std::path::Path,
         executed_layers: usize,
@@ -11789,7 +12098,6 @@ impl FixedLayerCache {
         stream: &CudaStream,
     ) -> Result<Self, Box<dyn Error>> {
         const HOST_HEADROOM: usize = 4 * 1024 * 1024 * 1024;
-        const RAW_SCRATCH_BYTES: usize = 128 * 1024 * 1024;
         let requested_device = parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")?;
         let requested_host = parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")?;
         let raw_mode = match std::env::var_os("COLIBRI_V4_RAW_FIXED_CACHE") {
@@ -11802,7 +12110,7 @@ impl FixedLayerCache {
             device_available_bytes()?,
             V4_DEVICE_CAPACITY_HEADROOM_BYTES
                 .saturating_add(device_reserve_bytes)
-                .saturating_add(usize::from(raw_mode) * RAW_SCRATCH_BYTES),
+                .saturating_add(usize::from(raw_mode) * RAW_FIXED_SCRATCH_BYTES),
             "device",
         );
         let host_budget_bytes = preflight_cache_budget(
@@ -11831,6 +12139,12 @@ impl FixedLayerCache {
                 device_hits: 0,
                 host_hits: 0,
                 misses: 0,
+                stationary_model_dir: None,
+                stationary_layout: None,
+                stationary_source_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+                stationary_h2d_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+                stationary_source_bytes_saved: 0,
+                stationary_h2d_bytes_saved: 0,
             });
         }
         let candidate_layers = match std::env::var("COLIBRI_V4_FIXED_CACHE_CANDIDATE_LAYERS") {
@@ -11863,7 +12177,7 @@ impl FixedLayerCache {
         {
             Some(DeviceBuffer::<u16>::zeroed(
                 stream,
-                RAW_SCRATCH_BYTES / std::mem::size_of::<u16>(),
+                RAW_FIXED_SCRATCH_BYTES / std::mem::size_of::<u16>(),
             )?)
         } else {
             None
@@ -11885,6 +12199,12 @@ impl FixedLayerCache {
             device_hits: 0,
             host_hits: 0,
             misses: 0,
+            stationary_model_dir: None,
+            stationary_layout: None,
+            stationary_source_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+            stationary_h2d_bytes: vec![0; v4_state::V4_LAYER_COUNT],
+            stationary_source_bytes_saved: 0,
+            stationary_h2d_bytes_saved: 0,
         })
     }
 
@@ -11899,6 +12219,248 @@ impl FixedLayerCache {
             self.host_selected[index],
             &self.plan[index],
         )
+    }
+
+    fn capture_stationary_raw(
+        &mut self,
+        model_dir: &std::path::Path,
+        layer: usize,
+        mut host: DecodedLayerHost,
+        mut runtime: LoadedLayerRuntime,
+        wo_a_raw: DeviceBuffer<u8>,
+        telemetry: &FixedLoadTelemetry,
+        stream: &CudaStream,
+    ) -> Result<(), Box<dyn Error>> {
+        self.validate_stationary_key(model_dir)?;
+        let Some(index) = self
+            .plan
+            .iter()
+            .position(|candidate| candidate.layer == layer)
+        else {
+            return Ok(());
+        };
+        let device_selected = self.device_selected[index];
+        let host_selected = self.host_selected[index];
+        let raw_device_bytes = self.plan[index].raw_device_bytes;
+        let raw_host_bytes = self.plan[index].raw_host_bytes;
+        let host_raw_len = host
+            .tail
+            .wo_a_raw
+            .as_ref()
+            .ok_or("stationary capture lost its prefetched raw host payload")?
+            .len();
+        if runtime.weights.wo_a.len() != host_raw_len || wo_a_raw.len() != host_raw_len {
+            return Err(format!("layer {layer} stationary raw wo_a shape mismatch").into());
+        }
+        if device_selected {
+            let decoded_wo_a =
+                std::mem::replace(&mut runtime.weights.wo_a, DeviceBuffer::zeroed(stream, 0)?);
+            drop(decoded_wo_a);
+            let resident_bytes = runtime
+                .weights
+                .num_bytes()
+                .checked_add(wo_a_raw.num_bytes())
+                .ok_or("stationary raw device resident byte overflow")?;
+            if resident_bytes != raw_device_bytes
+                || self
+                    .device_resident_bytes
+                    .checked_add(resident_bytes)
+                    .is_none_or(|bytes| bytes > self.device_budget_bytes)
+                || self.raw_device[layer].is_some()
+            {
+                return Err(format!(
+                    "layer {layer} stationary raw device capture violates its startup plan"
+                )
+                .into());
+            }
+            self.device_resident_bytes += resident_bytes;
+            self.stationary_source_bytes[layer] = telemetry.fixed_source_bytes;
+            self.stationary_h2d_bytes[layer] = telemetry.fixed_h2d_bytes;
+            self.raw_device[layer] = Some(RawLoadedLayerRuntime {
+                runtime,
+                wo_a_raw,
+                resident_bytes,
+            });
+        } else if host_selected {
+            let raw = host
+                .tail
+                .wo_a_raw
+                .take()
+                .ok_or("stationary raw host capture lost wo_a")?;
+            let resident_bytes = host
+                .num_bytes()
+                .checked_add(raw.len())
+                .ok_or("stationary raw host resident byte overflow")?;
+            if resident_bytes != raw_host_bytes
+                || self
+                    .host_resident_bytes
+                    .checked_add(resident_bytes)
+                    .is_none_or(|bytes| bytes > self.host_budget_bytes)
+                || self.raw_host[layer].is_some()
+            {
+                return Err(format!(
+                    "layer {layer} stationary raw host capture violates its startup plan"
+                )
+                .into());
+            }
+            self.host_resident_bytes += resident_bytes;
+            self.stationary_source_bytes[layer] = telemetry.fixed_source_bytes;
+            self.stationary_h2d_bytes[layer] = telemetry.fixed_h2d_bytes;
+            self.raw_host[layer] = Some(RawDecodedLayerHost {
+                host,
+                wo_a_raw: raw,
+                resident_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn access_stationary_raw<'a>(
+        &'a mut self,
+        model_dir: &std::path::Path,
+        layer: usize,
+        token_ids: &[i64],
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+    ) -> Result<(StationaryRawLease<'a>, FixedLoadTelemetry), Box<dyn Error>> {
+        self.validate_stationary_key(model_dir)?;
+        let candidate_index = self
+            .plan
+            .iter()
+            .position(|candidate| candidate.layer == layer);
+        let (device_selected, host_selected) = candidate_index
+            .map(|index| (self.device_selected[index], self.host_selected[index]))
+            .unwrap_or((false, false));
+        if device_selected && self.raw_device[layer].is_some() {
+            self.device_hits += 1;
+            self.stationary_source_bytes_saved = self
+                .stationary_source_bytes_saved
+                .checked_add(self.stationary_source_bytes[layer])
+                .ok_or("stationary source-saved byte overflow")?;
+            self.stationary_h2d_bytes_saved = self
+                .stationary_h2d_bytes_saved
+                .checked_add(self.stationary_h2d_bytes[layer])
+                .ok_or("stationary H2D-saved byte overflow")?;
+            let device_slot = &mut self.raw_device[layer];
+            let cached = device_slot
+                .take()
+                .ok_or("stationary raw device cache entry disappeared")?;
+            let scratch_slot = &mut self.raw_scratch;
+            let mut scratch = scratch_slot
+                .take()
+                .ok_or("stationary raw device scratch disappeared")?;
+            let RawLoadedLayerRuntime {
+                mut runtime,
+                wo_a_raw,
+                resident_bytes,
+            } = cached;
+            let decode_started = std::time::Instant::now();
+            launch_e4m3fn_to_bf16(module, stream, &wo_a_raw, &mut scratch)?;
+            stream.synchronize()?;
+            let fixed_decode_ns =
+                u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
+            return Ok((
+                StationaryRawLease {
+                    runtime: Some(runtime),
+                    device_slot: Some(device_slot),
+                    host_slot: None,
+                    scratch_slot: Some(scratch_slot),
+                    raw_device: Some(wo_a_raw),
+                    raw_host: None,
+                    scratch: Some(scratch),
+                    resident_bytes,
+                    decoded_wo_a_in_scratch: true,
+                },
+                FixedLoadTelemetry {
+                    fixed_decode_ns,
+                    cache_status: "stationary_raw_device_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        if host_selected && self.raw_host[layer].is_some() {
+            self.host_hits += 1;
+            self.stationary_source_bytes_saved = self
+                .stationary_source_bytes_saved
+                .checked_add(self.stationary_source_bytes[layer])
+                .ok_or("stationary source-saved byte overflow")?;
+            let host_slot = &mut self.raw_host[layer];
+            let cached = host_slot
+                .take()
+                .ok_or("stationary raw host cache entry disappeared")?;
+            let scratch_slot = &mut self.raw_scratch;
+            let mut scratch = scratch_slot
+                .take()
+                .ok_or("stationary raw host scratch disappeared")?;
+            let h2d_started = std::time::Instant::now();
+            let mut runtime = upload_layer_runtime(model_dir, layer, &cached.host, stream)?;
+            stream.synchronize()?;
+            let fixed_without_raw_bytes = runtime.weights.num_bytes();
+            let raw_h2d_started = std::time::Instant::now();
+            let wo_a_raw = DeviceBuffer::from_host(stream, &cached.wo_a_raw)?;
+            stream.synchronize()?;
+            let raw_h2d_ns =
+                u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let raw_h2d_bytes = wo_a_raw.num_bytes();
+            let decode_started = std::time::Instant::now();
+            launch_e4m3fn_to_bf16(module, stream, &wo_a_raw, &mut scratch)?;
+            stream.synchronize()?;
+            let fixed_decode_ns =
+                u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
+            let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let fixed_h2d_bytes = fixed_without_raw_bytes
+                .checked_add(raw_h2d_bytes)
+                .ok_or("stationary raw host H2D byte overflow")?;
+            return Ok((
+                StationaryRawLease {
+                    runtime: Some(runtime),
+                    device_slot: None,
+                    host_slot: Some(host_slot),
+                    scratch_slot: Some(scratch_slot),
+                    raw_device: None,
+                    raw_host: Some(cached),
+                    scratch: Some(scratch),
+                    resident_bytes: 0,
+                    decoded_wo_a_in_scratch: true,
+                },
+                FixedLoadTelemetry {
+                    fixed_decode_ns,
+                    fixed_h2d_ns,
+                    fixed_h2d_bytes,
+                    raw_h2d_ns,
+                    raw_h2d_bytes,
+                    cache_status: "stationary_raw_host_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        self.misses += 1;
+        let (host, mut telemetry) = load_layer_host_raw_wo_a(model_dir, layer, token_ids)?;
+        let (runtime, upload, wo_a_raw) =
+            upload_layer_runtime_raw_wo_a(model_dir, layer, &host, module, stream)?;
+        telemetry.fixed_decode_ns = upload.fixed_decode_ns;
+        telemetry.fixed_h2d_ns = upload.fixed_h2d_ns;
+        telemetry.fixed_h2d_bytes = upload.fixed_h2d_bytes;
+        telemetry.raw_h2d_ns = upload.raw_h2d_ns;
+        telemetry.raw_h2d_bytes = upload.raw_h2d_bytes;
+        telemetry.cache_status = "stationary_raw_miss";
+        drop(wo_a_raw);
+        Ok((
+            StationaryRawLease {
+                runtime: Some(runtime),
+                device_slot: None,
+                host_slot: None,
+                scratch_slot: None,
+                raw_device: None,
+                raw_host: None,
+                scratch: None,
+                resident_bytes: 0,
+                decoded_wo_a_in_scratch: false,
+            },
+            telemetry,
+        ))
     }
 
     fn access<R>(
@@ -12191,7 +12753,7 @@ fn upload_layer_runtime_raw_wo_a(
     host: &DecodedLayerHost,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
-) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry), Box<dyn Error>> {
+) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry, DeviceBuffer<u8>), Box<dyn Error>> {
     let raw = host
         .tail
         .wo_a_raw
@@ -12236,6 +12798,7 @@ fn upload_layer_runtime_raw_wo_a(
             cache_status: "prefetched_blocking_h2d",
             ..FixedLoadTelemetry::default()
         },
+        raw_wo_a,
     ))
 }
 
@@ -19248,7 +19811,7 @@ fn run_real_v4_device_token_state_gate(
                 .ok_or("raw wo_a gate host payload disappeared")?
                 .len();
             let host_payload_bytes = host.num_bytes();
-            let (runtime, telemetry) =
+            let (runtime, telemetry, _raw_wo_a) =
                 upload_layer_runtime_raw_wo_a(&model_dir, layer, &host, module, stream)?;
             let decoded_bytes = runtime.weights.wo_a.num_bytes();
             if telemetry.raw_h2d_bytes != raw_bytes

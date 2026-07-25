@@ -1,4 +1,4 @@
-# Colibri Rust/CUDA Rewrite Constraints
+# localMoE Rust/CUDA Rewrite Constraints
 
 `docs/RUST_REWRITE_AUDIT.md` is the architecture and migration baseline for
 this repository. Any change that alters the target architecture, migration

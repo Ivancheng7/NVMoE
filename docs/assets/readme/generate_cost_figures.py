@@ -483,7 +483,7 @@ def byte_savings_figure(
     body += text(
         48,
         430,
-        "Bars start at zero. Fill pattern and solid fill remain distinguishable without color.",
+        "Bars start at zero. Fill pattern and solid fill preserve grayscale separation.",
         12,
         C["muted"],
     )
@@ -548,7 +548,7 @@ def paired_panel(
 def timings_figure(data: dict) -> str:
     height = 640
     timing = data["timings"]
-    title_value = "Measured development timings: paired n=2, no CI"
+    title_value = "Measured development timings: all paired n=2 runs"
     body = text(48, 42, title_value, 25, weight="bold")
     body += text(
         48,
@@ -600,13 +600,13 @@ def timings_figure(data: dict) -> str:
     body += text(
         48,
         587,
-        "Development evidence only (n=2 per arm): descriptive paired ratios, no uncertainty interval or Flash claim.",
+        "MEASURED DEVELOPMENT · n=2 per arm · descriptive paired ratios · individual runs shown.",
         13,
         C["vermillion"],
         weight="bold",
     )
-    body += footer("Source: eight frozen raw JSONL traces; full paths and SHA-256 in cost-figures-provenance.json.", height)
-    return svg(title_value, "Paired raw development timings with all runs shown and no confidence intervals.", body, height)
+    body += footer("MEASURED DEVELOPMENT · paired request and routed-wall timings", height)
+    return svg(title_value, "Paired raw development timings with every run and median shown.", body, height)
 
 
 def pos5_figure(data: dict) -> str:
@@ -704,12 +704,12 @@ def pos5_figure(data: dict) -> str:
     body += text(
         48,
         554,
-        "This is one next-token development decode, not sustained throughput.",
+        "MEASURED DEVELOPMENT · one next-token decode · sustained rate remains unmeasured.",
         13,
         C["vermillion"],
         weight="bold",
     )
-    body += footer("Source: pos5-production-dag… JSONL · SHA-256 ae807d39e1e0…", height)
+    body += footer("MEASURED DEVELOPMENT · position 5 · n=1", height)
     return svg(title_value, "Measured position-5 next-token time decomposition with exact accounting closure.", body, height)
 
 
@@ -727,7 +727,7 @@ def hardware_ladder_figure(data: dict) -> str:
     body += text(
         48,
         93,
-        "There is deliberately no shared rate axis: target gates are not hardware-derived predictions.",
+        "Separate rate frames preserve the distinct models, estimands, and assumptions.",
         13,
         C["vermillion"],
         weight="bold",
@@ -738,7 +738,7 @@ def hardware_ladder_figure(data: dict) -> str:
     # Measured: solid border + solid point.
     body += rect(48, 150, 392, 126, C["paper"], C["blue"], 8, 2.5)
     body += circle(72, 176, 8, C["blue"], C["ink"], 1.5)
-    body += text(92, 181, "MEASURED", 12, C["blue"], weight="bold")
+    body += text(92, 181, "MEASURED DEVELOPMENT", 12, C["blue"], weight="bold")
     body += text(70, 215, "Pro · 12 GiB", 18, C["ink"], weight="bold")
     body += text(
         418,
@@ -749,15 +749,15 @@ def hardware_ladder_figure(data: dict) -> str:
         "end",
         "bold",
     )
-    body += text(70, 245, "One position-5 development decode; not sustained throughput.", 12, C["muted"])
+    body += text(70, 245, "One position-5 decode; sustained rate remains unmeasured.", 12, C["muted"])
 
-    # Calibrated: hatched cue and explicit no-run boundary.
+    # Calibrated: hatched cue and explicit run-count boundary.
     body += rect(48, 296, 392, 126, C["paper"], C["orange"], 8, 2.5)
     body += rect(64, 316, 18, 18, "url(#hatch-orange)", C["orange"], 1, 1.5)
     body += text(92, 330, "CALIBRATED", 12, C["orange"], weight="bold")
     body += text(70, 364, "Flash · 12 GiB", 18, C["ink"], weight="bold")
-    body += text(418, 364, "0.08–0.12 token/s", 18, C["orange"], "end", "bold")
-    body += text(70, 394, "Cold H1 projection; calibrated from Pro service. No Flash run.", 12, C["muted"])
+    body += text(418, 364, "0.08 to 0.12 token/s", 18, C["orange"], "end", "bold")
+    body += text(70, 394, "Cold H1 projection from Pro service · Flash run count: 0.", 12, C["muted"])
 
     def target_card(
         y: float,
@@ -768,7 +768,7 @@ def hardware_ladder_figure(data: dict) -> str:
     ) -> str:
         card = rect(480, y, 432, 105, C["paper"], C["green"], 8, 2.5, "8 5")
         card += rect(496, y + 15, 20, 20, C["paper"], C["green"], 1, 2, "5 3")
-        card += text(526, y + 31, "TARGET GATE", 12, C["green"], weight="bold")
+        card += text(526, y + 31, "TARGET · FUTURE ACCEPTANCE GATE", 12, C["green"], weight="bold")
         card += text(502, y + 63, model, 17, C["ink"], weight="bold")
         card += text(890, y + 63, band, 17, C["green"], "end", "bold")
         card += text(502, y + 88, assumption, 12, C["muted"])
@@ -779,27 +779,27 @@ def hardware_ladder_figure(data: dict) -> str:
     body += target_card(
         150,
         "Flash · 16 GiB",
-        "0.25–0.40 tok/s",
-        "Requires unimplemented resident-fixed H1 path.",
+        "0.25 to 0.40 tok/s",
+        "Resident-fixed H1 implementation remains pending.",
     )
     body += target_card(
         272,
         "Flash · 24 GiB",
-        "0.50–1.00 committed tok/s",
-        "H2 · q=0.8 assumed; not a prediction.",
-        "current H2 calibration: 0.20–0.29",
+        "0.50 to 1.00 committed tok/s",
+        "H2 · q=0.8 planning assumption.",
+        "current H2 calibration: 0.20 to 0.29",
     )
     body += target_card(
         394,
-        "Flash · 32–48 GiB",
-        "0.70–1.50 committed tok/s",
-        "H5 · q=0.8 assumed; not a prediction.",
-        "current H5 calibration: 0.26–0.37",
+        "Flash · 32 to 48 GiB",
+        "0.70 to 1.50 committed tok/s",
+        "H5 · q=0.8 planning assumption.",
+        "current H5 calibration: 0.26 to 0.37",
     )
     body += text(
         48,
         548,
-        "A Target is a future pass/fail threshold—not an estimate of what more VRAM will deliver.",
+        "TARGET defines a future pass/fail threshold. Hardware rate estimation remains a separate gate.",
         13,
         C["vermillion"],
         weight="bold",
@@ -811,8 +811,8 @@ def hardware_ladder_figure(data: dict) -> str:
         12,
         C["muted"],
     )
-    body += footer("Sources/formulas: cost-figures-provenance.json and docs/FLASH_MIGRATION_RESEARCH.md.", height)
-    return svg(title_value, "Current evidence and future hardware acceptance gates shown without a shared rate axis.", body, height)
+    body += footer("EVIDENCE TIERS · MEASURED DEVELOPMENT · CALIBRATED · TARGET", height)
+    return svg(title_value, "Current evidence and future hardware acceptance gates use separate rate frames.", body, height)
 
 
 def provenance(data: dict, metadata: dict[str, dict]) -> dict:
@@ -968,7 +968,7 @@ def render_all(data: dict, metadata: dict[str, dict]) -> dict[str, bytes]:
             35,
             [0, 5, 10, 15, 20, 25, 30, 35],
             "Measured field: physical.fixed_h2d_bytes. E2E timing is shown separately in Figure 15.",
-            "Source: four frozen raw/host JSONL traces; identity recorded in cost-figures-provenance.json.",
+            "MEASURED DEVELOPMENT · paired fixed-weight transfer evidence",
         ),
         "14-routed-cache-savings.svg": byte_savings_figure(
             "Measured routed cache: 34.603 GB less source and H2D each",
@@ -980,7 +980,7 @@ def render_all(data: dict, metadata: dict[str, dict]) -> dict[str, bytes]:
             70,
             [0, 10, 20, 30, 40, 50, 60, 70],
             "Strict audit: 1,830 routes · 844 loads · 986 hits · 61/61 layers · 0 fallback/errors.",
-            "Source: four cache ABBA traces + independent strict audit; SHA-256 in provenance JSON.",
+            "MEASURED DEVELOPMENT · paired cache evidence + strict accounting audit",
         ),
         "15-development-paired-timings.svg": timings_figure(data),
         "16-pos5-one-token-dag.svg": pos5_figure(data),
