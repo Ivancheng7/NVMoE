@@ -2531,7 +2531,6 @@ fn fixed_layer_decoded_host_bytes(
     if layer < 3 {
         device_bytes
             .checked_sub(v4_router::V4_ROUTED_EXPERTS * std::mem::size_of::<f32>())
-            .and_then(|bytes| bytes.checked_add(v4_router::V4_TOPK * std::mem::size_of::<i64>()))
             .and_then(|bytes| bytes.checked_add(duplicated_tail_bytes))
             .ok_or_else(|| "fixed decoded host size overflow".into())
     } else {
@@ -3416,12 +3415,36 @@ fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
     }
     stationary_raw_retention_static_check()?;
     println!(
-        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100,\"stationary_raw_selection\":\"device+host+miss\",\"stationary_raw_lease\":\"exclusive_take_restore\"}}"
+        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100,\"stationary_raw_selection\":\"device+host+miss\",\"stationary_raw_lease\":\"exclusive_take_restore\",\"fixed_host_request_ids_cached_bytes\":0,\"prompt_hash_id_bytes_dropped\":240,\"decode_hash_id_bytes_external\":48}}"
     );
     Ok(())
 }
 
 fn stationary_raw_retention_static_check() -> Result<(), Box<dyn Error>> {
+    const PROMPT_ROWS: usize = 5;
+    const DECODE_ROWS: usize = 1;
+    let mut router = v4_state::LayerRouterWeights::Hash {
+        ids: vec![0; PROMPT_ROWS * v4_router::V4_TOPK],
+    };
+    let removed_bytes = drop_request_hash_ids_before_fixed_retention(&mut router, PROMPT_ROWS)?;
+    let fixed_host_bytes = 1_000_usize;
+    let prompt_host_bytes = fixed_host_bytes
+        .checked_add(removed_bytes)
+        .ok_or("stationary raw static host byte overflow")?;
+    let decode_request_bytes = DECODE_ROWS
+        .checked_mul(v4_router::V4_TOPK)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<i64>()))
+        .ok_or("stationary raw static decode-ID byte overflow")?;
+    if removed_bytes != PROMPT_ROWS * v4_router::V4_TOPK * std::mem::size_of::<i64>()
+        || prompt_host_bytes - removed_bytes != fixed_host_bytes
+        || decode_request_bytes != 48
+        || !matches!(
+            router,
+            v4_state::LayerRouterWeights::Hash { ref ids } if ids.is_empty()
+        )
+    {
+        return Err("stationary raw request IDs leaked into fixed host bytes".into());
+    }
     let plans = [(0, 10, 12), (1, 11, 13), (2, 20, 20)]
         .into_iter()
         .map(|(layer, raw_device_bytes, raw_host_bytes)| FixedLayerPlan {
@@ -5113,6 +5136,7 @@ fn run_real_v4_layer_stationary_prefill(
                     cache.capture_stationary_raw(
                         root,
                         manifest.layer,
+                        prompt_len,
                         retention_host
                             .ok_or("stationary raw retention lost its prefetched host payload")?,
                         runtime,
@@ -11314,6 +11338,31 @@ struct DecodedLayerHost {
     tail: v4_state::L0TailWeights,
 }
 
+fn drop_request_hash_ids_before_fixed_retention(
+    router: &mut v4_state::LayerRouterWeights,
+    request_rows: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let v4_state::LayerRouterWeights::Hash { ids } = router else {
+        return Ok(0);
+    };
+    let expected = request_rows
+        .checked_mul(v4_router::V4_TOPK)
+        .ok_or("fixed-retention hash-row count overflow")?;
+    if ids.len() != expected {
+        return Err(format!(
+            "fixed-retention hash IDs have {} values, expected {expected}",
+            ids.len()
+        )
+        .into());
+    }
+    let removed_bytes = ids
+        .len()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or("fixed-retention hash-ID byte count overflow")?;
+    ids.clear();
+    Ok(removed_bytes)
+}
+
 struct FixedPrefetchedHost {
     layer: usize,
     host: DecodedLayerHost,
@@ -12225,6 +12274,7 @@ impl FixedLayerCache {
         &mut self,
         model_dir: &std::path::Path,
         layer: usize,
+        prompt_rows: usize,
         mut host: DecodedLayerHost,
         mut runtime: LoadedLayerRuntime,
         wo_a_raw: DeviceBuffer<u8>,
@@ -12282,6 +12332,7 @@ impl FixedLayerCache {
                 resident_bytes,
             });
         } else if host_selected {
+            drop_request_hash_ids_before_fixed_retention(&mut host.state.router, prompt_rows)?;
             let raw = host
                 .tail
                 .wo_a_raw
@@ -12591,8 +12642,9 @@ impl FixedLayerCache {
                 },
             ));
         }
-        let (host, mut telemetry) = load_layer_host(model_dir, layer, token_ids)?;
+        let (mut host, mut telemetry) = load_layer_host(model_dir, layer, token_ids)?;
         self.misses += 1;
+        drop_request_hash_ids_before_fixed_retention(&mut host.state.router, token_ids.len())?;
         if host.num_bytes() != decoded_host_bytes {
             return Err(format!(
                 "layer {layer} decoded host bytes {} != plan {decoded_host_bytes}",

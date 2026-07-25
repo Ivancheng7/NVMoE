@@ -12,7 +12,7 @@ localMoE是一个研究中的Rust和CUDA运行时，专门处理这类放置问�
 
 在第4层，覆盖5个位置的QD4门槛把路由范围的中位墙钟时间从`486.604659 ms`降到`118.169615 ms`，`4/4`对结果全部精确。这是本文声称的最大加速，范围仅限一个局部路由层机制门槛。提示词E2E与token吞吐各有独立测量，生产证据仍待补充。该门槛关闭了固定权重预取。[冻结的评审工件](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json)记录了范围与排除项。
 
-[查看消费级硬件路径](#从pro验证到flash产品目标) | [复现证据](#复现证据) | [阅读Flash迁移研究](docs/FLASH_MIGRATION_RESEARCH.md)
+[查看消费级硬件路径](#从pro验证到flash产品目标) | [复现证据](#复现证据) | [查看证据地图](#证据地图)
 
 ## 为什么做这个项目
 
@@ -160,11 +160,8 @@ python docs/assets/readme/generate_cost_figures.py \
 | [原始固定权重与缓存开发证据来源](docs/assets/readme/cost-figures-provenance.json) | 配对`n=2`字节图与计时图；置信区间不可用 |
 | [QD4确认摘要](docs/assets/readme/data/qd4-full61/confirmatory/summary.json) | 4组配对提示词E2E运行 |
 | [QD4 L3/L4支持门槛](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json) | 局部路由范围机制门槛，排除在full61确认统计之外 |
-| [Flash迁移研究](docs/FLASH_MIGRATION_RESEARCH.md) | 固定元数据、校准公式、目标边界和未来门槛 |
-| [Rust重写审计](docs/RUST_REWRITE_AUDIT.md) | 当前实现边界与待完成的验收工作 |
-| [技术报告](docs/V4_PRO_LAPTOP_TECHNICAL_REPORT.md) | 方法、早期机制、限制和证据谱系 |
 
-图13至图17由冻结的原始轨迹和Flash研究报告生成。来源文件记录实测值的轨迹哈希与计算过程，并把未来硬件区间标为硬编码的**TARGET**门槛。其预测公式仍未定义。Flash硬件图为当前实测证据和未来门槛使用独立速率框架。
+图13至图17由冻结的原始轨迹和固定的目标元数据生成。来源文件记录实测值的轨迹哈希与计算过程，并把未来硬件区间标为硬编码的**TARGET**门槛。其预测公式仍未定义。Flash硬件图为当前实测证据和未来门槛使用独立速率框架。
 
 不同谱系的比率保持分开。`4.117849x`路由层门槛、`1.342477723x`配对提示词结果和位置5的`0.02704225 token/s`观测回答的是不同问题。
 

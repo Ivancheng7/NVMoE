@@ -12,7 +12,7 @@ localMoE is a Rust and CUDA research runtime for this placement problem. The ful
 
 At layer 4, the five-position QD4 gate reduced routed-scope median wall time from `486.604659 ms` to `118.169615 ms`. All `4/4` pairs were exact. This is the largest speedup claimed here. Its scope is one local routed-layer mechanism gate. Prompt E2E and token throughput have separate measurements, and production evidence remains pending. This gate ran with fixed prefetch disabled. The [frozen review artifact](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json) records the scope and exclusions.
 
-[See the consumer hardware path](#from-pro-proof-to-flash-product-target) | [Reproduce the evidence](#reproduce-the-evidence) | [Read the Flash migration research](docs/FLASH_MIGRATION_RESEARCH.md)
+[See the consumer hardware path](#from-pro-proof-to-flash-product-target) | [Reproduce the evidence](#reproduce-the-evidence) | [Review the evidence map](#evidence-map)
 
 ## Why this exists
 
@@ -167,11 +167,8 @@ The [mechanism experiment record](docs/experiments/v4-pro-mechanisms-2026-07-24.
 | [Raw fixed and cache development provenance](docs/assets/readme/cost-figures-provenance.json) | Paired `n=2` byte and timing figures; CI unavailable |
 | [QD4 confirmatory summary](docs/assets/readme/data/qd4-full61/confirmatory/summary.json) | Four paired prompt-E2E runs |
 | [QD4 L3/L4 support gate](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json) | Local routed-scope mechanism gate, excluded from full61 statistics |
-| [Flash migration research](docs/FLASH_MIGRATION_RESEARCH.md) | Pinned metadata, calibration formulas, target boundaries, and future gates |
-| [Rust rewrite audit](docs/RUST_REWRITE_AUDIT.md) | Current implementation boundary and open acceptance work |
-| [Technical report](docs/V4_PRO_LAPTOP_TECHNICAL_REPORT.md) | Methods, older mechanisms, limitations, and evidence lineage |
 
-The figures `13` through `17` are generated from frozen raw traces and the Flash research report. Their provenance file records trace hashes and calculations for measured values, then marks the future hardware bands as hardcoded **TARGET** gates. Their predictive formula remains undefined. The Flash ladder gives measured current evidence and future gates separate rate frames.
+The figures `13` through `17` are generated from frozen raw traces and pinned target metadata. Their provenance file records trace hashes and calculations for measured values, then marks the future hardware bands as hardcoded **TARGET** gates. Their predictive formula remains undefined. The Flash ladder gives measured current evidence and future gates separate rate frames.
 
 Ratios from different lineages remain separate. The `4.117849x` routed-layer gate, the `1.342477723x` paired prompt result, and the `0.02704225 token/s` position-5 observation answer different questions.
 
