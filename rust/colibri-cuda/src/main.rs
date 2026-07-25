@@ -1278,8 +1278,8 @@ mod kernels {
             || attn_sink.len() != HEADS
             || topk_per_row == 0
             || topk.len() != rows * topk_per_row
-            || scores.len() != rows * HEADS * topk_per_row
-            || probabilities.len() != scores.len()
+            || scores.len() < rows * HEADS * topk_per_row
+            || probabilities.len() < rows * HEADS * topk_per_row
             || valid_counts.len() != rows * HEADS
             || index >= denominators.len()
         {
@@ -1349,12 +1349,13 @@ mod kernels {
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
         let score_width = HEADS * topk_per_row;
+        let score_len = q.len() / (HEADS * DIM) * score_width;
         if q.len() % (HEADS * DIM) != 0
             || kv.len() % DIM != 0
             || topk_per_row == 0
             || topk.len() != q.len() / (HEADS * DIM) * topk_per_row
-            || scores.len() != q.len() / (HEADS * DIM) * score_width
-            || index >= scores.len()
+            || scores.len() < score_len
+            || index >= score_len
         {
             return;
         }
@@ -1399,8 +1400,8 @@ mod kernels {
             || kv.len() % 512 != 0
             || topk_per_row == 0
             || topk.len() != rows * topk_per_row
-            || scores.len() != rows * HEADS * topk_per_row
-            || probabilities.len() != scores.len()
+            || scores.len() < rows * HEADS * topk_per_row
+            || probabilities.len() < rows * HEADS * topk_per_row
             || index >= denominators.len()
         {
             return;
@@ -1460,7 +1461,7 @@ mod kernels {
             || kv.len() % DIM != 0
             || topk_per_row == 0
             || topk.len() != rows * topk_per_row
-            || probabilities.len() != rows * HEADS * topk_per_row
+            || probabilities.len() < rows * HEADS * topk_per_row
             || denominators.len() != rows * HEADS
             || valid_counts.len() != rows * HEADS
             || index >= output.len()
@@ -2681,6 +2682,8 @@ fn main() {
         || std::env::var_os("COLIBRI_V4_CACHE_OFF_BENCH").is_some()
         || std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").is_some()
         || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_SPARSE_K128_MICROGATE").is_some()
+        || std::env::var_os("COLIBRI_V4_TARGETED_ATTENTION_AUDIT").is_some()
         || std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some();
     let mut full61_preflight = (std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
         || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
@@ -2696,6 +2699,12 @@ fn main() {
     }
     if benchmark_requested {
         benchmark_provenance().expect("validate benchmark source identity");
+    }
+    if optional_one_flag("COLIBRI_V4_SPARSE_K128_MICROGATE")
+        .expect("validate sparse K128 microgate flag")
+    {
+        sparse_attention_score_reuse_k128_attention_post_microgate();
+        return;
     }
     // ponytail: this smoke uses synchronous safe copies for a terminal parity
     // check; switch to event-owned async buffers when production dispatch lands.
@@ -3320,18 +3329,23 @@ fn validate_layer_stationary_prefill(
     qd4_replay_bench: bool,
     short_device_decode: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let targeted_attention_audit = optional_one_flag("COLIBRI_V4_TARGETED_ATTENTION_AUDIT")?;
     if prompt_len == 0
         || if short_device_decode {
             !(2..=V4_SHORT_DEVICE_DECODE_MAX_NEW_TOKENS).contains(&greedy_steps)
         } else {
             greedy_steps != 1
         }
-        || max_layers != v4_state::V4_LAYER_COUNT
+        || if targeted_attention_audit {
+            max_layers != 3 || short_device_decode
+        } else {
+            max_layers != v4_state::V4_LAYER_COUNT
+        }
         || !cache_is_off
         || qd4_replay_bench
     {
         return Err(
-            "layer-stationary prefill requires a nonempty prompt, greedy_steps=1 (or 2..=5 for short device decode), full61, fixed cache off, and the QD4 replay benchmark off"
+            "layer-stationary prefill requires a nonempty prompt, greedy_steps=1 (or 2..=5 for short device decode), full61 (or exactly 3 layers for the targeted attention audit), fixed cache off, and the QD4 replay benchmark off"
                 .into(),
         );
     }
@@ -3357,6 +3371,19 @@ fn short_device_decode_rows(
 }
 
 fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
+    for (topk_per_row, expected_score_reuse, scratch_topk_capacity) in [
+        (1, false, 1),
+        (SM89_SCORE_REUSE_MIN_TOPK - 1, false, 3),
+        (SM89_SCORE_REUSE_MIN_TOPK, true, 4),
+        (v4_state::KV_WINDOW, true, v4_state::KV_WINDOW),
+        (v4_state::KV_WINDOW + 1, true, v4_state::KV_WINDOW + 2),
+    ] {
+        if SparseAttentionArm::Sm89Crossover.uses_score_reuse(topk_per_row) != expected_score_reuse
+            || scratch_topk_capacity < topk_per_row
+        {
+            return Err("short device decode sm89 crossover/workspace boundary drift".into());
+        }
+    }
     let state_bytes = 31usize
         .checked_mul(V4_DEVICE_TOKEN_STATE_HCA_BYTES)
         .and_then(|bytes| {
@@ -3415,7 +3442,7 @@ fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
     }
     stationary_raw_retention_static_check()?;
     println!(
-        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100,\"stationary_raw_selection\":\"device+host+miss\",\"stationary_raw_lease\":\"exclusive_take_restore\",\"fixed_host_request_ids_cached_bytes\":0,\"prompt_hash_id_bytes_dropped\":240,\"decode_hash_id_bytes_external\":48}}"
+        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"sm89_crossover\":\"K<4=reference,K>=4=score_reuse\",\"sm89_workspace_cases\":[1,3,4,128,129],\"strict_arena_reuse_repeats\":100,\"stationary_raw_selection\":\"device+host+miss\",\"stationary_raw_lease\":\"exclusive_take_restore\",\"fixed_host_request_ids_cached_bytes\":0,\"prompt_hash_id_bytes_dropped\":240,\"decode_hash_id_bytes_external\":48}}"
     );
     Ok(())
 }
@@ -3648,7 +3675,10 @@ fn run_real_v4_full61_b1(
     if !(1..=v4_state::V4_LAYER_COUNT).contains(&max_layers) {
         return Err("COLIBRI_V4_MAX_LAYERS must be in 1..=61".into());
     }
-    if greedy_steps != 0 && max_layers != v4_state::V4_LAYER_COUNT {
+    if greedy_steps != 0
+        && max_layers != v4_state::V4_LAYER_COUNT
+        && !optional_one_flag("COLIBRI_V4_TARGETED_ATTENTION_AUDIT")?
+    {
         return Err("COLIBRI_V4_GREEDY_STEPS requires COLIBRI_V4_MAX_LAYERS=61".into());
     }
     let critical_path_profile = match std::env::var_os("COLIBRI_V4_CRITICAL_PATH_PROFILE") {
@@ -4365,7 +4395,14 @@ fn run_real_v4_layer_stationary_prefill(
     greedy_steps: usize,
     mut result: PendingResultFile,
 ) -> Result<(), Box<dyn Error>> {
-    if token_ids.len() != prompt_len || manifests.len() != v4_state::V4_LAYER_COUNT {
+    let targeted_attention_audit = optional_one_flag("COLIBRI_V4_TARGETED_ATTENTION_AUDIT")?;
+    if token_ids.len() != prompt_len
+        || if targeted_attention_audit {
+            manifests.len() != 3
+        } else {
+            manifests.len() != v4_state::V4_LAYER_COUNT
+        }
+    {
         return Err(
             "layer-stationary prefill received a non-prompt token or partial manifest".into(),
         );
@@ -4397,6 +4434,21 @@ fn run_real_v4_layer_stationary_prefill(
     }
     if device_short_decode && phase_profile && device_attention_audit {
         return Err("short device phase profile requires production non-audit attention".into());
+    }
+    if targeted_attention_audit
+        && (chat_user != Some("hi")
+            || prompt_len != 5
+            || greedy_steps != 1
+            || !fixed_prefetch
+            || !qd4_enabled
+            || !device_attention
+            || !device_attention_audit
+            || !raw_wo_a_gpu_decode
+            || device_short_decode
+            || sparse_attention_arm != SparseAttentionArm::Sm89Crossover
+            || std::env::var_os("COLIBRI_V4_TARGETED_ATTENTION_AUDIT_PATH").is_none())
+    {
+        return Err("targeted attention audit requires chat_user=hi, five-token prefill, layers 0..=2, greedy_steps=1, fixed prefetch, QD4, audited production attention, raw wo_a decode, sm89 crossover, no short decode, and an artifact path".into());
     }
     if qd4_enabled {
         if device_attention {
@@ -4543,6 +4595,7 @@ fn run_real_v4_layer_stationary_prefill(
     let mut one_token_decode_phase_profile_layer_outer_ns = 0_u64;
     let mut one_token_decode_phase_profile_final_outer_ns = 0_u64;
     let mut fixed_prefetch_records = Vec::with_capacity(manifests.len().saturating_sub(1));
+    let mut targeted_attention_audit_complete = false;
     let mut device_states = device_attention.then(|| {
         std::iter::repeat_with(|| None)
             .take(if device_short_decode {
@@ -4864,6 +4917,19 @@ fn run_real_v4_layer_stationary_prefill(
                         .as_mut()
                         .ok_or("host persistent state is unavailable outside device production")?
                         .transaction(manifest.layer, |layer_state| {
+                            let targeted_position = targeted_attention_audit
+                                && manifest.layer == 2
+                                && token_position == 3;
+                            let targeted_precommit = targeted_position
+                                .then(|| {
+                                    let host = host_persistent_state_audit(layer_state);
+                                    let state = device_state
+                                        .as_deref()
+                                        .ok_or("targeted audit device state disappeared")?;
+                                    let device = device_persistent_state_audit(stream, state)?;
+                                    Ok::<_, Box<dyn Error>>((host, device))
+                                })
+                                .transpose()?;
                             let expected_attention = if device_attention {
                                 let oracle_started = std::time::Instant::now();
                                 let oracle = run_real_layer_attention_rows(
@@ -4938,25 +5004,44 @@ fn run_real_v4_layer_stationary_prefill(
                                     &expected_state,
                                     &actual_state,
                                 )?;
-                                if let Some(index) =
-                                    first_mismatch(&expected_output, &run.attention_output)
-                                {
-                                    return Err(format!(
-                                        "device audit layer {} position {} attention_post first mismatch at {index}",
-                                        manifest.layer, token_position
-                                    )
-                                    .into());
-                                }
                                 let actual_topk = run
                                     .attention_topk
                                     .as_deref()
                                     .ok_or("device audit omitted sparse top-k D2H")?;
-                                if actual_topk != expected_topk.as_slice() {
-                                    return Err(format!(
-                                        "device audit layer {} position {} sparse top-k raw bits mismatch",
-                                        manifest.layer, token_position
-                                    )
-                                    .into());
+                                if targeted_position {
+                                    let (precommit_host, precommit_device) = targeted_precommit
+                                        .as_ref()
+                                        .ok_or("targeted audit omitted precommit state")?;
+                                    let _ = run_targeted_attention_audit(
+                                        module,
+                                        stream,
+                                        &runtime,
+                                        &hidden[token_position],
+                                        token_position,
+                                        layer_state,
+                                        device_state,
+                                        &expected_topk,
+                                        precommit_host,
+                                        precommit_device,
+                                    )?;
+                                    targeted_attention_audit_complete = true;
+                                } else {
+                                    if let Some(index) =
+                                        first_mismatch(&expected_output, &run.attention_output)
+                                    {
+                                        return Err(format!(
+                                            "device audit layer {} position {} attention_post first mismatch at {index}",
+                                            manifest.layer, token_position
+                                        )
+                                        .into());
+                                    }
+                                    if actual_topk != expected_topk.as_slice() {
+                                        return Err(format!(
+                                            "device audit layer {} position {} sparse top-k raw bits mismatch",
+                                            manifest.layer, token_position
+                                        )
+                                        .into());
+                                    }
                                 }
                                 run.stage.attention_audit_oracle_ns = oracle_ns;
                                 observed_state = Some(actual_state);
@@ -5113,6 +5198,9 @@ fn run_real_v4_layer_stationary_prefill(
                     }
                     hidden[token_position] = next_hidden;
                     layer_records[token_position].push(record);
+                    if targeted_attention_audit_complete {
+                        return Ok(());
+                    }
                     if l0_cutpoint && manifest.layer == 0 && token_position == 0 {
                         println!(
                             "COLIBRI_L0_POS0_CUTPOINT={}",
@@ -5171,6 +5259,12 @@ fn run_real_v4_layer_stationary_prefill(
         }
         scoped_result
     })?;
+    if targeted_attention_audit {
+        if !targeted_attention_audit_complete {
+            return Err("targeted attention audit did not reach layer 2 position 3".into());
+        }
+        return Ok(());
+    }
     if fixed_prefetch && fixed_prefetch_records.len() != manifests.len().saturating_sub(1) {
         return Err("layer-stationary fixed prefetch did not record every transition".into());
     }
@@ -12454,13 +12548,13 @@ impl FixedLayerCache {
             let raw_h2d_ns =
                 u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let raw_h2d_bytes = wo_a_raw.num_bytes();
+            let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let decode_started = std::time::Instant::now();
             launch_e4m3fn_to_bf16(module, stream, &wo_a_raw, &mut scratch)?;
             stream.synchronize()?;
             let fixed_decode_ns =
                 u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
-            let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let fixed_h2d_bytes = fixed_without_raw_bytes
                 .checked_add(raw_h2d_bytes)
                 .ok_or("stationary raw host H2D byte overflow")?;
@@ -15660,8 +15754,8 @@ fn run_sparse_attention_reference_state_device_into(
         || attn_sink.len() != v4_state::Q_HEADS
         || topk_per_row == 0
         || topk.len() != rows * topk_per_row
-        || scratch.scores.len() != score_len
-        || scratch.probabilities.len() != score_len
+        || scratch.scores.len() < score_len
+        || scratch.probabilities.len() < score_len
         || scratch.denominators.len() != head_len
         || scratch.valid_counts.len() != head_len
     {
@@ -15714,8 +15808,8 @@ fn run_sparse_attention_score_reuse_device_into(
         || topk_per_row == 0
         || topk.len() != rows * topk_per_row
         || output.len() != q.len()
-        || scratch.scores.len() != score_len
-        || scratch.probabilities.len() != score_len
+        || scratch.scores.len() < score_len
+        || scratch.probabilities.len() < score_len
         || scratch.denominators.len() != head_len
         || scratch.valid_counts.len() != head_len
     {
@@ -18099,8 +18193,9 @@ fn run_device_attention_after_commit(
     } else {
         raw_topk
     };
-    match sparse_attention_arm_from_env()? {
-        SparseAttentionArm::Reference => run_sparse_attention_device_into(
+    let sparse_arm = sparse_attention_arm_from_env()?;
+    if !sparse_arm.uses_score_reuse(topk.len()) {
+        run_sparse_attention_device_into(
             module,
             stream,
             &state.q_rope,
@@ -18109,46 +18204,43 @@ fn run_device_attention_after_commit(
             topk,
             &mut state.sparse,
             topk.len(),
-        )?,
-        SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
-            if csa_boundary {
-                run_sparse_attention_score_reuse_device_into(
-                    module,
-                    stream,
-                    &state.q_rope,
-                    &state.attention_cache,
-                    &weights.attn_sink,
-                    topk,
-                    &mut state.sparse,
-                    &mut state.sparse_csa,
-                    topk.len(),
-                )?
-            } else if position == 0 {
-                run_sparse_attention_score_reuse_device_into(
-                    module,
-                    stream,
-                    &state.q_rope,
-                    &state.attention_cache,
-                    &weights.attn_sink,
-                    topk,
-                    &mut state.sparse,
-                    &mut state.sparse_pos0,
-                    topk.len(),
-                )?
-            } else {
-                run_sparse_attention_score_reuse_device_into(
-                    module,
-                    stream,
-                    &state.q_rope,
-                    &state.attention_cache,
-                    &weights.attn_sink,
-                    topk,
-                    &mut state.sparse,
-                    &mut state.sparse_pos1,
-                    topk.len(),
-                )?
-            }
-        }
+        )?;
+    } else if csa_boundary {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.attention_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            &mut state.sparse_csa,
+            topk.len(),
+        )?;
+    } else if position == 0 {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.attention_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            &mut state.sparse_pos0,
+            topk.len(),
+        )?;
+    } else {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.attention_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            &mut state.sparse_pos1,
+            topk.len(),
+        )?;
     }
     rope_lut.copy_inverse_row(stream, position, &state.inverse_freqs)?;
     run_rope_device_into(
@@ -18980,6 +19072,374 @@ fn first_mismatch<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
         .zip(right)
         .position(|(left, right)| left != right)
         .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+fn targeted_stage_u16(name: &str, expected: &[u16], actual: &[u16]) -> serde_json::Value {
+    let mismatch = first_mismatch(expected, actual);
+    serde_json::json!({
+        "stage": name,
+        "exact": mismatch.is_none(),
+        "elements": {"reference": expected.len(), "candidate": actual.len()},
+        "digest": {"reference": format!("{:016x}", fnv1a_u16(expected)), "candidate": format!("{:016x}", fnv1a_u16(actual))},
+        "first_mismatch": mismatch.map(|index| serde_json::json!({
+            "index": index,
+            "reference_bits": expected.get(index).map(|value| format!("{value:04x}")),
+            "candidate_bits": actual.get(index).map(|value| format!("{value:04x}")),
+            "reference_bf16": expected.get(index).map(|&value| format!("{:.9e}", v4_router::bf16_to_f32(value))),
+            "candidate_bf16": actual.get(index).map(|&value| format!("{:.9e}", v4_router::bf16_to_f32(value))),
+        })),
+    })
+}
+
+fn targeted_stage_f32(name: &str, expected: &[f32], actual: &[f32]) -> serde_json::Value {
+    let mismatch = expected
+        .iter()
+        .zip(actual)
+        .position(|(&expected, &actual)| expected.to_bits() != actual.to_bits())
+        .or_else(|| (expected.len() != actual.len()).then_some(expected.len().min(actual.len())));
+    serde_json::json!({
+        "stage": name,
+        "exact": mismatch.is_none(),
+        "elements": {"reference": expected.len(), "candidate": actual.len()},
+        "digest": {"reference": format!("{:016x}", fnv1a_f32(expected)), "candidate": format!("{:016x}", fnv1a_f32(actual))},
+        "first_mismatch": mismatch.map(|index| serde_json::json!({
+            "index": index,
+            "reference_bits": expected.get(index).map(|value| format!("{:08x}", value.to_bits())),
+            "candidate_bits": actual.get(index).map(|value| format!("{:08x}", value.to_bits())),
+            "reference_f32": expected.get(index).map(|value| format!("{value:.9e}")),
+            "candidate_f32": actual.get(index).map(|value| format!("{value:.9e}")),
+        })),
+    })
+}
+
+fn targeted_stage_i32(name: &str, expected: &[i32], actual: &[i32]) -> serde_json::Value {
+    let mismatch = first_mismatch(expected, actual);
+    serde_json::json!({
+        "stage": name,
+        "exact": mismatch.is_none(),
+        "elements": {"reference": expected.len(), "candidate": actual.len()},
+        "digest": {"reference": format!("{:016x}", fnv1a_i32(expected)), "candidate": format!("{:016x}", fnv1a_i32(actual))},
+        "first_mismatch": mismatch.map(|index| serde_json::json!({
+            "index": index,
+            "reference": expected.get(index),
+            "candidate": actual.get(index),
+        })),
+    })
+}
+
+fn targeted_stage_u32(name: &str, expected: &[u32], actual: &[u32]) -> serde_json::Value {
+    let expected_i32 = expected
+        .iter()
+        .map(|&value| value as i32)
+        .collect::<Vec<_>>();
+    let actual_i32 = actual.iter().map(|&value| value as i32).collect::<Vec<_>>();
+    let mismatch = first_mismatch(expected, actual);
+    serde_json::json!({
+        "stage": name,
+        "exact": mismatch.is_none(),
+        "elements": {"reference": expected.len(), "candidate": actual.len()},
+        "digest": {"reference": format!("{:016x}", fnv1a_i32(&expected_i32)), "candidate": format!("{:016x}", fnv1a_i32(&actual_i32))},
+        "first_mismatch": mismatch.map(|index| serde_json::json!({
+            "index": index,
+            "reference": expected.get(index),
+            "candidate": actual.get(index),
+        })),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_targeted_attention_audit(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    hc_hidden: &[u16],
+    position: usize,
+    host_state: &v4_state::V4LayerPersistentState,
+    device_state: &DeviceTokenState,
+    expected_topk: &[i32],
+    precommit_host: &PersistentStateAudit,
+    precommit_device: &PersistentStateAudit,
+) -> Result<bool, Box<dyn Error>> {
+    if runtime.weights.layer != 2
+        || position != 3
+        || host_state.committed_kv_rows() != 4
+        || device_state.committed_rows != 4
+        || expected_topk.len() != v4_state::KV_WINDOW + 1
+    {
+        return Err("targeted attention audit reached the wrong layer/position geometry".into());
+    }
+    let weights = &runtime.weights;
+    let mut stages = vec![
+        targeted_stage_u16("precommit.kv", &precommit_host.kv, &precommit_device.kv),
+        targeted_stage_u16(
+            "precommit.compressed_kv",
+            &precommit_host.compressed_kv,
+            &precommit_device.compressed_kv,
+        ),
+        targeted_stage_u16(
+            "precommit.indexer_kv",
+            &precommit_host.indexer_kv,
+            &precommit_device.indexer_kv,
+        ),
+        targeted_stage_f32(
+            "precommit.main_compressor_kv",
+            &precommit_host.main_kv,
+            &precommit_device.main_kv,
+        ),
+        targeted_stage_f32(
+            "precommit.main_compressor_score",
+            &precommit_host.main_score,
+            &precommit_device.main_score,
+        ),
+    ];
+    if let (Some(expected), Some(actual)) = (
+        precommit_host.indexer_main_kv.as_deref(),
+        precommit_device.indexer_main_kv.as_deref(),
+    ) {
+        stages.push(targeted_stage_f32(
+            "precommit.indexer_compressor_kv",
+            expected,
+            actual,
+        ));
+    }
+    if let (Some(expected), Some(actual)) = (
+        precommit_host.indexer_main_score.as_deref(),
+        precommit_device.indexer_main_score.as_deref(),
+    ) {
+        stages.push(targeted_stage_f32(
+            "precommit.indexer_compressor_score",
+            expected,
+            actual,
+        ));
+    }
+
+    let freqs = v4_state::compressed_rope_freqs(position);
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        hc_hidden,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+    )?;
+    let actual_hc_hidden = device_state.hc_hidden.to_host_vec(stream)?;
+    let actual_post = device_state.post.to_host_vec(stream)?;
+    let actual_comb = device_state.comb.to_host_vec(stream)?;
+    stages.extend([
+        targeted_stage_u16("input.hc_hidden", hc_hidden, &actual_hc_hidden),
+        targeted_stage_f32("input.hc_post", &attn_hc.post, &actual_post),
+        targeted_stage_f32("input.hc_comb", &attn_hc.comb, &actual_comb),
+    ]);
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &weights.attn_norm,
+        v4_state::HIDDEN,
+    )?;
+    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let q_lora = run_l0_rmsnorm(
+        module,
+        stream,
+        &q_lora_raw,
+        &weights.q_norm,
+        weights.wq_a.out_features,
+    )?;
+    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    let q_rope = run_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
+    stages.extend([
+        targeted_stage_u16(
+            "input.attn_input",
+            &attn_input,
+            &device_state.attn_input.to_host_vec(stream)?,
+        ),
+        targeted_stage_u16(
+            "input.q_rope",
+            &q_rope,
+            &device_state.q_rope.to_host_vec(stream)?,
+        ),
+    ]);
+
+    let cache = host_state.attention_cache_bf16();
+    let actual_cache = device_state.attention_cache.to_host_vec(stream)?;
+    stages.push(targeted_stage_u16(
+        "input.attention_cache",
+        &cache,
+        &actual_cache[..cache.len()],
+    ));
+    let actual_topk = device_state.topk_csa[0].to_host_vec(stream)?;
+    stages.push(targeted_stage_i32(
+        "input.topk",
+        expected_topk,
+        &actual_topk,
+    ));
+
+    let topk = v4_state::SparseTopk {
+        indices: expected_topk.to_vec(),
+        rows: 1,
+        per_row: expected_topk.len(),
+        window_per_row: v4_state::KV_WINDOW,
+        compressed_per_row: 1,
+    };
+    let reference_sparse =
+        run_sparse_attention(module, stream, &q_rope, &cache, &weights.attn_sink, &topk)?;
+    let q_device = DeviceBuffer::from_host(stream, &q_rope)?;
+    let cache_device = DeviceBuffer::from_host(stream, &cache)?;
+    let topk_device = DeviceBuffer::from_host(stream, expected_topk)?;
+    let mut reference_state =
+        SparseAttentionScoreReuseScratch::new(stream, 1, expected_topk.len())?;
+    run_sparse_attention_reference_state_device_into(
+        module,
+        stream,
+        &q_device,
+        &cache_device,
+        &weights.attn_sink,
+        &topk_device,
+        &mut reference_state,
+        expected_topk.len(),
+    )?;
+    let logical_scores = v4_state::Q_HEADS * expected_topk.len();
+    let candidate_state = &device_state.sparse_csa;
+    let reference_scores = reference_state.scores.to_host_vec(stream)?;
+    let candidate_scores = candidate_state.scores.to_host_vec(stream)?;
+    let reference_probabilities = reference_state.probabilities.to_host_vec(stream)?;
+    let candidate_probabilities = candidate_state.probabilities.to_host_vec(stream)?;
+    stages.extend([
+        targeted_stage_f32(
+            "scores",
+            &reference_scores[..logical_scores],
+            &candidate_scores[..logical_scores],
+        ),
+        targeted_stage_f32(
+            "probabilities",
+            &reference_probabilities[..logical_scores],
+            &candidate_probabilities[..logical_scores],
+        ),
+        targeted_stage_f32(
+            "denominators",
+            &reference_state.denominators.to_host_vec(stream)?,
+            &candidate_state.denominators.to_host_vec(stream)?,
+        ),
+        targeted_stage_u32(
+            "valid_counts",
+            &reference_state.valid_counts.to_host_vec(stream)?,
+            &candidate_state.valid_counts.to_host_vec(stream)?,
+        ),
+        targeted_stage_u16(
+            "sparse",
+            &reference_sparse,
+            &device_state.sparse.to_host_vec(stream)?,
+        ),
+    ]);
+
+    let sparse_inverse = run_l0_rope(
+        module,
+        stream,
+        &reference_sparse,
+        &freqs,
+        v4_state::Q_HEADS,
+        true,
+    )?;
+    let wo_a = run_l0_wo_a(module, stream, &sparse_inverse, &weights.wo_a)?;
+    let (attention_f32, attention) =
+        run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let attention_post = run_l0_hc_post(
+        module,
+        stream,
+        &attention,
+        hc_hidden,
+        &attn_hc.post,
+        &attn_hc.comb,
+    )?;
+    stages.extend([
+        targeted_stage_u16(
+            "sparse_inverse",
+            &sparse_inverse,
+            &device_state.sparse_inverse.to_host_vec(stream)?,
+        ),
+        targeted_stage_u16("wo_a_bf16", &wo_a, &device_state.wo_a.to_host_vec(stream)?),
+        serde_json::json!({
+            "stage": "wo_b_weights",
+            "exact": true,
+            "basis": "reference and candidate share the same loaded DeviceFp8Matrix",
+            "bytes": weights.wo_b.num_bytes(),
+        }),
+        targeted_stage_f32(
+            "attention_f32",
+            &attention_f32,
+            &device_state.attention_f32.to_host_vec(stream)?,
+        ),
+        targeted_stage_u16(
+            "attention_bf16",
+            &attention,
+            &device_state.attention.to_host_vec(stream)?,
+        ),
+        targeted_stage_u16(
+            "attention_post",
+            &attention_post,
+            &device_state.after_attention.to_host_vec(stream)?,
+        ),
+    ]);
+    let first_divergence = stages
+        .iter()
+        .find(|stage| stage.get("exact").and_then(serde_json::Value::as_bool) == Some(false))
+        .and_then(|stage| stage.get("stage"))
+        .cloned();
+    let exact = first_divergence.is_none();
+    let cublas = cublas_exact::CublasExact::load()?;
+    let cublas_provenance = cublas.provenance();
+    let artifact = serde_json::json!({
+        "schema": "colibri-v4-targeted-attention-audit-v1",
+        "status": if exact { "PASS" } else { "FAIL" },
+        "provenance": benchmark_provenance()?,
+        "model_revision": v4_state::REVISION,
+        "configuration": {
+            "chat_user": "hi",
+            "executed_layers": 3,
+            "target": {"layer": 2, "position": 3},
+            "device_attention_audit": true,
+            "sparse_attention_arm": "sm89_crossover",
+            "logical_topk": expected_topk.len(),
+            "score_scratch_capacity_topk": candidate_state.scores.len() / v4_state::Q_HEADS,
+            "reference": "scalar sparse_attn_v4_bf16 plus reference-state probe",
+            "candidate": "sparse_attn_v4_scores+probabilities+values",
+            "same_process_same_precommit_state": true,
+            "cublas": {
+                "sha256": cublas_provenance.actual_sha256,
+                "version": cublas_provenance.version,
+            },
+        },
+        "first_divergence": first_divergence,
+        "stages": stages,
+        "process": {
+            "exit_status": 0,
+            "peak_host_rss_bytes": process_peak_rss_bytes()?,
+        },
+    });
+    let path = std::path::PathBuf::from(
+        std::env::var_os("COLIBRI_V4_TARGETED_ATTENTION_AUDIT_PATH")
+            .ok_or("targeted attention audit artifact path disappeared")?,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    serde_json::to_writer_pretty(&mut output, &artifact)?;
+    writeln!(output)?;
+    output.sync_all()?;
+    println!(
+        "{{\"status\":\"{}\",\"mode\":\"v4-targeted-attention-audit\",\"layer\":2,\"position\":3,\"logical_topk\":{},\"first_divergence\":{},\"artifact\":{}}}",
+        if exact { "PASS" } else { "FAIL" },
+        expected_topk.len(),
+        serde_json::to_string(&first_divergence)?,
+        serde_json::to_string(&path)?,
+    );
+    Ok(exact)
 }
 
 fn check_attention_audit(
@@ -23599,6 +24059,30 @@ mod tests {
             profile["top_level"]["attention"]["temporary"]["steady_device_alloc_count"],
             0
         );
+        let (a, b, c, q) = (10, 20, 30, 0);
+        let host_hit = FixedLoadTelemetry {
+            fixed_h2d_ns: a + b,
+            fixed_decode_ns: c,
+            cache_status: "stationary_raw_host_hit",
+            ..FixedLoadTelemetry::default()
+        };
+        let host_stage = LayerStageTelemetry {
+            layer_prepare_ns: a + b + c + q,
+            layer_prepare_count: 1,
+            ..LayerStageTelemetry::default()
+        };
+        assert!(
+            stationary_layer_phase_profile_json(0, 60, Some(&host_hit), &host_stage, 0, false)
+                .is_ok()
+        );
+        let old_overlap = FixedLoadTelemetry {
+            fixed_h2d_ns: a + b + c,
+            ..host_hit
+        };
+        assert!(
+            stationary_layer_phase_profile_json(0, 60, Some(&old_overlap), &host_stage, 0, false)
+                .is_err()
+        );
         assert!(profile["closure"]["exact"].as_bool().unwrap());
         assert_eq!(profile["top_level"]["routed"]["wall_ns"], 100);
         assert_eq!(
@@ -23893,6 +24377,7 @@ mod tests {
             1,
             std::time::Duration::from_millis(100),
             None,
+            |_| Ok(()),
             |_, _, job| Ok(job.route_slot),
             |_, batch| {
                 let mut slots = batch.completions;
@@ -23908,6 +24393,7 @@ mod tests {
             1,
             std::time::Duration::from_millis(100),
             None,
+            |_| Ok(()),
             |_, _, job| {
                 if job.route_slot == 2 {
                     Err("injected lane error".into())
@@ -23925,6 +24411,7 @@ mod tests {
             1,
             std::time::Duration::from_millis(20),
             None,
+            |_| Ok(()),
             |_, _, job| {
                 assert_ne!(job.route_slot, 2, "injected lane panic");
                 Ok(job.route_slot)
@@ -24395,6 +24882,342 @@ mod tests {
             "score reuse did not accelerate the isolated L3 127->128 fixture"
         );
     }
+}
+
+fn sparse_attention_score_reuse_k128_attention_post_microgate() {
+    fn assert_bf16_stage(stage: &str, actual: &[u16], expected: &[u16]) {
+        assert_eq!(actual.len(), expected.len(), "{stage}: length");
+        if let Some((index, (&actual, &expected))) = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected)
+        {
+            panic!(
+                "{stage}: BF16 mismatch at {index}: {actual:04x} != {expected:04x}, delta={}",
+                (v4_router::bf16_to_f32(actual) - v4_router::bf16_to_f32(expected)).abs()
+            );
+        }
+    }
+
+    let topk_host = v4_state::window_topk_cpu(1, 3, v4_state::KV_WINDOW)
+        .unwrap()
+        .0;
+    assert_eq!(topk_host.len(), v4_state::KV_WINDOW);
+    assert_eq!(&topk_host[..5], &[0, 1, 2, 3, -1]);
+    let q_host = (0..v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)
+        .map(|index| {
+            let value =
+                ((index.wrapping_mul(73).wrapping_add(19) % 257) as f32 - 128.0) * 0.007_812_5;
+            v4_router::f32_to_bf16_rne(value)
+        })
+        .collect::<Vec<_>>();
+    let kv_host = (0..v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)
+        .map(|index| {
+            let value =
+                ((index.wrapping_mul(151).wrapping_add(41) % 509) as f32 - 254.0) * 0.003_906_25;
+            v4_router::f32_to_bf16_rne(value)
+        })
+        .collect::<Vec<_>>();
+    let sink_host = (0..v4_state::Q_HEADS)
+        .map(|head| -1.0_f32 - (head % 11) as f32 * 0.0625)
+        .collect::<Vec<_>>();
+    let context = CudaContext::new(0).expect("create CUDA context");
+    let stream = context.default_stream();
+    let module = kernels::load(&context).expect("load embedded Rust PTX");
+    let q = DeviceBuffer::from_host(&stream, &q_host).unwrap();
+    let kv = DeviceBuffer::from_host(&stream, &kv_host).unwrap();
+    let sink = DeviceBuffer::from_host(&stream, &sink_host).unwrap();
+    let topk = DeviceBuffer::from_host(&stream, &topk_host).unwrap();
+    let mut reference = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+    let mut candidate = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+    let mut reference_state =
+        SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW).unwrap();
+    let mut candidate_state =
+        SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW).unwrap();
+    run_sparse_attention_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk,
+        &mut reference,
+        v4_state::KV_WINDOW,
+    )
+    .unwrap();
+    run_sparse_attention_reference_state_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk,
+        &mut reference_state,
+        v4_state::KV_WINDOW,
+    )
+    .unwrap();
+    run_sparse_attention_score_reuse_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk,
+        &mut candidate,
+        &mut candidate_state,
+        v4_state::KV_WINDOW,
+    )
+    .unwrap();
+    assert_eq!(
+        candidate_state.scores.to_host_vec(&stream).unwrap(),
+        reference_state.scores.to_host_vec(&stream).unwrap(),
+        "scores"
+    );
+    assert_eq!(
+        candidate_state.probabilities.to_host_vec(&stream).unwrap(),
+        reference_state.probabilities.to_host_vec(&stream).unwrap(),
+        "probabilities"
+    );
+    assert_eq!(
+        candidate_state.denominators.to_host_vec(&stream).unwrap(),
+        reference_state.denominators.to_host_vec(&stream).unwrap(),
+        "denominators"
+    );
+    assert_eq!(
+        candidate_state.valid_counts.to_host_vec(&stream).unwrap(),
+        reference_state.valid_counts.to_host_vec(&stream).unwrap(),
+        "valid counts"
+    );
+    let reference_sparse = reference.to_host_vec(&stream).unwrap();
+    assert_bf16_stage(
+        "sparse",
+        &candidate.to_host_vec(&stream).unwrap(),
+        &reference_sparse,
+    );
+
+    let mut topk_129_host = topk_host.clone();
+    topk_129_host.push(-1);
+    let topk_129 = DeviceBuffer::from_host(&stream, &topk_129_host).unwrap();
+    let mut reference_129 = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+    let mut candidate_129 = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+    let mut reference_state_130 = SparseAttentionScoreReuseScratch::new(&stream, 1, 130).unwrap();
+    let mut candidate_state_130 = SparseAttentionScoreReuseScratch::new(&stream, 1, 130).unwrap();
+    run_sparse_attention_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk_129,
+        &mut reference_129,
+        129,
+    )
+    .unwrap();
+    run_sparse_attention_reference_state_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk_129,
+        &mut reference_state_130,
+        129,
+    )
+    .unwrap();
+    run_sparse_attention_score_reuse_device_into(
+        &module,
+        &stream,
+        &q,
+        &kv,
+        &sink,
+        &topk_129,
+        &mut candidate_129,
+        &mut candidate_state_130,
+        129,
+    )
+    .unwrap();
+    let logical_score_len = v4_state::Q_HEADS * 129;
+    assert_eq!(
+        &candidate_state_130.scores.to_host_vec(&stream).unwrap()[..logical_score_len],
+        &reference_state_130.scores.to_host_vec(&stream).unwrap()[..logical_score_len],
+        "K129 scores in K130 scratch"
+    );
+    assert_eq!(
+        &candidate_state_130
+            .probabilities
+            .to_host_vec(&stream)
+            .unwrap()[..logical_score_len],
+        &reference_state_130
+            .probabilities
+            .to_host_vec(&stream)
+            .unwrap()[..logical_score_len],
+        "K129 probabilities in K130 scratch"
+    );
+    assert_bf16_stage(
+        "K129 sparse in K130 scratch",
+        &candidate_129.to_host_vec(&stream).unwrap(),
+        &reference_129.to_host_vec(&stream).unwrap(),
+    );
+
+    let forward_freqs = (0..v4_state::Q_ROPE_DIM / 2)
+        .flat_map(|pair| {
+            if pair.is_multiple_of(2) {
+                [0.875_f32, 0.5]
+            } else {
+                [0.625_f32, -0.75]
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut inverse_freqs_host = forward_freqs.clone();
+    for sine in inverse_freqs_host.iter_mut().skip(1).step_by(2) {
+        *sine = -*sine;
+    }
+    let reference_inverse = run_l0_rope(
+        &module,
+        &stream,
+        &reference_sparse,
+        &forward_freqs,
+        v4_state::Q_HEADS,
+        true,
+    )
+    .unwrap();
+    let inverse_freqs = DeviceBuffer::from_host(&stream, &inverse_freqs_host).unwrap();
+    let mut candidate_inverse = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+    run_rope_device_into(
+        &module,
+        &stream,
+        &candidate,
+        &inverse_freqs,
+        &mut candidate_inverse,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )
+    .unwrap();
+    assert_bf16_stage(
+        "sparse_inverse",
+        &candidate_inverse.to_host_vec(&stream).unwrap(),
+        &reference_inverse,
+    );
+
+    let group_input = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM / v4_state::O_GROUPS;
+    let wo_a_width = v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    let mut wo_a_host = vec![0_u16; wo_a_width * group_input];
+    for output in 0..wo_a_width {
+        wo_a_host[output * group_input + output.wrapping_mul(17) % group_input] =
+            v4_router::f32_to_bf16_rne(1.0);
+    }
+    let wo_a = DeviceBuffer::from_host(&stream, &wo_a_host).unwrap();
+    drop(wo_a_host);
+    let reference_wo_a = run_l0_wo_a(&module, &stream, &reference_inverse, &wo_a).unwrap();
+    let mut candidate_wo_a = DeviceBuffer::<u16>::zeroed(&stream, wo_a_width).unwrap();
+    run_l0_wo_a_device_into(
+        &module,
+        &stream,
+        &candidate_inverse,
+        &wo_a,
+        &mut candidate_wo_a,
+    )
+    .unwrap();
+    assert_bf16_stage(
+        "wo_a",
+        &candidate_wo_a.to_host_vec(&stream).unwrap(),
+        &reference_wo_a,
+    );
+
+    let mut wo_b_host = vec![0_u8; v4_state::HIDDEN * wo_a_width];
+    let one_fp8 = v4_state::E4M3Fn::encode(1.0).unwrap().0;
+    for output in 0..v4_state::HIDDEN {
+        wo_b_host[output * wo_a_width + output.wrapping_mul(29) % wo_a_width] = one_fp8;
+    }
+    let wo_b = DeviceFp8Matrix {
+        weight: DeviceBuffer::from_host(&stream, &wo_b_host).unwrap(),
+        scale: DeviceBuffer::from_host(
+            &stream,
+            &vec![
+                127_u8;
+                v4_state::HIDDEN.div_ceil(v4_state::FP8_BLOCK)
+                    * (wo_a_width / v4_state::FP8_BLOCK)
+            ],
+        )
+        .unwrap(),
+        in_features: wo_a_width,
+        out_features: v4_state::HIDDEN,
+    };
+    drop(wo_b_host);
+    let mut candidate_quantized = DeviceBuffer::<u8>::zeroed(&stream, wo_a_width).unwrap();
+    let mut candidate_scales =
+        DeviceBuffer::<u8>::zeroed(&stream, wo_a_width / v4_state::FP8_BLOCK).unwrap();
+    let mut empty_candidate = DeviceBuffer::<u16>::zeroed(&stream, 0).unwrap();
+    let mut candidate_attention_f32 =
+        DeviceBuffer::<f32>::zeroed(&stream, v4_state::HIDDEN).unwrap();
+    let mut candidate_attention = DeviceBuffer::<u16>::zeroed(&stream, v4_state::HIDDEN).unwrap();
+    let (reference_attention_f32, reference_attention) =
+        run_l0_fp8_linear(&module, &stream, &reference_wo_a, &wo_b, false).unwrap();
+    run_l0_fp8_linear_device_into(
+        &module,
+        &stream,
+        &candidate_wo_a,
+        &wo_b,
+        &mut candidate_quantized,
+        &mut candidate_scales,
+        &mut empty_candidate,
+        &mut candidate_attention_f32,
+        &mut candidate_attention,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        candidate_attention_f32.to_host_vec(&stream).unwrap(),
+        reference_attention_f32,
+        "attention f32"
+    );
+    assert_bf16_stage(
+        "attention",
+        &candidate_attention.to_host_vec(&stream).unwrap(),
+        &reference_attention,
+    );
+
+    let residual_host = vec![0_u16; v4_state::HC * v4_state::HIDDEN];
+    let post_host = [1.0_f32; v4_state::HC];
+    let comb_host = [0.0_f32; v4_state::HC * v4_state::HC];
+    let reference_post = run_l0_hc_post(
+        &module,
+        &stream,
+        &reference_attention,
+        &residual_host,
+        &post_host,
+        &comb_host,
+    )
+    .unwrap();
+    let residual = DeviceBuffer::from_host(&stream, &residual_host).unwrap();
+    let post = DeviceBuffer::from_host(&stream, &post_host).unwrap();
+    let comb = DeviceBuffer::from_host(&stream, &comb_host).unwrap();
+    let mut candidate_post =
+        DeviceBuffer::<u16>::zeroed(&stream, v4_state::HC * v4_state::HIDDEN).unwrap();
+    run_l0_hc_post_device_into(
+        &module,
+        &stream,
+        &candidate_attention,
+        &residual,
+        &post,
+        &comb,
+        &mut candidate_post,
+    )
+    .unwrap();
+    assert_bf16_stage(
+        "attention_post",
+        &candidate_post.to_host_vec(&stream).unwrap(),
+        &reference_post,
+    );
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-sparse-k128-attention-post-microgate\",\"topk_per_row\":128,\"valid_keys\":4,\"max_scratch_case\":{{\"logical_topk\":129,\"capacity_topk\":130}},\"stages\":[\"scores\",\"probabilities\",\"denominators\",\"valid_counts\",\"sparse\",\"sparse_inverse\",\"wo_a\",\"attention_f32\",\"attention_bf16\",\"attention_post\"]}}"
+    );
+}
+
+#[cfg(test)]
+mod tests_continued {
+    use super::*;
 
     #[test]
     fn csa_indexer_scores_match_cpu_oracle_and_select_causal_topk() {
