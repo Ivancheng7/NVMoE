@@ -1,345 +1,199 @@
-<p align="center">
-  <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
-</p>
+# Pro proves the engine. Flash makes it useful at home.
 
-<p align="center">
-  <a href="https://justvugg.github.io/colibri"><img src="https://img.shields.io/badge/website-justvugg.github.io%2Fcolibri-1f6feb" alt="Website"></a>
-  <a href="https://github.com/JustVugg/colibri/releases"><img src="https://img.shields.io/github/v/release/JustVugg/colibri?color=2ea043" alt="Latest release"></a>
-</p>
+Colibri is a Rust and CUDA research runtime aimed at one concrete outcome: run a full sparse MoE checkpoint on a consumer desktop even when its active bytes exceed VRAM. The product target is DeepSeek-V4-Flash, with a 24 GiB desktop gate of `0.5 to 1.0 committed token/s` for useful batch and background work. That rate is a **TARGET**, not a measurement, and Flash support is not implemented.
 
-<p align="center">
-  <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
-  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
-</p>
+The checkpoint does not need to fit in VRAM. The exact working set does. Colibri stages fixed weights and routed experts from SSD through RAM to GPU while decode, transfer, and compute overlap. Routed contributions are reduced in canonical order, while the separate speculative-state path commits only an accepted prefix.
 
-**Tiny engine, immense model.** Run **GLM-5.2 (744B-parameter MoE)** on a consumer machine with ~25 GB of RAM — in pure C, with zero dependencies, by streaming experts from disk.
+The proof engine is DeepSeek-V4-Pro: a 1.6T-total, 49B-activated model with an `805.33 GiB` checkpoint. On a laptop with `12,282 MiB` of VRAM and `32 GB` of RAM, the current prototype traverses all 61 layers and has produced a real next token at position 5 in `36.979170611 s`, or `0.02704225 token/s`. That is a single **MEASURED DEVELOPMENT** decode, not interactive or sustained throughput.
 
-Colibrì is a lightweight, quality-preserving MoE runtime that treats VRAM, RAM,
-and storage as one managed memory hierarchy. Insufficient fast memory may reduce
-speed, but the default policy **never silently changes model precision or router
-semantics**.
+**MEASURED DEVELOPMENT ROUTED-SCOPE SPEEDUP: `4.117849x`**
 
-```
-$ ./coli chat
-  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
-  ✓ ready in 32s · resident 9.9 GB
-  › ciao!
-  ◆ Ciao! 😊 Come posso aiutarti oggi?
-```
+At layer 4, the five-position QD4 gate reduced routed-scope median wall time from `486.604659 ms` to `118.169615 ms`. All `4/4` pairs were exact. This is the largest speedup claimed here, and its boundary matters: it is a local routed-layer mechanism gate, not prompt E2E, not token throughput, and not production evidence. Fixed prefetch was not exercised. The [frozen review artifact](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json) records the scope and exclusions.
 
-## See it running
+[See the consumer hardware path](#from-pro-proof-to-flash-product-target) | [Reproduce the evidence](#reproduce-the-evidence) | [Read the Flash migration research](docs/FLASH_MIGRATION_RESEARCH.md)
 
-<p align="center">
-  <img src="docs/media/colibri-dashboard.png" width="900" alt="colibrì web dashboard — live metrics, hardware panel, expert tiers">
-</p>
-<p align="center"><em>The web dashboard (<code>./coli web</code>): a 744B model at <strong>4 tok/s, TTFT 1.6 s, disk 0</strong> —
-full expert residency on 6× RTX 5090, with live token metrics, the per-turn time breakdown,
-the VRAM/RAM/disk tier bar and the live mini-brain in the corner.</em></p>
+## Why this exists
 
-<p align="center">
-  <img src="docs/media/colibri-brain.png" width="900" alt="the Brain page — 19,456 experts as a live cortex">
-</p>
-<p align="center"><em>The <strong>Brain</strong> page: all 19,456 experts as a living cortex — colour is the storage tier,
-brightness is routing heat, and every expert routed in a turn flashes white. Hovering shows the expert's
-<a href="https://github.com/JustVugg/colibri/issues/175">measured topic affinity</a>.</em></p>
+All 64 pinned Pro shards stay on local SSD. RAM and VRAM are bounded working windows, not containers for the whole model.
 
-<p align="center">
-  <img src="docs/media/colibri-atlas.png" width="900" alt="the Atlas page — the measured expert atlas as a 3-D galaxy">
-</p>
-<p align="center"><em>The <strong>Atlas</strong> page: the <a href="https://github.com/JustVugg/colibri/issues/175">measured expert atlas</a>
-as a 3-D galaxy — 13,260 characterised experts, 1,041 replicated specialists clustering by topic
-(poetry, law, Chinese, SQL…). Position is measured routing affinity, not a learned embedding. Drag to spin.</em></p>
+![The 805.33 GiB V4-Pro checkpoint is much larger than the recorded laptop's 32 GB RAM and 12 GiB VRAM](docs/assets/readme/01-capacity.svg)
 
-## The vision
+| Recorded system | Value |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 4080 Laptop, `12,282 MiB` VRAM |
+| Host memory | `32 GB` RAM |
+| Pro checkpoint | 64 pinned shards, `864,721,029,744 B` actual files |
+| Executed scope | Complete 61-layer Rust-canonical mechanism path |
 
-Frontier models should not be sealed inside datacenters. colibrì exists so that
-**anyone curious enough can open one up**: run a 744B-parameter mind on hardware
-you already own, watch every expert fire in real time, and change the code that
-does it. Not renting intelligence behind an API — *holding* it: probing it,
-measuring it, improving it. Every optimisation in this project started with
-someone measuring something on their own machine; the engine is deliberately
-small enough that the next one can come from you.
+Complete has a narrow meaning here. Every pinned source shard is local and the recorded Rust path traverses all 61 layers. It does not mean official-reference numerical parity, a complete general generation runtime, or a finished service.
 
-## The idea
+## What Pro proves
 
-A 744B Mixture-of-Experts model activates only ~40B parameters per token — and
-only ~11 GB of those change from token to token (the routed experts):
+The position-5 run closes one full decode timing ledger. Fixed layer work dominates at `29.606 s`; routed work takes `3.407 s`; the final head takes `1.535 s`. The recorded stages plus a `0.005 s` unattributed gap close exactly to the measured outer span.
 
-<p align="center">
-  <img src="docs/media/sparse.png" width="880" alt="only ~5.4% of parameters are active per token">
-</p>
+![Measured development timing for one V4-Pro next-token decode at position 5 across all 61 layers](docs/assets/readme/16-pos5-one-token-dag.svg)
 
-So the model doesn't need to *fit* in fast memory — it needs to be **placed**:
+This run is evidence that the prototype can drive one real next-token path through the full model under a checked capacity budget. It is `n=1`, so the reciprocal rate is descriptive. It says nothing about thermal steady state, latency distributions, or chat speed.
 
-- the **dense part** (attention, shared experts, embeddings — ~17B params) stays
-  **resident in RAM at int4** (~9.9 GB);
-- the **19,456 routed experts** (75 MoE layers × 256 + the MTP head, ~19 MB each
-  at int4) live **on disk** (~370 GB) and are **streamed on demand**, with a
-  per-layer LRU cache, a learned pinned hot-store, and an optional VRAM tier.
+A separate confirmatory packet tests the persistent four-lane QD4 mechanism on the official single-user `hi` prompt. Across four paired ABBA runs, median prompt E2E fell from `199.431954 s` to `148.555131 s`, a `1.342477723x` ratio of medians. All `4/4` pairs match at 305 layer records plus the final output.
 
-Think of the core algorithm as **a JIT, but for weights**. A compiler JIT never
-compiles the whole program — it watches what actually runs and compiles the hot
-paths, just in time. colibrì makes the same bet about a 744B parameter space:
-parameters are not resident state to be held, they are **data to be staged**
-across a heterogeneous storage hierarchy (VRAM / RAM / NVMe), exactly when the
-router proves they are needed. Measured routing heat decides which experts earn
-which tier, the router runs a layer ahead so prefetch hides the staging latency,
-and — like a JIT — the engine learns your workload: the more you run, the hotter
-the right experts get. It works because routing has measurable structure (see
-the [expert atlas](https://github.com/JustVugg/colibri/issues/175)) — and
-structure is cacheable.
+![Four paired full61 QD4 prompt runs with exact semantic records](docs/assets/readme/12-qd4-full61.svg)
 
-The engine is a single C file (`c/glm.c`) plus small headers. No BLAS, no Python
-at runtime, no GPU required.
+That result is prompt E2E for one Rust-canonical mechanism comparison. It is not next-token throughput, TTFT, official-reference full61 parity, or a claim about every MoE model.
 
-## How it works
+### What the current full-model path can do
 
-### The per-token path
+The prototype can load all pinned Pro shards, format and tokenize the official single-user `hi` prompt, execute the complete 61-layer Rust-canonical path, and run a narrow ID-only greedy loop with a two-step teacher-forced check and EOS test. The position-5 pilot retains one bounded state per layer for five prompt tokens plus one generated input.
 
-<p align="center">
-  <img src="docs/media/token-path.png" width="880" alt="route → union → place → overlap → learn">
-</p>
+It cannot yet establish useful generated text, system messages, tools, multiturn chat, sampling, long context, sustained throughput, or general model compatibility. Official numerical-policy acceptance against the pinned reference remains open.
 
-Every layer of every token walks the same five steps. The design goal is that
-**placement only ever decides speed** — the router's decisions and the weights'
-precision are the same whether an expert answered from VRAM or from disk.
+## What moving fewer bytes buys
 
-### One memory hierarchy instead of one memory requirement
+The recent development traces isolate two costs that a home runtime has to remove.
 
-<p align="center">
-  <img src="docs/media/tiers.png" width="880" alt="VRAM / RAM / NVMe three-tier expert residency">
-</p>
+Raw fixed-weight transfer keeps `wo_a` in FP8 across PCIe and decodes it on the GPU. In two paired full61 development runs per arm, fixed H2D fell from `29.062 GB` to `24.968 GB`, saving `4.094 GB` or `14.1%`.
 
-### Dual-SSD: two copies of the model, twice the read bandwidth
+![Measured fixed-weight H2D bytes for host BF16 decode versus raw GPU FP8 decode](docs/assets/readme/13-fixed-h2d-savings.svg)
 
-Decode is disk-bound on most machines, and expert reads are read-only — so if you have a **second SSD**, put a full copy of the model on it and let the engine stream from both drives at once:
+A strict immutable 32-slot routed cache avoids repeated source loads and H2D misses. In two paired development runs per arm, routed source bytes and routed H2D each fell from `64.223 GB` to `29.620 GB`, saving `34.603 GB` or `53.9%` per field. The independent audit recorded 1,830 routes, 844 loads, 986 hits, maximum occupancy 29, all 61 layers complete, and no fallback or worker error.
+
+![Measured routed source and H2D byte reduction from the strict 32-slot immutable cache](docs/assets/readme/14-routed-cache-savings.svg)
+
+Bytes are mechanism evidence, not a throughput promise. The paired timings show where the gains survived: raw GPU decode improved the E2E median by `1.171788x`; the routed cache improved routed-wall median by `1.430045x`, but E2E median by only `1.068977x`.
+
+![All paired n equals 2 development timings for raw GPU decode and the immutable routed cache](docs/assets/readme/15-development-paired-timings.svg)
+
+Every point and pair line is shown. Each arm has `n=2`; no confidence interval is estimated, and these are not production benchmarks.
+
+## Why Rust
+
+Rust does not make GEMM magically faster. It makes the disk to CPU decode to PCIe to GPU overlap easier to express without making state ownership implicit.
+
+![The bounded SSD to RAM to VRAM execution path used by the Rust prototype](docs/assets/readme/02-execution-path.svg)
+
+| Runtime contract | Concrete mechanism |
+| --- | --- |
+| A cache slot cannot be reused while work still owns it | A move-only lease takes the slot out of the resident map and returns it only after job completion, preventing premature or ABA-style reuse |
+| Capacity is checked before the run | An exact byte ledger covers the QD4 cache, device state, RoPE, transients, and `2 GiB` headroom; Rust RAII keeps scoped allocations tied to their owners |
+| PCIe carries the smaller representation | Raw `wo_a` stays FP8 through H2D and is decoded to BF16 on the GPU |
+| Parallel completion cannot change model order | A bounded pool of four stable worker lanes may finish in any order, then the canonical reducer applies routed expert IDs in ascending order and the shared expert last |
+| Hot-path storage keeps stable geometry | Preallocated device state pools and strict reusable host arenas reject geometry changes or reallocation |
+| Rejected speculative rows cannot leak into state | Prefix commit checks the authoritative base and commits only accepted rows; the rejected suffix never becomes semantic state |
+
+This is why the rewrite matters. Placement policy can change where bytes wait, while ownership and reduction order keep the accepted computation auditable.
+
+## From Pro proof to Flash product target
+
+Flash is the smaller product candidate, not a completed port. The pinned checkpoint has `284B` total and `13B` activated parameters, 43 layers, 46 shards, and `159,617,149,040 B` of actual shard files. No Flash inference has run in this repository.
+
+![Evidence map separating the measured Pro result, calibrated Flash floor, and future Flash hardware gates](docs/assets/readme/17-hardware-evidence-ladder.svg)
+
+The rows below do not share a benchmark workload or a common evidence tier. The Pro row is observed. The Flash rows are either calibrated from Pro development traces or hard acceptance targets for work that has not been built.
+
+| Desktop VRAM | Model and path | Rate | Evidence boundary |
+| ---: | --- | ---: | --- |
+| `12 GiB` | Pro, H1 position-5 decode | `0.02704 token/s` | **MEASURED DEVELOPMENT**, one token, not sustained |
+| `12 GiB` | Flash, cold H1 | `0.08 to 0.12 token/s` | **CALIBRATED**, no Flash run |
+| `16 GiB` | Flash, H1 | `0.25 to 0.40 token/s` | **TARGET**, conditional on unimplemented fixed/head residency |
+| `24 GiB` | Flash, H2 at `q about 0.8` | `0.5 to 1.0 committed token/s` | **TARGET**; current-path calibration is only `0.20 to 0.29` |
+| `32 to 48 GiB` | Flash, H5 at `q about 0.8` | `0.7 to 1.5 committed token/s` | **TARGET**; route overlap dependent, current-path calibration is only `0.26 to 0.37` |
+
+`H` is the speculative horizon, the number of drafted positions verified together. `q` is the planning assumption that the next drafted token is accepted given that the preceding drafted tokens were accepted. It is not a cache hit rate and it has not been measured for this runtime. Rejection rollback, draft cost, and the real acceptance distribution can erase the projected gain.
+
+For smaller MoE checkpoints, fewer fixed bytes, routed bytes, and layers make the same placement problem less severe. The method still requires exact per-model metadata, state schedules, routing semantics, and numerical gates. The current runtime is Pro-specific; smaller size does not imply compatibility.
+
+The `24 GiB` target is about making full-model batch and background inference useful on a home workstation. It is not a claim of fluid interactive chat. The first Flash work remains gated on exact metadata and byte closure, one representative routed layer, then exact 43-layer H1 and H2 runs.
+
+## Planned `colibri plan`
+
+The intended product entry point is a hardware planner. It is planned and does not exist yet.
 
 ```bash
-COLI_MODEL=/fast/glm52_i4 COLI_MODEL_MIRROR=/second/glm52_i4 ./coli chat
-COLI_DISK_WEIGHTS=9,3 ...   # optional: primary,mirror bandwidth ratio (else measured at startup)
+# Planned interface. This command does not exist yet.
+colibri plan \
+  --model deepseek-ai/DeepSeek-V4-Flash@60d8d70770c6776ff598c94bb586a859a38244f1 \
+  --vram 24GiB --ram HOST_GIB \
+  --ssd-read MEASURED_SSD_GBPS --pcie-h2d MEASURED_PCIE_GBPS \
+  --context CONTEXT_TOKENS --concurrency REQUESTS \
+  --spec-horizon H --acceptance Q
 ```
 
-Each expert is routed to one drive by a deterministic hash, weighted by the two drives' measured (or declared) bandwidth, so readahead/PILOT prefetch and the demand read always hit the same drive and nothing is cached twice. The aggregate bandwidth is the sum of both drives — a 9 GB/s + 3 GB/s pair reads experts ~33% faster than the fast drive alone, and the OMP-parallel pin/warmup load streams from both. Details worth knowing:
+Its inputs are the exact model revision, VRAM, RAM, measured SSD direct-read bandwidth, measured PCIe H2D bandwidth, context, concurrency, `H`, and `q`. Its output should be a placement plan with mandatory bytes, capacity reserve and margin, the expected bottleneck, and a rate tier labeled **MEASURED**, **CALIBRATED**, or **TARGET**.
 
-- the mirror is **validated at startup** (per-file size + safetensors header must be byte-identical to the primary); divergent or missing files silently stay on the primary, so a **partial mirror is fine** — a smaller second SSD holding only some shards still helps;
-- the mirror is **never written**: `.coli_usage`, `.coli_kv` and all sidecars stay on the primary;
-- a read error on the mirror falls back to the primary (one warning, no crash), so unplugging the second drive mid-run degrades instead of killing the server;
-- routing never changes tokens — both copies are byte-identical, and the per-run `MIRROR:` stats line shows GB served per drive.
+Until that command exists, use the evidence quickstart below to check what is real.
 
-The same engine spans the whole range: on a 25 GB laptop everything streams from
-disk (slow but correct); on a large host the entire expert set becomes resident
-(`CUDA_EXPERT_GB=auto PIN_GB=all`) and disk drops out of the decode path
-entirely. Between the tiers sits a **learning cache**: the engine records which
-experts *your* workload routes to (`.coli_usage`, updated every turn) and pins
-the hottest ones automatically — colibrì literally gets faster the more you use
-it. On multi-socket hosts, `COLI_NUMA=1` interleaves the resident weights across
-memory controllers ([#82](https://github.com/JustVugg/colibri/issues/82)).
+## Reproduce the evidence
 
-### Never wait for the disk twice
-
-Misses are expensive, so the engine spends most of its cleverness avoiding and
-overlapping them: each expert's three matrices are stored adjacent and read in
-one `pread`; a bounded async I/O pool (`PIPE=1`, default) loads missing experts
-while resident ones compute; batched positions read each unique expert once
-(**batch-union**); and a router-lookahead thread (`PILOT=1`) prefetches the next
-layer's experts — routing is measurably **71.6% predictable one layer ahead**.
-On GPUs, the resident pipeline (`COLI_CUDA_PIPE=2`) keeps the residual stream
-on-device across layers so the CPU expert loop runs uninterrupted; on Apple
-Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
-math on the unified-memory GPU.
-
-> **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
-> often a large win on drives with DRAM cache and bandwidth headroom (+34%
-> decode measured with `PIPE=1` on a Blackwell/Windows box; 4.25→9.69 GB/s in
-> iobench on a GB10) — but it is drive-dependent: QLC/DRAM-less or virtualised
-> disks can be neutral to negative. Try it first; keep what your hardware
-> rewards.
-
-### Faithful model, compressed state
-
-The forward pass is validated **token-exact against a `transformers` oracle**
-(teacher-forcing 32/32). MLA attention stores a compressed KV state — 576
-floats/token instead of 32,768 (**57× smaller**) — and persists it across
-restarts (`.coli_kv`): conversations reopen warm with zero re-prefill,
-byte-identical to an uninterrupted session. DSA sparse attention (GLM-5.2's
-lightning indexer) is implemented faithfully and validated by forcing full-key
-selection to reproduce dense attention exactly.
-
-### Speculative decoding, honestly
-
-GLM-5.2's native MTP head drafts tokens that the main model verifies in one
-batched forward — 2.2–2.8 tokens/forward when it pays. Two hard-won rules ship
-as defaults: the MTP head must be **int8** (int4 heads collapse to 0–4%
-acceptance, [#8](https://github.com/JustVugg/colibri/issues/8)), and draft and
-verify must compute **the same function** — `SPEC_PIN=1` pins both to one
-kernel family ([#163](https://github.com/JustVugg/colibri/issues/163) is the
-full forensic story). Grammar-forced drafts
-([`GRAMMAR=file.gbnf`](docs/grammar-draft.md)) add ~free acceptance on
-constrained JSON output. Whether speculation is a net win depends on your
-cache temperature — measure, and use `DRAFT=0` when it doesn't pay.
-
-## What it achieves
-
-<p align="center">
-  <img src="docs/media/ladder.png" width="880" alt="measured decode speed by hardware class">
-</p>
-
-Same engine, same int4 container — the hardware only changes where the experts
-live. Highlights from the [full benchmark tables](docs/benchmarks.md):
-
-- **6× RTX 5090, full residency:** 5.8–6.8 tok/s decode, TTFT ~13 s
-  ([experiment log](docs/experiments/glm52-6x5090-2026-07-12.md));
-- **128 GB CPU-only desktop:** ~1.8 tok/s warm ([#200](https://github.com/JustVugg/colibri/issues/200));
-- **single RTX 5070 Ti laptop-class box:** 1.07 tok/s via the GPU-resident
-  pipeline ([#273](https://github.com/JustVugg/colibri/issues/273));
-- **25 GB dev box:** 0.05–0.1 tok/s cold — the proven floor where this project
-  started, and still the honest baseline.
-
-Quality is measured, not assumed: the int4 container's quantization cost and the
-scale-granularity/rotation ablations live in
-[docs/benchmarks.md](docs/benchmarks.md#quality-benchmark) and
-[#108](https://github.com/JustVugg/colibri/issues/108)/[#81](https://github.com/JustVugg/colibri/issues/81).
-
-## Get started
-
-You need two things: **the program** (a few hundred KB) and **the model**
-(372 GB). Step-by-step for every platform in the
-[Quick Start guide](docs/quickstart.md).
-
-### 1. Get colibri
-
-**Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
-Take the archive for your platform from
-[Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
+Use WSL2/Linux, CUDA 12.x, LLVM/NVPTX, libclang, and an Ada `sm_89` GPU. Put the checkpoint on WSL-native ext4, not under `/mnt/c` or `/mnt/d`. Set `COLIBRI_DSV4_MODEL_DIR`, `COLIBRI_ORACLE_PYTHON`, and `COLIBRI_CUBLAS_EXACT_LIB` as described in the [full61 environment contract](rust/colibri-cuda/tools/V4_FULL61_ORACLE.md).
 
 ```bash
-mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
-python3 coli info                         # engine ready ✓
+git clone https://github.com/andyzpb/rust-colibri-pro.git
+cd rust-colibri-pro/rust
+cargo oxide doctor
+cargo fmt --check
+cargo check --locked -p colibri-cuda
+./run-identified.sh test --arch sm_89
 ```
 
-Inside you get the engine (`colibri`, `colibri.exe` on Windows), the `coli`
-launcher and its Python helpers. Nothing to rename or configure — `coli` finds
-the engine next to itself. You only need
-[Python 3](https://www.python.org/downloads/) installed: the launcher and the
-API gateway are Python scripts, while the engine itself is pure C with zero
-dependencies.
-
-**Or build from source** — needs `gcc` (or clang) with OpenMP:
+Validate the compact evidence envelopes, then regenerate figures `13` through
+`17` if the identified raw development logs are available:
 
 ```bash
-git clone https://github.com/JustVugg/colibri && cd colibri/c
-./setup.sh                                # checks gcc/OpenMP, builds, self-tests
+cd ..
+python -m json.tool docs/assets/readme/data/qd4-full61/confirmatory/summary.json >/dev/null
+python -m json.tool docs/assets/readme/data/qd4-stationary-gate/review-boundary.json >/dev/null
+python docs/assets/readme/generate_cost_figures.py \
+  --artifact-root /mnt/colibri-native/.logs \
+  --check
 ```
 
-Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
-engine still lives in `c/` — an editable install from the clone, not a wheel).
+The repository carries compact review and summary envelopes rather than bulky
+raw traces. The cost-figure command requires those identified raw development
+logs locally. Their expected paths, SHA-256 identities, source fields,
+formulas, units, and evidence classes are frozen in
+[`cost-figures-provenance.json`](docs/assets/readme/cost-figures-provenance.json).
+The generator rejects an identity mismatch and renders twice before accepting
+deterministic output.
 
-### 2. Get the model
+The exact model-run commands and fail-closed preflight are in the [mechanism experiment record](docs/experiments/v4-pro-mechanisms-2026-07-24.md). The README does not replace them with an unrecorded one-line chat command.
 
-A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
-version with the int8 MTP heads**. It is about **372 GB**, so put it on a disk
-with the room, ideally a fast one:
+## Evidence map
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+| Evidence | Role |
+| --- | --- |
+| [Position-5 trace identity and timing formulas](docs/assets/readme/cost-figures-provenance.json) | One real next-token development decode |
+| [Raw fixed and cache development provenance](docs/assets/readme/cost-figures-provenance.json) | Paired `n=2` byte and timing figures, no CI |
+| [QD4 confirmatory summary](docs/assets/readme/data/qd4-full61/confirmatory/summary.json) | Four paired prompt-E2E runs |
+| [QD4 L3/L4 support gate](docs/assets/readme/data/qd4-stationary-gate/review-boundary.json) | Local routed-scope mechanism gate, excluded from full61 statistics |
+| [Flash migration research](docs/FLASH_MIGRATION_RESEARCH.md) | Pinned metadata, calibration formulas, target boundaries, and future gates |
+| [Rust rewrite audit](docs/RUST_REWRITE_AUDIT.md) | Current implementation boundary and open acceptance work |
+| [Technical report](docs/V4_PRO_LAPTOP_TECHNICAL_REPORT.md) | Methods, older mechanisms, limitations, and evidence lineage |
 
-> ⚠️ The original mirror ships int4 MTP heads → 0% draft acceptance
-> ([#8](https://github.com/JustVugg/colibri/issues/8)). Check yours:
-> `ls -l <model>/out-mtp-*` — int8 (correct) is `3527131672 / 5366238584 / 1065950496`.
+The figures `13` through `17` are generated from frozen raw traces and the Flash research report. Their provenance file records trace hashes and calculations for measured values, then marks the future hardware bands as hardcoded **TARGET** gates with no predictive formula. The Flash ladder deliberately separates measured current evidence from future gates and has no shared rate axis.
 
-Or convert from the FP8 source yourself — one resumable command that never needs
-the full 756 GB on disk at once:
+Ratios from different lineages are not multiplied. In particular, the `4.117849x` routed-layer gate, the `1.342477723x` paired prompt result, and the `0.02704225 token/s` position-5 observation answer different questions.
 
-```bash
-./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
+## Repository layout
+
+```text
+rust/colibri-cuda/          Rust + cuda-oxide V4-Pro prototype
+rust/colibri-cuda/tools/    oracle, trace, and evidence tools
+docs/assets/readme/         deterministic figures and tracked artifacts
+c/                          retained upstream C/CUDA oracle and baseline
 ```
 
-### 3. Run it
+## Research status
 
-```bash
-COLI_MODEL=/nvme/glm52_i4 ./coli chat     # RAM budget, cache and MTP auto-detected
-COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk placement
-COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
-./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
-./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
-```
+This repository is a research prototype. Current work targets one pinned DeepSeek-V4-Pro revision on one Ada laptop. Multi-family weights, official-reference full61 acceptance, generation quality, long context, sustained throughput, and service behavior remain open.
 
-On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
-The engine at runtime is pure C — python is only used by the one-time converter
-and the optional API gateway.
+Earlier layer-stationary, expert-slot reuse, phase-profile, and fixed-prefetch experiments remain in the technical report and experiment record. Their estimands and frozen source identities differ, so their ratios are kept separate.
 
-### 4. Go deeper
+## Upstream attribution
 
-| topic | doc |
-|---|---|
-| Benchmarks, community datapoints, quality measurements | [docs/benchmarks.md](docs/benchmarks.md) |
-| Tuning knobs, policies, the learning cache, prefetch | [docs/tuning.md](docs/tuning.md) |
-| Windows 11 native build (+ CUDA DLL) | [docs/windows.md](docs/windows.md) |
-| CUDA backend, VRAM expert tier, full residency | [docs/cuda.md](docs/cuda.md) |
-| Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
-| OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
-| Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
-| Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
+This repository is based on [JustVugg/colibri](https://github.com/JustVugg/colibri). The retained C engine, CUDA baseline, tests, tools, documentation, web and desktop code, and some assets are upstream work.
 
-## What's next
-
-- **Algorithmic research is active.** The current hierarchy is LRU + a learned
-  pin set; the next step is under way — smarter placement and scheduling,
-  overlap of CPU and GPU expert execution, and routing-aware speculation.
-  Everything lands the way this project always works: measured, reviewed, and
-  merged in the open.
-- **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
-
-## Supporting the project
-
-colibrì started as a one-person project on a 12-core laptop with 25 GB of RAM;
-today its numbers come from a community of real machines. If it's useful to you:
-
-- ⭐ star the repo and share it;
-- 🐛 open issues with benchmark numbers from your hardware — datapoints move
-  this project more than anything else;
-- 💬 reach out via GitHub issues to sponsor development or donate hardware.
-
-## Repo layout
-
-```
-Makefile                  root build/check entry point
-c/
-├── glm.c                 single-file GLM engine
-├── st.h, tok.h, json.h   runtime headers
-├── backend_cuda.*        optional CUDA tier
-├── Makefile              build and local checks
-├── coli                  user-facing CLI
-├── openai_server.py      OpenAI-compatible HTTP gateway
-├── setup.sh              one-command local setup
-├── tools/                offline conversion, fixtures and benchmarks
-├── scripts/              long-running conversion helpers
-└── tests/                dependency-free C and Python tests
-web/                      browser UI (pure OpenAI-API client)
-desktop/                  Tauri v2 desktop shell wrapping the web UI
-docs/                     reference docs, experiments, media
-```
-
-The runtime path intentionally stays flat and readable: `glm.c` plus its small
-headers. From the repository root, `make`, `make check`, and `make clean`
-delegate to the engine Makefile.
-
-## Why "colibrì"
-
-The hummingbird weighs a few grams, hovers in place, and visits a thousand
-flowers a day. This engine keeps a 744-billion-parameter giant alive on
-hummingbird rations: 25 GB of RAM, twelve CPU cores, and a lot of disk patience.
-
-## Acknowledgements
-
-colibrì is an engine; the minds it runs are a gift. Thank you to the teams
-releasing frontier-class weights in the open — **Z.ai** (GLM), **Moonshot AI**
-(Kimi), **Alibaba Qwen**, **MiniMax**, and **Allen AI** (OLMoE) — and to every
-contributor who benchmarked, bisected, replicated an atlas run, or sent a patch.
-This project is proof of what open weights make possible.
+The upstream README inspired the information order: start with the capacity problem, show the memory path, then attach evidence. Its GLM-5.2 figures, product claims, and performance numbers are not used for this DeepSeek-V4-Pro result.
 
 ## License
 
-Apache 2.0. GLM-5.2 weights are released by Z.ai under MIT.
+Code remains under [Apache License 2.0](LICENSE). Model weights and their associated materials follow the terms on the model release page.

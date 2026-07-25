@@ -1,0 +1,11 @@
+{
+  "raw": [
+    { "text": "Hello", "ids": [19923], "decoded": "Hello" },
+    { "text": "你好", "ids": [30594], "decoded": "你好" }
+  ],
+  "special": {
+    "bos": { "text": "<｜begin▁of▁sentence｜>", "id": 0 },
+    "eos": { "text": "<｜end▁of▁sentence｜>", "id": 1 },
+    "pad": { "text": "<｜end▁of▁sentence｜>", "id": 1 }
+  }
+}

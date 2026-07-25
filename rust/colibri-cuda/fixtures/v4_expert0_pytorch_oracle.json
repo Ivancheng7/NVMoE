@@ -1,0 +1,228 @@
+{
+  "binary": {
+    "input": {
+      "bytes": 14336,
+      "dtype": "bfloat16-le",
+      "offset": 8,
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "magic_ascii": "CV4E0P1",
+    "output": {
+      "bytes": 28672,
+      "dtype": "float32-le",
+      "offset": 14344,
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "sha256": "1da5119527f2e4b1644afc8d8d7d2c3561e7abcdcde6b36b8e6eef5bdea3e950"
+  },
+  "case": {
+    "expert": 0,
+    "hidden": 7168,
+    "input_seed": 97,
+    "intermediate": 3072,
+    "layer": 0,
+    "route_weight": 0.625,
+    "rows": 1,
+    "swiglu_limit": 10.0
+  },
+  "environment": {
+    "cuda_matmul_allow_tf32": false,
+    "cudnn_allow_tf32": false,
+    "deterministic_algorithms": true,
+    "device": "cpu",
+    "float32_matmul_precision": "highest",
+    "safetensors": "0.8.0",
+    "threads": 1,
+    "torch": "2.13.0+cpu"
+  },
+  "model_revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+  "official_source": {
+    "kernel.py": {
+      "lines": "40-125,442-535",
+      "sha256": "59b325083d7103975cba025bd0d60ea343bb82d8fff53088afb7c04bd380c0c2"
+    },
+    "model.py": {
+      "lines": "108-120,587-606",
+      "sha256": "ce962f1face79d4f633d36436576214057a7e11443c9789935e1deb5c6cd1d71"
+    },
+    "official_cuda_kernel_executed": false,
+    "reason": "the isolated oracle has CPU-only PyTorch and no TileLang; this is an independent PyTorch tensor-formula reference"
+  },
+  "schema": "colibri-v4-expert0-pytorch-oracle-v1",
+  "semantics": {
+    "activation": "BF16 groups of 128 -> E8M0 ceil-power-of-two scale -> clamped E4M3",
+    "expert": "w1/w3 BF16 -> FP32 clamp(up,-10,10), clamp(gate,max=10) -> silu(gate)*up*0.625 -> BF16 -> w2 -> BF16",
+    "gemm": "FP32 32-K partial dot, then activation_scale * weight_scale, accumulated in K order, BF16 output",
+    "input": "BF16 RNE of (((flat_index * 17 + 97) % 113) - 56) / 64",
+    "weight": "low nibble then high nibble FP4 E2M1, E8M0 scale per 32 K values"
+  },
+  "shard": "model-00002-of-00064.safetensors",
+  "source_tensors": {
+    "w1": {
+      "scale": "layers.0.ffn.experts.0.w1.scale",
+      "scale_dtype": "float8_e8m0fnu",
+      "scale_sha256": "55963ed29a8809d604751323c07d2105de67fb17e19c114b0922bc6fe0695867",
+      "scale_shape": [
+        3072,
+        224
+      ],
+      "weight": "layers.0.ffn.experts.0.w1.weight",
+      "weight_sha256": "e006bdbda60a3fbfc12d63a69f8e1108211e1b81e0250958fcd6b397a95ac88b",
+      "weight_storage_dtype": "int8",
+      "weight_storage_shape": [
+        3072,
+        3584
+      ]
+    },
+    "w2": {
+      "scale": "layers.0.ffn.experts.0.w2.scale",
+      "scale_dtype": "float8_e8m0fnu",
+      "scale_sha256": "40d6d5af627f2b435c15496d3b71b95200ec299a40f2b59cd6e3f742a1a5cbb9",
+      "scale_shape": [
+        7168,
+        96
+      ],
+      "weight": "layers.0.ffn.experts.0.w2.weight",
+      "weight_sha256": "9e32ee781bd9e4140c3f8c6991129f98c59f6fb02eb60ddfc38d5f1eb2b38126",
+      "weight_storage_dtype": "int8",
+      "weight_storage_shape": [
+        7168,
+        1536
+      ]
+    },
+    "w3": {
+      "scale": "layers.0.ffn.experts.0.w3.scale",
+      "scale_dtype": "float8_e8m0fnu",
+      "scale_sha256": "1c3da74bd74b7aa8473a6a95a3bf93a60291caa362e0141169b877e0c1ef8300",
+      "scale_shape": [
+        3072,
+        224
+      ],
+      "weight": "layers.0.ffn.experts.0.w3.weight",
+      "weight_sha256": "0b75f8e9dc8fd3ce57fe5cab8f933044c418fe6a4fbf05dc73efeed82402f8d0",
+      "weight_storage_dtype": "int8",
+      "weight_storage_shape": [
+        3072,
+        3584
+      ]
+    }
+  },
+  "stages": {
+    "input_bf16": {
+      "dtype": "bfloat16",
+      "max": 0.875,
+      "min": -0.875,
+      "sha256": "5353921308d2bf8730cb1848cd395987bff59e52ca5a9e75ecb66a44b128842d",
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "input_fp8": {
+      "dtype": "float8_e4m3fn",
+      "max": 448.0,
+      "min": -448.0,
+      "sha256": "5f4c06985a82df6328725088517729dfcdea6cb28b6113a883e84bcebcf26e07",
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "input_scale_e8m0": {
+      "dtype": "float8_e8m0fnu",
+      "max": 0.001953125,
+      "min": 0.001953125,
+      "sha256": "067fbd560bb9e895642a62b4979ab7d4ca9f88df768ff2399cdc726f1facd256",
+      "shape": [
+        1,
+        56
+      ]
+    },
+    "output_bf16": {
+      "dtype": "bfloat16",
+      "max": 2.59375,
+      "min": -2.90625,
+      "sha256": "4b8f2d2070bb08c87efa09e13fc5b2155f32b8a7ce853d38e18c4a1fdd3917eb",
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "output_f32": {
+      "dtype": "float32",
+      "max": 2.59375,
+      "min": -2.90625,
+      "sha256": "2e36cb58d4aadbe21344b59f46d0de979da4e67d120b258bf4f79b8e4eef8225",
+      "shape": [
+        1,
+        7168
+      ]
+    },
+    "routed_bf16": {
+      "dtype": "bfloat16",
+      "max": 4.4375,
+      "min": -6.28125,
+      "sha256": "97153f6de9f17a99c602981ad44c15656626487e3ba466d5b78c9b2a8017642f",
+      "shape": [
+        1,
+        3072
+      ]
+    },
+    "routed_fp8": {
+      "dtype": "float8_e4m3fn",
+      "max": 416.0,
+      "min": -416.0,
+      "sha256": "ecf59a714fa6b4b1dbbd313dfb07b14604489eab2105b1562d3f0c05243c6687",
+      "shape": [
+        1,
+        3072
+      ]
+    },
+    "routed_scale_e8m0": {
+      "dtype": "float8_e8m0fnu",
+      "max": 0.015625,
+      "min": 0.00390625,
+      "sha256": "c44d08b68122c144055f388bce815843c030a7330eced60250a3779f33065d5b",
+      "shape": [
+        1,
+        24
+      ]
+    },
+    "w1_bf16": {
+      "dtype": "bfloat16",
+      "max": 3.546875,
+      "min": -4.03125,
+      "sha256": "9051207fa7fb47563a7d85a5deeadf2660cc0c38c76924fad57a7f543556e697",
+      "shape": [
+        1,
+        3072
+      ]
+    },
+    "w3_bf16": {
+      "dtype": "bfloat16",
+      "max": 3.375,
+      "min": -4.28125,
+      "sha256": "92a34529928afd3e86aca9b6ca9c1dd56c5ba04208b8dc18390925809b07d3fb",
+      "shape": [
+        1,
+        3072
+      ]
+    },
+    "weighted_swiglu_f32": {
+      "dtype": "float32",
+      "max": 4.438462257385254,
+      "min": -6.273921012878418,
+      "sha256": "9257cf6635170bd9750d378787456325d091af9bda82767bcf7f2a4cbf9db2bc",
+      "shape": [
+        1,
+        3072
+      ]
+    }
+  }
+}

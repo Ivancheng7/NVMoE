@@ -1,0 +1,247 @@
+{
+  "schema": "colibri-v4-full61-stationary-qd4-confirmatory-derived-summary-v1",
+  "provenance": {
+    "status": "derived_from_raw",
+    "producer": "independent stdlib replay; not a runner-emitted artifact",
+    "protocol_sha256": "617d7b099e2067a7cf544432a1e146b18630f6c4309d17da2afe527d45806b97",
+    "protocol_schema": "colibri-v4-full61-stationary-qd4-confirmatory-n4-abba-v1",
+    "pilot_copied": false,
+    "analysis_excludes": [
+      "the unshipped local V4 full61 stationary QD4 pilot",
+      "all pilot, old-A, and incident artifacts"
+    ],
+    "capacity_guard_basis": "frozen STOP gate declares zero violations; all eight runner logs report PASS; raw traces do not include per-run memory readings"
+  },
+  "execution_order": [
+    "01-A",
+    "02-B",
+    "03-B",
+    "04-A",
+    "05-B",
+    "06-A",
+    "07-A",
+    "08-B"
+  ],
+  "runs": [
+    {
+      "name": "01-A",
+      "arm": "A",
+      "trace": {
+        "path": "01-A.jsonl",
+        "sha256": "6a6c6f691556dd0f9e816320f5b7be220b0ed9b0d634d5eafe95e4e66480e258",
+        "bytes": 660156,
+        "records": 307
+      },
+      "log": {
+        "path": "01-A.log",
+        "sha256": "e70fbb100421dcb209c8d511fe8e24fdbac5319fead8babb5c2416b01a2ce945",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 199832706490,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v1"
+    },
+    {
+      "name": "02-B",
+      "arm": "B",
+      "trace": {
+        "path": "02-B.jsonl",
+        "sha256": "3d77d34dd3d053f04b5af164f082254efe30f72f888c2906cbe481a1c1f95376",
+        "bytes": 695133,
+        "records": 307
+      },
+      "log": {
+        "path": "02-B.log",
+        "sha256": "9e9d662b7238aad2d298e99d391585922a7a8825a3d1e7b353c52ee6dfd9a906",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 148140518176,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v2"
+    },
+    {
+      "name": "03-B",
+      "arm": "B",
+      "trace": {
+        "path": "03-B.jsonl",
+        "sha256": "cefa894794177db223731dbe5218ea5f8bb5ecd9fa0112c8a24f115f0222213f",
+        "bytes": 694951,
+        "records": 307
+      },
+      "log": {
+        "path": "03-B.log",
+        "sha256": "7b1ad38d57ee6df0229b1979d38e1d18034efdd3fcc8a33043ff2508ba4e57a2",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 146336023879,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v2"
+    },
+    {
+      "name": "04-A",
+      "arm": "A",
+      "trace": {
+        "path": "04-A.jsonl",
+        "sha256": "34cf4ea6272f7a8e58ab0f302075f7e65a7e560bb482e52c84355f196f32192a",
+        "bytes": 659903,
+        "records": 307
+      },
+      "log": {
+        "path": "04-A.log",
+        "sha256": "08e910ba97bdbf09e7d5d9ae61151bced754309ebe67583e48b011af9752dd82",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 197576603395,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v1"
+    },
+    {
+      "name": "05-B",
+      "arm": "B",
+      "trace": {
+        "path": "05-B.jsonl",
+        "sha256": "84c628c16b910c4de99be3c3d8ed32a305f0ad2f2fd48700842397a158f64b97",
+        "bytes": 695154,
+        "records": 307
+      },
+      "log": {
+        "path": "05-B.log",
+        "sha256": "5747f3889233e0e5f6f5de9d2db2936500c2ba444595112aafc83aa1980385d5",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 148969744253,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v2"
+    },
+    {
+      "name": "06-A",
+      "arm": "A",
+      "trace": {
+        "path": "06-A.jsonl",
+        "sha256": "67a141ba631e7ea6128ef3ca0619151fab517121b4082d501e0ce76dddebaf64",
+        "bytes": 660066,
+        "records": 307
+      },
+      "log": {
+        "path": "06-A.log",
+        "sha256": "db600e352e3dd5ae5a9d1001b4619ac135c80dd51551ffbf6ce7cc647a14c64f",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 199031201993,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v1"
+    },
+    {
+      "name": "07-A",
+      "arm": "A",
+      "trace": {
+        "path": "07-A.jsonl",
+        "sha256": "b32aeae1495185eaac0bae34d63cd28cca8203f988b7f89fbfe801dcee76ec02",
+        "bytes": 660150,
+        "records": 307
+      },
+      "log": {
+        "path": "07-A.log",
+        "sha256": "05b15fbc4c13e0292c34158bd20aa6c3380cb99cf3ba3376f8e4cf949165c2dd",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 201296711312,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v1"
+    },
+    {
+      "name": "08-B",
+      "arm": "B",
+      "trace": {
+        "path": "08-B.jsonl",
+        "sha256": "b9e0d999f8cdddba4d2a591d6dbc91472e78de789f1efa3d974b44d666a06307",
+        "bytes": 695303,
+        "records": 307
+      },
+      "log": {
+        "path": "08-B.log",
+        "sha256": "6780e726e38cee548b1c0f8be1f89cfb6ba4f25a0848a9fbb6c67c8836aac4ae",
+        "bytes": 265,
+        "records": 1
+      },
+      "request_e2e_ns": 150255431867,
+      "phase_schema": "colibri-v4-stationary-phase-profile-v2"
+    }
+  ],
+  "statistics": {
+    "A_request_e2e_ns": [
+      199832706490,
+      197576603395,
+      199031201993,
+      201296711312
+    ],
+    "B_request_e2e_ns": [
+      148140518176,
+      146336023879,
+      148969744253,
+      150255431867
+    ],
+    "A_median_ns": 199431954241.5,
+    "B_median_ns": 148555131214.5,
+    "ratio_of_medians_A_over_B": 1.3424777226546185,
+    "paired_A_over_B": [
+      1.348940242348731,
+      1.3501569754168596,
+      1.3360511759688534,
+      1.3396967338270982
+    ],
+    "paired_A_over_B_positive": 4,
+    "A_p95_ns_linear": 201077110588.7,
+    "B_p95_ns_linear": 150062578724.9,
+    "B_over_A_p95": 0.7462936894485747
+  },
+  "arm_contracts": {
+    "A": {
+      "routed_expert_slot_reuse": true,
+      "routed_qd4": false,
+      "lanes": 0,
+      "route_jobs_per_layer": 0,
+      "routed_expert_loads": 844,
+      "routed_source_bytes": 29619781632,
+      "routed_h2d_bytes": 29619781632
+    },
+    "B": {
+      "routed_expert_slot_reuse": false,
+      "routed_qd4": true,
+      "lanes": 4,
+      "route_jobs_per_layer": 6,
+      "routed_expert_loads": 1830,
+      "routed_source_bytes": 64222986240,
+      "routed_h2d_bytes": 64222986240
+    },
+    "both": {
+      "fixed_source_bytes": 24968176264,
+      "fixed_h2d_bytes": 29061571000,
+      "fixed_runtime_loads": 61
+    }
+  },
+  "integrity": {
+    "all_8_runs_have_307_records": true,
+    "all_8_logs_report_PASS": true,
+    "all_run_semantic_projections_exact": true,
+    "all_run_finals_exact": true,
+    "paired_semantic_and_final_exact": 4,
+    "per_record_and_request_phase_closure": true,
+    "A_phase_schema": "colibri-v4-stationary-phase-profile-v1",
+    "B_phase_schema": "colibri-v4-stationary-phase-profile-v2",
+    "all_runs_fixed_prefetch_transitions": 60,
+    "all_runs_fixed_prefetch_ready_before_consume": 60,
+    "all_runs_fixed_prefetch_consume_wait_ns": 0
+  },
+  "gates": {
+    "ratio_of_medians_A_over_B_min": 1.1,
+    "ratio_of_medians_pass": true,
+    "paired_A_over_B_positive_min": 3,
+    "paired_A_over_B_positive_pass": true,
+    "B_p95_over_A_p95_max": 1.05,
+    "B_p95_pass": true,
+    "capacity_guard_violations": 0,
+    "capacity_guard_observation": "protocol STOP gate plus eight PASS logs; not directly recorded in raw traces"
+  },
+  "decision": "GO"
+}

@@ -1,0 +1,268 @@
+{
+  "artifact_identity": {
+    "cache_off_pair1": {
+      "bytes": 870361,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-a1.jsonl",
+      "sha256": "a6c7509e644366c162058822e6ba6a5e9cf3b5872156bc215e5deb749e938cf4"
+    },
+    "cache_off_pair2": {
+      "bytes": 870448,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-a2.jsonl",
+      "sha256": "61338061e833e85165f465b92b0ff8e00063b0a9ddffefe2187305fd67e0271c"
+    },
+    "cache_on_pair1": {
+      "bytes": 869848,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-b1.jsonl",
+      "sha256": "333c0ff7cd719198e5debbfd8c6b4d3b09f7ac7342b26b1b42d4eed6f549a078"
+    },
+    "cache_on_pair2": {
+      "bytes": 869873,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-b2.jsonl",
+      "sha256": "5af29cc0ee387f3eab7f4e383a023728f3f5f68f40e087f3e89ae4e92e7c16cb"
+    },
+    "cache_strict_audit": {
+      "bytes": 901793,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/full61-qd4-immutable-cache-strict-audit-b43-20260725.jsonl",
+      "sha256": "6d0972b01ee945bfb88c47f92acb5b306de2cd8e1eb3cd3c0696deeb90e920c1"
+    },
+    "flash_migration_research": {
+      "path": "docs/FLASH_MIGRATION_RESEARCH.md",
+      "role": "calibration formulas and projection boundary; no Flash run",
+      "sha256": "93323873a7f7ee190599576bacb718b002537042d3385941d1b5cc62096ba3fa"
+    },
+    "host_bf16_pair1": {
+      "bytes": 870566,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-host-b.jsonl",
+      "sha256": "0ee931dd095243d8cda15a32c3a12649c6cc1cb4fce0c9576b564ea27c852a4e"
+    },
+    "host_bf16_pair2": {
+      "bytes": 870212,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-host-b-2.jsonl",
+      "sha256": "6f3a60246121be268674eb671521e9c0fe37fdbae0ccfc7200bbdc37f475af65"
+    },
+    "pos5_one_token": {
+      "bytes": 1071477,
+      "lines": 369,
+      "path": "/mnt/colibri-native/.logs/pos5-production-dag-0009-b15c-20260725.jsonl",
+      "sha256": "ae807d39e1e087a5f93da75f1d5ceca71da0b6f88ffce436fbda83cb41f0bf94"
+    },
+    "raw_gpu_pair1": {
+      "bytes": 869703,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-raw-a.jsonl",
+      "sha256": "8a8690f2868e10ae0b7cb7bc0a3ad8c4055f1a7efe8b45fcaa1d13ca7178004f"
+    },
+    "raw_gpu_pair2": {
+      "bytes": 869892,
+      "lines": 307,
+      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-raw-a-2.jsonl",
+      "sha256": "49dd68b2673cf0ab2126f5b0e81a16107b6179918837068053ef45294372a8b6"
+    }
+  },
+  "figures": {
+    "13-fixed-h2d-savings.svg": {
+      "evidence_class": "Measured",
+      "field": "run.physical.fixed_h2d_bytes",
+      "formula": "saved = host_bf16_decode_bytes - raw_gpu_decode_bytes",
+      "host_bf16_decode_bytes": 29061571000,
+      "raw_gpu_decode_bytes": 24967930296,
+      "saved_bytes": 4093640704,
+      "scope": "V4-Pro full61 development ABBA; n=2 per arm"
+    },
+    "14-routed-cache-savings.svg": {
+      "cache_off_bytes_per_field": 64222986240,
+      "cache_on_bytes_per_field": 29619781632,
+      "evidence_class": "Measured",
+      "fields": [
+        "run.physical.routed_source_bytes",
+        "run.physical.routed_h2d_bytes"
+      ],
+      "formula": "saved_per_field = cache_off_bytes_per_field - cache_on_bytes_per_field",
+      "saved_bytes_per_field": 34603204608,
+      "scope": "V4-Pro full61 development ABBA; n=2 per arm; independently strict-audited",
+      "strict_audit": {
+        "completed_layers": 61,
+        "d2d_bytes": 64222986240,
+        "d2d_copies": 1830,
+        "eviction": "none",
+        "expert_union_loads": 844,
+        "fallbacks": 0,
+        "h2d_bytes": 29619781632,
+        "h2d_loads": 844,
+        "hits": 986,
+        "max_occupancy": 29,
+        "route_executions": 1830,
+        "slots": 32,
+        "source_bytes": 29619781632,
+        "source_loads": 844,
+        "worker_errors": 0
+      }
+    },
+    "15-development-paired-timings.svg": {
+      "evidence_class": "Measured development",
+      "median_ratios_left_over_right": {
+        "cache_off_over_on_e2e": 1.0689774370869407,
+        "cache_off_over_on_routed_wall": 1.4300454906364322,
+        "host_over_raw_e2e": 1.171788154618803
+      },
+      "n_per_arm": 2,
+      "note": "All points and pair lines are shown; n=2 is not used to draw a CI.",
+      "pairs": {
+        "fixed_decode_e2e_ns": [
+          {
+            "host_bf16": 36071091655,
+            "pair": 1,
+            "raw_gpu": 29488280148
+          },
+          {
+            "host_bf16": 28728430859,
+            "pair": 2,
+            "raw_gpu": 25811410550
+          }
+        ],
+        "routed_cache_e2e_ns": [
+          {
+            "cache_off": 28962896282,
+            "cache_on": 26776759715,
+            "pair": 1
+          },
+          {
+            "cache_off": 27660119996,
+            "cache_on": 26192568087,
+            "pair": 2
+          }
+        ],
+        "routed_cache_wall_ns": [
+          {
+            "cache_off": 13510464710,
+            "cache_on": 8979928616,
+            "pair": 1
+          },
+          {
+            "cache_off": 11790658984,
+            "cache_on": 8712602048,
+            "pair": 2
+          }
+        ]
+      },
+      "uncertainty_interval": null
+    },
+    "16-pos5-one-token-dag.svg": {
+      "decode_final_outer_ns": 1535407462,
+      "decode_layer_outer_ns": 35443763149,
+      "decode_outer_ns": 36979170611,
+      "evidence_class": "Measured development",
+      "formulas": [
+        "sum(stage_ns) + layer_unattributed_gap_ns = decode_layer_outer_ns",
+        "decode_layer_outer_ns + decode_final_outer_ns = decode_outer_ns",
+        "next_token_rate_tok_s = 1e9 / decode_outer_ns"
+      ],
+      "layer_records": 61,
+      "layer_unattributed_gap_ns": 5041159,
+      "n": 1,
+      "next_token_rate_tok_s": 0.02704225063670128,
+      "note": "One development next-token decode; not sustained throughput.",
+      "stage_ns": {
+        "attention": 1403744433,
+        "layer_prepare": 29605884253,
+        "routed": 3407328163,
+        "router": 707032784,
+        "shared": 314732357
+      },
+      "token_position": 5
+    },
+    "17-hardware-evidence-ladder.svg": {
+      "display_structure": "Current evidence and future gates are separated; there is no shared rate axis.",
+      "mixed_workload_warning": "Rows are not like-for-like benchmark speedups.",
+      "rows": [
+        {
+          "evidence_class": "Measured",
+          "formula": "1e9 / measured position-5 decode_outer_ns",
+          "model": "V4-Pro",
+          "rate_tok_s": 0.02704225063670128,
+          "scope": "one H1 next-token development decode; not sustained throughput",
+          "vram_gib": 12
+        },
+        {
+          "evidence_class": "Calibrated",
+          "formula": "cold H1 projection 8-12 s gives reciprocal 0.083-0.125 tok/s; display band is conservatively rounded",
+          "hardcoded_display_band_tok_s": [
+            0.08,
+            0.12
+          ],
+          "model": "V4-Flash",
+          "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3",
+          "vram_gib": 12
+        },
+        {
+          "evidence_class": "Target",
+          "formula": "1 / [4.0, 2.5] s; requires unimplemented short-context fixed residency",
+          "hardcoded_band_tok_s": [
+            0.25,
+            0.4
+          ],
+          "model": "V4-Flash",
+          "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3 resident-fixed H1 hypothesis",
+          "vram_gib": 16
+        },
+        {
+          "assumptions": {
+            "H": 2,
+            "q": 0.8
+          },
+          "current_path_calibrated_band_tok_s": [
+            0.2,
+            0.29
+          ],
+          "evidence_class": "Target",
+          "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.44-4.88 s; that consequence is not evidence.",
+          "hardcoded_band_tok_s": [
+            0.5,
+            1.0
+          ],
+          "model": "V4-Flash",
+          "source": "README planning brief; current report calibrates only 0.20-0.29 committed tok/s for H2",
+          "vram_gib": 24
+        },
+        {
+          "assumptions": {
+            "H": 5,
+            "q": 0.8
+          },
+          "current_path_calibrated_band_tok_s": [
+            0.26,
+            0.37
+          ],
+          "evidence_class": "Target",
+          "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.46-5.27 s; that consequence is not evidence.",
+          "hardcoded_band_tok_s": [
+            0.7,
+            1.5
+          ],
+          "model": "V4-Flash",
+          "source": "README planning brief; current report calibrates only 0.26-0.37 committed tok/s for H5",
+          "vram_gib": [
+            32,
+            48
+          ]
+        }
+      ]
+    }
+  },
+  "generator": "docs/assets/readme/generate_cost_figures.py",
+  "schema": "colibri-readme-cost-figures-v1",
+  "units": {
+    "display_storage": "decimal GB = bytes / 1e9",
+    "hardware_capacity": "GiB",
+    "rate": "tokens per second",
+    "source_bytes": "bytes",
+    "time": "nanoseconds in artifacts; seconds in figures"
+  }
+}

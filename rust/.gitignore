@@ -1,0 +1,7 @@
+/target/
+/*.ll
+/*.opt.ll
+/*.ptx
+/.source-identity.manifest
+/.source-identity.*
+/rustc-ice-*.txt

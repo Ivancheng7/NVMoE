@@ -45,6 +45,13 @@ c/bench/
 stats*.txt
 *.log
 
+# Local Rust builds and generated release-audit output. Keep Rust sources,
+# fixtures, and checked evidence versioned; only these reproducible byproducts
+# belong outside a commit.
+/target/
+/colibri_engine.egg-info/
+/graphify-out/
+
 # script di ricerca stadio-0 (esperimenti locali, non parte del motore)
 /engine.py
 /run.py

@@ -1,0 +1,24174 @@
+//! First Rust-CUDA pipeline primitives corresponding to `pipe_add_n`,
+//! `silu_mul`, and `pipe_rows_add` in `c/backend_cuda.cu`.
+
+#![recursion_limit = "256"]
+
+#[allow(dead_code)] // wired into model dispatch after the current CUDA smoke phase
+mod cublas_exact;
+mod safetensors;
+mod v4_certified;
+mod v4_chat;
+mod v4_expert;
+mod v4_federated;
+mod v4_fp4;
+mod v4_router;
+mod v4_state;
+mod v4_tokenizer;
+
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::error::Error;
+use std::io::Write;
+
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer, sys};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
+
+#[cuda_module]
+mod kernels {
+    use super::*;
+
+    fn bf16_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    fn f32_to_bf16_rne(value: f32) -> u16 {
+        let bits = value.to_bits();
+        ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+    }
+
+    fn decode_fp4(byte: u8, pair: usize) -> f32 {
+        let nibble = if pair == 0 { byte & 0x0f } else { byte >> 4 };
+        let magnitude = match nibble & 0x07 {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            _ => 6.0,
+        };
+        if magnitude == 0.0 || nibble & 0x08 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
+    }
+
+    fn decode_e4m3fn(bits: u8) -> f32 {
+        let negative = bits & 0x80 != 0;
+        let magnitude = bits & 0x7f;
+        if magnitude == 0x7f {
+            return f32::NAN;
+        }
+        let exponent = magnitude >> 3;
+        let mantissa = magnitude & 7;
+        let value = if exponent == 0 {
+            mantissa as f32 * 0.001953125
+        } else {
+            (1.0 + mantissa as f32 / 8.0)
+                * f32::from_bits(((exponent as i32 - 7 + 127) as u32) << 23)
+        };
+        if negative { -value } else { value }
+    }
+
+    fn quantize_e4m3fn_bits(value: f32) -> u8 {
+        let sign = if value.to_bits() >> 31 != 0 { 0x80 } else { 0 };
+        let value = if value.abs() > 448.0 {
+            448.0
+        } else {
+            value.abs()
+        };
+        let mut best_bits = 0_u8;
+        let mut best_distance = f32::INFINITY;
+        let mut bits = 0_u8;
+        while bits <= 126 {
+            let candidate = decode_e4m3fn(bits);
+            let distance = (value - candidate).abs();
+            if distance < best_distance
+                || (distance == best_distance && bits & 1 == 0 && best_bits & 1 != 0)
+            {
+                best_bits = bits;
+                best_distance = distance;
+            }
+            bits += 1;
+        }
+        best_bits | sign
+    }
+
+    fn quantize_e4m3fn(value: f32) -> f32 {
+        decode_e4m3fn(quantize_e4m3fn_bits(value))
+    }
+
+    #[kernel]
+    pub fn e4m3fn_to_bf16(input: &[u8], mut output: DisjointSlice<u16>) {
+        let index = thread::index_1d().get() as usize;
+        if index < input.len() && index < output.len() {
+            unsafe {
+                *output.as_mut_ptr().add(index) = f32_to_bf16_rne(decode_e4m3fn(input[index]));
+            }
+        }
+    }
+
+    fn decode_e8m0fnu(bits: u8) -> f32 {
+        match bits {
+            0 => f32::from_bits(1 << 22),
+            255 => f32::NAN,
+            exponent => f32::from_bits((exponent as u32) << 23),
+        }
+    }
+
+    fn encode_e8m0_power_of_two(value: f32) -> u8 {
+        if value.to_bits() == 1 << 22 {
+            0
+        } else {
+            ((value.to_bits() >> 23) & 0xff) as u8
+        }
+    }
+
+    fn pow2_ceil(value: f32) -> f32 {
+        let bits = value.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+        let has_fraction = bits & 0x007f_ffff != 0;
+        f32::from_bits(((exponent + has_fraction as i32 + 127) as u32) << 23)
+    }
+
+    fn e2m1_even(value: f32) -> bool {
+        matches!(
+            value.abs().to_bits(),
+            0 | 0x3f80_0000 | 0x4000_0000 | 0x4080_0000
+        )
+    }
+
+    fn quantize_e2m1(value: f32) -> f32 {
+        const LEVELS: [f32; 15] = [
+            -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        ];
+        let mut best = 0.0_f32;
+        let mut distance = f32::INFINITY;
+        for candidate in LEVELS {
+            let candidate_distance = (value - candidate).abs();
+            if candidate_distance < distance
+                || (candidate_distance == distance && e2m1_even(candidate) && !e2m1_even(best))
+            {
+                best = candidate;
+                distance = candidate_distance;
+            }
+        }
+        best
+    }
+
+    fn sqrt_newton(value: f32) -> f32 {
+        if value <= 0.0 {
+            return 0.0;
+        }
+        let mut estimate = if value < 1.0 { 1.0 } else { value };
+        for _ in 0..16 {
+            estimate = 0.5 * (estimate + value / estimate);
+        }
+        estimate
+    }
+
+    fn pytorch_square_sum_bf16(input: &[u16], start: usize, width: usize) -> f32 {
+        const LANES: usize = 8;
+        const ILP: usize = 4;
+        const LEVELS: usize = 4;
+        const LEVEL_STEP: usize = 16;
+        let groups = width / (LANES * ILP);
+        let mut partials = [0.0_f32; LEVELS * ILP * LANES];
+        let mut group = 0;
+
+        while group + LEVEL_STEP <= groups {
+            for _ in 0..LEVEL_STEP {
+                for interleave in 0..ILP {
+                    let source = start + (group * ILP + interleave) * LANES;
+                    for lane in 0..LANES {
+                        let value = bf16_to_f32(input[source + lane]);
+                        partials[interleave * LANES + lane] += value * value;
+                    }
+                }
+                group += 1;
+            }
+            for level in 1..LEVELS {
+                for interleave in 0..ILP {
+                    for lane in 0..LANES {
+                        let destination = (level * ILP + interleave) * LANES + lane;
+                        let source = ((level - 1) * ILP + interleave) * LANES + lane;
+                        partials[destination] += partials[source];
+                        partials[source] = 0.0;
+                    }
+                }
+                if group & (15 << (level * 4)) != 0 {
+                    break;
+                }
+            }
+        }
+        while group < groups {
+            for interleave in 0..ILP {
+                let source = start + (group * ILP + interleave) * LANES;
+                for lane in 0..LANES {
+                    let value = bf16_to_f32(input[source + lane]);
+                    partials[interleave * LANES + lane] += value * value;
+                }
+            }
+            group += 1;
+        }
+        for level in 1..LEVELS {
+            for interleave in 0..ILP {
+                for lane in 0..LANES {
+                    partials[interleave * LANES + lane] +=
+                        partials[(level * ILP + interleave) * LANES + lane];
+                }
+            }
+        }
+        for interleave in 1..ILP {
+            for lane in 0..LANES {
+                partials[lane] += partials[interleave * LANES + lane];
+            }
+        }
+        let mut sum = 0.0_f32;
+        for column in groups * LANES * ILP..width {
+            let value = bf16_to_f32(input[start + column]);
+            sum += value * value;
+        }
+        for lane in 0..LANES {
+            sum += partials[lane];
+        }
+        sum
+    }
+
+    #[kernel]
+    pub fn quantize_v4_activation(input: &[u16], mut output: DisjointSlice<f32>) {
+        const BLOCK: usize = 128;
+        let index = thread::index_1d();
+        let output_index = index.get() as usize;
+        let Some(destination) = output.get_mut(index) else {
+            return;
+        };
+        if output_index >= input.len() {
+            return;
+        }
+        let start = output_index / BLOCK * BLOCK;
+        let mut amax = 0.0_f32;
+        for offset in 0..BLOCK {
+            let value = bf16_to_f32(input[start + offset]).abs();
+            if value > amax {
+                amax = value;
+            }
+        }
+        let scale = pow2_ceil(if amax > 1e-4 { amax } else { 1e-4 } / 448.0);
+        *destination = quantize_e4m3fn(bf16_to_f32(input[output_index]) / scale) * scale;
+    }
+
+    #[kernel]
+    pub fn quantize_v4_fp8_bf16(
+        input: &[u16],
+        mut output: DisjointSlice<u8>,
+        mut scales: DisjointSlice<u8>,
+        mut dequantized: DisjointSlice<u16>,
+        row_width: u32,
+        quantized_width: u32,
+        block_size: u32,
+    ) {
+        let row_width = row_width as usize;
+        let quantized_width = quantized_width as usize;
+        let block_size = block_size as usize;
+        let group = thread::index_1d().get() as usize;
+        if row_width == 0
+            || quantized_width == 0
+            || block_size == 0
+            || quantized_width > row_width
+            || quantized_width % block_size != 0
+            || input.len() % row_width != 0
+            || group >= scales.len()
+        {
+            return;
+        }
+        let rows = input.len() / row_width;
+        let groups_per_row = quantized_width / block_size;
+        if scales.len() != rows * groups_per_row
+            || (!output.is_empty() && output.len() != rows * quantized_width)
+            || (!dequantized.is_empty() && dequantized.len() != input.len())
+        {
+            return;
+        }
+        let row = group / groups_per_row;
+        let group_in_row = group % groups_per_row;
+        let input_start = row * row_width + group_in_row * block_size;
+        let output_start = group * block_size;
+        let mut amax = 0.0_f32;
+        for column in 0..block_size {
+            amax = amax.max(bf16_to_f32(input[input_start + column]).abs());
+        }
+        let scale = pow2_ceil(amax.max(1e-4) / 448.0);
+        // SAFETY: one thread owns one complete disjoint quantization group.
+        unsafe {
+            *scales.as_mut_ptr().add(group) = encode_e8m0_power_of_two(scale);
+            for column in 0..block_size {
+                let bits = quantize_e4m3fn_bits(bf16_to_f32(input[input_start + column]) / scale);
+                if !output.is_empty() {
+                    *output.as_mut_ptr().add(output_start + column) = bits;
+                }
+                if !dequantized.is_empty() {
+                    *dequantized.as_mut_ptr().add(input_start + column) =
+                        f32_to_bf16_rne(decode_e4m3fn(bits) * scale);
+                }
+            }
+        }
+    }
+
+    /// Correctness-first FP8 GEMV: one warp owns one output element and
+    /// accumulates official 128-K scaled partials in K order.
+    #[kernel]
+    pub fn matvec_v4_fp8(
+        input: &[u8],
+        input_scales: &[u8],
+        weight: &[u8],
+        weight_scales: &[u8],
+        mut output_f32: DisjointSlice<f32>,
+        mut output_bf16: DisjointSlice<u16>,
+        in_features: u32,
+        out_features: u32,
+        strict_k_order: bool,
+    ) {
+        const BLOCK: usize = 128;
+        let thread_index = thread::index_1d().get() as usize;
+        let output_index = thread_index / 32;
+        let lane = warp::lane_id() as usize;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if in_features == 0 || in_features % BLOCK != 0 || out_features == 0 {
+            return;
+        }
+        let blocks = in_features / BLOCK;
+        let rows = input.len() / in_features;
+        if input.len() != rows * in_features
+            || input_scales.len() != rows * blocks
+            || weight.len() != out_features * in_features
+            || weight_scales.len() != ((out_features + BLOCK - 1) / BLOCK) * blocks
+            || output_f32.len() != rows * out_features
+            || output_bf16.len() != rows * out_features
+            || output_index >= output_f32.len()
+        {
+            return;
+        }
+        let row = output_index / out_features;
+        let output_row = output_index % out_features;
+        let mut accumulated = 0.0_f32;
+        if strict_k_order && lane == 0 {
+            // ponytail: one lane preserves the official K order for exact BF16;
+            // restore a parallel reduction only when it also passes this gate.
+            for block in 0..blocks {
+                let mut partial = 0.0_f32;
+                let input_start = row * in_features + block * BLOCK;
+                let weight_start = output_row * in_features + block * BLOCK;
+                for column in 0..BLOCK {
+                    partial += decode_e4m3fn(input[input_start + column])
+                        * decode_e4m3fn(weight[weight_start + column]);
+                }
+                let scale = decode_e8m0fnu(input_scales[row * blocks + block])
+                    * decode_e8m0fnu(weight_scales[(output_row / BLOCK) * blocks + block]);
+                accumulated += partial * scale;
+            }
+        } else if !strict_k_order {
+            for block in 0..blocks {
+                let mut partial = 0.0_f32;
+                let input_start = row * in_features + block * BLOCK;
+                let weight_start = output_row * in_features + block * BLOCK;
+                let mut column = lane;
+                while column < BLOCK {
+                    partial += decode_e4m3fn(input[input_start + column])
+                        * decode_e4m3fn(weight[weight_start + column]);
+                    column += 32;
+                }
+                partial += warp::shuffle_xor_f32(partial, 16);
+                partial += warp::shuffle_xor_f32(partial, 8);
+                partial += warp::shuffle_xor_f32(partial, 4);
+                partial += warp::shuffle_xor_f32(partial, 2);
+                partial += warp::shuffle_xor_f32(partial, 1);
+                if lane == 0 {
+                    let scale = decode_e8m0fnu(input_scales[row * blocks + block])
+                        * decode_e8m0fnu(weight_scales[(output_row / BLOCK) * blocks + block]);
+                    accumulated += partial * scale;
+                }
+            }
+        }
+        if lane == 0 {
+            // SAFETY: lane zero uniquely owns this checked output element.
+            unsafe {
+                *output_f32.as_mut_ptr().add(output_index) = accumulated;
+                *output_bf16.as_mut_ptr().add(output_index) = f32_to_bf16_rne(accumulated);
+            }
+        }
+    }
+
+    /// Streamed BF16 output-head GEMV: one warp owns one vocabulary row.
+    #[kernel]
+    pub fn matvec_bf16_streamed(
+        input: &[u16],
+        weight: &[u16],
+        mut output: DisjointSlice<f32>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        let lane = warp::lane_id() as usize;
+        let output_row = thread::index_1d().get() as usize / 32;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if input.len() != in_features
+            || weight.len() < out_features * in_features
+            || output.len() < out_features
+            || output_row >= out_features
+        {
+            return;
+        }
+        let mut sum = 0.0_f32;
+        let mut column = lane;
+        while column < in_features {
+            sum +=
+                bf16_to_f32(input[column]) * bf16_to_f32(weight[output_row * in_features + column]);
+            column += 32;
+        }
+        sum += warp::shuffle_xor_f32(sum, 16);
+        sum += warp::shuffle_xor_f32(sum, 8);
+        sum += warp::shuffle_xor_f32(sum, 4);
+        sum += warp::shuffle_xor_f32(sum, 2);
+        sum += warp::shuffle_xor_f32(sum, 1);
+        if lane == 0 {
+            // SAFETY: lane zero uniquely owns this checked output row.
+            unsafe {
+                *output.as_mut_ptr().add(output_row) = sum;
+            }
+        }
+    }
+
+    /// Official V4 FP8 GEMM arithmetic for row-major A and transposed row-major B.
+    ///
+    /// One warp computes a 16x8 tensor-core tile with all 16 logical A rows
+    /// duplicated from one input row; lanes 0..3 own that row's eight outputs.
+    #[kernel]
+    pub fn matvec_v4_fp8_mma(
+        input: &[u8],
+        input_scales: &[u8],
+        weight: &[u8],
+        weight_scales: &[u8],
+        mut output_f32: DisjointSlice<f32>,
+        mut output_bf16: DisjointSlice<u16>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        const FP8_BLOCK: usize = 128;
+        const MMA_K: usize = 32;
+        const MMA_N: usize = 8;
+        let thread_index = thread::index_1d().get() as usize;
+        let warp_index = thread_index / 32;
+        let lane = warp::lane_id() as usize;
+        let group = lane / 4;
+        let thread_in_group = lane % 4;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if in_features == 0
+            || in_features % FP8_BLOCK != 0
+            || out_features == 0
+            || out_features % MMA_N != 0
+        {
+            return;
+        }
+        let rows = input.len() / in_features;
+        let output_tiles = out_features / MMA_N;
+        if input.len() != rows * in_features
+            || output_f32.len() != rows * out_features
+            || output_bf16.len() != rows * out_features
+            || warp_index >= rows * output_tiles
+        {
+            return;
+        }
+        let blocks = in_features / FP8_BLOCK;
+        if input_scales.len() != rows * blocks
+            || weight.len() != out_features * in_features
+            || weight_scales.len() != ((out_features + FP8_BLOCK - 1) / FP8_BLOCK) * blocks
+        {
+            return;
+        }
+        let row = warp_index / output_tiles;
+        let output_start = (warp_index % output_tiles) * MMA_N;
+        let weight_row = output_start + group;
+        let mut total = [0.0_f32; 4];
+        for block in 0..blocks {
+            let mut fragment = [0.0_f32; 4];
+            for mma_k in 0..(FP8_BLOCK / MMA_K) {
+                let k_start = block * FP8_BLOCK + mma_k * MMA_K;
+                let a0_start = row * in_features + k_start + thread_in_group * 4;
+                let a1_start = a0_start + 16;
+                let a0 = (input[a0_start] as u32)
+                    | ((input[a0_start + 1] as u32) << 8)
+                    | ((input[a0_start + 2] as u32) << 16)
+                    | ((input[a0_start + 3] as u32) << 24);
+                let a1 = (input[a1_start] as u32)
+                    | ((input[a1_start + 1] as u32) << 8)
+                    | ((input[a1_start + 2] as u32) << 16)
+                    | ((input[a1_start + 3] as u32) << 24);
+                let b0_start = weight_row * in_features + k_start + thread_in_group * 4;
+                let b1_start = b0_start + 16;
+                let b0 = (weight[b0_start] as u32)
+                    | ((weight[b0_start + 1] as u32) << 8)
+                    | ((weight[b0_start + 2] as u32) << 16)
+                    | ((weight[b0_start + 3] as u32) << 24);
+                let b1 = (weight[b1_start] as u32)
+                    | ((weight[b1_start + 1] as u32) << 8)
+                    | ((weight[b1_start + 2] as u32) << 16)
+                    | ((weight[b1_start + 3] as u32) << 24);
+                // SAFETY: every active lane in this full warp executes the same
+                // register-only m16n8k32 instruction with PTX-documented fragments.
+                fragment = unsafe {
+                    cuda_device::wmma::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                        fragment,
+                        [a0, a0, a1, a1],
+                        [b0, b1],
+                    )
+                };
+            }
+            let scale = decode_e8m0fnu(input_scales[row * blocks + block])
+                * decode_e8m0fnu(weight_scales[(output_start / FP8_BLOCK) * blocks + block]);
+            for index in 0..4 {
+                total[index] = cuda_device::float::fma_rn_f32(fragment[index], scale, total[index]);
+            }
+        }
+        if group == 0 {
+            let output_index = row * out_features + output_start + thread_in_group * 2;
+            // SAFETY: lanes 0..3 uniquely own two outputs in this warp's 8-wide tile.
+            unsafe {
+                *output_f32.as_mut_ptr().add(output_index) = total[0];
+                *output_f32.as_mut_ptr().add(output_index + 1) = total[1];
+                *output_bf16.as_mut_ptr().add(output_index) = f32_to_bf16_rne(total[0]);
+                *output_bf16.as_mut_ptr().add(output_index + 1) = f32_to_bf16_rne(total[1]);
+            }
+        }
+    }
+
+    /// V4 Compressor projection for HCA, CSA, and the CSA indexer.
+    #[kernel]
+    pub fn compressor_v4_bf16_f32(
+        input: &[u16],
+        wkv: &[u16],
+        wgate: &[u16],
+        ape: &[f32],
+        mut kv: DisjointSlice<f32>,
+        mut score: DisjointSlice<f32>,
+        mut score_plus_ape: DisjointSlice<f32>,
+        start_pos: u32,
+        hidden: u32,
+        outputs: u32,
+        compress_ratio: u32,
+    ) {
+        const K_BLOCK: usize = 192;
+        let index = thread::index_1d();
+        let output_index = index.get() as usize;
+        let hidden = hidden as usize;
+        let outputs = outputs as usize;
+        let compress_ratio = compress_ratio as usize;
+        if hidden == 0 || outputs == 0 || !matches!(compress_ratio, 4 | 128) {
+            return;
+        }
+        let rows = input.len() / hidden;
+        if input.len() % hidden != 0
+            || rows == 0
+            || wkv.len() != outputs * hidden
+            || wgate.len() != outputs * hidden
+            || ape.len() != compress_ratio * outputs
+            || kv.len() != rows * outputs
+            || score.len() != rows * outputs
+            || score_plus_ape.len() != rows * outputs
+            || output_index >= rows * outputs
+        {
+            return;
+        }
+        let row = output_index / outputs;
+        let output = output_index % outputs;
+        let ape_row = (start_pos as usize + row) % compress_ratio;
+        let ape_index = ape_row * outputs + output;
+        let mut kv_accumulated = 0.0_f32;
+        let mut score_accumulated = 0.0_f32;
+        let mut block = 0;
+        while block < hidden {
+            let mut kv_block = 0.0_f32;
+            let mut score_block = 0.0_f32;
+            let end = (block + K_BLOCK).min(hidden);
+            let mut column = block;
+            while column < end {
+                let value = bf16_to_f32(input[row * hidden + column]);
+                kv_block = cuda_device::float::fma_rn_f32(
+                    value,
+                    bf16_to_f32(wkv[output * hidden + column]),
+                    kv_block,
+                );
+                score_block = cuda_device::float::fma_rn_f32(
+                    value,
+                    bf16_to_f32(wgate[output * hidden + column]),
+                    score_block,
+                );
+                column += 1;
+            }
+            kv_accumulated += kv_block;
+            score_accumulated += score_block;
+            block += K_BLOCK;
+        }
+        // SAFETY: this thread uniquely owns the checked row-major output.
+        unsafe {
+            *kv.as_mut_ptr().add(output_index) = kv_accumulated;
+            *score.as_mut_ptr().add(output_index) = score_accumulated;
+            *score_plus_ape.as_mut_ptr().add(output_index) = score_accumulated + ape[ape_index];
+        }
+    }
+
+    /// Ratio-4 decode boundary pooling.  The first four slots are the prior
+    /// overlapping window and the second four slots hold the current rows.
+    #[kernel]
+    pub fn compressor_pool_ratio4_v4_f32(
+        persistent_kv: &[f32],
+        persistent_score: &[f32],
+        mut output: DisjointSlice<f32>,
+        head_dim: u32,
+    ) {
+        let dimension = thread::index_1d().get() as usize;
+        let head_dim = head_dim as usize;
+        let value_width = 2 * head_dim;
+        if head_dim == 0
+            || output.len() != head_dim
+            || persistent_kv.len() != 8 * value_width
+            || persistent_score.len() != 8 * value_width
+            || dimension >= head_dim
+        {
+            return;
+        }
+        let mut maximum = f32::NEG_INFINITY;
+        for slot in 0..4 {
+            maximum = maximum.max(persistent_score[slot * value_width + dimension]);
+        }
+        for slot in 0..4 {
+            maximum =
+                maximum.max(persistent_score[(4 + slot) * value_width + head_dim + dimension]);
+        }
+        let mut denominator = 0.0_f32;
+        let mut numerator = 0.0_f32;
+        for slot in 0..4 {
+            let index = slot * value_width + dimension;
+            let weight = libm::expf(persistent_score[index] - maximum);
+            denominator += weight;
+            numerator += persistent_kv[index] * weight;
+        }
+        for slot in 0..4 {
+            let index = (4 + slot) * value_width + head_dim + dimension;
+            let weight = libm::expf(persistent_score[index] - maximum);
+            denominator += weight;
+            numerator += persistent_kv[index] * weight;
+        }
+        unsafe { *output.as_mut_ptr().add(dimension) = numerator / denominator }
+    }
+
+    /// The exact host CSA indexer uses a 128-wide Walsh-Hadamard transform,
+    /// BF16 rounding, then blockwise E2M1 simulation.  A single thread owns a
+    /// complete vector so this preserves that observable operation order.
+    #[kernel]
+    pub fn indexer_fp4_sim_v4_bf16(input: &[u16], mut output: DisjointSlice<u16>) {
+        const WIDTH: usize = 128;
+        let vector = thread::index_1d().get() as usize;
+        if input.len() % WIDTH != 0 || output.len() != input.len() || vector >= input.len() / WIDTH
+        {
+            return;
+        }
+        let mut values = [0.0_f32; WIDTH];
+        for column in 0..WIDTH {
+            values[column] = bf16_to_f32(input[vector * WIDTH + column]);
+        }
+        let mut stride = 1;
+        while stride < WIDTH {
+            let mut block = 0;
+            while block < WIDTH {
+                for offset in 0..stride {
+                    let left = values[block + offset];
+                    let right = values[block + stride + offset];
+                    values[block + offset] = left + right;
+                    values[block + stride + offset] = left - right;
+                }
+                block += stride * 2;
+            }
+            stride *= 2;
+        }
+        let scale = 1.0_f32 / sqrt_newton(WIDTH as f32);
+        for value in &mut values {
+            *value = bf16_to_f32(f32_to_bf16_rne(*value * scale));
+        }
+        for block in (0..WIDTH).step_by(32) {
+            let mut amax = 0.0_f32;
+            for offset in 0..32 {
+                amax = amax.max(values[block + offset].abs());
+            }
+            let quant_scale = pow2_ceil((amax / 6.0).max(f32::from_bits(1 << 22)));
+            for offset in 0..32 {
+                values[block + offset] =
+                    quantize_e2m1(values[block + offset] / quant_scale) * quant_scale;
+            }
+        }
+        for column in 0..WIDTH {
+            unsafe {
+                *output.as_mut_ptr().add(vector * WIDTH + column) = f32_to_bf16_rne(values[column]);
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn f32_to_bf16_rne_v4(input: &[f32], mut output: DisjointSlice<u16>) {
+        let index = thread::index_1d().get() as usize;
+        if input.len() != output.len() || index >= input.len() {
+            return;
+        }
+        unsafe { *output.as_mut_ptr().add(index) = f32_to_bf16_rne(input[index]) }
+    }
+
+    #[kernel]
+    pub fn scale_f32_in_place_v4(mut values: DisjointSlice<f32>, scale: f32) {
+        let index = thread::index_1d();
+        if let Some(value) = values.get_mut(index) {
+            *value *= scale;
+        }
+    }
+
+    /// CSA indexer scoring after its q/kv projections, rotation, FP4
+    /// simulation, and per-head weight projection.
+    #[kernel]
+    pub fn indexer_scores_v4_f32(
+        q: &[f32],
+        kv: &[f32],
+        weights: &[f32],
+        mut scores: DisjointSlice<f32>,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        keys: u32,
+    ) {
+        let index = thread::index_1d();
+        let output = index.get() as usize;
+        let rows = rows as usize;
+        let heads = heads as usize;
+        let head_dim = head_dim as usize;
+        let keys = keys as usize;
+        if rows == 0
+            || heads == 0
+            || head_dim == 0
+            || keys == 0
+            || q.len() != rows * heads * head_dim
+            || kv.len() != keys * head_dim
+            || weights.len() != rows * heads
+            || scores.len() < rows * keys
+            || output >= rows * keys
+        {
+            return;
+        }
+        let row = output / keys;
+        let key = output % keys;
+        let mut score = 0.0_f32;
+        for head in 0..heads {
+            let mut dot = 0.0_f32;
+            for dimension in 0..head_dim {
+                dot +=
+                    q[(row * heads + head) * head_dim + dimension] * kv[key * head_dim + dimension];
+            }
+            score += dot.max(0.0) * weights[row * heads + head];
+        }
+        if let Some(destination) = scores.get_mut(index) {
+            *destination = score;
+        }
+    }
+
+    #[kernel]
+    pub fn linear_v4_bf16_f32(
+        input: &[u16],
+        weight: &[u16],
+        mut output: DisjointSlice<f32>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        let index = thread::index_1d();
+        let output_index = index.get() as usize;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if in_features == 0
+            || out_features == 0
+            || input.len() % in_features != 0
+            || weight.len() != in_features * out_features
+            || output.len() != input.len() / in_features * out_features
+            || output_index >= output.len()
+        {
+            return;
+        }
+        let row = output_index / out_features;
+        let column = output_index % out_features;
+        let mut value = 0.0_f32;
+        for feature in 0..in_features {
+            value += bf16_to_f32(input[row * in_features + feature])
+                * bf16_to_f32(weight[column * in_features + feature]);
+        }
+        if let Some(destination) = output.get_mut(index) {
+            *destination = value;
+        }
+    }
+
+    /// Deterministic CSA selection ordered by score descending, then key ascending.
+    /// This correctness-first kernel intentionally uses one independent scan per rank.
+    #[kernel]
+    pub fn indexer_topk_v4_f32(
+        scores: &[f32],
+        valid_keys: &[u32],
+        mut output: DisjointSlice<i32>,
+        rows: u32,
+        keys: u32,
+        topk: u32,
+        offset: u32,
+    ) {
+        let rows = rows as usize;
+        let keys = keys as usize;
+        let topk = topk as usize;
+        let index = thread::index_1d().get() as usize;
+        if rows == 0
+            || keys == 0
+            || topk == 0
+            || topk > 1_024
+            || topk > keys
+            || scores.len() < rows * keys
+            || valid_keys.len() < rows
+            || output.len() < rows * topk
+            || index >= rows * topk
+        {
+            return;
+        }
+        let row = index / topk;
+        let rank = index % topk;
+        let valid = valid_keys[row] as usize;
+        if valid > keys || rank >= valid {
+            unsafe { *output.as_mut_ptr().add(index) = -1 }
+            return;
+        }
+        let mut previous_score = f32::INFINITY;
+        let mut previous_key = 0_usize;
+        let mut final_selected_key = 0_usize;
+        for selection in 0..=rank {
+            let mut selected_score = f32::NEG_INFINITY;
+            let mut selected_key = 0_usize;
+            for key in 0..valid {
+                let score = scores[row * keys + key];
+                if !score.is_finite() {
+                    unsafe { *output.as_mut_ptr().add(index) = -1 }
+                    return;
+                }
+                let follows_previous = selection == 0
+                    || score < previous_score
+                    || (score == previous_score && key > previous_key);
+                if follows_previous
+                    && (score > selected_score || (score == selected_score && key < selected_key))
+                {
+                    selected_score = score;
+                    selected_key = key;
+                }
+            }
+            previous_score = selected_score;
+            previous_key = selected_key;
+            final_selected_key = selected_key;
+        }
+        unsafe { *output.as_mut_ptr().add(index) = (offset as usize + final_selected_key) as i32 }
+    }
+
+    /// Decode-mode FP4 matvec: one warp owns one output row. Its lanes walk
+    /// strided 32-K E8M0 tiles and reduce in registers; FP4 remains packed.
+    #[kernel]
+    pub fn matvec_v4_fp4(
+        input: &[f32],
+        packed: &[u8],
+        scales: &[u8],
+        mut output: DisjointSlice<u16>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        const WEIGHT_BLOCK: usize = 32;
+        let thread_index = thread::index_1d();
+        let thread_index = thread_index.get() as usize;
+        let output_index = thread_index / 32;
+        let lane = warp::lane_id() as usize;
+        let output_len = output.len();
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if output_index >= output_len
+            || in_features == 0
+            || in_features % WEIGHT_BLOCK != 0
+            || output_index >= input.len() / in_features * out_features
+        {
+            return;
+        }
+        let row = output_index / out_features;
+        let output_row = output_index % out_features;
+        let packed_row = output_row * (in_features / 2);
+        let scale_row = output_row * (in_features / WEIGHT_BLOCK);
+        let input_row = row * in_features;
+        let mut acc = 0.0_f32;
+        let mut block = lane;
+        while block < in_features / WEIGHT_BLOCK {
+            let scale = f32::from_bits((scales[scale_row + block] as u32) << 23);
+            let packed_start = packed_row + block * (WEIGHT_BLOCK / 2);
+            let input_start = input_row + block * WEIGHT_BLOCK;
+            for pair in 0..WEIGHT_BLOCK / 2 {
+                let byte = packed[packed_start + pair];
+                acc += input[input_start + pair * 2] * decode_fp4(byte, 0) * scale;
+                acc += input[input_start + pair * 2 + 1] * decode_fp4(byte, 1) * scale;
+            }
+            block += 32;
+        }
+        acc += warp::shuffle_xor_f32(acc, 16);
+        acc += warp::shuffle_xor_f32(acc, 8);
+        acc += warp::shuffle_xor_f32(acc, 4);
+        acc += warp::shuffle_xor_f32(acc, 2);
+        acc += warp::shuffle_xor_f32(acc, 1);
+        if lane == 0 {
+            // SAFETY: one lane per warp writes a unique output_index; bounds
+            // were checked above and the host launches exactly 32 lanes/output.
+            unsafe { *output.as_mut_ptr().add(output_index) = f32_to_bf16_rne(acc) };
+        }
+    }
+
+    #[kernel]
+    pub fn swiglu_route_bf16(
+        gate: &[u16],
+        up: &[u16],
+        mut output: DisjointSlice<u16>,
+        route_weight: f32,
+    ) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        let Some(value) = output.get_mut(index) else {
+            return;
+        };
+        if index_raw >= gate.len() || index_raw >= up.len() {
+            return;
+        }
+        let gate = bf16_to_f32(gate[index_raw]).min(10.0);
+        let up = bf16_to_f32(up[index_raw]).max(-10.0).min(10.0);
+        *value = f32_to_bf16_rne(gate / (1.0 + libm::expf(-gate)) * up * route_weight);
+    }
+
+    #[kernel]
+    pub fn bf16_to_f32_rows(input: &[u16], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        let Some(value) = output.get_mut(index) else {
+            return;
+        };
+        if index_raw < input.len() {
+            *value = bf16_to_f32(input[index_raw]);
+        }
+    }
+
+    #[kernel]
+    pub fn add_in_place(mut x: DisjointSlice<f32>, t: &[f32]) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        if let Some(value) = x.get_mut(index) {
+            *value += t[index_raw];
+        }
+    }
+
+    #[kernel]
+    pub fn fill_f32(mut output: DisjointSlice<f32>, value: f32) {
+        let index = thread::index_1d().get() as usize;
+        if index < output.len() {
+            unsafe { *output.as_mut_ptr().add(index) = value };
+        }
+    }
+
+    #[kernel]
+    pub fn fill_u32(mut output: DisjointSlice<u32>, value: u32) {
+        let index = thread::index_1d().get() as usize;
+        if index < output.len() {
+            unsafe { *output.as_mut_ptr().add(index) = value };
+        }
+    }
+
+    #[kernel]
+    pub fn silu_mul_in_place(mut gate: DisjointSlice<f32>, up: &[f32]) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        if let Some(value) = gate.get_mut(index) {
+            let input = *value;
+            *value = (input / (1.0 + libm::expf(-input))) * up[index_raw];
+        }
+    }
+
+    #[kernel]
+    pub fn rows_add_in_place(mut x: DisjointSlice<f32>, partial: &[f32], rows: &[i32], d: u32) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        if index_raw >= partial.len() {
+            return;
+        }
+        let d = d as usize;
+        let partial_row = index_raw / d;
+        let x_index = rows[partial_row] as usize * d + index_raw % d;
+        // SAFETY: launch_rows_add proves d, lengths, and row targets before enqueueing.
+        unsafe { *x.as_mut_ptr().add(x_index) += partial[index_raw] }
+    }
+
+    #[kernel]
+    pub fn decode_v4_fp4_blockwise(
+        packed: &[u8],
+        scales: &[u8],
+        mut output: DisjointSlice<f32>,
+        logical_cols: u32,
+    ) {
+        let index = thread::index_1d();
+        let index_raw = index.get();
+        let Some(value) = output.get_mut(index) else {
+            return;
+        };
+        let logical_cols = logical_cols as usize;
+        let row = index_raw / logical_cols;
+        let column = index_raw % logical_cols;
+        let byte = packed[row * (logical_cols / 2) + column / 2];
+        let nibble = if column % 2 == 0 {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        };
+        let magnitude = match nibble & 0x07 {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            _ => 6.0,
+        };
+        let fp4 = if magnitude == 0.0 || nibble & 0x08 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        let scale = scales[row * (logical_cols / 32) + column / 32];
+        // E8M0's stored exponent matches the exponent field in an f32 power of two.
+        *value = fp4 * f32::from_bits((scale as u32) << 23);
+    }
+
+    #[kernel]
+    pub fn rmsnorm_v4_bf16(
+        input: &[u16],
+        norm: &[u16],
+        mut output: DisjointSlice<u16>,
+        hidden: u32,
+    ) {
+        let row = thread::index_1d().get() as usize;
+        let hidden = hidden as usize;
+        let start = row * hidden;
+        let unit_rms = norm.is_empty();
+        if start + hidden > input.len()
+            || (!unit_rms && norm.len() != hidden)
+            || start + hidden > output.len()
+        {
+            return;
+        }
+        let mut square_sum = 0.0;
+        if unit_rms {
+            for column in 0..hidden {
+                let value = f32::from_bits((input[start + column] as u32) << 16);
+                square_sum += bf16_to_f32(f32_to_bf16_rne(value * value));
+            }
+        } else {
+            square_sum = pytorch_square_sum_bf16(input, start, hidden);
+        }
+        let inv_rms = if unit_rms {
+            let mean = bf16_to_f32(f32_to_bf16_rne(square_sum / hidden as f32));
+            let mean_eps = bf16_to_f32(f32_to_bf16_rne(mean + 1e-6));
+            bf16_to_f32(f32_to_bf16_rne(1.0 / sqrt_newton(mean_eps)))
+        } else {
+            1.0 / sqrt_newton(square_sum / hidden as f32 + 1e-6)
+        };
+        for column in 0..hidden {
+            let normalized = f32::from_bits((input[start + column] as u32) << 16) * inv_rms;
+            let value = if unit_rms {
+                normalized
+            } else {
+                normalized * f32::from_bits((norm[column] as u32) << 16)
+            };
+            let bits = value.to_bits();
+            // SAFETY: the row bounds above prove this output index is valid.
+            unsafe {
+                *output.as_mut_ptr().add(start + column) =
+                    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16;
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn rope_v4_bf16(
+        input: &[u16],
+        freqs_cis_f32_pairs: &[f32],
+        mut output: DisjointSlice<u16>,
+        heads: u32,
+        head_dim: u32,
+    ) {
+        const ROPE_DIM: usize = 64;
+        let heads = heads as usize;
+        let head_dim = head_dim as usize;
+        let index = thread::index_1d();
+        let offset = index.get() as usize;
+        let row_width = heads * head_dim;
+        if heads == 0
+            || head_dim < ROPE_DIM
+            || input.len() % row_width != 0
+            || input.len() / row_width == 0
+            || input.len() / row_width > 4
+            || output.len() != input.len()
+            || freqs_cis_f32_pairs.len() != input.len() / row_width * ROPE_DIM
+        {
+            return;
+        }
+        let Some(destination) = output.get_mut(index) else {
+            return;
+        };
+        let dimension = offset % head_dim;
+        if dimension < head_dim - ROPE_DIM {
+            *destination = input[offset];
+            return;
+        }
+        let position = offset / row_width;
+        let pair_dimension = (dimension - (head_dim - ROPE_DIM)) / 2;
+        let pair_start = offset - (dimension & 1);
+        let frequency = position * ROPE_DIM + pair_dimension * 2;
+        let real = bf16_to_f32(input[pair_start]);
+        let imaginary = bf16_to_f32(input[pair_start + 1]);
+        let cosine = freqs_cis_f32_pairs[frequency];
+        let sine = freqs_cis_f32_pairs[frequency + 1];
+        let product_0 = if dimension & 1 == 0 {
+            real * cosine
+        } else {
+            real * sine
+        };
+        let product_1 = if dimension & 1 == 0 {
+            imaginary * sine
+        } else {
+            imaginary * cosine
+        };
+        // SAFETY: volatile reads of initialized locals preserve the official
+        // two-rounded-products order instead of contracting this into FMA.
+        let product_0 = unsafe { core::ptr::read_volatile(&product_0) };
+        let product_1 = unsafe { core::ptr::read_volatile(&product_1) };
+        let rotated = if dimension & 1 == 0 {
+            product_0 - product_1
+        } else {
+            product_0 + product_1
+        };
+        *destination = f32_to_bf16_rne(rotated);
+    }
+
+    #[kernel]
+    pub fn causal_topk_v4_i32(mut output: DisjointSlice<i32>) {
+        let index = thread::index_1d();
+        let offset = index.get() as usize;
+        if output.len() != 16 {
+            return;
+        }
+        let Some(destination) = output.get_mut(index) else {
+            return;
+        };
+        let row = offset / 4;
+        let column = offset % 4;
+        *destination = if column <= row { column as i32 } else { -1 };
+    }
+
+    #[kernel]
+    pub fn sparse_attn_v4_bf16(
+        q: &[u16],
+        kv: &[u16],
+        attn_sink: &[f32],
+        topk: &[i32],
+        mut output: DisjointSlice<u16>,
+        topk_per_row: u32,
+    ) {
+        const HEADS: usize = 128;
+        const DIM: usize = 512;
+        const SCALE: f32 = 0.044_194_173;
+        let index = thread::index_1d().get() as usize;
+        let topk_per_row = topk_per_row as usize;
+        if q.len() != output.len()
+            || q.len() % (HEADS * DIM) != 0
+            || kv.len() % DIM != 0
+            || attn_sink.len() != HEADS
+            || topk_per_row == 0
+            || topk.len() != q.len() / (HEADS * DIM) * topk_per_row
+            || index >= output.len()
+        {
+            return;
+        }
+        let row = index / (HEADS * DIM);
+        let head = index / DIM % HEADS;
+        let dimension = index % DIM;
+        let q_start = (row * HEADS + head) * DIM;
+        let mut score_max = f32::NEG_INFINITY;
+        let mut valid = 0;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / DIM {
+                continue;
+            }
+            let mut score = 0.0_f32;
+            for column in 0..DIM {
+                score +=
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+            }
+            score *= SCALE;
+            score_max = score_max.max(score);
+            valid += 1;
+        }
+        if valid == 0 {
+            unsafe { *output.as_mut_ptr().add(index) = 0 }
+            return;
+        }
+        let mut numerator = 0.0_f32;
+        let mut denominator = 0.0_f32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / DIM {
+                continue;
+            }
+            let mut score = 0.0_f32;
+            for column in 0..DIM {
+                score +=
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+            }
+            let probability = libm::expf(score * SCALE - score_max);
+            denominator += probability;
+            numerator += probability * bf16_to_f32(kv[key as usize * DIM + dimension]);
+        }
+        denominator += libm::expf(attn_sink[head] - score_max);
+        unsafe {
+            *output.as_mut_ptr().add(index) = f32_to_bf16_rne(numerator / denominator);
+        }
+    }
+
+    // Candidate arm: retain the scalar kernel above as the reference.  These
+    // three phases only materialize values that the reference recomputes for
+    // every output dimension; every floating-point chain keeps its order.
+    #[kernel]
+    pub fn sparse_attn_v4_reference_state(
+        q: &[u16],
+        kv: &[u16],
+        attn_sink: &[f32],
+        topk: &[i32],
+        mut scores: DisjointSlice<f32>,
+        mut probabilities: DisjointSlice<f32>,
+        mut denominators: DisjointSlice<f32>,
+        mut valid_counts: DisjointSlice<u32>,
+        topk_per_row: u32,
+    ) {
+        const HEADS: usize = 128;
+        const DIM: usize = 512;
+        const SCALE: f32 = 0.044_194_173;
+        let index = thread::index_1d().get() as usize;
+        let topk_per_row = topk_per_row as usize;
+        let rows = denominators.len() / HEADS;
+        if rows == 0
+            || q.len() != rows * HEADS * DIM
+            || kv.len() % DIM != 0
+            || attn_sink.len() != HEADS
+            || topk_per_row == 0
+            || topk.len() != rows * topk_per_row
+            || scores.len() != rows * HEADS * topk_per_row
+            || probabilities.len() != scores.len()
+            || valid_counts.len() != rows * HEADS
+            || index >= denominators.len()
+        {
+            return;
+        }
+        let row = index / HEADS;
+        let head = index % HEADS;
+        let q_start = (row * HEADS + head) * DIM;
+        let mut score_max = f32::NEG_INFINITY;
+        let mut valid = 0_u32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / DIM {
+                continue;
+            }
+            let mut score = 0.0_f32;
+            for column in 0..DIM {
+                score +=
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+            }
+            unsafe { *scores.as_mut_ptr().add(index * topk_per_row + slot) = score }
+            score *= SCALE;
+            score_max = score_max.max(score);
+            valid += 1;
+        }
+        if valid == 0 {
+            unsafe {
+                *denominators.as_mut_ptr().add(index) = 0.0;
+                *valid_counts.as_mut_ptr().add(index) = 0;
+            }
+            return;
+        }
+        let mut denominator = 0.0_f32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / DIM {
+                continue;
+            }
+            let mut score = 0.0_f32;
+            for column in 0..DIM {
+                score +=
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+            }
+            let probability = libm::expf(score * SCALE - score_max);
+            unsafe {
+                *probabilities.as_mut_ptr().add(index * topk_per_row + slot) = probability;
+            }
+            denominator += probability;
+        }
+        denominator += libm::expf(attn_sink[head] - score_max);
+        unsafe {
+            *denominators.as_mut_ptr().add(index) = denominator;
+            *valid_counts.as_mut_ptr().add(index) = valid;
+        }
+    }
+
+    #[kernel]
+    pub fn sparse_attn_v4_scores(
+        q: &[u16],
+        kv: &[u16],
+        topk: &[i32],
+        mut scores: DisjointSlice<f32>,
+        topk_per_row: u32,
+    ) {
+        const HEADS: usize = 128;
+        const DIM: usize = 512;
+        let index = thread::index_1d().get() as usize;
+        let topk_per_row = topk_per_row as usize;
+        let score_width = HEADS * topk_per_row;
+        if q.len() % (HEADS * DIM) != 0
+            || kv.len() % DIM != 0
+            || topk_per_row == 0
+            || topk.len() != q.len() / (HEADS * DIM) * topk_per_row
+            || scores.len() != q.len() / (HEADS * DIM) * score_width
+            || index >= scores.len()
+        {
+            return;
+        }
+        let row = index / score_width;
+        let head = index / topk_per_row % HEADS;
+        let slot = index % topk_per_row;
+        let key = topk[row * topk_per_row + slot];
+        let score = if key < 0 || key as usize >= kv.len() / DIM {
+            0.0_f32
+        } else {
+            let q_start = (row * HEADS + head) * DIM;
+            let mut score = 0.0_f32;
+            for column in 0..DIM {
+                score +=
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+            }
+            score
+        };
+        unsafe { *scores.as_mut_ptr().add(index) = score }
+    }
+
+    #[kernel]
+    pub fn sparse_attn_v4_probabilities(
+        scores: &[f32],
+        kv: &[u16],
+        attn_sink: &[f32],
+        topk: &[i32],
+        mut probabilities: DisjointSlice<f32>,
+        mut denominators: DisjointSlice<f32>,
+        mut valid_counts: DisjointSlice<u32>,
+        topk_per_row: u32,
+    ) {
+        const HEADS: usize = 128;
+        const SCALE: f32 = 0.044_194_173;
+        let index = thread::index_1d().get() as usize;
+        let topk_per_row = topk_per_row as usize;
+        let rows = denominators.len() / HEADS;
+        if rows == 0
+            || denominators.len() != rows * HEADS
+            || valid_counts.len() != rows * HEADS
+            || attn_sink.len() != HEADS
+            || kv.len() % 512 != 0
+            || topk_per_row == 0
+            || topk.len() != rows * topk_per_row
+            || scores.len() != rows * HEADS * topk_per_row
+            || probabilities.len() != scores.len()
+            || index >= denominators.len()
+        {
+            return;
+        }
+        let row = index / HEADS;
+        let mut score_max = f32::NEG_INFINITY;
+        let mut valid = 0_u32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / 512 {
+                continue;
+            }
+            let score = scores[index * topk_per_row + slot] * SCALE;
+            score_max = score_max.max(score);
+            valid += 1;
+        }
+        if valid == 0 {
+            unsafe {
+                *denominators.as_mut_ptr().add(index) = 0.0;
+                *valid_counts.as_mut_ptr().add(index) = 0;
+            }
+            return;
+        }
+        let mut denominator = 0.0_f32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / 512 {
+                continue;
+            }
+            let probability = libm::expf(scores[index * topk_per_row + slot] * SCALE - score_max);
+            unsafe { *probabilities.as_mut_ptr().add(index * topk_per_row + slot) = probability }
+            denominator += probability;
+        }
+        denominator += libm::expf(attn_sink[index % HEADS] - score_max);
+        unsafe {
+            *denominators.as_mut_ptr().add(index) = denominator;
+            *valid_counts.as_mut_ptr().add(index) = valid;
+        }
+    }
+
+    #[kernel]
+    pub fn sparse_attn_v4_values(
+        kv: &[u16],
+        topk: &[i32],
+        probabilities: &[f32],
+        denominators: &[f32],
+        valid_counts: &[u32],
+        mut output: DisjointSlice<u16>,
+        topk_per_row: u32,
+    ) {
+        const HEADS: usize = 128;
+        const DIM: usize = 512;
+        let index = thread::index_1d().get() as usize;
+        let topk_per_row = topk_per_row as usize;
+        let rows = output.len() / (HEADS * DIM);
+        if output.len() != rows * HEADS * DIM
+            || kv.len() % DIM != 0
+            || topk_per_row == 0
+            || topk.len() != rows * topk_per_row
+            || probabilities.len() != rows * HEADS * topk_per_row
+            || denominators.len() != rows * HEADS
+            || valid_counts.len() != rows * HEADS
+            || index >= output.len()
+        {
+            return;
+        }
+        let row = index / (HEADS * DIM);
+        let head = index / DIM % HEADS;
+        let dimension = index % DIM;
+        let head_index = row * HEADS + head;
+        if valid_counts[head_index] == 0 {
+            unsafe { *output.as_mut_ptr().add(index) = 0 }
+            return;
+        }
+        let mut numerator = 0.0_f32;
+        for slot in 0..topk_per_row {
+            let key = topk[row * topk_per_row + slot];
+            if key < 0 || key as usize >= kv.len() / DIM {
+                continue;
+            }
+            numerator += probabilities[head_index * topk_per_row + slot]
+                * bf16_to_f32(kv[key as usize * DIM + dimension]);
+        }
+        unsafe {
+            *output.as_mut_ptr().add(index) = f32_to_bf16_rne(numerator / denominators[head_index]);
+        }
+    }
+
+    #[kernel]
+    pub fn wo_a_v4_bf16(input: &[u16], weight: &[u16], mut output: DisjointSlice<u16>) {
+        const HEADS: usize = 128;
+        const HEAD_DIM: usize = 512;
+        const GROUPS: usize = 16;
+        const GROUP_INPUT: usize = HEADS * HEAD_DIM / GROUPS;
+        const GROUP_OUTPUT: usize = 1_024;
+        const OUTPUT: usize = GROUPS * GROUP_OUTPUT;
+        let index = thread::index_1d().get() as usize;
+        if input.len() % (HEADS * HEAD_DIM) != 0
+            || weight.len() != OUTPUT * GROUP_INPUT
+            || output.len() != input.len() / (HEADS * HEAD_DIM) * OUTPUT
+            || index >= output.len()
+        {
+            return;
+        }
+        let row = index / OUTPUT;
+        let output_row = index % OUTPUT;
+        let group = output_row / GROUP_OUTPUT;
+        let input_start = row * HEADS * HEAD_DIM + group * GROUP_INPUT;
+        let weight_start = output_row * GROUP_INPUT;
+        let mut accumulated = 0.0_f32;
+        for column in 0..GROUP_INPUT {
+            accumulated = cuda_device::float::fma_rn_f32(
+                bf16_to_f32(input[input_start + column]),
+                bf16_to_f32(weight[weight_start + column]),
+                accumulated,
+            );
+        }
+        unsafe { *output.as_mut_ptr().add(index) = f32_to_bf16_rne(accumulated) }
+    }
+
+    #[kernel]
+    pub fn gate_logits_v4_bf16(input: &[u16], gate: &[u16], mut logits: DisjointSlice<f32>) {
+        const HIDDEN: usize = 7_168;
+        const EXPERTS: usize = 384;
+        const K_BLOCK: usize = 192;
+        let index = thread::index_1d().get() as usize;
+        if input.len() % HIDDEN != 0
+            || gate.len() != EXPERTS * HIDDEN
+            || logits.len() != input.len() / HIDDEN * EXPERTS
+            || index >= logits.len()
+        {
+            return;
+        }
+        let row = index / EXPERTS;
+        let expert = index % EXPERTS;
+        let mut accumulated = 0.0_f32;
+        let mut block = 0;
+        while block < HIDDEN {
+            let mut partial = 0.0_f32;
+            let end = (block + K_BLOCK).min(HIDDEN);
+            for column in block..end {
+                partial = cuda_device::float::fma_rn_f32(
+                    bf16_to_f32(input[row * HIDDEN + column]),
+                    bf16_to_f32(gate[expert * HIDDEN + column]),
+                    partial,
+                );
+            }
+            accumulated += partial;
+            block += K_BLOCK;
+        }
+        unsafe { *logits.as_mut_ptr().add(index) = accumulated }
+    }
+
+    #[kernel]
+    pub fn hc_post_v4_bf16(
+        input: &[u16],
+        residual: &[u16],
+        post: &[f32],
+        comb: &[f32],
+        mut output: DisjointSlice<u16>,
+    ) {
+        const HIDDEN: usize = 7_168;
+        const HC: usize = 4;
+        let index = thread::index_1d().get() as usize;
+        if input.len() % HIDDEN != 0
+            || residual.len() != input.len() * HC
+            || post.len() != input.len() / HIDDEN * HC
+            || comb.len() != input.len() / HIDDEN * HC * HC
+            || output.len() != residual.len()
+            || index >= output.len()
+        {
+            return;
+        }
+        let row = index / (HC * HIDDEN);
+        let copy = index / HIDDEN % HC;
+        let column = index % HIDDEN;
+        let residual_start = row * HC * HIDDEN;
+        let mut products = [0.0_f32; HC];
+        for source in 0..HC {
+            let product = comb[(row * HC + source) * HC + copy]
+                * bf16_to_f32(residual[residual_start + source * HIDDEN + column]);
+            products[source] = unsafe { core::ptr::read_volatile(&product) };
+        }
+        let residual_sum = (products[0] + products[2]) + (products[1] + products[3]);
+        let branch = post[row * HC + copy] * bf16_to_f32(input[row * HIDDEN + column]);
+        let branch = unsafe { core::ptr::read_volatile(&branch) };
+        unsafe {
+            *output.as_mut_ptr().add(index) = f32_to_bf16_rne(branch + residual_sum);
+        }
+    }
+
+    #[kernel]
+    pub fn mhc_pre_v4_bf16(
+        input: &[u16],
+        hc_fn: &[f32],
+        hc_scale: &[f32],
+        hc_base: &[f32],
+        mut collapsed: DisjointSlice<u16>,
+        mut post: DisjointSlice<f32>,
+        mut comb: DisjointSlice<f32>,
+    ) {
+        const H: usize = 7168;
+        const HC: usize = 4;
+        const MIX: usize = 24;
+        const EPS: f32 = 1e-6;
+        const K_BLOCK: usize = 192;
+        let row = thread::index_1d().get() as usize;
+        if input.len() % (HC * H) != 0
+            || row >= input.len() / (HC * H)
+            || hc_fn.len() != MIX * HC * H
+            || hc_scale.len() != 3
+            || hc_base.len() != MIX
+            || collapsed.len() != input.len() / HC
+            || post.len() != input.len() / H
+            || comb.len() != input.len() / (HC * H) * HC * HC
+        {
+            return;
+        }
+        let start = row * HC * H;
+        let square = pytorch_square_sum_bf16(input, start, HC * H);
+        let inv = 1.0 / sqrt_newton(square / (HC * H) as f32 + EPS);
+        let mut mixes = [0.0; MIX];
+        for out in 0..MIX {
+            let mut dot = 0.0;
+            let mut block = 0;
+            while block < HC * H {
+                let mut partial = 0.0;
+                let end = (block + K_BLOCK).min(HC * H);
+                for i in block..end {
+                    partial = cuda_device::float::fma_rn_f32(
+                        bf16_to_f32(input[start + i]),
+                        hc_fn[out * HC * H + i],
+                        partial,
+                    );
+                }
+                dot += partial;
+                block += K_BLOCK;
+            }
+            mixes[out] = dot * inv;
+        }
+        let mut pre = [0.0; HC];
+        for i in 0..HC {
+            pre[i] = 1.0 / (1.0 + libm::expf(-(mixes[i] * hc_scale[0] + hc_base[i]))) + EPS;
+            unsafe {
+                *post.as_mut_ptr().add(row * HC + i) =
+                    2.0 / (1.0 + libm::expf(-(mixes[HC + i] * hc_scale[1] + hc_base[HC + i])));
+            }
+        }
+        let base = row * HC * HC;
+        for i in 0..HC {
+            let mut max = f32::NEG_INFINITY;
+            for j in 0..HC {
+                let x = mixes[2 * HC + i * HC + j] * hc_scale[2] + hc_base[2 * HC + i * HC + j];
+                unsafe {
+                    *comb.as_mut_ptr().add(base + i * HC + j) = x;
+                }
+                max = max.max(x);
+            }
+            let mut sum = 0.0;
+            for j in 0..HC {
+                let x = libm::expf(unsafe { *comb.as_mut_ptr().add(base + i * HC + j) } - max);
+                unsafe {
+                    *comb.as_mut_ptr().add(base + i * HC + j) = x;
+                }
+                sum += x;
+            }
+            for j in 0..HC {
+                unsafe {
+                    let p = comb.as_mut_ptr().add(base + i * HC + j);
+                    *p = *p / sum + EPS;
+                }
+            }
+        }
+        for step in 0..20 {
+            for j in 0..HC {
+                let mut sum = 0.0;
+                for i in 0..HC {
+                    unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                }
+                for i in 0..HC {
+                    unsafe {
+                        let p = comb.as_mut_ptr().add(base + i * HC + j);
+                        *p = *p / (sum + EPS)
+                    }
+                }
+            }
+            if step != 19 {
+                for i in 0..HC {
+                    let mut sum = 0.0;
+                    for j in 0..HC {
+                        unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                    }
+                    for j in 0..HC {
+                        unsafe {
+                            let p = comb.as_mut_ptr().add(base + i * HC + j);
+                            *p = *p / (sum + EPS)
+                        }
+                    }
+                }
+            }
+        }
+        for col in 0..H {
+            let mut value = 0.0;
+            for copy in 0..HC {
+                value += pre[copy] * bf16_to_f32(input[start + copy * H + col]);
+            }
+            unsafe {
+                *collapsed.as_mut_ptr().add(row * H + col) = f32_to_bf16_rne(value);
+            }
+        }
+    }
+
+    /// mHC's normalized linear stage only: [rows, 4, H] -> [rows, 24].
+    #[kernel]
+    pub fn mhc_linear_v4_bf16_scalar(input: &[u16], hc_fn: &[f32], mut mixes: DisjointSlice<f32>) {
+        const H: usize = 7168;
+        const HC: usize = 4;
+        const MIX: usize = 24;
+        const EPS: f32 = 1e-6;
+        const K_BLOCK: usize = 192;
+        let row = thread::index_1d().get() as usize;
+        if input.len() % (HC * H) != 0
+            || row >= input.len() / (HC * H)
+            || hc_fn.len() != MIX * HC * H
+            || mixes.len() != input.len() / (HC * H) * MIX
+        {
+            return;
+        }
+        let start = row * HC * H;
+        let square = pytorch_square_sum_bf16(input, start, HC * H);
+        let inv = 1.0 / sqrt_newton(square / (HC * H) as f32 + EPS);
+        for out in 0..MIX {
+            let mut dot = 0.0;
+            let mut block = 0;
+            while block < HC * H {
+                let mut partial = 0.0;
+                let end = (block + K_BLOCK).min(HC * H);
+                for i in block..end {
+                    partial = cuda_device::float::fma_rn_f32(
+                        bf16_to_f32(input[start + i]),
+                        hc_fn[out * HC * H + i],
+                        partial,
+                    );
+                }
+                dot += partial;
+                block += K_BLOCK;
+            }
+            // SAFETY: the layout check above proves this output row exists.
+            unsafe { *mixes.as_mut_ptr().add(row * MIX + out) = dot * inv }
+        }
+    }
+
+    /// SM89 candidate: one warp owns one row, with lane 0 preserving the
+    /// scalar RMS reduction and each of lanes 0..24 preserving one output's
+    /// original 192-wide FMA/block accumulation order.
+    #[kernel]
+    pub fn mhc_linear_v4_bf16(input: &[u16], hc_fn: &[f32], mut mixes: DisjointSlice<f32>) {
+        const H: usize = 7168;
+        const HC: usize = 4;
+        const MIX: usize = 24;
+        const EPS: f32 = 1e-6;
+        const K_BLOCK: usize = 192;
+        let thread = thread::index_1d().get() as usize;
+        let row = thread / 32;
+        let lane = thread % 32;
+        let layout_valid = input.len() % (HC * H) == 0
+            && hc_fn.len() == MIX * HC * H
+            && mixes.len() == input.len() / (HC * H) * MIX;
+        let row_valid = layout_valid && row < input.len() / (HC * H);
+        let lane_zero_inv = if row_valid && lane == 0 {
+            let start = row * HC * H;
+            let square = pytorch_square_sum_bf16(input, start, HC * H);
+            1.0 / sqrt_newton(square / (HC * H) as f32 + EPS)
+        } else {
+            0.0
+        };
+        let inv = warp::shuffle_f32(lane_zero_inv, 0);
+        if !row_valid || lane >= MIX {
+            return;
+        }
+        let start = row * HC * H;
+        let mut dot = 0.0;
+        let mut block = 0;
+        while block < HC * H {
+            let mut partial = 0.0;
+            let end = (block + K_BLOCK).min(HC * H);
+            for i in block..end {
+                partial = cuda_device::float::fma_rn_f32(
+                    bf16_to_f32(input[start + i]),
+                    hc_fn[lane * HC * H + i],
+                    partial,
+                );
+            }
+            dot += partial;
+            block += K_BLOCK;
+        }
+        // SAFETY: the layout check above proves this output row exists.
+        unsafe { *mixes.as_mut_ptr().add(row * MIX + lane) = dot * inv }
+    }
+
+    /// mHC's Sinkhorn/collapse stage. Trace order is logits, softmax, then
+    /// every column and (except the final iteration) row normalization.
+    #[kernel]
+    pub fn mhc_sinkhorn_v4_bf16(
+        input: &[u16],
+        mixes: &[f32],
+        hc_scale: &[f32],
+        hc_base: &[f32],
+        mut pre: DisjointSlice<f32>,
+        mut post: DisjointSlice<f32>,
+        mut comb: DisjointSlice<f32>,
+        mut collapsed: DisjointSlice<u16>,
+        mut trace: DisjointSlice<f32>,
+    ) {
+        const H: usize = 7168;
+        const HC: usize = 4;
+        const MIX: usize = 24;
+        const EPS: f32 = 1e-6;
+        let row = thread::index_1d().get() as usize;
+        if input.len() % (HC * H) != 0
+            || row >= input.len() / (HC * H)
+            || mixes.len() != input.len() / (HC * H) * MIX
+            || hc_scale.len() != 3
+            || hc_base.len() != MIX
+            || pre.len() != input.len() / H
+            || post.len() != input.len() / H
+            || comb.len() != input.len() / (HC * H) * HC * HC
+            || collapsed.len() != input.len() / HC
+            || trace.len() != input.len() / (HC * H) * 41 * HC * HC
+        {
+            return;
+        }
+        let start = row * HC * H;
+        let mix = row * MIX;
+        let base = row * HC * HC;
+        let trace_base = row * 41 * HC * HC;
+        let mut local_pre = [0.0; HC];
+        for i in 0..HC {
+            local_pre[i] =
+                1.0 / (1.0 + libm::expf(-(mixes[mix + i] * hc_scale[0] + hc_base[i]))) + EPS;
+            // SAFETY: checked row-major output layouts above.
+            unsafe {
+                *pre.as_mut_ptr().add(row * HC + i) = local_pre[i];
+                *post.as_mut_ptr().add(row * HC + i) = 2.0
+                    / (1.0 + libm::expf(-(mixes[mix + HC + i] * hc_scale[1] + hc_base[HC + i])));
+            }
+        }
+        for i in 0..HC {
+            let mut max = f32::NEG_INFINITY;
+            for j in 0..HC {
+                let value =
+                    mixes[mix + 2 * HC + i * HC + j] * hc_scale[2] + hc_base[2 * HC + i * HC + j];
+                unsafe { *comb.as_mut_ptr().add(base + i * HC + j) = value }
+                max = max.max(value);
+            }
+            for j in 0..HC {
+                unsafe {
+                    *trace.as_mut_ptr().add(trace_base + i * HC + j) =
+                        *comb.as_mut_ptr().add(base + i * HC + j)
+                }
+            }
+            let mut sum = 0.0;
+            for j in 0..HC {
+                let value = libm::expf(unsafe { *comb.as_mut_ptr().add(base + i * HC + j) } - max);
+                unsafe { *comb.as_mut_ptr().add(base + i * HC + j) = value }
+                sum += value;
+            }
+            for j in 0..HC {
+                unsafe {
+                    let value = comb.as_mut_ptr().add(base + i * HC + j);
+                    *value = *value / sum + EPS;
+                    *trace.as_mut_ptr().add(trace_base + HC * HC + i * HC + j) = *value;
+                }
+            }
+        }
+        for step in 0..20 {
+            for j in 0..HC {
+                let mut sum = 0.0;
+                for i in 0..HC {
+                    unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                }
+                for i in 0..HC {
+                    unsafe {
+                        let value = comb.as_mut_ptr().add(base + i * HC + j);
+                        *value = *value / (sum + EPS);
+                    }
+                }
+            }
+            for i in 0..HC {
+                for j in 0..HC {
+                    unsafe {
+                        *trace
+                            .as_mut_ptr()
+                            .add(trace_base + (2 + step * 2) * HC * HC + i * HC + j) =
+                            *comb.as_mut_ptr().add(base + i * HC + j)
+                    }
+                }
+            }
+            if step != 19 {
+                for i in 0..HC {
+                    let mut sum = 0.0;
+                    for j in 0..HC {
+                        unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                    }
+                    for j in 0..HC {
+                        unsafe {
+                            let value = comb.as_mut_ptr().add(base + i * HC + j);
+                            *value = *value / (sum + EPS);
+                        }
+                    }
+                }
+                for i in 0..HC {
+                    for j in 0..HC {
+                        unsafe {
+                            *trace
+                                .as_mut_ptr()
+                                .add(trace_base + (3 + step * 2) * HC * HC + i * HC + j) =
+                                *comb.as_mut_ptr().add(base + i * HC + j)
+                        }
+                    }
+                }
+            }
+        }
+        for col in 0..H {
+            let mut value = 0.0;
+            for copy in 0..HC {
+                value += local_pre[copy] * bf16_to_f32(input[start + copy * H + col]);
+            }
+            unsafe { *collapsed.as_mut_ptr().add(row * H + col) = f32_to_bf16_rne(value) }
+        }
+    }
+
+    #[kernel]
+    pub fn select_v4_router(
+        logits: &[f32],
+        bias: &[f32],
+        hash_ids: &[i64],
+        mut output_ids: DisjointSlice<i32>,
+        mut output_weights: DisjointSlice<f32>,
+        hash_mode: u32,
+    ) {
+        const EXPERTS: usize = 384;
+        const TOPK: usize = 6;
+        let row = thread::index_1d().get() as usize;
+        let start = row * EXPERTS;
+        let output_start = row * TOPK;
+        if start + EXPERTS > logits.len()
+            || output_start + TOPK > output_ids.len()
+            || output_start + TOPK > output_weights.len()
+            || bias.len() != EXPERTS
+            || (hash_mode != 0 && output_start + TOPK > hash_ids.len())
+        {
+            return;
+        }
+
+        let mut ids = [0_i32; TOPK];
+        let mut raw = [0.0; TOPK];
+        if hash_mode != 0 {
+            for slot in 0..TOPK {
+                let id = hash_ids[output_start + slot];
+                if id < 0 || id >= EXPERTS as i64 {
+                    return;
+                }
+                ids[slot] = id as i32;
+                let logit = logits[start + id as usize];
+                let softplus = if logit > 20.0 {
+                    logit
+                } else if logit > 0.0 {
+                    logit + libm::log1pf(libm::expf(-logit))
+                } else {
+                    libm::log1pf(libm::expf(logit))
+                };
+                raw[slot] = sqrt_newton(softplus);
+            }
+        } else {
+            let mut selected = [f32::NEG_INFINITY; TOPK];
+            for expert in 0..EXPERTS {
+                let logit = logits[start + expert];
+                let softplus = if logit > 20.0 {
+                    logit
+                } else if logit > 0.0 {
+                    logit + libm::log1pf(libm::expf(-logit))
+                } else {
+                    libm::log1pf(libm::expf(logit))
+                };
+                let candidate_raw = sqrt_newton(softplus);
+                let candidate = candidate_raw + bias[expert];
+                let mut slot = 0;
+                while slot < TOPK && candidate <= selected[slot] {
+                    slot += 1;
+                }
+                if slot < TOPK {
+                    let mut tail = TOPK - 1;
+                    while tail > slot {
+                        selected[tail] = selected[tail - 1];
+                        ids[tail] = ids[tail - 1];
+                        raw[tail] = raw[tail - 1];
+                        tail -= 1;
+                    }
+                    selected[slot] = candidate;
+                    ids[slot] = expert as i32;
+                    raw[slot] = candidate_raw;
+                }
+            }
+        }
+        let mut sum = 0.0;
+        for value in raw {
+            sum += value;
+        }
+        for slot in 0..TOPK {
+            // SAFETY: the output bounds above prove both row-local indices.
+            unsafe {
+                *output_ids.as_mut_ptr().add(output_start + slot) = ids[slot];
+                *output_weights.as_mut_ptr().add(output_start + slot) = raw[slot] / sum * 2.5;
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RowsAddError {
+    ZeroWidth,
+    InputNotWholeRows,
+    PartialLength { expected: usize, actual: usize },
+    DeviceRowsLength { expected: usize, actual: usize },
+    NegativeRow(i32),
+    RowOutOfRange { row: i32, row_count: usize },
+    DuplicateRow(i32),
+    IntegerOverflow,
+}
+
+impl std::fmt::Display for RowsAddError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for RowsAddError {}
+
+fn validate_rows_add(
+    x_len: usize,
+    partial_len: usize,
+    device_rows_len: usize,
+    rows: &[i32],
+    d: usize,
+) -> Result<Option<(u32, u32)>, RowsAddError> {
+    if d == 0 {
+        return Err(RowsAddError::ZeroWidth);
+    }
+    if x_len % d != 0 {
+        return Err(RowsAddError::InputNotWholeRows);
+    }
+    let partial_len_expected = rows
+        .len()
+        .checked_mul(d)
+        .ok_or(RowsAddError::IntegerOverflow)?;
+    if partial_len != partial_len_expected {
+        return Err(RowsAddError::PartialLength {
+            expected: partial_len_expected,
+            actual: partial_len,
+        });
+    }
+    if device_rows_len != rows.len() {
+        return Err(RowsAddError::DeviceRowsLength {
+            expected: rows.len(),
+            actual: device_rows_len,
+        });
+    }
+
+    let row_count = x_len / d;
+    let mut seen = HashSet::with_capacity(rows.len());
+    for &row in rows {
+        let row_index = usize::try_from(row).map_err(|_| RowsAddError::NegativeRow(row))?;
+        if row_index >= row_count {
+            return Err(RowsAddError::RowOutOfRange { row, row_count });
+        }
+        if !seen.insert(row) {
+            return Err(RowsAddError::DuplicateRow(row));
+        }
+    }
+
+    let elements =
+        u32::try_from(partial_len_expected).map_err(|_| RowsAddError::IntegerOverflow)?;
+    let d = u32::try_from(d).map_err(|_| RowsAddError::IntegerOverflow)?;
+    Ok((elements != 0).then_some((elements, d)))
+}
+
+fn launch_rows_add(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    x: &mut DeviceBuffer<f32>,
+    partial: &DeviceBuffer<f32>,
+    device_rows: &DeviceBuffer<i32>,
+    rows: &[i32],
+    d: usize,
+) -> Result<(), Box<dyn Error>> {
+    let Some((elements, d)) =
+        validate_rows_add(x.len(), partial.len(), device_rows.len(), rows, d)?
+    else {
+        return Ok(());
+    };
+    // SAFETY: validation proves the 1-D launch has one partial element per
+    // thread, matching device row indices, in-range unique target rows, and
+    // lossless kernel scalar conversions. This only enqueues work on stream.
+    unsafe {
+        module.rows_add_in_place(
+            stream,
+            LaunchConfig::for_num_elems(elements),
+            x,
+            partial,
+            device_rows,
+            d,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_fp4_decode(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    packed: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+    layout: v4_fp4::Fp4E2M1x2Layout,
+) -> Result<(), Box<dyn Error>> {
+    if packed.len() != layout.packed_len()
+        || scales.len() != layout.scale_len()
+        || output.len() != layout.element_len()
+    {
+        return Err("FP4 device buffer length disagrees with validated layout".into());
+    }
+    let elements =
+        u32::try_from(layout.element_len()).map_err(|_| "FP4 decode exceeds 1-D launch")?;
+    let logical_cols =
+        u32::try_from(layout.logical_cols()).map_err(|_| "FP4 columns exceed u32")?;
+    // SAFETY: Fp4E2M1x2Layout proves the packed half-column and one-scale-per-32
+    // addressing used by the kernel; this only enqueues the format-oracle launch.
+    unsafe {
+        module.decode_v4_fp4_blockwise(
+            stream,
+            LaunchConfig::for_num_elems(elements),
+            packed,
+            scales,
+            output,
+            logical_cols,
+        )
+    }?;
+    Ok(())
+}
+
+fn run_v4_router_gpu_oracle(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    norm: &[u16],
+    logits: &[f32],
+    bias: &[f32],
+    hash_ids: &[i64],
+    hash_mode: bool,
+) -> Result<(Vec<u16>, v4_router::RouterSelection), Box<dyn Error>> {
+    let rows = input.len() / v4_router::V4_HIDDEN;
+    if input.len() % v4_router::V4_HIDDEN != 0
+        || norm.len() != v4_router::V4_HIDDEN
+        || logits.len() != rows * v4_router::V4_ROUTED_EXPERTS
+        || bias.len() != v4_router::V4_ROUTED_EXPERTS
+        || (hash_mode && hash_ids.len() != rows * v4_router::V4_TOPK)
+    {
+        return Err("validated V4 router buffer length disagrees with launch shape".into());
+    }
+    let rows = u32::try_from(rows).map_err(|_| "V4 router rows exceed 1-D launch")?;
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let norm = DeviceBuffer::from_host(stream, norm)?;
+    let mut normalized = DeviceBuffer::from_host(stream, &vec![0_u16; input.len()])?;
+    let logits = DeviceBuffer::from_host(stream, logits)?;
+    let bias = DeviceBuffer::from_host(stream, bias)?;
+    let hash_ids = DeviceBuffer::from_host(stream, hash_ids)?;
+    let mut ids =
+        DeviceBuffer::from_host(stream, &vec![0_i32; rows as usize * v4_router::V4_TOPK])?;
+    let mut weights =
+        DeviceBuffer::from_host(stream, &vec![0_f32; rows as usize * v4_router::V4_TOPK])?;
+    // SAFETY: validated fixed V4 dimensions prove every kernel slice length and
+    // scalar conversion. Both launches stay on the stream; terminal copies below
+    // are smoke-only parity boundaries.
+    unsafe {
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows),
+            &input,
+            &norm,
+            &mut normalized,
+            v4_router::V4_HIDDEN as u32,
+        )?;
+        module.select_v4_router(
+            stream,
+            LaunchConfig::for_num_elems(rows),
+            &logits,
+            &bias,
+            &hash_ids,
+            &mut ids,
+            &mut weights,
+            hash_mode as u32,
+        )?;
+    }
+    Ok((
+        normalized.to_host_vec(stream)?,
+        v4_router::RouterSelection {
+            ids: ids.to_host_vec(stream)?,
+            weights: weights.to_host_vec(stream)?,
+        },
+    ))
+}
+
+fn assert_close(name: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "{name}: output length");
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let tolerance = 2e-5 * expected.abs().max(1.0);
+        assert!(
+            (*actual - *expected).abs() <= tolerance,
+            "{name}: index {index}, expected {expected}, got {actual}"
+        );
+    }
+}
+
+fn v4_model_dir() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let path = std::env::var_os("COLIBRI_DSV4_MODEL_DIR")
+        .or_else(|| std::env::var_os("COLIBRI_DSV4_DIR"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("COLIBRI_DSV4_EXPERT_SHARD")
+                .map(std::path::PathBuf::from)
+                .and_then(|path| path.parent().map(std::path::Path::to_owned))
+        })
+        .ok_or("set COLIBRI_DSV4_MODEL_DIR to the pinned ext4 snapshot")?;
+    v4_state::validate_model_dir(&path)?;
+    Ok(path)
+}
+
+fn v4_expert_shard() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let path = std::env::var_os("COLIBRI_DSV4_EXPERT_SHARD")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(v4_model_dir()?.join("model-00002-of-00064.safetensors"));
+    if path.file_name().and_then(|name| name.to_str()) != Some("model-00002-of-00064.safetensors")
+        || path.symlink_metadata()?.file_type().is_symlink()
+        || !path.is_file()
+    {
+        return Err("COLIBRI_DSV4_EXPERT_SHARD must be the regular pinned shard 2".into());
+    }
+    v4_state::validate_model_dir(
+        path.parent()
+            .ok_or("COLIBRI_DSV4_EXPERT_SHARD has no model directory")?,
+    )?;
+    Ok(path)
+}
+
+fn synthetic_only() -> Result<bool, Box<dyn Error>> {
+    match std::env::var_os("COLIBRI_SYNTHETIC_ONLY") {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err("COLIBRI_SYNTHETIC_ONLY must be exactly 1 when set".into()),
+    }
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String, Box<dyn Error>> {
+    let output = std::process::Command::new("sha256sum")
+        .arg("--")
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("sha256sum failed for {}", path.display()).into());
+    }
+    let hash = std::str::from_utf8(&output.stdout)?
+        .split_whitespace()
+        .next()
+        .ok_or("sha256sum returned no digest")?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "sha256sum returned an invalid digest for {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
+fn validate_source_identity(
+    source_identity: &str,
+    manifest_path: &std::path::Path,
+    binary_path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if source_identity.len() != 64
+        || !source_identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("COLIBRI_SOURCE_IDENTITY must be 64 lowercase hexadecimal characters".into());
+    }
+    let manifest_metadata = manifest_path.symlink_metadata()?;
+    if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+        return Err("source identity manifest must be a regular non-symlink file".into());
+    }
+    let manifest_path = manifest_path.canonicalize()?;
+    if sha256_file(&manifest_path)? != source_identity {
+        return Err("source identity does not match the manifest digest".into());
+    }
+    let source_root = manifest_path
+        .parent()
+        .ok_or("source identity manifest has no parent directory")?
+        .canonicalize()?;
+    let mut seen = HashSet::new();
+    for (line_number, line) in std::fs::read_to_string(&manifest_path)?.lines().enumerate() {
+        let (expected, relative) = line
+            .split_once("  ")
+            .ok_or_else(|| format!("invalid source identity manifest line {}", line_number + 1))?;
+        if expected.len() != 64
+            || !expected
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!("invalid digest on manifest line {}", line_number + 1).into());
+        }
+        let relative = std::path::Path::new(relative);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(format!("unsafe source path on manifest line {}", line_number + 1).into());
+        }
+        let source = source_root.join(relative);
+        let metadata = source.symlink_metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "source {} is not a regular non-symlink file",
+                source.display()
+            )
+            .into());
+        }
+        let source = source.canonicalize()?;
+        if !source.starts_with(&source_root) || !seen.insert(source.clone()) {
+            return Err(format!("invalid or duplicate source {}", source.display()).into());
+        }
+        if sha256_file(&source)? != expected {
+            return Err(format!("source identity mismatch for {}", source.display()).into());
+        }
+    }
+    if seen.is_empty() {
+        return Err("source identity manifest is empty".into());
+    }
+    let binary_metadata = binary_path.symlink_metadata()?;
+    if binary_metadata.file_type().is_symlink() || !binary_metadata.is_file() {
+        return Err("benchmark binary must be a regular non-symlink file".into());
+    }
+    let binary_path = binary_path.canonicalize()?;
+    let binary_sha256 = sha256_file(&binary_path)?;
+    Ok(serde_json::json!({
+        "source_identity_sha256": source_identity,
+        "source_manifest": manifest_path,
+        "binary": binary_path,
+        "binary_sha256": binary_sha256,
+        "build_mode": if cfg!(debug_assertions) { "debug" } else { "release" },
+    }))
+}
+
+fn benchmark_provenance() -> Result<serde_json::Value, Box<dyn Error>> {
+    let identity = std::env::var("COLIBRI_SOURCE_IDENTITY")
+        .map_err(|_| "benchmark requires COLIBRI_SOURCE_IDENTITY; use rust/run-identified.sh")?;
+    let manifest = std::env::var_os("COLIBRI_SOURCE_IDENTITY_MANIFEST")
+        .map(std::path::PathBuf::from)
+        .ok_or("benchmark requires COLIBRI_SOURCE_IDENTITY_MANIFEST; use rust/run-identified.sh")?;
+    validate_source_identity(&identity, &manifest, &std::env::current_exe()?)
+}
+
+struct PendingResultFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    committed: bool,
+}
+
+impl PendingResultFile {
+    fn reserve(path: std::path::PathBuf) -> Result<Self, Box<dyn Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "refusing to overwrite V4 B1 trace artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn file_mut(&mut self) -> &mut std::fs::File {
+        self.file.as_mut().expect("pending result file disappeared")
+    }
+
+    fn commit(&mut self) -> Result<(), Box<dyn Error>> {
+        self.file_mut().flush()?;
+        self.file_mut().sync_all()?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingResultFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            drop(self.file.take());
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn parse_optional_one_flag(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool, Box<dyn Error>> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(format!("{name} must be exactly 1 when set").into()),
+    }
+}
+
+fn optional_one_flag(name: &str) -> Result<bool, Box<dyn Error>> {
+    let value = std::env::var_os(name);
+    parse_optional_one_flag(name, value.as_deref())
+}
+
+fn parse_default_true_zero_one_flag(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool, Box<dyn Error>> {
+    match value {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Err(format!("{name} must be exactly 0 or 1 when set").into()),
+    }
+}
+
+fn raw_wo_a_gpu_decode_enabled() -> Result<bool, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_RAW_WO_A_GPU_DECODE");
+    parse_default_true_zero_one_flag("COLIBRI_V4_RAW_WO_A_GPU_DECODE", value.as_deref())
+}
+
+fn fixed_prefetch_wo_a_decode_arm(
+    fixed_prefetch: bool,
+    device_attention: bool,
+    raw_wo_a_gpu_decode: bool,
+) -> &'static str {
+    if !fixed_prefetch || !device_attention {
+        "inactive"
+    } else if raw_wo_a_gpu_decode {
+        "raw_fp8_gpu_decode"
+    } else {
+        "host_bf16_decode"
+    }
+}
+
+fn validate_phase_profile_mode(
+    full61_requested: bool,
+    layer_stationary_prefill: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !full61_requested || !layer_stationary_prefill {
+        return Err("COLIBRI_V4_PHASE_PROFILE requires full61 layer-stationary prefill".into());
+    }
+    Ok(())
+}
+
+fn validate_fixed_prefetch_mode(
+    full61_requested: bool,
+    layer_stationary_prefill: bool,
+    cache_is_off: bool,
+) -> Result<(), Box<dyn Error>> {
+    validate_fixed_prefetch_requirements(
+        full61_requested,
+        layer_stationary_prefill,
+        cache_is_off,
+        host_available_bytes()?,
+    )
+}
+
+fn validate_fixed_prefetch_requirements(
+    full61_requested: bool,
+    layer_stationary_prefill: bool,
+    cache_is_off: bool,
+    host_available_bytes: usize,
+) -> Result<(), Box<dyn Error>> {
+    if !full61_requested || !layer_stationary_prefill || !cache_is_off {
+        return Err(
+            "COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH requires full61 layer-stationary prefill with fixed cache off"
+                .into(),
+        );
+    }
+    const PREFETCH_HOST_HEADROOM: usize = 4 * 1024 * 1024 * 1024;
+    if host_available_bytes < PREFETCH_HOST_HEADROOM {
+        return Err(
+            "layer-stationary fixed prefetch requires at least 4 GiB WSL MemAvailable".into(),
+        );
+    }
+    Ok(())
+}
+
+const FIXED_PREFETCH_WINDOW_DEPTH: usize = 2;
+const FIXED_PREFETCH_HOST_HEADROOM_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+fn fixed_layer_decoded_host_bytes(
+    layer: usize,
+    device_bytes: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let duplicated_tail_bytes = (v4_state::HIDDEN
+        + v4_router::V4_ROUTED_EXPERTS * v4_state::HIDDEN)
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or("fixed decoded host duplicate-tail size overflow")?;
+    if layer < 3 {
+        device_bytes
+            .checked_sub(v4_router::V4_ROUTED_EXPERTS * std::mem::size_of::<f32>())
+            .and_then(|bytes| bytes.checked_add(v4_router::V4_TOPK * std::mem::size_of::<i64>()))
+            .and_then(|bytes| bytes.checked_add(duplicated_tail_bytes))
+            .ok_or_else(|| "fixed decoded host size overflow".into())
+    } else {
+        device_bytes
+            .checked_add(duplicated_tail_bytes)
+            .ok_or_else(|| "fixed decoded host size overflow".into())
+    }
+}
+
+fn validate_fixed_prefetch_window(
+    model_dir: &std::path::Path,
+    manifests: &[v4_state::LayerExecutionManifest],
+    qd4_enabled: bool,
+    qd4_immutable_expert_cache: bool,
+    strict_audit_arena_bytes: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let max_future_host_bytes = manifests
+        .iter()
+        .map(|manifest| {
+            let (_, device_bytes, _) = fixed_layer_tensor_plan(model_dir, manifest.layer)?;
+            fixed_layer_decoded_host_bytes(manifest.layer, device_bytes)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+        .into_iter()
+        .max()
+        .ok_or("fixed prefetch window has no layer plans")?;
+    let future_host_bytes = max_future_host_bytes
+        .checked_mul(FIXED_PREFETCH_WINDOW_DEPTH)
+        .ok_or("fixed prefetch window host reserve overflow")?;
+    let required_bytes = FIXED_PREFETCH_HOST_HEADROOM_BYTES
+        .checked_add(future_host_bytes)
+        .and_then(|bytes| bytes.checked_add(usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+            )
+        })
+        .and_then(|bytes| bytes.checked_add(strict_audit_arena_bytes))
+        .ok_or("fixed prefetch window host requirement overflow")?;
+    let available_bytes = host_available_bytes()?;
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "bounded fixed prefetch requires MemAvailable >= {required_bytes} (headroom={} + {} future decoded hosts x {} + QD4 reserve={} + immutable cache={} + strict audit arena={}), got {available_bytes}",
+            FIXED_PREFETCH_HOST_HEADROOM_BYTES,
+            FIXED_PREFETCH_WINDOW_DEPTH,
+            max_future_host_bytes,
+            usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES,
+            usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+            strict_audit_arena_bytes,
+        )
+        .into());
+    }
+    Ok(max_future_host_bytes)
+}
+
+struct Full61Preflight {
+    layer_stationary_prefill: bool,
+    layer_stationary_expert_reuse: bool,
+    phase_profile: bool,
+    fixed_prefetch: bool,
+    qd4_enabled: bool,
+    qd4_immutable_expert_cache: bool,
+    qd4_bench: bool,
+    result: Option<PendingResultFile>,
+}
+
+impl Full61Preflight {
+    fn from_env() -> Result<Self, Box<dyn Error>> {
+        let full61_requested = optional_one_flag("COLIBRI_V4_FULL61_B1")?;
+        let phase_profile = optional_one_flag("COLIBRI_V4_PHASE_PROFILE")?;
+        let fixed_prefetch = optional_one_flag("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH")?;
+        if !full61_requested {
+            return Err("set COLIBRI_V4_FULL61_B1=1".into());
+        }
+        let layer_stationary_prefill = optional_one_flag("COLIBRI_V4_LAYER_STATIONARY_PREFILL")?;
+        if phase_profile {
+            validate_phase_profile_mode(full61_requested, layer_stationary_prefill)?;
+        }
+        let layer_stationary_expert_reuse =
+            optional_one_flag("COLIBRI_V4_LAYER_STATIONARY_EXPERT_REUSE")?;
+        let qd4_enabled = optional_one_flag("COLIBRI_V4_ROUTED_QD4")?;
+        let qd4_immutable_expert_cache =
+            optional_one_flag("COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE")?;
+        let qd4_bench = optional_one_flag("COLIBRI_V4_ROUTED_QD4_BENCH")?;
+        let raw_cache = optional_one_flag("COLIBRI_V4_RAW_FIXED_CACHE")?;
+        let cache_is_off = parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? == 0
+            && parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")? == 0
+            && std::env::var_os("COLIBRI_V4_FIXED_CACHE_BASELINE_JSONL").is_none()
+            && !raw_cache;
+        if qd4_enabled && qd4_bench {
+            return Err("QD4 full inference requires the replay benchmark off".into());
+        }
+        if layer_stationary_expert_reuse && !layer_stationary_prefill {
+            return Err(
+                "COLIBRI_V4_LAYER_STATIONARY_EXPERT_REUSE requires layer-stationary prefill".into(),
+            );
+        }
+        if layer_stationary_expert_reuse && qd4_enabled {
+            return Err(
+                "layer-stationary expert reuse and persistent QD4 lanes are mutually exclusive"
+                    .into(),
+            );
+        }
+        if qd4_immutable_expert_cache && (!qd4_enabled || !layer_stationary_prefill) {
+            return Err(
+                "COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE=1 requires layer-stationary prefill and COLIBRI_V4_ROUTED_QD4=1"
+                    .into(),
+            );
+        }
+        if layer_stationary_prefill && (!cache_is_off || qd4_bench) {
+            return Err(
+                "layer-stationary prefill requires fixed cache and the QD4 replay benchmark off"
+                    .into(),
+            );
+        }
+        if fixed_prefetch {
+            validate_fixed_prefetch_mode(full61_requested, layer_stationary_prefill, cache_is_off)?;
+        }
+        let result_path = std::env::var_os("COLIBRI_V4_RESULT_JSONL").map(std::path::PathBuf::from);
+        if layer_stationary_prefill && result_path.is_none() {
+            return Err("layer-stationary prefill requires COLIBRI_V4_RESULT_JSONL".into());
+        }
+        Ok(Self {
+            layer_stationary_prefill,
+            layer_stationary_expert_reuse,
+            phase_profile,
+            fixed_prefetch,
+            qd4_enabled,
+            qd4_immutable_expert_cache,
+            qd4_bench,
+            result: result_path.map(PendingResultFile::reserve).transpose()?,
+        })
+    }
+}
+
+fn main() {
+    let benchmark_requested = std::env::var_os("COLIBRI_V4_B2_LAYER_STATIONARY_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_B4_LAYER_STATIONARY_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_B4_FULL61_PROMOTION").is_some()
+        || std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some()
+        || std::env::var_os("COLIBRI_V4_FINAL_HEAD_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_DEVICE_TOKEN_STATE_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_SPARSE_TOPK_SWEEP").is_some()
+        || std::env::var_os("COLIBRI_V4_CACHE_OFF_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some();
+    let mut full61_preflight = (std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some())
+    .then(Full61Preflight::from_env)
+    .transpose()
+    .expect("validate V4 full61 configuration");
+    if optional_one_flag("COLIBRI_V4_SHORT_DECODE_STATIC_CHECK")
+        .expect("validate short decode static-check flag")
+    {
+        short_device_decode_static_check().expect("validate short decode static contract");
+        return;
+    }
+    if benchmark_requested {
+        benchmark_provenance().expect("validate benchmark source identity");
+    }
+    // ponytail: this smoke uses synchronous safe copies for a terminal parity
+    // check; switch to event-owned async buffers when production dispatch lands.
+    let context = CudaContext::new(0).expect("create CUDA context");
+    let stream = context.default_stream();
+    let module = kernels::load(&context).expect("load embedded Rust PTX");
+
+    if std::env::var_os("COLIBRI_V4_FINAL_HEAD_BENCH").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_final_head_bench(&context, &module, &stream)
+            .expect("run real V4 final-head Stage1 benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_wavefront_attention_bench(&context, &module, &stream)
+            .expect("run real V4 CDQW attention benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_device_attention_preflight_gate(&context, &module, &stream)
+            .expect("run device-attention capacity preflight gate");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_DEVICE_TOKEN_STATE_GATE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_device_token_state_gate(&context, &module, &stream)
+            .expect("run real V4 device token-state pos3 gate");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_qd4_stationary_gate(&context, &module, &stream).expect("run V4 QD4 stationary gate");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_qd4_immutable_cache_targeted_gate(&context, &module, &stream)
+            .expect("run V4 QD4 immutable-cache targeted gate");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_SPARSE_TOPK_SWEEP").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_sparse_attention_topk_sweep(&context, &module, &stream)
+            .expect("run sparse-attention top-k crossover sweep");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_CACHE_OFF_BENCH").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_cache_off_bench().expect("run real V4 cache-off Stage0 benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_B2_LAYER_STATIONARY_BENCH").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_b2_layer_stationary(&context, &module, &stream)
+            .expect("run real V4 B2 layer-stationary benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_B4_LAYER_STATIONARY_BENCH").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_b4_layer_stationary(&context, &module, &stream, false)
+            .expect("run real V4 B4 layer-stationary benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_B4_FULL61_PROMOTION").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        run_real_v4_b4_layer_stationary(&context, &module, &stream, true)
+            .expect("run real V4 B4 full61 layer-stationary promotion benchmark");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some() {
+        run_real_v4_full61_b1(
+            &context,
+            &module,
+            &stream,
+            full61_preflight
+                .take()
+                .expect("V4 full61 preflight disappeared"),
+        )
+        .expect("run real V4 full61 B=1 inference");
+        return;
+    }
+
+    if std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some() {
+        let config = DualBenchConfig::from_env().expect("validate netem benchmark configuration");
+        let path = v4_expert_shard().expect("validate pinned V4 expert shard");
+        let shard = safetensors::ShardFile::open(&path).expect("open V4 expert shard");
+        run_v4_two_worker_loopback(&context, &module, &shard, &path, Some(&config))
+            .expect("run V4 dual-worker benchmark");
+        println!("PASS: V4 dual-worker benchmark-only entry");
+        return;
+    }
+
+    for &length in &[0usize, 1, 17, 4_097] {
+        let input: Vec<f32> = (0..length).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let rhs: Vec<f32> = (0..length)
+            .map(|i| ((i % 7) as i32 - 3) as f32 * 0.5)
+            .collect();
+        let expected: Vec<f32> = input.iter().zip(&rhs).map(|(x, y)| x + y).collect();
+        if length == 0 {
+            assert_close("add_in_place", &input, &expected);
+            continue;
+        }
+
+        let mut device_input = DeviceBuffer::from_host(&stream, &input).expect("upload add input");
+        let device_rhs = DeviceBuffer::from_host(&stream, &rhs).expect("upload add rhs");
+        // SAFETY: the 1-D launch covers length elements and the kernel
+        // bounds-checks before accessing either equally sized device buffer.
+        unsafe {
+            module.add_in_place(
+                &stream,
+                LaunchConfig::for_num_elems(length as u32),
+                &mut device_input,
+                &device_rhs,
+            )
+        }
+        .expect("launch add_in_place");
+        let actual = device_input
+            .to_host_vec(&stream)
+            .expect("download add result");
+        assert_close("add_in_place", &actual, &expected);
+    }
+
+    for &length in &[0usize, 1, 17, 4_097] {
+        let gate: Vec<f32> = (0..length).map(|i| i as f32 * 0.25 - 2.0).collect();
+        let up: Vec<f32> = (0..length)
+            .map(|i| ((i % 5) as i32 - 2) as f32 * 0.75)
+            .collect();
+        let expected: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| (gate / (1.0 + (-gate).exp())) * up)
+            .collect();
+        if length == 0 {
+            assert_close("silu_mul_in_place", &gate, &expected);
+            continue;
+        }
+
+        let mut device_gate = DeviceBuffer::from_host(&stream, &gate).expect("upload silu gate");
+        let device_up = DeviceBuffer::from_host(&stream, &up).expect("upload silu up");
+        // SAFETY: the 1-D launch covers length elements and the kernel
+        // bounds-checks before accessing either equally sized device buffer.
+        unsafe {
+            module.silu_mul_in_place(
+                &stream,
+                LaunchConfig::for_num_elems(length as u32),
+                &mut device_gate,
+                &device_up,
+            )
+        }
+        .expect("launch silu_mul_in_place");
+        let actual = device_gate
+            .to_host_vec(&stream)
+            .expect("download silu result");
+        assert_close("silu_mul_in_place", &actual, &expected);
+    }
+
+    let (row_count, d) = (8usize, 257usize);
+    let rows = [6i32, 1, 4];
+    let input: Vec<f32> = (0..row_count * d).map(|i| i as f32 * 0.125 - 3.0).collect();
+    let partial: Vec<f32> = (0..rows.len() * d)
+        .map(|i| ((i % 11) as i32 - 5) as f32 * 0.25)
+        .collect();
+    let mut expected = input.clone();
+    for (partial_row, &row) in rows.iter().enumerate() {
+        for column in 0..d {
+            expected[row as usize * d + column] += partial[partial_row * d + column];
+        }
+    }
+    let mut device_input = DeviceBuffer::from_host(&stream, &input).expect("upload rows add input");
+    let device_partial =
+        DeviceBuffer::from_host(&stream, &partial).expect("upload rows add partial");
+    let device_rows = DeviceBuffer::from_host(&stream, &rows).expect("upload rows add indices");
+    launch_rows_add(
+        &module,
+        &stream,
+        &mut device_input,
+        &device_partial,
+        &device_rows,
+        &rows,
+        d,
+    )
+    .expect("launch rows_add_in_place");
+    let actual = device_input
+        .to_host_vec(&stream)
+        .expect("download rows add result");
+    assert_close("rows_add_in_place", &actual, &expected);
+
+    let packed: Vec<u8> = (0..64)
+        .map(|index| [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe][index % 8])
+        .collect();
+    let scales = vec![126u8, 128, 127, 129];
+    let layout =
+        v4_fp4::Fp4E2M1x2Layout::new(&packed, &scales, 2, 64).expect("validate V4 FP4 fixture");
+    let mut expected = vec![0.0; layout.element_len()];
+    for row in 0..2 {
+        for block in 0..2 {
+            layout
+                .decode_block(row, block, &mut expected[row * 64 + block * 32..][..32])
+                .expect("decode validated V4 FP4 fixture block");
+        }
+    }
+    let device_packed = DeviceBuffer::from_host(&stream, &packed).expect("upload V4 FP4 weights");
+    let device_scales = DeviceBuffer::from_host(&stream, &scales).expect("upload V4 FP4 scales");
+    let mut device_output = DeviceBuffer::from_host(&stream, &vec![0.0f32; expected.len()])
+        .expect("allocate V4 FP4 output");
+    launch_v4_fp4_decode(
+        &module,
+        &stream,
+        &device_packed,
+        &device_scales,
+        &mut device_output,
+        layout,
+    )
+    .expect("launch V4 FP4 format oracle");
+    let actual = device_output
+        .to_host_vec(&stream)
+        .expect("download V4 FP4 output");
+    assert_close("decode_v4_fp4_blockwise", &actual, &expected);
+    if synthetic_only().expect("validate COLIBRI_SYNTHETIC_ONLY") {
+        println!("SKIP: explicit COLIBRI_SYNTHETIC_ONLY=1 disables all real V4 checks");
+    } else {
+        run_real_v4_fp4_slice_if_available(&module, &stream).expect("real V4 FP4 range check");
+        run_real_v4_router_slice_if_available(&module, &stream)
+            .expect("real V4 router range check");
+        run_real_v4_state_slice_if_available(&module, &stream).expect("real V4 state range check");
+        run_real_v4_fp8_projection_slice_if_available(&context, &module, &stream)
+            .expect("real V4 FP8 projection check");
+        run_real_v4_compressor_slice_if_available(&module, &stream)
+            .expect("real V4 Compressor check");
+        run_real_v4_expert0_slice_if_available(&context, &module, &stream)
+            .expect("real V4 routed expert parity check");
+    }
+
+    println!("PASS: Rust CUDA primitives, V4 FP4/router, and routed expert-0 parity");
+}
+
+struct StreamedFinalHeadRun {
+    output: v4_state::FinalHeadOutput,
+    read_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    d2h_ns: u64,
+    cpu_preprocess_ns: u64,
+    wall_ns: u64,
+}
+
+fn f32_ulp_distance(left: f32, right: f32) -> u32 {
+    let ordered = |value: f32| {
+        let bits = value.to_bits();
+        if bits & 0x8000_0000 == 0 {
+            bits | 0x8000_0000
+        } else {
+            !bits
+        }
+    };
+    ordered(left).abs_diff(ordered(right))
+}
+
+fn final_head_comparison(actual: &[f32], expected: &[f32]) -> (usize, f32, f32, u32) {
+    let mut mismatches = 0;
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    let mut max_ulp = 0_u32;
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        if !actual.is_finite() || !expected.is_finite() {
+            mismatches += 1;
+            max_abs = f32::INFINITY;
+            max_rel = f32::INFINITY;
+            max_ulp = u32::MAX;
+            continue;
+        }
+        let difference = (actual - expected).abs();
+        max_abs = max_abs.max(difference);
+        max_rel = max_rel.max(difference / expected.abs().max(f32::MIN_POSITIVE));
+        max_ulp = max_ulp.max(f32_ulp_distance(actual, expected));
+        mismatches += usize::from(difference > 2e-4 * expected.abs().max(1.0));
+    }
+    (mismatches, max_abs, max_rel, max_ulp)
+}
+
+fn run_real_v4_final_head_bench(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let repeats = std::env::var("COLIBRI_V4_FINAL_HEAD_REPEATS")
+        .unwrap_or_else(|_| "3".into())
+        .parse::<usize>()?;
+    if repeats < 3 {
+        return Err("COLIBRI_V4_FINAL_HEAD_REPEATS must be at least 3".into());
+    }
+    let layer_baseline_ns = std::env::var("COLIBRI_V4_FINAL_HEAD_BASELINE_LAYER_NS")
+        .map_err(|_| "set COLIBRI_V4_FINAL_HEAD_BASELINE_LAYER_NS for the request projection")?
+        .parse::<u64>()?;
+    let result_path = std::env::var_os("COLIBRI_V4_FINAL_HEAD_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_FINAL_HEAD_RESULT_JSONL")?;
+    let root = v4_model_dir()?;
+    let embedding = v4_state::load(&root, &[0])?.embedding;
+    let mut hc_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+    for _ in 0..v4_state::HC {
+        hc_hidden.extend_from_slice(&embedding);
+    }
+    let weights = v4_state::load_final_head(&root)?;
+    let source_bytes = v4_state::VOCAB * v4_state::HIDDEN * 2;
+    let mut result = std::fs::File::create(&result_path)?;
+    writeln!(
+        result,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-final-head-stage1-v1",
+            "provenance": benchmark_provenance()?,
+            "token_e2e_ns": serde_json::Value::Null,
+            "request_e2e_ns": serde_json::Value::Null,
+            "model_revision": v4_state::REVISION,
+            "input": "official token-0 embedding repeated across HC=4",
+            "head_dtype": "BF16",
+            "head_shape": [v4_state::VOCAB, v4_state::HIDDEN],
+            "source_bytes": source_bytes,
+            "gpu_chunk_rows": 1024,
+            "repeats": repeats,
+            "cache_protocol": "repeat 0: POSIX_FADV_DONTNEED before each CPU/GPU arm; later repeats: warm",
+            "baseline_layer_ns": layer_baseline_ns,
+        })
+    )?;
+    let mut cpu_wall = Vec::with_capacity(repeats);
+    let mut gpu_wall = Vec::with_capacity(repeats);
+    let mut all_canonical = true;
+    for repeat in 0..repeats {
+        let cache = if repeat == 0 { "fadvise_cold" } else { "warm" };
+        if repeat == 0 {
+            weights.advise_head_dontneed()?;
+        }
+        let cpu = v4_state::final_checkpoint_head_cpu_timed(&weights, &hc_hidden, 1)?;
+        if repeat == 0 {
+            weights.advise_head_dontneed()?;
+        }
+        let gpu = run_streamed_final_head_gpu(context, module, stream, &weights, &hc_hidden)?;
+        let (mismatches, max_abs, max_rel, max_ulp) =
+            final_head_comparison(&gpu.output.logits_f32, &cpu.output.logits_f32);
+        let argmax_exact = gpu.output.argmax == cpu.output.argmax;
+        all_canonical &= mismatches == 0 && argmax_exact;
+        cpu_wall.push(cpu.wall_ns);
+        gpu_wall.push(gpu.wall_ns);
+        writeln!(
+            result,
+            "{}",
+            serde_json::json!({
+                "event": "repeat",
+                "repeat": repeat,
+                "cache": cache,
+                "cpu": {
+                    "wall_ns": cpu.wall_ns,
+                    "read_ns": cpu.read_ns,
+                    "source_bytes": source_bytes,
+                },
+                "gpu": {
+                    "wall_ns": gpu.wall_ns,
+                    "read_ns": gpu.read_ns,
+                    "source_bytes": source_bytes,
+                    "h2d_ns": gpu.h2d_ns,
+                    "h2d_bytes": source_bytes + v4_state::HIDDEN * 2,
+                    "kernel_ns": gpu.kernel_ns,
+                    "d2h_ns": gpu.d2h_ns,
+                    "d2h_bytes": v4_state::VOCAB * 4,
+                    "cpu_preprocess_ns": gpu.cpu_preprocess_ns,
+                },
+                "canonical": {
+                    "logit_relative_tolerance": 2e-4,
+                    "logit_mismatches": mismatches,
+                    "max_abs": max_abs,
+                    "max_rel": max_rel,
+                    "max_ulp": max_ulp,
+                    "argmax_exact": argmax_exact,
+                    "cpu_argmax": cpu.output.argmax[0],
+                    "gpu_argmax": gpu.output.argmax[0],
+                },
+            })
+        )?;
+    }
+    let warm_cpu = median_u64(&cpu_wall[1..]);
+    let warm_gpu = median_u64(&gpu_wall[1..]);
+    let final_improvement = 1.0 - warm_gpu as f64 / warm_cpu as f64;
+    let baseline_request_ns = layer_baseline_ns.saturating_add(warm_cpu);
+    let projected_request_ns = layer_baseline_ns.saturating_add(warm_gpu);
+    let request_improvement = 1.0 - projected_request_ns as f64 / baseline_request_ns as f64;
+    let pass = all_canonical && final_improvement >= 0.50 && request_improvement >= 0.20;
+    writeln!(
+        result,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": if pass { "PASS" } else { "KILL" },
+            "canonical": all_canonical,
+            "warm_cpu_wall_median_ns": warm_cpu,
+            "warm_gpu_wall_median_ns": warm_gpu,
+            "final_head_improvement": final_improvement,
+            "required_final_head_improvement": 0.50,
+            "baseline_request_ns": baseline_request_ns,
+            "projected_request_ns": projected_request_ns,
+            "projected_request_improvement": request_improvement,
+            "required_request_improvement": 0.20,
+        })
+    )?;
+    result.sync_all()?;
+    println!(
+        "{{\"status\":\"{}\",\"mode\":\"v4-final-head-stage1\",\"final_head_improvement\":{final_improvement:.6},\"projected_request_improvement\":{request_improvement:.6},\"result_jsonl\":{}}}",
+        if pass { "PASS" } else { "KILL" },
+        serde_json::to_string(&result_path)?,
+    );
+    Ok(())
+}
+
+fn run_streamed_final_head_gpu(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    weights: &v4_state::FinalHeadWeights,
+    hc_hidden_bf16: &[u16],
+) -> Result<StreamedFinalHeadRun, Box<dyn Error>> {
+    const CHUNK_ROWS: usize = 1_024;
+    let wall_started = std::time::Instant::now();
+    let cpu_started = std::time::Instant::now();
+    let pre = v4_state::final_hc_gate_cpu(
+        hc_hidden_bf16,
+        1,
+        v4_state::HC,
+        v4_state::HIDDEN,
+        &weights.hc_fn_f32,
+        weights.hc_scale_f32,
+        &weights.hc_base_f32,
+    )?;
+    let mut output = v4_state::final_hc_head_cpu(
+        hc_hidden_bf16,
+        1,
+        v4_state::HC,
+        v4_state::HIDDEN,
+        &pre,
+        &weights
+            .norm_bf16
+            .iter()
+            .map(|&bits| v4_router::bf16_to_f32(bits))
+            .collect::<Vec<_>>(),
+        &vec![0.0; v4_state::HIDDEN],
+        1,
+    )?;
+    output.logits_f32 = vec![0.0; v4_state::VOCAB];
+    output.argmax[0] = 0;
+    let mut cpu_preprocess_ns = u64::try_from(cpu_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+    let input_upload_started = std::time::Instant::now();
+    let device_input = DeviceBuffer::from_host(stream, &output.normalized_bf16)?;
+    let mut h2d_ns = u64::try_from(input_upload_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let device_weight = DeviceBuffer::<u16>::zeroed(stream, CHUNK_ROWS * v4_state::HIDDEN)?;
+    let mut device_output = DeviceBuffer::<f32>::zeroed(stream, CHUNK_ROWS)?;
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let mut bytes = vec![0_u8; CHUNK_ROWS * v4_state::HIDDEN * 2];
+    let mut words = vec![0_u16; CHUNK_ROWS * v4_state::HIDDEN];
+    let mut read_ns = 0_u64;
+    let mut kernel_ns = 0_u64;
+    let mut d2h_ns = 0_u64;
+    for token_start in (0..v4_state::VOCAB).step_by(CHUNK_ROWS) {
+        let chunk_rows = (v4_state::VOCAB - token_start).min(CHUNK_ROWS);
+        let chunk_elements = chunk_rows * v4_state::HIDDEN;
+        let chunk_bytes = chunk_elements * 2;
+        let read_started = std::time::Instant::now();
+        weights.read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])?;
+        read_ns = read_ns
+            .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let decode_started = std::time::Instant::now();
+        for (word, bytes) in words[..chunk_elements]
+            .iter_mut()
+            .zip(bytes[..chunk_bytes].chunks_exact(2))
+        {
+            *word = u16::from_le_bytes([bytes[0], bytes[1]]);
+        }
+        cpu_preprocess_ns = cpu_preprocess_ns
+            .saturating_add(u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let upload_started = std::time::Instant::now();
+        // SAFETY: the preallocated device buffer is at least `chunk_bytes`
+        // long, and the host words remain borrowed until synchronization.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                device_weight.cu_deviceptr(),
+                words.as_ptr(),
+                chunk_bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()?;
+        h2d_ns = h2d_ns
+            .saturating_add(u64::try_from(upload_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        start.record(stream)?;
+        // SAFETY: one complete warp owns each output row and all buffer
+        // extents were checked above.
+        unsafe {
+            module.matvec_bf16_streamed(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(chunk_rows * 32)?),
+                &device_input,
+                &device_weight,
+                &mut device_output,
+                u32::try_from(v4_state::HIDDEN)?,
+                u32::try_from(chunk_rows)?,
+            )?;
+        }
+        end.record(stream)?;
+        end.synchronize()?;
+        kernel_ns = kernel_ns.saturating_add((start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64);
+        let download_started = std::time::Instant::now();
+        let chunk = device_output.to_host_vec(stream)?;
+        d2h_ns = d2h_ns.saturating_add(
+            u64::try_from(download_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        output.logits_f32[token_start..token_start + chunk_rows]
+            .copy_from_slice(&chunk[..chunk_rows]);
+    }
+    for token in 1..v4_state::VOCAB {
+        if output.logits_f32[token] > output.logits_f32[output.argmax[0]] {
+            output.argmax[0] = token;
+        }
+    }
+    Ok(StreamedFinalHeadRun {
+        output,
+        read_ns,
+        h2d_ns,
+        kernel_ns,
+        d2h_ns,
+        cpu_preprocess_ns,
+        wall_ns: u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
+}
+
+const V4_EOS_TOKEN_ID: i64 = 1;
+const V4_LAYER_EXPERT_RETAINED_SLOTS: usize = 32;
+
+fn should_retain_layer_expert(retained: usize) -> bool {
+    retained < V4_LAYER_EXPERT_RETAINED_SLOTS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GreedyStopReason {
+    Eos,
+    MaxNewTokens,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GreedyDecision {
+    IgnorePrompt,
+    EmitAndContinue,
+    EmitAndStop(GreedyStopReason),
+}
+
+fn greedy_argmax_decision(
+    prompt_len: usize,
+    token_position: usize,
+    generated_count: usize,
+    max_new_tokens: usize,
+    argmax: i64,
+) -> GreedyDecision {
+    if token_position + 1 < prompt_len {
+        GreedyDecision::IgnorePrompt
+    } else if argmax == V4_EOS_TOKEN_ID {
+        GreedyDecision::EmitAndStop(GreedyStopReason::Eos)
+    } else if generated_count + 1 == max_new_tokens {
+        GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens)
+    } else {
+        GreedyDecision::EmitAndContinue
+    }
+}
+
+fn b1_needs_final_head(prompt_len: usize, token_position: usize) -> bool {
+    token_position + 1 >= prompt_len
+}
+
+fn chat_input_conflict(
+    chat_user_present: bool,
+    raw_prompt_present: bool,
+    id_input_present: bool,
+) -> bool {
+    chat_user_present && (raw_prompt_present || id_input_present)
+}
+
+fn greedy_forward_tokens(prompt_len: usize, greedy_steps: usize) -> Result<usize, Box<dyn Error>> {
+    if prompt_len == 0 {
+        return Err("greedy decoding requires at least one prompt token".into());
+    }
+    prompt_len
+        .checked_add(greedy_steps.saturating_sub(1))
+        .ok_or_else(|| "greedy decoding token count overflow".into())
+}
+
+fn validate_layer_stationary_prefill(
+    prompt_len: usize,
+    greedy_steps: usize,
+    max_layers: usize,
+    cache_is_off: bool,
+    qd4_replay_bench: bool,
+    short_device_decode: bool,
+) -> Result<(), Box<dyn Error>> {
+    if prompt_len == 0
+        || if short_device_decode {
+            !(2..=V4_SHORT_DEVICE_DECODE_MAX_NEW_TOKENS).contains(&greedy_steps)
+        } else {
+            greedy_steps != 1
+        }
+        || max_layers != v4_state::V4_LAYER_COUNT
+        || !cache_is_off
+        || qd4_replay_bench
+    {
+        return Err(
+            "layer-stationary prefill requires a nonempty prompt, greedy_steps=1 (or 2..=5 for short device decode), full61, fixed cache off, and the QD4 replay benchmark off"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn short_device_decode_rows(
+    prompt_len: usize,
+    greedy_steps: usize,
+    enabled: bool,
+) -> Result<usize, Box<dyn Error>> {
+    if !enabled {
+        return Ok(prompt_len);
+    }
+    if !(2..=V4_SHORT_DEVICE_DECODE_MAX_NEW_TOKENS).contains(&greedy_steps) {
+        return Err("short device decode requires COLIBRI_V4_GREEDY_STEPS=2..=5".into());
+    }
+    let rows = greedy_forward_tokens(prompt_len, greedy_steps)?;
+    if rows > V4_SHORT_DEVICE_DECODE_MAX_ROWS {
+        return Err("short device decode exceeds its nine-row request-state ceiling".into());
+    }
+    Ok(rows)
+}
+
+fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
+    let state_bytes = 31usize
+        .checked_mul(V4_DEVICE_TOKEN_STATE_HCA_BYTES)
+        .and_then(|bytes| {
+            30usize
+                .checked_mul(V4_DEVICE_TOKEN_STATE_MAX_BYTES)
+                .and_then(|csa| bytes.checked_add(csa))
+        })
+        .ok_or("short device decode state ledger overflow")?;
+    let rope_bytes = 2usize
+        .checked_mul(V4_SHORT_DEVICE_DECODE_MAX_ROWS)
+        .and_then(|bytes| bytes.checked_mul(v4_state::Q_ROPE_DIM))
+        .and_then(|bytes| bytes.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or("short device decode RoPE ledger overflow")?;
+    let total_bytes = [
+        V4_QD4_DEVICE_BYTES,
+        V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+        494_348_312,
+        state_bytes,
+        rope_bytes,
+        V4_TID2EID_TRANSIENT_MAX_BYTES,
+        V4_DEVICE_CAPACITY_HEADROOM_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+    .ok_or("short device decode capacity ledger overflow")?;
+    if short_device_decode_rows(5, 2, true)? != 6
+        || short_device_decode_rows(5, 5, true)? != 9
+        || csa_compressed_rows_after(3) != 1
+        || csa_compressed_rows_after(6) != 1
+        || csa_compressed_rows_after(7) != 2
+        || csa_compressed_rows_after(8) != 2
+        || state_bytes != 3_763_637_590
+        || rope_bytes != 4_608
+        || total_bytes != 7_673_079_710
+    {
+        return Err("short device decode static contract mismatch".into());
+    }
+    strict_compressor_host_arena_static_check()?;
+    let mut compressor = v4_state::V4CompressorState::new_decode(4, 1)?;
+    let mut compressed_rows = 0;
+    for position in 0..9 {
+        let prepared = v4_state::CompressorPrepared {
+            kv_f32: vec![position as f32 + 1.0; 2],
+            score_f32: vec![position as f32 + 2.0; 2],
+            score_plus_ape_f32: vec![position as f32 + 3.0; 2],
+        };
+        let (next, pooled) = compressor.prepare_decode_row_and_pool(&prepared, position)?;
+        compressed_rows += usize::from(pooled.is_some());
+        if (position == 3 || position == 7) != pooled.is_some() {
+            return Err("short device decode CSA compressor boundary drift".into());
+        }
+        compressor = next;
+    }
+    if compressed_rows != 2 {
+        return Err("short device decode CSA compressed row count drift at position 8".into());
+    }
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-short-device-decode-static-check\",\"rows\":9,\"state_bytes\":{state_bytes},\"rope_bytes\":{rope_bytes},\"capacity_bytes\":{total_bytes},\"csa_compressed_rows_pos8\":{compressed_rows},\"strict_arena_reuse_repeats\":100}}"
+    );
+    Ok(())
+}
+
+fn strict_compressor_host_arena_static_check() -> Result<(), Box<dyn Error>> {
+    for (outputs, ratio) in [(512_usize, 128_usize), (1_024, 4)] {
+        let weights = outputs
+            .checked_mul(v4_state::HIDDEN)
+            .ok_or("strict arena static weight size overflow")?;
+        let mut wkv_bf16 = vec![0_u16; weights];
+        let mut wgate_bf16 = vec![0_u16; weights];
+        let mut ape_f32 = vec![0.0_f32; outputs * ratio];
+        let mut input_f32 = vec![0.0_f32; v4_state::HIDDEN];
+        let mut wkv_f32 = vec![0.0_f32; weights];
+        let mut wgate_f32 = vec![0.0_f32; weights];
+        let mut kv_f32 = vec![0.0_f32; outputs];
+        let mut score_f32 = vec![0.0_f32; outputs];
+        let mut score_plus_ape_f32 = vec![0.0_f32; outputs];
+        let baseline = [
+            (wkv_bf16.as_ptr() as usize, wkv_bf16.capacity()),
+            (wgate_bf16.as_ptr() as usize, wgate_bf16.capacity()),
+            (ape_f32.as_ptr() as usize, ape_f32.capacity()),
+            (input_f32.as_ptr() as usize, input_f32.capacity()),
+            (wkv_f32.as_ptr() as usize, wkv_f32.capacity()),
+            (wgate_f32.as_ptr() as usize, wgate_f32.capacity()),
+            (kv_f32.as_ptr() as usize, kv_f32.capacity()),
+            (score_f32.as_ptr() as usize, score_f32.capacity()),
+            (
+                score_plus_ape_f32.as_ptr() as usize,
+                score_plus_ape_f32.capacity(),
+            ),
+        ];
+        for repeat in 0..100 {
+            wkv_bf16.fill(repeat as u16);
+            wgate_bf16.fill((repeat + 1) as u16);
+            ape_f32.fill(repeat as f32);
+            input_f32.fill(repeat as f32);
+            wkv_f32.fill(repeat as f32);
+            wgate_f32.fill(repeat as f32);
+            kv_f32.fill(repeat as f32);
+            score_f32.fill(repeat as f32);
+            score_plus_ape_f32.fill(repeat as f32);
+            let current = [
+                (wkv_bf16.as_ptr() as usize, wkv_bf16.capacity()),
+                (wgate_bf16.as_ptr() as usize, wgate_bf16.capacity()),
+                (ape_f32.as_ptr() as usize, ape_f32.capacity()),
+                (input_f32.as_ptr() as usize, input_f32.capacity()),
+                (wkv_f32.as_ptr() as usize, wkv_f32.capacity()),
+                (wgate_f32.as_ptr() as usize, wgate_f32.capacity()),
+                (kv_f32.as_ptr() as usize, kv_f32.capacity()),
+                (score_f32.as_ptr() as usize, score_f32.capacity()),
+                (
+                    score_plus_ape_f32.as_ptr() as usize,
+                    score_plus_ape_f32.capacity(),
+                ),
+            ];
+            if baseline != current {
+                return Err("strict Compressor host arena reallocated during reuse check".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qd4_lane_count(enabled: bool) -> usize {
+    usize::from(enabled) * V4_QD4_LANES
+}
+
+fn validate_qd4_lane_reserve(
+    host_available: usize,
+    device_available: usize,
+) -> Result<(), Box<dyn Error>> {
+    if host_available < V4_QD4_PINNED_HOST_BYTES || device_available < V4_QD4_DEVICE_BYTES {
+        return Err("persistent QD4 lanes lack the explicit pinned-host/device reserve".into());
+    }
+    Ok(())
+}
+
+fn qd4_expected_routed_loads(layers: usize, prompt_len: usize) -> Result<usize, Box<dyn Error>> {
+    layers
+        .checked_mul(prompt_len)
+        .and_then(|rows| rows.checked_mul(v4_router::V4_TOPK))
+        .ok_or_else(|| "QD4 routed load count overflow".into())
+}
+
+fn run_real_v4_full61_b1(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    mut preflight: Full61Preflight,
+) -> Result<(), Box<dyn Error>> {
+    let prompt_text = match std::env::var("COLIBRI_V4_PROMPT_TEXT") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let chat_user = match std::env::var("COLIBRI_V4_CHAT_USER") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if chat_input_conflict(
+        chat_user.is_some(),
+        prompt_text.is_some(),
+        std::env::var_os("COLIBRI_V4_TOKEN_IDS").is_some()
+            || std::env::var_os("COLIBRI_V4_TOKEN_ID").is_some(),
+    ) {
+        return Err(
+            "COLIBRI_V4_CHAT_USER is mutually exclusive with raw V4 prompt and token ID inputs"
+                .into(),
+        );
+    }
+    if prompt_text.is_some()
+        && (std::env::var_os("COLIBRI_V4_TOKEN_IDS").is_some()
+            || std::env::var_os("COLIBRI_V4_TOKEN_ID").is_some())
+    {
+        return Err("COLIBRI_V4_PROMPT_TEXT is mutually exclusive with V4 token ID inputs".into());
+    }
+    let mut tokenizer = None;
+    let mut token_ids = if let Some(user) = chat_user.as_deref() {
+        let tokenizer_root = v4_model_dir()?;
+        let loaded = v4_tokenizer::V4Tokenizer::open(&tokenizer_root)?;
+        let prompt = v4_chat::format_single_user(user, v4_chat::ThinkingMode::Chat);
+        let ids = loaded.encode_raw(&prompt)?;
+        tokenizer = Some(loaded);
+        ids
+    } else if let Some(text) = prompt_text.as_deref() {
+        let tokenizer_root = v4_model_dir()?;
+        let loaded = v4_tokenizer::V4Tokenizer::open(&tokenizer_root)?;
+        let ids = loaded.encode_raw(text)?;
+        tokenizer = Some(loaded);
+        ids
+    } else {
+        match std::env::var("COLIBRI_V4_TOKEN_IDS") {
+            Ok(value) => value
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<i64>)
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(std::env::VarError::NotPresent) => vec![
+                std::env::var("COLIBRI_V4_TOKEN_ID")
+                    .map_err(|_| "set COLIBRI_V4_TOKEN_ID or COLIBRI_V4_TOKEN_IDS")?
+                    .parse::<i64>()?,
+            ],
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if token_ids.len() > v4_state::KV_WINDOW {
+        return Err(if chat_user.is_some() {
+            "COLIBRI_V4_CHAT_USER encodes beyond the existing V4 KV window"
+        } else if prompt_text.is_some() {
+            "COLIBRI_V4_PROMPT_TEXT encodes beyond the existing V4 KV window"
+        } else {
+            "COLIBRI_V4_TOKEN_IDS exceeds the existing V4 KV window"
+        }
+        .into());
+    }
+    v4_state::validate_ids(&token_ids)?;
+    let prompt_len = token_ids.len();
+    let greedy_steps = match std::env::var("COLIBRI_V4_GREEDY_STEPS") {
+        Ok(value) => value.parse::<usize>()?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(error) => return Err(error.into()),
+    };
+    let root = v4_model_dir()?;
+    let request_started = std::time::Instant::now();
+    let max_layers = match std::env::var("COLIBRI_V4_MAX_LAYERS") {
+        Ok(value) => value.parse::<usize>()?,
+        Err(std::env::VarError::NotPresent) => v4_state::V4_LAYER_COUNT,
+        Err(error) => return Err(error.into()),
+    };
+    if !(1..=v4_state::V4_LAYER_COUNT).contains(&max_layers) {
+        return Err("COLIBRI_V4_MAX_LAYERS must be in 1..=61".into());
+    }
+    if greedy_steps != 0 && max_layers != v4_state::V4_LAYER_COUNT {
+        return Err("COLIBRI_V4_GREEDY_STEPS requires COLIBRI_V4_MAX_LAYERS=61".into());
+    }
+    let critical_path_profile = match std::env::var_os("COLIBRI_V4_CRITICAL_PATH_PROFILE") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err("COLIBRI_V4_CRITICAL_PATH_PROFILE must be exactly 1 when set".into());
+        }
+    };
+    if preflight.qd4_bench {
+        if token_ids.len() != 1
+            || max_layers < 5
+            || parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? != 0
+            || parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")? != 0
+        {
+            return Err("QD4 benchmark requires one token, layers 0..=4, and M2 cache off".into());
+        }
+        let path = std::env::var_os("COLIBRI_V4_ROUTED_QD4_RESULT_JSONL")
+            .map(std::path::PathBuf::from)
+            .ok_or("set COLIBRI_V4_ROUTED_QD4_RESULT_JSONL")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut result = std::fs::File::create(path)?;
+        writeln!(
+            result,
+            "{}",
+            serde_json::json!({
+                "event": "run",
+                "schema": "colibri-v4-routed-qd4-v2",
+                "provenance": benchmark_provenance()?,
+                "token_e2e_ns": serde_json::Value::Null,
+                "model_revision": v4_state::REVISION,
+            })
+        )?;
+    }
+    let qd4_enabled = preflight.qd4_enabled;
+    if critical_path_profile
+        && (token_ids.as_slice() != [0, 1]
+            || max_layers != 5
+            || !qd4_enabled
+            || !bench_telemetry_enabled())
+    {
+        return Err(
+            "critical-path profile requires token IDs 0,1, max_layers=5, QD4=1, and bench telemetry"
+                .into(),
+        );
+    }
+    let sparse_attention_arm = sparse_attention_arm_from_env()?;
+    let mut manifests = v4_state::serial_layer_manifests(0)?;
+    manifests.truncate(max_layers);
+    let mut result = match preflight.result.take() {
+        Some(result) => result,
+        None => PendingResultFile::reserve(
+            root.join("oracles")
+                .join(format!("v4_full61_token_{}_pos_0.rust.jsonl", token_ids[0])),
+        )?,
+    };
+    let result_path = result.path().to_owned();
+    let max_forward_tokens = greedy_forward_tokens(prompt_len, greedy_steps)?;
+    let layer_stationary_prefill = preflight.layer_stationary_prefill;
+    let device_short_decode = optional_one_flag("COLIBRI_V4_DEVICE_ONE_TOKEN_DECODE")?;
+    let layer_stationary_expert_reuse = preflight.layer_stationary_expert_reuse;
+    let phase_profile = preflight.phase_profile;
+    if layer_stationary_prefill {
+        validate_layer_stationary_prefill(
+            prompt_len,
+            greedy_steps,
+            max_layers,
+            true,
+            preflight.qd4_bench,
+            device_short_decode,
+        )?;
+        return run_real_v4_layer_stationary_prefill(
+            context,
+            module,
+            stream,
+            &root,
+            &token_ids,
+            prompt_len,
+            &manifests,
+            chat_user.as_deref(),
+            prompt_text.as_deref(),
+            tokenizer.as_ref(),
+            sparse_attention_arm,
+            layer_stationary_expert_reuse,
+            qd4_enabled,
+            preflight.qd4_immutable_expert_cache,
+            phase_profile,
+            preflight.fixed_prefetch,
+            device_short_decode,
+            greedy_steps,
+            result,
+        );
+    }
+    if device_short_decode {
+        return Err(
+            "COLIBRI_V4_DEVICE_ONE_TOKEN_DECODE=1 enables short device decode and requires layer-stationary prefill".into(),
+        );
+    }
+    let cublas = cublas_exact::CublasExact::load()?;
+    let cublas_provenance = cublas.provenance().clone();
+    drop(cublas);
+    let qd4_device_reserve_bytes = usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES;
+    let qd4_host_reserve_bytes = usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES;
+    let mut cache = FixedLayerCache::from_env(
+        &root,
+        max_layers,
+        qd4_device_reserve_bytes,
+        qd4_host_reserve_bytes,
+        stream,
+    )?;
+    let qd4_setup_started = std::time::Instant::now();
+    let mut qd4_lanes = if qd4_enabled {
+        Some(
+            (0..4)
+                .map(|_| {
+                    let lane_stream = context.new_stream()?;
+                    ExpertSlot::new_empty(context, module, &lane_stream)
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+        )
+    } else {
+        None
+    };
+    let qd4_startup_setup_ns = if qd4_enabled {
+        u64::try_from(qd4_setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let mut persistent = v4_state::V4SerialPersistentState::new(max_forward_tokens)?;
+    let mut layer_records = Vec::with_capacity(max_layers * max_forward_tokens);
+    let mut token_records = Vec::with_capacity(max_forward_tokens);
+    let mut token_e2e_ns = Vec::with_capacity(max_forward_tokens);
+    let mut last_hidden = Vec::new();
+    let final_weights = (greedy_steps != 0)
+        .then(|| v4_state::load_final_head(&root))
+        .transpose()?;
+    let mut greedy_finals = Vec::with_capacity(max_forward_tokens);
+    let mut generated_ids = Vec::with_capacity(greedy_steps);
+    let mut greedy_stop_reason = None;
+    for token_position in 0..max_forward_tokens {
+        let token_id = token_ids[token_position];
+        let embedding = v4_state::load(&root, &[token_id])?.embedding;
+        let mut hc_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+        for _ in 0..v4_state::HC {
+            hc_hidden.extend_from_slice(&embedding);
+        }
+        let token_started = std::time::Instant::now();
+        let mut current_records = Vec::with_capacity(max_layers);
+        let (hidden, telemetry) = v4_state::run_serial_layer_transactions(
+            &mut persistent,
+            hc_hidden,
+            &manifests,
+            |manifest, hidden, layer_state| {
+                let timeline_origin = critical_path_profile
+                    .then_some(())
+                    .filter(|_| token_position == 1 && matches!(manifest.layer, 3 | 4))
+                    .map(|_| std::time::Instant::now());
+                let hash_started = std::time::Instant::now();
+                let hash_ids = load_layer_hash_ids(&root, manifest.layer, &[token_id])?;
+                let dynamic_hash_read_ns =
+                    u64::try_from(hash_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let (run, fixed) = cache.access(
+                    &root,
+                    manifest.layer,
+                    &[token_id],
+                    module,
+                    stream,
+                    |runtime| {
+                        let qd4 = qd4_lanes.as_deref_mut();
+                        run_real_layer_rows(
+                            context,
+                            module,
+                            stream,
+                            runtime,
+                            qd4,
+                            None,
+                            None,
+                            &hash_ids,
+                            hidden,
+                            &[token_id],
+                            token_position,
+                            Some(layer_state),
+                            None,
+                            None,
+                            false,
+                            timeline_origin,
+                            false,
+                            None,
+                        )
+                    },
+                )?;
+                if run.routes.ids.len() != v4_router::V4_TOPK {
+                    return Err(format!(
+                        "layer {} router produced incomplete B=1 routes",
+                        manifest.layer
+                    )
+                    .into());
+                }
+                let main = layer_state.compressor();
+                let indexer = layer_state.indexer();
+                let mut record = serde_json::json!({
+                    "event": "layer",
+                    "token_position": token_position,
+                    "token_id": token_id,
+                    "layer": manifest.layer,
+                    "compression_ratio": manifest.compression_ratio.get(),
+                    "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
+                    "kv_cache_bf16_digest": format!("{:016x}", fnv1a_u16(layer_state.kv_bf16())),
+                    "main_compressed_kv_bf16_digest": format!("{:016x}", fnv1a_u16(layer_state.compressed_kv_bf16())),
+                    "main_compressor_kv_state_f32_digest": format!("{:016x}", fnv1a_f32(main.kv())),
+                    "main_compressor_score_state_f32_digest": format!("{:016x}", fnv1a_f32(main.score())),
+                    "indexer_compressed_kv_bf16_digest": format!("{:016x}", fnv1a_u16(layer_state.indexer_kv_bf16())),
+                    "indexer_compressor_kv_state_f32_digest": indexer.map(|state| format!("{:016x}", fnv1a_f32(state.kv()))),
+                    "indexer_compressor_score_state_f32_digest": indexer.map(|state| format!("{:016x}", fnv1a_f32(state.score()))),
+                    "route_ids": &run.routes.ids,
+                    "route_weights_f32": &run.routes.weights,
+                    "attention_topk_digest": format!("{:016x}", run.attention_topk_digest),
+                    "attention_topk_per_row": run.attention_topk_per_row,
+                    "indexer_topk_gpu_ns": run.indexer_topk_gpu_ns,
+                    "source_range_bytes": fixed.fixed_source_bytes,
+                });
+                if bench_telemetry_enabled() {
+                    record
+                        .as_object_mut()
+                        .ok_or("layer telemetry record is not an object")?
+                        .insert(
+                            "bench".into(),
+                            serde_json::json!({
+                                "fixed_cache_status": fixed.cache_status,
+                                "fixed_read_ns": if matches!(fixed.cache_status, "raw_device_hit" | "raw_host_hit") { Some(0_u64) } else { None },
+                                "fixed_alloc_ns": if fixed.cache_status == "raw_device_hit" { Some(0_u64) } else { None },
+                                "raw_decode_alloc_ns": if matches!(fixed.cache_status, "raw_device_hit" | "raw_host_hit") { Some(0_u64) } else { None },
+                                "fixed_read_alloc_ns": fixed.fixed_read_alloc_ns,
+                                "fixed_decode_ns": fixed.fixed_decode_ns,
+                                "fixed_h2d_ns": fixed.fixed_h2d_ns,
+                                "fixed_h2d_bytes": fixed.fixed_h2d_bytes,
+                                "raw_read_ns": fixed.raw_read_ns,
+                                "raw_source_bytes": fixed.raw_source_bytes,
+                                "raw_h2d_ns": fixed.raw_h2d_ns,
+                                "raw_h2d_bytes": fixed.raw_h2d_bytes,
+                                "dynamic_hash_read_ns": dynamic_hash_read_ns,
+                                "attention_ns": run.stage.attention_ns,
+                                "router_ns": run.stage.router_ns,
+                                "router_mhc_ns": run.stage.router_mhc_ns,
+                                "router_mhc_input_alloc_h2d_sync_ns": run.stage.router_mhc_input_alloc_h2d_sync_ns,
+                                "router_mhc_workspace_alloc_sync_ns": run.stage.router_mhc_workspace_alloc_sync_ns,
+                                "router_mhc_workspace_init_gpu_ns": run.stage.router_mhc_workspace_init_gpu_ns,
+                                "router_mhc_mixing_linear_sync_ns": run.stage.router_mhc_mixing_linear_sync_ns,
+                                "router_mhc_mixing_linear_gpu_ns": run.stage.router_mhc_mixing_linear_gpu_ns,
+                                "router_mhc_sinkhorn_normalize_collapse_sync_ns": run.stage.router_mhc_sinkhorn_normalize_collapse_sync_ns,
+                                "router_mhc_sinkhorn_normalize_collapse_gpu_ns": run.stage.router_mhc_sinkhorn_normalize_collapse_gpu_ns,
+                                "router_mhc_output_d2h_sync_ns": run.stage.router_mhc_output_d2h_sync_ns,
+                                "router_mhc_other_ns": run.stage.router_mhc_other_ns,
+                                "router_host_prep_ns": run.stage.router_host_prep_ns,
+                                "router_alloc_h2d_sync_ns": run.stage.router_alloc_h2d_sync_ns,
+                                "router_workspace_alloc_ns": run.stage.router_workspace_alloc_ns,
+                                "router_kernel_select_sync_ns": run.stage.router_kernel_select_sync_ns,
+                                "router_kernel_select_gpu_ns": run.stage.router_kernel_select_gpu_ns,
+                                "router_d2h_sync_ns": run.stage.router_d2h_sync_ns,
+                                "router_other_ns": run.stage.router_other_ns,
+                                "shared_ns": run.stage.shared_ns,
+                                "routed_ns": run.stage.routed_ns,
+                                "routed_read_ns": run.stage.routed_read_ns,
+                                "routed_alloc_ns": run.stage.routed_alloc_ns,
+                                "routed_setup_ns": run.stage.routed_setup_ns,
+                                "routed_h2d_ns": run.stage.routed_h2d_ns,
+                                "routed_kernel_ns": run.stage.routed_kernel_ns,
+                                "commit_ns": run.stage.commit_ns,
+                                "routed_source_bytes": run.stage.routed_source_bytes,
+                                "routed_h2d_bytes": run.stage.routed_h2d_bytes,
+                            }),
+                        );
+                }
+                if let Some(timeline) = run.critical_path_timeline {
+                    record
+                        .as_object_mut()
+                        .ok_or("layer timeline record is not an object")?
+                        .insert("critical_path_timeline".into(), timeline.as_json());
+                }
+                current_records.push(record);
+                Ok(v4_state::TransactionalLayerOutput {
+                    next_hidden: run.output,
+                    source_range_bytes: manifest.contract_range_bytes,
+                    indexer_topk_cpu_ns: 0,
+                })
+            },
+        )?;
+        if telemetry.len() != max_layers {
+            return Err("V4 B=1 prefix committed fewer layers than requested".into());
+        }
+        for (record, telemetry) in current_records.iter_mut().zip(&telemetry) {
+            let object = record
+                .as_object_mut()
+                .ok_or("full61 layer telemetry record is not an object")?;
+            object.insert(
+                "manifest_contract_range_bytes".into(),
+                telemetry.source_range_bytes.into(),
+            );
+            object.insert("layer_elapsed_ns".into(), telemetry.layer_elapsed_ns.into());
+            object.insert("kv_rows_before".into(), telemetry.kv_rows_before.into());
+            object.insert("kv_rows_after".into(), telemetry.kv_rows_after.into());
+            object.insert(
+                "indexer_topk_cpu_ns".into(),
+                telemetry.indexer_topk_cpu_ns.into(),
+            );
+            if let Some(timeline) = object
+                .get_mut("critical_path_timeline")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let output_ready_ns = timeline
+                    .get("output_ready_ns")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("critical-path timeline omitted output ready timestamp")?;
+                timeline.insert(
+                    "outer_transaction_commit_and_unprofiled_residual_ns".into(),
+                    telemetry
+                        .layer_elapsed_ns
+                        .saturating_sub(output_ready_ns)
+                        .into(),
+                );
+                timeline.insert(
+                    "outer_layer_elapsed_ns".into(),
+                    telemetry.layer_elapsed_ns.into(),
+                );
+            }
+        }
+        let elapsed_ns = u64::try_from(token_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        token_e2e_ns.push(elapsed_ns);
+        token_records.push(serde_json::json!({
+            "event": "token",
+            "token_position": token_position,
+            "token_id": token_id,
+            "e2e_ns": elapsed_ns,
+            "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&hidden)),
+            "device_cache_resident_bytes": cache.device_resident_bytes,
+            "host_cache_resident_bytes": cache.host_resident_bytes,
+            "device_cache_hits": cache.device_hits,
+            "host_cache_hits": cache.host_hits,
+            "cache_misses": cache.misses,
+        }));
+        layer_records.extend(current_records);
+        last_hidden = hidden;
+        if b1_needs_final_head(prompt_len, token_position) {
+            if let Some(weights) = &final_weights {
+                let cpu = v4_state::final_checkpoint_head_cpu_timed(weights, &last_hidden, 1)?;
+                let next_id = i64::try_from(cpu.output.argmax[0])?;
+                match greedy_argmax_decision(
+                    prompt_len,
+                    token_position,
+                    generated_ids.len(),
+                    greedy_steps,
+                    next_id,
+                ) {
+                    GreedyDecision::IgnorePrompt => {}
+                    GreedyDecision::EmitAndContinue => {
+                        generated_ids.push(next_id);
+                        token_ids.push(next_id);
+                    }
+                    GreedyDecision::EmitAndStop(reason) => {
+                        generated_ids.push(next_id);
+                        token_ids.push(next_id);
+                        greedy_stop_reason = Some(reason);
+                    }
+                }
+                greedy_finals.push(serde_json::json!({
+                "event": "final",
+                "position": token_position,
+                "input_id": token_id,
+                "input_kind": if token_position < prompt_len { "prompt" } else { "generated" },
+                "state": "V4SerialPersistentState",
+                "head": "canonical_cpu_streamed_bf16",
+                "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
+                "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+                "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+                "argmax": cpu.output.argmax[0],
+                "status": "PASS",
+            }));
+                if greedy_stop_reason.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let forward_input_len = token_records.len();
+    let greedy_stop_reason = if greedy_steps == 0 {
+        None
+    } else {
+        Some(
+            match greedy_stop_reason.ok_or("greedy decoding ended without a stop reason")? {
+                GreedyStopReason::Eos => "eos",
+                GreedyStopReason::MaxNewTokens => "max_new_tokens",
+            },
+        )
+    };
+    let mut request_e2e_ns = None;
+    let mut final_head_header = serde_json::Value::Null;
+    let mut final_record = None;
+    let mut argmax = None;
+    if max_layers == v4_state::V4_LAYER_COUNT && greedy_steps == 0 {
+        let load_started = std::time::Instant::now();
+        let final_weights = v4_state::load_final_head(&root)?;
+        let fixed_read_ns = u64::try_from(load_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let cpu = v4_state::final_checkpoint_head_cpu_timed(&final_weights, &last_hidden, 1)?;
+        let cpu_final_wall_ns = fixed_read_ns.saturating_add(cpu.wall_ns);
+        request_e2e_ns =
+            Some(u64::try_from(request_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        final_head_header = serde_json::json!({
+            "mode": "canonical_cpu_streamed_bf16",
+            "fixed_read_ns": fixed_read_ns,
+            "cpu_oracle": {
+                "wall_ns": cpu_final_wall_ns,
+                "streamed_weight_read_ns": cpu.read_ns,
+            },
+            "h2d_ns": 0,
+            "kernel_ns": 0,
+            "stage1_gpu_status": "KILL",
+        });
+        argmax = Some(cpu.output.argmax[0]);
+        final_record = Some(serde_json::json!({
+            "event": "final",
+            "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
+            "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+            "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+            "argmax": cpu.output.argmax[0],
+            "status": "PASS",
+        }));
+    } else if greedy_steps != 0 {
+        request_e2e_ns = Some(token_e2e_ns.iter().copied().sum());
+        final_head_header = serde_json::json!({
+            "mode": "canonical_cpu_streamed_bf16",
+            "invocation": "after_each_forward",
+            "weight_shard": "model-00063-of-00064.safetensors",
+            "output": "per-forward final records"
+        });
+    }
+    let mut provenance = benchmark_provenance()?;
+    provenance
+        .as_object_mut()
+        .ok_or("benchmark provenance is not an object")?
+        .insert(
+            "cublas_exact".into(),
+            serde_json::json!({
+                "resolved_path": cublas_provenance.resolved_path,
+                "sha256": cublas_provenance.actual_sha256,
+                "version": cublas_provenance.version,
+                "dladdr_path": cublas_provenance.dladdr_path,
+                "proc_maps_path": cublas_provenance.maps_path,
+            }),
+        );
+    let mut run_header = serde_json::json!({
+        "event": "run",
+        "schema": if greedy_steps != 0 {
+            "colibri-v4-greedy-id-trace-v1"
+        } else if token_ids.len() == 1 && cache.plan.is_empty() {
+            "colibri-v4-full61-trace-v1"
+        } else {
+            "colibri-v4-fixed-cache-trace-v1"
+        },
+        "implementation": "rust-cuda",
+        "provenance": provenance,
+        "token_e2e_ns": token_e2e_ns,
+        "request_e2e_ns": request_e2e_ns,
+        "request_e2e_definition": "token input through canonical CPU-streamed final logits and argmax",
+        "final_head": final_head_header,
+        "model_revision": v4_state::REVISION,
+        "token_id": if token_ids.len() == 1 { Some(token_ids[0]) } else { None },
+        "token_ids": &token_ids[..forward_input_len],
+        "emitted_token_ids": &token_ids,
+        "prompt_ids": &token_ids[..prompt_len],
+        "greedy_steps": greedy_steps,
+        "generated_ids": &generated_ids,
+        "generation_mode": if greedy_steps == 0 { "teacher_forced" } else { "id_only_greedy_argmax" },
+        "start_pos": 0,
+        "layers": v4_state::V4_LAYER_COUNT,
+        "executed_layers": max_layers,
+        "model_dir": root,
+        "device_fixed_cache_budget_bytes": cache.device_budget_bytes,
+        "host_fixed_cache_budget_bytes": cache.host_budget_bytes,
+        "fixed_read_alloc_split": "unavailable",
+        "raw_fixed_cache": cache.raw_mode,
+        "raw_fixed_scratch_bytes": cache.raw_scratch.as_ref().map_or(0, DeviceBuffer::num_bytes),
+        "sparse_attention_arm": match sparse_attention_arm {
+            SparseAttentionArm::Reference => "reference:sparse_attn_v4_bf16",
+            SparseAttentionArm::ScoreReuse => "score_reuse:sparse_attn_v4_scores+probabilities+values",
+            SparseAttentionArm::Sm89Crossover => {
+                "sm89_crossover:K<4=reference,K>=4=score_reuse"
+            }
+        },
+        "routed_qd4": qd4_enabled,
+        "routed_qd4_startup_setup_ns": qd4_startup_setup_ns,
+        "routed_qd4_pinned_host_bytes": qd4_host_reserve_bytes,
+        "routed_qd4_device_bytes": qd4_device_reserve_bytes,
+    });
+    if prompt_text.is_some() || chat_user.is_some() {
+        let tokenizer = tokenizer
+            .as_ref()
+            .ok_or("raw V4 text prompt has no loaded tokenizer")?;
+        let generated_for_decode = generated_ids
+            .iter()
+            .copied()
+            .filter(|&id| id != V4_EOS_TOKEN_ID)
+            .collect::<Vec<_>>();
+        let cumulative_for_decode = token_ids
+            .iter()
+            .copied()
+            .filter(|&id| id != V4_EOS_TOKEN_ID)
+            .collect::<Vec<_>>();
+        let header = run_header
+            .as_object_mut()
+            .ok_or("V4 B1 run header is not an object")?;
+        header.insert(
+            "encoded_prompt_ids".into(),
+            serde_json::json!(&token_ids[..prompt_len]),
+        );
+        header.insert(
+            "generated_only_decoded_text".into(),
+            serde_json::json!(tokenizer.decode(&generated_for_decode)?),
+        );
+        header.insert(
+            "cumulative_decoded_text".into(),
+            serde_json::json!(tokenizer.decode(&cumulative_for_decode)?),
+        );
+        if let Some(text) = prompt_text.as_deref() {
+            header.insert("prompt_text".into(), serde_json::json!(text));
+            header.insert(
+                "tokenizer".into(),
+                serde_json::json!({
+                    "mode": "raw",
+                    "chat_template": false,
+                    "add_special_tokens": false,
+                }),
+            );
+        } else {
+            header.insert(
+                "chat_user".into(),
+                serde_json::json!(chat_user.as_deref().ok_or("missing V4 chat user")?),
+            );
+            header.insert(
+                "prompt_encoding".into(),
+                serde_json::json!({
+                    "name": "official_encoding_dsv4",
+                    "mode": "single_user",
+                    "thinking_mode": "chat",
+                    "jinja_template": false,
+                    "tools": false,
+                    "multiturn": false,
+                    "add_special_tokens": false,
+                }),
+            );
+        }
+    }
+    if let Some(stop_reason) = greedy_stop_reason {
+        let header = run_header
+            .as_object_mut()
+            .ok_or("V4 B1 run header is not an object")?;
+        header.insert("stop_reason".into(), serde_json::json!(stop_reason));
+        header.insert("eos_token_id".into(), serde_json::json!(V4_EOS_TOKEN_ID));
+        header.insert("max_new_tokens".into(), serde_json::json!(greedy_steps));
+        header.insert(
+            "actual_generated_count".into(),
+            serde_json::json!(generated_ids.len()),
+        );
+    }
+    writeln!(result.file_mut(), "{run_header}")?;
+    for (index, plan) in cache.plan.iter().enumerate() {
+        let tier = if cache.device_selected[index] {
+            if cache.raw_mode {
+                "raw_device"
+            } else {
+                "device"
+            }
+        } else if cache.host_selected[index] {
+            if cache.raw_mode { "raw_host" } else { "host" }
+        } else {
+            "uncached"
+        };
+        for tensor in &plan.tensors {
+            writeln!(
+                result.file_mut(),
+                "{}",
+                serde_json::json!({
+                    "event": "fixed_cache_manifest",
+                    "revision": v4_state::REVISION,
+                    "layer": plan.layer,
+                    "tensor": tensor.name,
+                    "dtype": tensor.dtype,
+                    "shape": tensor.shape,
+                    "source_bytes": tensor.source_bytes,
+                    "decoded_bytes": tensor.decoded_bytes,
+                    "expected_device_saved_ns_per_byte": plan.device_saved_ns as f64 / plan.device_bytes as f64,
+                    "expected_host_saved_ns_per_byte": plan.host_saved_ns as f64 / plan.host_bytes as f64,
+                    "tier": tier,
+                })
+            )?;
+        }
+    }
+    let mut token_record = token_records.iter();
+    for (position, record) in layer_records.iter().enumerate() {
+        writeln!(result.file_mut(), "{record}")?;
+        if token_ids.len() > 1 && (position + 1).is_multiple_of(max_layers) {
+            writeln!(
+                result.file_mut(),
+                "{}",
+                token_record
+                    .next()
+                    .ok_or("missing token telemetry record")?
+            )?;
+        }
+    }
+    for final_record in greedy_finals {
+        writeln!(result.file_mut(), "{final_record}")?;
+    }
+    if let Some(final_record) = final_record {
+        writeln!(result.file_mut(), "{final_record}")?;
+    }
+    result.commit()?;
+    if let Some(stop_reason) = greedy_stop_reason {
+        if let Some(text) = prompt_text.as_deref() {
+            println!(
+                "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"tokenizer\":\"raw\",\"chat_template\":false,\"prompt_text\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"stop_reason\":{},\"eos_token_id\":{},\"max_new_tokens\":{},\"actual_generated_count\":{},\"result_jsonl\":{}}}",
+                serde_json::to_string(text)?,
+                serde_json::to_string(&token_ids)?,
+                serde_json::to_string(&generated_ids)?,
+                max_layers,
+                serde_json::to_string(&generated_ids.last())?,
+                serde_json::to_string(stop_reason)?,
+                V4_EOS_TOKEN_ID,
+                greedy_steps,
+                generated_ids.len(),
+                serde_json::to_string(&result_path)?
+            );
+        } else if let Some(user) = chat_user.as_deref() {
+            println!(
+                "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"prompt_encoding\":\"official_encoding_dsv4\",\"chat_mode\":\"single_user\",\"jinja_template\":false,\"tools\":false,\"multiturn\":false,\"chat_user\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"stop_reason\":{},\"eos_token_id\":{},\"max_new_tokens\":{},\"actual_generated_count\":{},\"result_jsonl\":{}}}",
+                serde_json::to_string(user)?,
+                serde_json::to_string(&token_ids)?,
+                serde_json::to_string(&generated_ids)?,
+                max_layers,
+                serde_json::to_string(&generated_ids.last())?,
+                serde_json::to_string(stop_reason)?,
+                V4_EOS_TOKEN_ID,
+                greedy_steps,
+                generated_ids.len(),
+                serde_json::to_string(&result_path)?
+            );
+        } else {
+            println!(
+                "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"stop_reason\":{},\"eos_token_id\":{},\"max_new_tokens\":{},\"actual_generated_count\":{},\"result_jsonl\":{}}}",
+                serde_json::to_string(&token_ids)?,
+                serde_json::to_string(&generated_ids)?,
+                max_layers,
+                serde_json::to_string(&generated_ids.last())?,
+                serde_json::to_string(stop_reason)?,
+                V4_EOS_TOKEN_ID,
+                greedy_steps,
+                generated_ids.len(),
+                serde_json::to_string(&result_path)?
+            );
+        }
+    } else if let Some(text) = prompt_text {
+        println!(
+            "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"tokenizer\":\"raw\",\"chat_template\":false,\"prompt_text\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"result_jsonl\":{}}}",
+            serde_json::to_string(&text)?,
+            serde_json::to_string(&token_ids)?,
+            serde_json::to_string(&generated_ids)?,
+            max_layers,
+            serde_json::to_string(&argmax)?,
+            serde_json::to_string(&result_path)?
+        );
+    } else if let Some(user) = chat_user.as_deref() {
+        println!(
+            "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"prompt_encoding\":\"official_encoding_dsv4\",\"chat_mode\":\"single_user\",\"jinja_template\":false,\"tools\":false,\"multiturn\":false,\"chat_user\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"result_jsonl\":{}}}",
+            serde_json::to_string(user)?,
+            serde_json::to_string(&token_ids)?,
+            serde_json::to_string(&generated_ids)?,
+            max_layers,
+            serde_json::to_string(&argmax)?,
+            serde_json::to_string(&result_path)?
+        );
+    } else {
+        println!(
+            "{{\"status\":\"PASS\",\"mode\":\"v4-b1-prefix\",\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"result_jsonl\":{}}}",
+            serde_json::to_string(&token_ids)?,
+            serde_json::to_string(&generated_ids)?,
+            max_layers,
+            serde_json::to_string(&argmax)?,
+            serde_json::to_string(&result_path)?
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_real_v4_layer_stationary_prefill(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    root: &std::path::Path,
+    token_ids: &[i64],
+    prompt_len: usize,
+    manifests: &[v4_state::LayerExecutionManifest],
+    chat_user: Option<&str>,
+    prompt_text: Option<&str>,
+    tokenizer: Option<&v4_tokenizer::V4Tokenizer>,
+    sparse_attention_arm: SparseAttentionArm,
+    expert_slot_reuse: bool,
+    qd4_enabled: bool,
+    qd4_immutable_expert_cache: bool,
+    phase_profile: bool,
+    fixed_prefetch: bool,
+    device_short_decode: bool,
+    greedy_steps: usize,
+    mut result: PendingResultFile,
+) -> Result<(), Box<dyn Error>> {
+    if token_ids.len() != prompt_len || manifests.len() != v4_state::V4_LAYER_COUNT {
+        return Err(
+            "layer-stationary prefill received a non-prompt token or partial manifest".into(),
+        );
+    }
+    if expert_slot_reuse && qd4_enabled {
+        return Err("layer-stationary expert reuse and QD4 lanes must not coexist".into());
+    }
+    if qd4_immutable_expert_cache && !qd4_enabled {
+        return Err("QD4 immutable expert cache requires persistent QD4 lanes".into());
+    }
+    let device_attention = optional_one_flag("COLIBRI_V4_DEVICE_ATTENTION_PRODUCTION")?;
+    let device_attention_audit = optional_one_flag("COLIBRI_V4_DEVICE_ATTENTION_AUDIT")?;
+    if device_attention_audit && !device_attention {
+        return Err(
+            "COLIBRI_V4_DEVICE_ATTENTION_AUDIT=1 requires COLIBRI_V4_DEVICE_ATTENTION_PRODUCTION=1"
+                .into(),
+        );
+    }
+    if device_short_decode && !device_attention {
+        return Err("short device decode requires device-attention production".into());
+    }
+    let l0_cutpoint = optional_one_flag("COLIBRI_V4_L0_POS0_CUTPOINT")?;
+    let raw_wo_a_gpu_decode = raw_wo_a_gpu_decode_enabled()?;
+    let fixed_prefetch_wo_a_arm =
+        fixed_prefetch_wo_a_decode_arm(fixed_prefetch, device_attention, raw_wo_a_gpu_decode);
+    let fixed_prefetch_raw_wo_a = fixed_prefetch_wo_a_arm == "raw_fp8_gpu_decode";
+    if device_short_decode && !fixed_prefetch_raw_wo_a {
+        return Err("short device decode requires raw wo_a fixed prefetch".into());
+    }
+    if device_short_decode && phase_profile && device_attention_audit {
+        return Err("short device phase profile requires production non-audit attention".into());
+    }
+    if qd4_enabled {
+        if device_attention {
+            if host_available_bytes()?
+                < V4_QD4_PINNED_HOST_BYTES
+                    + usize::from(qd4_immutable_expert_cache)
+                        * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES
+            {
+                return Err("persistent QD4 lanes lack the explicit pinned-host reserve".into());
+            }
+        } else {
+            if !qd4_immutable_expert_cache {
+                validate_qd4_lane_reserve(host_available_bytes()?, device_available_bytes()?)?;
+            }
+            let required_host = V4_QD4_PINNED_HOST_BYTES
+                + usize::from(qd4_immutable_expert_cache)
+                    * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES;
+            let required_device = V4_QD4_DEVICE_BYTES
+                + usize::from(qd4_immutable_expert_cache)
+                    * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES;
+            if host_available_bytes()? < required_host
+                || device_available_bytes()? < required_device
+            {
+                return Err("persistent QD4 lanes plus immutable cache lack the explicit pinned-host/device reserve".into());
+            }
+        }
+    }
+    if device_attention && prompt_len != 5 {
+        return Err(
+            "device attention semantic pilot requires exactly five prompt positions".into(),
+        );
+    }
+    let short_decode_rows =
+        short_device_decode_rows(prompt_len, greedy_steps, device_short_decode)?;
+    let strict_audit_scratch_required =
+        strict_compressor_enabled() && (!device_attention || device_attention_audit);
+    let strict_audit_arena_bytes = strict_audit_scratch_required
+        .then(StrictCompressorScratch::host_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let device_attention_capacity = device_attention
+        .then(|| {
+            validate_device_attention_capacity(
+                root,
+                qd4_enabled,
+                qd4_immutable_expert_cache,
+                short_decode_rows,
+                device_available_bytes()?,
+            )
+        })
+        .transpose()?;
+    let fixed_prefetch_max_future_host_bytes = fixed_prefetch
+        .then(|| {
+            validate_fixed_prefetch_window(
+                root,
+                manifests,
+                qd4_enabled,
+                qd4_immutable_expert_cache,
+                strict_audit_arena_bytes,
+            )
+        })
+        .transpose()?;
+    let request_started = std::time::Instant::now();
+    let device_rope_lut_started = std::time::Instant::now();
+    let device_rope_lut = device_attention
+        .then(|| DeviceRequestRopeLut::new(stream, short_decode_rows))
+        .transpose()?;
+    let device_rope_lut_setup_ns = device_attention
+        .then(|| u64::try_from(device_rope_lut_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let mut strict_scratch = strict_audit_scratch_required
+        .then(|| StrictCompressorScratch::new(stream))
+        .transpose()?;
+    let mut hidden = token_ids
+        .iter()
+        .map(|&token_id| {
+            let embedding = v4_state::load(root, &[token_id])?.embedding;
+            let mut row = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+            for _ in 0..v4_state::HC {
+                row.extend_from_slice(&embedding);
+            }
+            Ok::<_, Box<dyn Error>>(row)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let host_persistent_rows = if device_short_decode && device_attention_audit {
+        short_decode_rows
+    } else {
+        prompt_len
+    };
+    let mut persistent = (!device_attention || device_attention_audit)
+        .then(|| v4_state::V4SerialPersistentState::new(host_persistent_rows))
+        .transpose()?;
+    let mut layer_records = (0..prompt_len)
+        .map(|_| Vec::with_capacity(manifests.len()))
+        .collect::<Vec<Vec<serde_json::Value>>>();
+    let mut fixed_source_bytes = 0_usize;
+    let mut fixed_h2d_bytes = 0_usize;
+    let mut routed_source_bytes = 0_usize;
+    let mut routed_h2d_bytes = 0_usize;
+    let mut routed_expert_loads = 0_usize;
+    let mut device_attention_dispatches = 0_usize;
+    let device_attention_host_fallbacks = 0_usize;
+    let mut device_attention_h2d_count = usize::from(device_attention);
+    let mut device_attention_h2d_bytes = device_rope_lut
+        .as_ref()
+        .map_or(0, DeviceRequestRopeLut::num_bytes);
+    let mut device_attention_rope_lut_d2d_count = 0_usize;
+    let mut device_attention_rope_lut_d2d_bytes = 0_usize;
+    let mut device_attention_terminal_d2h_count = 0_usize;
+    let mut device_attention_terminal_d2h_bytes = 0_usize;
+    let mut device_attention_audit_d2h_count = 0_usize;
+    let mut device_attention_audit_d2h_bytes = 0_usize;
+    let mut phase_profile_top_level_ns = 0_u64;
+    let mut phase_profile_layer_outer_ns = 0_u64;
+    let mut phase_profile_final_outer_ns = 0_u64;
+    let mut one_token_decode_phase_profile_layer_outer_ns = 0_u64;
+    let mut one_token_decode_phase_profile_final_outer_ns = 0_u64;
+    let mut fixed_prefetch_records = Vec::with_capacity(manifests.len().saturating_sub(1));
+    let mut device_states = device_attention.then(|| {
+        std::iter::repeat_with(|| None)
+            .take(if device_short_decode {
+                v4_state::V4_LAYER_COUNT
+            } else {
+                2
+            })
+            .collect::<Vec<Option<DeviceTokenState>>>()
+    });
+    let qd4_setup_started = std::time::Instant::now();
+    let mut qd4_lanes = if qd4_enabled {
+        Some(
+            (0..qd4_lane_count(true))
+                .map(|_| {
+                    let lane_stream = context.new_stream()?;
+                    ExpertSlot::new_empty(context, module, &lane_stream)
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?,
+        )
+    } else {
+        None
+    };
+    let mut qd4_immutable_cache = qd4_immutable_expert_cache
+        .then(|| Qd4ImmutableExpertCache::new(context, module))
+        .transpose()?;
+    let qd4_startup_setup_ns = qd4_enabled
+        .then(|| u64::try_from(qd4_setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+
+    std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+        let mut prefetch_window: VecDeque<FixedPrefetchTask<'_>> = VecDeque::new();
+        let mut next_prefetch_index = 0_usize;
+        let scoped_result = (|| -> Result<(), Box<dyn Error>> {
+            while fixed_prefetch
+                && prefetch_window.len() < FIXED_PREFETCH_WINDOW_DEPTH
+                && next_prefetch_index < manifests.len()
+            {
+                let next_layer = manifests[next_prefetch_index].layer;
+                let worker_root = root.to_owned();
+                let worker_start_ns = timeline_elapsed_ns(request_started);
+                let worker = scope.spawn(move || {
+                    let (host, telemetry) = if fixed_prefetch_raw_wo_a {
+                        load_layer_host_raw_wo_a(&worker_root, next_layer, token_ids)
+                    } else {
+                        load_layer_host(&worker_root, next_layer, token_ids)
+                    }
+                    .map_err(|error| error.to_string())?;
+                    let worker_end_ns = timeline_elapsed_ns(request_started);
+                    Ok(FixedPrefetchedHost {
+                        layer: next_layer,
+                        host_bytes: host.num_bytes(),
+                        host,
+                        telemetry,
+                        worker_start_ns,
+                        worker_end_ns,
+                    })
+                });
+                prefetch_window.push_back(FixedPrefetchTask {
+                    layer: next_layer,
+                    transition: None,
+                    worker,
+                });
+                next_prefetch_index += 1;
+            }
+            for (manifest_index, manifest) in manifests.iter().enumerate() {
+                let fixed_scope_started_ns =
+                    phase_profile.then(|| timeline_elapsed_ns(request_started));
+                let layer_prepare_started = phase_profile.then(std::time::Instant::now);
+                let mut prefetched_current = false;
+                let (runtime, fixed) = if fixed_prefetch {
+                    let consume_start_ns = timeline_elapsed_ns(request_started);
+                    let task = prefetch_window
+                        .pop_front()
+                        .ok_or("bounded fixed prefetch window is empty at consume")?;
+                    if task.layer != manifest.layer {
+                        return Err("bounded fixed prefetch window lost layer order".into());
+                    }
+                    let compute_end_ns = task
+                        .transition
+                        .as_ref()
+                        .map(|transition| transition.compute_end_ns);
+                    let prefetched = task
+                        .worker
+                        .join()
+                        .map_err(|_| "layer-stationary fixed prefetch worker panicked")?
+                        .map_err(|error| {
+                            format!("layer-stationary fixed prefetch worker failed: {error}")
+                        })?;
+                    if manifest_index > 0 {
+                        let transition = task.transition.ok_or(
+                        "bounded fixed prefetch reached consume before the preceding layer closed",
+                    )?;
+                        fixed_prefetch_records.push(fixed_prefetch_transition_json(
+                            transition.from_layer,
+                            prefetched.layer,
+                            &prefetched.telemetry,
+                            prefetched.worker_start_ns,
+                            prefetched.worker_end_ns,
+                            prefetched.host_bytes,
+                            transition.compute_start_ns,
+                            compute_end_ns
+                                .ok_or("bounded fixed prefetch transition lacks compute end")?,
+                            consume_start_ns,
+                            FIXED_PREFETCH_WINDOW_DEPTH,
+                        )?);
+                    } else if compute_end_ns.is_some() {
+                        return Err(
+                            "bounded fixed prefetch startup task unexpectedly has a transition"
+                                .into(),
+                        );
+                    }
+                    let h2d_started = std::time::Instant::now();
+                    let (runtime, upload) = if fixed_prefetch_raw_wo_a {
+                        upload_layer_runtime_raw_wo_a(
+                            root,
+                            manifest.layer,
+                            &prefetched.host,
+                            module,
+                            stream,
+                        )?
+                    } else {
+                        let runtime =
+                            upload_layer_runtime(root, manifest.layer, &prefetched.host, stream)?;
+                        if bench_telemetry_enabled() {
+                            stream.synchronize()?;
+                        }
+                        (
+                            runtime,
+                            FixedLoadTelemetry {
+                                fixed_h2d_ns: u64::try_from(h2d_started.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                                fixed_h2d_bytes: 0,
+                                cache_status: "prefetched_blocking_h2d",
+                                ..FixedLoadTelemetry::default()
+                            },
+                        )
+                    };
+                    let mut telemetry = prefetched.telemetry;
+                    telemetry.fixed_h2d_ns = upload.fixed_h2d_ns;
+                    telemetry.fixed_h2d_bytes = if fixed_prefetch_raw_wo_a {
+                        upload.fixed_h2d_bytes
+                    } else {
+                        runtime.weights.num_bytes()
+                    };
+                    telemetry.fixed_decode_ns = upload.fixed_decode_ns;
+                    telemetry.raw_h2d_ns = upload.raw_h2d_ns;
+                    telemetry.raw_h2d_bytes = upload.raw_h2d_bytes;
+                    prefetched_current = true;
+                    (runtime, telemetry)
+                } else {
+                    load_layer_runtime(root, manifest.layer, token_ids, stream)?
+                };
+                fixed_source_bytes = fixed_source_bytes.saturating_add(fixed.fixed_source_bytes);
+                fixed_h2d_bytes = fixed_h2d_bytes.saturating_add(fixed.fixed_h2d_bytes);
+                let blocking_fixed = prefetched_current.then(|| FixedLoadTelemetry {
+                    fixed_decode_ns: fixed.fixed_decode_ns,
+                    fixed_h2d_ns: fixed.fixed_h2d_ns,
+                    fixed_h2d_bytes: fixed.fixed_h2d_bytes,
+                    fixed_source_bytes: fixed.fixed_source_bytes,
+                    raw_h2d_ns: fixed.raw_h2d_ns,
+                    raw_h2d_bytes: fixed.raw_h2d_bytes,
+                    cache_status: "prefetched_blocking_h2d",
+                    ..FixedLoadTelemetry::default()
+                });
+                let hash_ids = load_layer_hash_ids(root, manifest.layer, token_ids)?;
+                let layer_prepare_ns = layer_prepare_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                while fixed_prefetch
+                    && prefetch_window.len() < FIXED_PREFETCH_WINDOW_DEPTH
+                    && next_prefetch_index < manifests.len()
+                {
+                    let next_layer = manifests[next_prefetch_index].layer;
+                    let worker_root = root.to_owned();
+                    let worker_start_ns = timeline_elapsed_ns(request_started);
+                    let worker = scope.spawn(move || {
+                        let (host, telemetry) = if fixed_prefetch_raw_wo_a {
+                            load_layer_host_raw_wo_a(&worker_root, next_layer, token_ids)
+                        } else {
+                            load_layer_host(&worker_root, next_layer, token_ids)
+                        }
+                        .map_err(|error| error.to_string())?;
+                        let worker_end_ns = timeline_elapsed_ns(request_started);
+                        Ok(FixedPrefetchedHost {
+                            layer: next_layer,
+                            host_bytes: host.num_bytes(),
+                            host,
+                            telemetry,
+                            worker_start_ns,
+                            worker_end_ns,
+                        })
+                    });
+                    prefetch_window.push_back(FixedPrefetchTask {
+                        layer: next_layer,
+                        transition: None,
+                        worker,
+                    });
+                    next_prefetch_index += 1;
+                }
+                let compute_start_ns = timeline_elapsed_ns(request_started);
+                if let Some(cache) = qd4_immutable_cache.as_mut() {
+                    cache.begin_layer(manifest.layer)?;
+                }
+                // ponytail: retain at most the laptop-safe per-layer cap; add eviction
+                // only if profiling shows reloads beyond that cap dominate.
+                let mut expert_slots = expert_slot_reuse.then(BTreeMap::new);
+                let device_state_started = std::time::Instant::now();
+                let mut device_state_reset_cuda_ns = 0_u64;
+                let mut device_state_reset_calls = 0_usize;
+                let mut device_state = None;
+                if device_attention {
+                    let states = device_states
+                        .as_mut()
+                        .ok_or("device state cache disappeared during production prefill")?;
+                    let state_index = if device_short_decode {
+                        manifest.layer
+                    } else if manifest.compression_ratio == v4_state::CompressionRatio::Csa4 {
+                        1
+                    } else {
+                        0
+                    };
+                    let slot = states
+                        .get_mut(state_index)
+                        .ok_or("device state cache index is outside its declared layout")?;
+                    if slot.is_none() {
+                        *slot = Some(DeviceTokenState::new(stream, &runtime.weights)?);
+                    }
+                    let state = slot
+                        .as_mut()
+                        .ok_or("device state cache slot disappeared during production prefill")?;
+                    let csa = manifest.compression_ratio == v4_state::CompressionRatio::Csa4;
+                    let reset_start = (!device_short_decode && csa)
+                        .then(|| {
+                            stream
+                                .context()
+                                .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+                        })
+                        .transpose()?;
+                    if let Some(start) = reset_start.as_ref() {
+                        start.record(stream)?;
+                    }
+                    if !device_short_decode {
+                        device_state_reset_calls =
+                            state.reset_for_layer(module, stream, &runtime.weights)?;
+                    }
+                    if let Some(start) = reset_start.as_ref() {
+                        let reset_end = stream
+                            .context()
+                            .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+                        reset_end.record(stream)?;
+                        reset_end.synchronize()?;
+                        device_state_reset_cuda_ns =
+                            (start.elapsed_ms(&reset_end)? as f64 * 1_000_000.0) as u64;
+                    }
+                    device_state = Some(state);
+                }
+                let device_state_setup_ns = device_attention
+                    .then(|| {
+                        u64::try_from(device_state_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                    })
+                    .unwrap_or(0);
+                for token_position in 0..prompt_len {
+                    let layer_scope_started_ns = phase_profile.then(|| {
+                        if token_position == 0 {
+                            fixed_scope_started_ns
+                                .expect("profiled fixed scope must have a request-relative start")
+                        } else {
+                            timeline_elapsed_ns(request_started)
+                        }
+                    });
+                    let token_id = token_ids[token_position];
+                    let row_hash_ids = if runtime.weights.hash_router {
+                        &hash_ids[token_position * v4_router::V4_TOPK
+                            ..(token_position + 1) * v4_router::V4_TOPK]
+                    } else {
+                        &[]
+                    };
+                    let kv_rows_before = device_state.as_ref().map_or_else(
+                        || {
+                            persistent
+                                .as_ref()
+                                .and_then(|state| state.layer(manifest.layer))
+                                .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
+                        },
+                        |state| state.committed_rows,
+                    );
+                    let cutpoint_pre_hidden =
+                        l0_cutpoint.then(|| format!("{:016x}", fnv1a_u16(&hidden[token_position])));
+                    let mut observed_state = None;
+                    let mut completed = None;
+                    if device_attention && !device_attention_audit {
+                        completed = Some(run_real_layer_rows(
+                            context,
+                            module,
+                            stream,
+                            &runtime,
+                            qd4_lanes.as_deref_mut(),
+                            qd4_immutable_cache.as_mut(),
+                            expert_slots.as_mut(),
+                            row_hash_ids,
+                            &hidden[token_position],
+                            &[token_id],
+                            token_position,
+                            None,
+                            device_state.as_deref_mut(),
+                            device_rope_lut.as_ref(),
+                            false,
+                            None,
+                            false,
+                            None,
+                        )?);
+                    } else {
+                        persistent
+                        .as_mut()
+                        .ok_or("host persistent state is unavailable outside device production")?
+                        .transaction(manifest.layer, |layer_state| {
+                            let expected_attention = if device_attention {
+                                let oracle_started = std::time::Instant::now();
+                                let oracle = run_real_layer_attention_rows(
+                                    module,
+                                    stream,
+                                    &runtime,
+                                    &hidden[token_position],
+                                    token_position,
+                                    layer_state,
+                                    None,
+                                    strict_scratch.as_mut(),
+                                )?;
+                                Some((
+                                    oracle.output,
+                                    oracle.topk.ok_or("strict audit host oracle omitted top-k")?,
+                                    host_persistent_state_audit(layer_state),
+                                    u64::try_from(oracle_started.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                ))
+                            } else {
+                                None
+                            };
+                            let mut run = run_real_layer_rows(
+                                context,
+                                module,
+                                stream,
+                                &runtime,
+                                qd4_lanes.as_deref_mut(),
+                                qd4_immutable_cache.as_mut(),
+                                expert_slots.as_mut(),
+                                row_hash_ids,
+                                &hidden[token_position],
+                                &[token_id],
+                                token_position,
+                                Some(layer_state),
+                                device_state.as_deref_mut(),
+                                device_rope_lut.as_ref(),
+                                device_attention_audit,
+                                None,
+                                false,
+                                strict_scratch.as_mut(),
+                            )?;
+                            if let Some((expected_output, expected_topk, expected_state, oracle_ns)) =
+                                expected_attention
+                            {
+                                let device_state =
+                                    device_state.as_ref().ok_or("device audit state disappeared")?;
+                                let actual_state = device_persistent_state_audit(stream, device_state)?;
+                                let (audit_d2h_count, audit_d2h_bytes) =
+                                    device_persistent_state_audit_d2h_transfer(device_state);
+                                let transfer = run
+                                    .device_transfer
+                                    .as_mut()
+                                    .ok_or("device audit omitted transfer telemetry")?;
+                                transfer.intermediate_or_audit_d2h_count = transfer
+                                    .intermediate_or_audit_d2h_count
+                                    .saturating_add(audit_d2h_count);
+                                transfer.intermediate_or_audit_d2h_bytes = transfer
+                                    .intermediate_or_audit_d2h_bytes
+                                    .saturating_add(audit_d2h_bytes);
+                                run.stage.attention_intermediate_or_audit_d2h_count = run
+                                    .stage
+                                    .attention_intermediate_or_audit_d2h_count
+                                    .saturating_add(audit_d2h_count);
+                                run.stage.attention_intermediate_or_audit_d2h_bytes = run
+                                    .stage
+                                    .attention_intermediate_or_audit_d2h_bytes
+                                    .saturating_add(audit_d2h_bytes);
+                                check_persistent_state_audit(
+                                    manifest.layer,
+                                    token_position,
+                                    &expected_state,
+                                    &actual_state,
+                                )?;
+                                if let Some(index) =
+                                    first_mismatch(&expected_output, &run.attention_output)
+                                {
+                                    return Err(format!(
+                                        "device audit layer {} position {} attention_post first mismatch at {index}",
+                                        manifest.layer, token_position
+                                    )
+                                    .into());
+                                }
+                                let actual_topk = run
+                                    .attention_topk
+                                    .as_deref()
+                                    .ok_or("device audit omitted sparse top-k D2H")?;
+                                if actual_topk != expected_topk.as_slice() {
+                                    return Err(format!(
+                                        "device audit layer {} position {} sparse top-k raw bits mismatch",
+                                        manifest.layer, token_position
+                                    )
+                                    .into());
+                                }
+                                run.stage.attention_audit_oracle_ns = oracle_ns;
+                                observed_state = Some(actual_state);
+                            }
+                            completed = Some(run);
+                            Ok(())
+                        })?;
+                    }
+                    let mut run = completed
+                        .ok_or("layer-stationary prefill transaction produced no output")?;
+                    if run.routes.ids.len() != v4_router::V4_TOPK {
+                        return Err(format!(
+                            "layer {} router produced incomplete causal prefill routes",
+                            manifest.layer
+                        )
+                        .into());
+                    }
+                    if token_position == 0 && device_attention {
+                        run.stage.device_state_setup_ns = device_state_setup_ns;
+                        run.stage.device_state_setup_count = 1;
+                        run.stage.device_state_reset_cuda_ns = device_state_reset_cuda_ns;
+                        run.stage.device_state_reset_calls = device_state_reset_calls;
+                    }
+                    if token_position == 0 && phase_profile {
+                        run.stage.layer_prepare_ns = layer_prepare_ns;
+                        run.stage.layer_prepare_count = 1;
+                    }
+                    let kv_rows_after = device_state.as_ref().map_or_else(
+                        || {
+                            persistent
+                                .as_ref()
+                                .and_then(|state| state.layer(manifest.layer))
+                                .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
+                        },
+                        |state| state.committed_rows,
+                    );
+                    if kv_rows_after != kv_rows_before + 1 {
+                        return Err(
+                            "layer-stationary prefill committed a noncontiguous KV row".into()
+                        );
+                    }
+                    let state_digests = if let Some(state) = observed_state.as_ref() {
+                        Some((
+                            fnv1a_u16(&state.kv),
+                            fnv1a_u16(&state.compressed_kv),
+                            fnv1a_f32(&state.main_kv),
+                            fnv1a_f32(&state.main_score),
+                            fnv1a_u16(&state.indexer_kv),
+                            state.indexer_main_kv.as_deref().map(fnv1a_f32),
+                            state.indexer_main_score.as_deref().map(fnv1a_f32),
+                        ))
+                    } else if !device_attention {
+                        let state = persistent
+                            .as_ref()
+                            .and_then(|state| state.layer(manifest.layer))
+                            .ok_or("host layer state disappeared after commit")?;
+                        let main = state.compressor();
+                        let indexer = state.indexer();
+                        Some((
+                            fnv1a_u16(state.kv_bf16()),
+                            fnv1a_u16(state.compressed_kv_bf16()),
+                            fnv1a_f32(main.kv()),
+                            fnv1a_f32(main.score()),
+                            fnv1a_u16(state.indexer_kv_bf16()),
+                            indexer.map(|value| fnv1a_f32(value.kv())),
+                            indexer.map(|value| fnv1a_f32(value.score())),
+                        ))
+                    } else {
+                        None
+                    };
+                    let topk_observed = run.attention_topk.is_some();
+                    let record = serde_json::json!({
+                        "event": "layer",
+                        "token_position": token_position,
+                        "token_id": token_id,
+                        "layer": manifest.layer,
+                        "compression_ratio": manifest.compression_ratio.get(),
+                        "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
+                        "persistent_state_observed": state_digests.is_some(),
+                        "kv_cache_bf16_digest": state_digests.as_ref().map(|value| format!("{:016x}", value.0)),
+                        "main_compressed_kv_bf16_digest": state_digests.as_ref().map(|value| format!("{:016x}", value.1)),
+                        "main_compressor_kv_state_f32_digest": state_digests.as_ref().map(|value| format!("{:016x}", value.2)),
+                        "main_compressor_score_state_f32_digest": state_digests.as_ref().map(|value| format!("{:016x}", value.3)),
+                        "indexer_compressed_kv_bf16_digest": state_digests.as_ref().map(|value| format!("{:016x}", value.4)),
+                        "indexer_compressor_kv_state_f32_digest": state_digests.as_ref().and_then(|value| value.5.map(|digest| format!("{digest:016x}"))),
+                        "indexer_compressor_score_state_f32_digest": state_digests.as_ref().and_then(|value| value.6.map(|digest| format!("{digest:016x}"))),
+                        "route_ids": &run.routes.ids,
+                        "route_weights_f32": &run.routes.weights,
+                        "topk_observed": topk_observed,
+                        "attention_topk_digest": topk_observed.then(|| format!("{:016x}", run.attention_topk_digest)),
+                        "attention_topk_per_row": topk_observed.then_some(run.attention_topk_per_row),
+                        "manifest_contract_range_bytes": manifest.contract_range_bytes,
+                        "kv_rows_before": kv_rows_before,
+                        "kv_rows_after": kv_rows_after,
+                    });
+                    let (next_hidden, mut record, stage, indexer_topk_gpu_ns, transfer) = (
+                        run.output,
+                        record,
+                        run.stage,
+                        run.indexer_topk_gpu_ns,
+                        run.device_transfer,
+                    );
+                    if device_attention {
+                        let transfer = transfer
+                            .ok_or("device attention dispatch omitted transfer telemetry")?;
+                        device_attention_dispatches = device_attention_dispatches.saturating_add(1);
+                        device_attention_h2d_count =
+                            device_attention_h2d_count.saturating_add(transfer.h2d_count);
+                        device_attention_h2d_bytes =
+                            device_attention_h2d_bytes.saturating_add(transfer.h2d_bytes);
+                        device_attention_rope_lut_d2d_count = device_attention_rope_lut_d2d_count
+                            .saturating_add(transfer.rope_lut_d2d_count);
+                        device_attention_rope_lut_d2d_bytes = device_attention_rope_lut_d2d_bytes
+                            .saturating_add(transfer.rope_lut_d2d_bytes);
+                        device_attention_terminal_d2h_count = device_attention_terminal_d2h_count
+                            .saturating_add(transfer.terminal_d2h_count);
+                        device_attention_terminal_d2h_bytes = device_attention_terminal_d2h_bytes
+                            .saturating_add(transfer.terminal_d2h_bytes);
+                        device_attention_audit_d2h_count = device_attention_audit_d2h_count
+                            .saturating_add(transfer.intermediate_or_audit_d2h_count);
+                        device_attention_audit_d2h_bytes = device_attention_audit_d2h_bytes
+                            .saturating_add(transfer.intermediate_or_audit_d2h_bytes);
+                    } else if transfer.is_some() {
+                        return Err(
+                            "host attention unexpectedly reported device transfer telemetry".into(),
+                        );
+                    }
+                    routed_source_bytes =
+                        routed_source_bytes.saturating_add(stage.routed_source_bytes);
+                    routed_h2d_bytes = routed_h2d_bytes.saturating_add(stage.routed_h2d_bytes);
+                    routed_expert_loads =
+                        routed_expert_loads.saturating_add(stage.routed_expert_loads);
+                    if let Some(request_start_ns) = layer_scope_started_ns {
+                        let request_end_ns = timeline_elapsed_ns(request_started);
+                        let fixed_scope = (token_position == 0)
+                            .then_some(blocking_fixed.as_ref().unwrap_or(&fixed));
+                        let (profile, attributed_ns, outer_ns) =
+                            stationary_layer_phase_profile_json(
+                                request_start_ns,
+                                request_end_ns,
+                                fixed_scope,
+                                &stage,
+                                indexer_topk_gpu_ns,
+                                qd4_enabled,
+                            )?;
+                        record
+                            .as_object_mut()
+                            .ok_or("stationary layer record is not an object")?
+                            .insert("phase_profile".into(), profile);
+                        phase_profile_top_level_ns =
+                            phase_profile_top_level_ns.saturating_add(attributed_ns);
+                        phase_profile_layer_outer_ns =
+                            phase_profile_layer_outer_ns.saturating_add(outer_ns);
+                    }
+                    hidden[token_position] = next_hidden;
+                    layer_records[token_position].push(record);
+                    if l0_cutpoint && manifest.layer == 0 && token_position == 0 {
+                        println!(
+                            "COLIBRI_L0_POS0_CUTPOINT={}",
+                            serde_json::json!({
+                                "pre_hidden_bf16_digest": cutpoint_pre_hidden,
+                                "start_pos": token_position,
+                                "compression_ratio": manifest.compression_ratio.get(),
+                                "runtime_weight_bytes": runtime.weights.num_bytes(),
+                                "pre_committed_rows": kv_rows_before,
+                                "record": layer_records[token_position].last(),
+                            })
+                        );
+                        return Err("L0 pos0 cutpoint reached after the production record".into());
+                    }
+                }
+                if let Some(cache) = qd4_immutable_cache.as_mut() {
+                    cache.finish_layer(manifest.layer)?;
+                }
+                drop(expert_slots);
+                drop(runtime);
+                if fixed_prefetch && manifest_index + 1 < manifests.len() {
+                    let next_layer = manifests[manifest_index + 1].layer;
+                    let task = prefetch_window
+                        .iter_mut()
+                        .find(|task| task.layer == next_layer)
+                        .ok_or("bounded fixed prefetch lost the next ordered layer")?;
+                    task.transition = Some(FixedPrefetchTransition {
+                        from_layer: manifest.layer,
+                        compute_start_ns,
+                        compute_end_ns: timeline_elapsed_ns(request_started),
+                    });
+                }
+            }
+            if !prefetch_window.is_empty() {
+                return Err("bounded fixed prefetch left an unconsumed worker".into());
+            }
+            Ok(())
+        })();
+        while let Some(task) = prefetch_window.pop_front() {
+            let _ = task.worker.join();
+        }
+        scoped_result
+    })?;
+    if fixed_prefetch && fixed_prefetch_records.len() != manifests.len().saturating_sub(1) {
+        return Err("layer-stationary fixed prefetch did not record every transition".into());
+    }
+    if persistent
+        .as_ref()
+        .is_some_and(|state| state.allocated_layers() != v4_state::V4_LAYER_COUNT)
+        || layer_records
+            .iter()
+            .any(|records| records.len() != v4_state::V4_LAYER_COUNT)
+    {
+        return Err("layer-stationary prefill did not commit every layer/position pair".into());
+    }
+    if device_attention {
+        let expected_dispatches = prompt_len * v4_state::V4_LAYER_COUNT;
+        let expected_csa_boundary_copies = manifests
+            .iter()
+            .filter(|manifest| manifest.compression_ratio == v4_state::CompressionRatio::Csa4)
+            .count();
+        let expected_rope_lut_d2d_count = expected_dispatches
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(expected_csa_boundary_copies))
+            .ok_or("device RoPE LUT D2D count overflow")?;
+        let rope_row_bytes = v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
+        let expected_h2d_count = expected_dispatches + 1;
+        let expected_h2d_bytes = device_attention_expected_h2d_bytes(
+            device_rope_lut
+                .as_ref()
+                .map_or(0, DeviceRequestRopeLut::num_bytes),
+            expected_dispatches,
+        )?;
+        if device_attention_dispatches != expected_dispatches
+            || device_attention_host_fallbacks != 0
+            || device_attention_h2d_count != expected_h2d_count
+            || device_attention_h2d_bytes != expected_h2d_bytes
+            || device_attention_rope_lut_d2d_count != expected_rope_lut_d2d_count
+            || device_attention_rope_lut_d2d_bytes != expected_rope_lut_d2d_count * rope_row_bytes
+            || device_attention_terminal_d2h_count != expected_dispatches
+            || device_attention_terminal_d2h_bytes
+                != expected_dispatches
+                    * v4_state::HC
+                    * v4_state::HIDDEN
+                    * std::mem::size_of::<u16>()
+            || (!device_attention_audit
+                && (device_attention_audit_d2h_count != 0 || device_attention_audit_d2h_bytes != 0))
+        {
+            return Err("device attention measured transfer/dispatch accounting diverged from the strict five-token contract".into());
+        }
+    }
+    if qd4_enabled {
+        let expected_loads = qd4_expected_routed_loads(manifests.len(), prompt_len)?;
+        if let Some(cache) = qd4_immutable_cache.as_ref() {
+            let telemetry = &cache.telemetry;
+            let expected_d2d_bytes = expected_loads
+                .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                .ok_or("QD4 immutable expert cache D2D byte count overflow")?;
+            if telemetry.route_executions != expected_loads
+                || telemetry.source_loads != telemetry.expert_union_loads
+                || telemetry.source_bytes
+                    != telemetry
+                        .source_loads
+                        .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                        .ok_or("QD4 immutable expert cache source byte count overflow")?
+                || telemetry.h2d_loads != telemetry.source_loads
+                || telemetry.h2d_bytes != telemetry.source_bytes
+                || telemetry.hits != expected_loads.saturating_sub(telemetry.source_loads)
+                || telemetry.d2d_copies != expected_loads
+                || telemetry.d2d_bytes != expected_d2d_bytes
+                || telemetry.max_occupancy > V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+                || telemetry.completed_layers != manifests.len()
+                || telemetry.worker_errors != 0
+                || telemetry.fallbacks != 0
+                || routed_expert_loads != telemetry.source_loads
+                || routed_source_bytes != telemetry.source_bytes
+                || routed_h2d_bytes != telemetry.h2d_bytes
+            {
+                return Err(
+                    "stationary QD4 immutable cache physical telemetry did not close".into(),
+                );
+            }
+        } else {
+            let expected_bytes = expected_loads
+                .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                .ok_or("QD4 routed byte count overflow")?;
+            if routed_expert_loads != expected_loads
+                || routed_source_bytes != expected_bytes
+                || routed_h2d_bytes != expected_bytes
+            {
+                return Err(
+                    "stationary QD4 routed load/byte accounting diverged from its six-route contract"
+                        .into(),
+                );
+            }
+        }
+    }
+
+    let final_scope_started_ns = phase_profile.then(|| timeline_elapsed_ns(request_started));
+    let final_load_started = phase_profile.then(std::time::Instant::now);
+    let final_weights = v4_state::load_final_head(root)?;
+    let final_fixed_read_ns = final_load_started
+        .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    let cpu =
+        v4_state::final_checkpoint_head_cpu_timed(&final_weights, &hidden[prompt_len - 1], 1)?;
+    let mut final_phase_profile = None;
+    if let Some(request_start_ns) = final_scope_started_ns {
+        let request_end_ns = timeline_elapsed_ns(request_started);
+        let (profile, attributed_ns) = stationary_final_phase_profile_json(
+            request_start_ns,
+            request_end_ns,
+            final_fixed_read_ns.expect("profiled final load must have a duration"),
+            cpu.wall_ns,
+            cpu.read_ns,
+            qd4_enabled,
+        )?;
+        final_phase_profile = Some(profile);
+        phase_profile_top_level_ns = phase_profile_top_level_ns.saturating_add(attributed_ns);
+        phase_profile_final_outer_ns = request_end_ns - request_start_ns;
+    }
+    let argmax = cpu.output.argmax[0];
+    let generated_id = i64::try_from(argmax)?;
+    let stop_reason = if generated_id == V4_EOS_TOKEN_ID {
+        "eos"
+    } else {
+        "max_new_tokens"
+    };
+    let mut short_decode_records = Vec::new();
+    let mut short_decode_finals = Vec::new();
+    let mut short_decode_fixed_source_bytes = 0_usize;
+    let mut short_decode_fixed_h2d_bytes = 0_usize;
+    let mut short_decode_routed_source_bytes = 0_usize;
+    let mut short_decode_routed_h2d_bytes = 0_usize;
+    let mut generated_ids = vec![generated_id];
+    if device_short_decode {
+        let states = device_states
+            .as_mut()
+            .ok_or("short device decode lost its persistent state vector")?;
+        if states.len() != v4_state::V4_LAYER_COUNT {
+            return Err("short device decode state vector is not full61".into());
+        }
+        let rope_lut = device_rope_lut
+            .as_ref()
+            .ok_or("short device decode lost its request RoPE LUT")?;
+        let mut decode_input_id = generated_id;
+        for token_position in prompt_len..short_decode_rows {
+            let embedding = v4_state::load(root, &[decode_input_id])?.embedding;
+            let mut decode_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+            for _ in 0..v4_state::HC {
+                decode_hidden.extend_from_slice(&embedding);
+            }
+            for manifest in manifests {
+                let layer_scope_started_ns =
+                    phase_profile.then(|| timeline_elapsed_ns(request_started));
+                let layer_prepare_started = phase_profile.then(std::time::Instant::now);
+                let (host, mut fixed) =
+                    load_layer_host_raw_wo_a(root, manifest.layer, &[decode_input_id])?;
+                let (runtime, upload) =
+                    upload_layer_runtime_raw_wo_a(root, manifest.layer, &host, module, stream)?;
+                fixed.fixed_decode_ns = upload.fixed_decode_ns;
+                fixed.fixed_h2d_ns = upload.fixed_h2d_ns;
+                fixed.fixed_h2d_bytes = upload.fixed_h2d_bytes;
+                fixed.raw_h2d_ns = upload.raw_h2d_ns;
+                fixed.raw_h2d_bytes = upload.raw_h2d_bytes;
+                let hash_ids = load_layer_hash_ids(root, manifest.layer, &[decode_input_id])?;
+                let layer_prepare_ns = layer_prepare_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                let mut oracle = None;
+                if device_attention_audit {
+                    persistent
+                        .as_mut()
+                        .ok_or("short device decode audit lost its host persistent state")?
+                        .transaction(manifest.layer, |host_state| {
+                            let run = run_real_layer_rows(
+                                context,
+                                module,
+                                stream,
+                                &runtime,
+                                qd4_lanes.as_deref_mut(),
+                                None,
+                                None,
+                                if runtime.weights.hash_router {
+                                    &hash_ids
+                                } else {
+                                    &[]
+                                },
+                                &decode_hidden,
+                                &[decode_input_id],
+                                token_position,
+                                Some(host_state),
+                                None,
+                                None,
+                                false,
+                                None,
+                                true,
+                                strict_scratch.as_mut(),
+                            )?;
+                            oracle = Some((run, host_persistent_state_audit(host_state)));
+                            Ok(())
+                        })?;
+                }
+                let state = states
+                    .get_mut(manifest.layer)
+                    .and_then(Option::as_mut)
+                    .ok_or("short device decode layer state was not retained during prefill")?;
+                if state.layer != manifest.layer || state.committed_rows != token_position {
+                    return Err("short device decode persistent-state continuity mismatch".into());
+                }
+                let kv_rows_before = state.committed_rows;
+                let mut run = run_real_layer_rows(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    qd4_lanes.as_deref_mut(),
+                    None,
+                    None,
+                    if runtime.weights.hash_router {
+                        &hash_ids
+                    } else {
+                        &[]
+                    },
+                    &decode_hidden,
+                    &[decode_input_id],
+                    token_position,
+                    None,
+                    Some(state),
+                    Some(rope_lut),
+                    device_attention_audit,
+                    None,
+                    device_attention_audit,
+                    None,
+                )?;
+                if phase_profile {
+                    run.stage.layer_prepare_ns = layer_prepare_ns;
+                    run.stage.layer_prepare_count = 1;
+                }
+                let observed_state = device_attention_audit
+                    .then(|| device_persistent_state_audit(stream, state))
+                    .transpose()?;
+                let kv_rows_after = state.committed_rows;
+                if kv_rows_after != kv_rows_before + 1 {
+                    return Err("short device decode committed a noncontiguous KV row".into());
+                }
+                if run.routes.ids.len() != v4_router::V4_TOPK {
+                    return Err("short device decode produced incomplete routes".into());
+                }
+                if let Some((expected_run, expected_state)) = oracle.as_ref() {
+                    let actual_state = observed_state
+                        .as_ref()
+                        .ok_or("short device decode audit omitted device persistent state")?;
+                    check_short_decode_full_layer_audit(
+                        manifest.layer,
+                        token_position,
+                        expected_run,
+                        expected_state,
+                        &run,
+                        actual_state,
+                    )?;
+                }
+                short_decode_fixed_source_bytes = short_decode_fixed_source_bytes
+                    .checked_add(fixed.fixed_source_bytes)
+                    .ok_or("short device decode fixed source byte overflow")?;
+                short_decode_fixed_h2d_bytes = short_decode_fixed_h2d_bytes
+                    .checked_add(upload.fixed_h2d_bytes)
+                    .ok_or("short device decode fixed H2D byte overflow")?;
+                short_decode_routed_source_bytes = short_decode_routed_source_bytes
+                    .checked_add(run.stage.routed_source_bytes)
+                    .ok_or("short device decode routed source byte overflow")?;
+                short_decode_routed_h2d_bytes = short_decode_routed_h2d_bytes
+                    .checked_add(run.stage.routed_h2d_bytes)
+                    .ok_or("short device decode routed H2D byte overflow")?;
+                let topk_observed = run.attention_topk.is_some();
+                let mut record = serde_json::json!({
+                    "event": "layer",
+                    "token_position": token_position,
+                    "token_id": decode_input_id,
+                    "layer": manifest.layer,
+                    "compression_ratio": manifest.compression_ratio.get(),
+                    "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
+                    "kv_cache_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.kv))),
+                    "main_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.compressed_kv))),
+                    "main_compressor_kv_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_kv))),
+                    "main_compressor_score_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_score))),
+                    "indexer_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.indexer_kv))),
+                    "indexer_compressor_kv_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_kv.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
+                    "indexer_compressor_score_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_score.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
+                    "route_ids": run.routes.ids,
+                    "route_weights_f32": run.routes.weights,
+                    "attention_topk_digest": topk_observed.then(|| format!("{:016x}", run.attention_topk_digest)),
+                    "attention_topk_per_row": topk_observed.then_some(run.attention_topk_per_row),
+                    "kv_rows_before": kv_rows_before,
+                    "kv_rows_after": kv_rows_after,
+                    "fixed_source_bytes": fixed.fixed_source_bytes,
+                    "fixed_h2d_bytes": upload.fixed_h2d_bytes,
+                    "routed_source_bytes": run.stage.routed_source_bytes,
+                    "routed_h2d_bytes": run.stage.routed_h2d_bytes,
+                    "qd4_immutable_cache": false,
+                });
+                if let Some(request_start_ns) = layer_scope_started_ns {
+                    let request_end_ns = timeline_elapsed_ns(request_started);
+                    let (profile, attributed_ns, outer_ns) = stationary_layer_phase_profile_json(
+                        request_start_ns,
+                        request_end_ns,
+                        Some(&fixed),
+                        &run.stage,
+                        run.indexer_topk_gpu_ns,
+                        qd4_enabled,
+                    )?;
+                    record
+                        .as_object_mut()
+                        .ok_or("short decode layer record is not an object")?
+                        .insert("phase_profile".into(), profile);
+                    phase_profile_top_level_ns =
+                        phase_profile_top_level_ns.saturating_add(attributed_ns);
+                    one_token_decode_phase_profile_layer_outer_ns =
+                        one_token_decode_phase_profile_layer_outer_ns.saturating_add(outer_ns);
+                }
+                short_decode_records.push(record);
+                decode_hidden = run.output;
+            }
+            let decode_final_scope_started_ns =
+                phase_profile.then(|| timeline_elapsed_ns(request_started));
+            let decode_cpu =
+                v4_state::final_checkpoint_head_cpu_timed(&final_weights, &decode_hidden, 1)?;
+            let mut decode_profile = None;
+            if let Some(request_start_ns) = decode_final_scope_started_ns {
+                let request_end_ns = timeline_elapsed_ns(request_started);
+                let (profile, attributed_ns) = stationary_final_phase_profile_json(
+                    request_start_ns,
+                    request_end_ns,
+                    0,
+                    decode_cpu.wall_ns,
+                    decode_cpu.read_ns,
+                    qd4_enabled,
+                )?;
+                decode_profile = Some(profile);
+                phase_profile_top_level_ns =
+                    phase_profile_top_level_ns.saturating_add(attributed_ns);
+                one_token_decode_phase_profile_final_outer_ns =
+                    one_token_decode_phase_profile_final_outer_ns
+                        .saturating_add(request_end_ns - request_start_ns);
+            }
+            let next_id = i64::try_from(decode_cpu.output.argmax[0])?;
+            generated_ids.push(next_id);
+            short_decode_finals.push((
+                token_position,
+                decode_input_id,
+                decode_cpu,
+                decode_hidden,
+                decode_profile,
+            ));
+            decode_input_id = next_id;
+        }
+    }
+    let request_e2e_ns = timeline_elapsed_ns(request_started);
+    let (phase_profiled_outer_ns, phase_profile_request_gap_ns, one_token_decode_outer) =
+        if phase_profile {
+            if device_short_decode {
+                let (prefill_outer_ns, decode_outer_ns, profiled_outer_ns, request_gap_ns) =
+                    stationary_one_token_phase_profile_outer_accounting(
+                        phase_profile_layer_outer_ns,
+                        phase_profile_final_outer_ns,
+                        one_token_decode_phase_profile_layer_outer_ns,
+                        one_token_decode_phase_profile_final_outer_ns,
+                        request_e2e_ns,
+                    )?;
+                (
+                    profiled_outer_ns,
+                    request_gap_ns,
+                    Some((prefill_outer_ns, decode_outer_ns)),
+                )
+            } else {
+                let (profiled_outer_ns, request_gap_ns) =
+                    stationary_phase_profile_outer_accounting(
+                        phase_profile_layer_outer_ns,
+                        phase_profile_final_outer_ns,
+                        request_e2e_ns,
+                    )?;
+                (profiled_outer_ns, request_gap_ns, None)
+            }
+        } else {
+            (0, 0, None)
+        };
+    if phase_profile && phase_profile_top_level_ns > request_e2e_ns {
+        return Err("stationary phase profile top-level scopes exceed request E2E".into());
+    }
+    let cublas_provenance = if let Some(scratch) = strict_scratch.as_ref() {
+        scratch.hca_cublas.provenance().clone()
+    } else {
+        cublas_exact::CublasExact::load()?.provenance().clone()
+    };
+    let result_path = result.path().to_owned();
+    let mut provenance = benchmark_provenance()?;
+    provenance
+        .as_object_mut()
+        .ok_or("benchmark provenance is not an object")?
+        .insert(
+            "cublas_exact".into(),
+            serde_json::json!({
+                "resolved_path": cublas_provenance.resolved_path,
+                "sha256": cublas_provenance.actual_sha256,
+                "version": cublas_provenance.version,
+                "dladdr_path": cublas_provenance.dladdr_path,
+                "proc_maps_path": cublas_provenance.maps_path,
+            }),
+        );
+    let sparse_attention_arm_label = match sparse_attention_arm {
+        SparseAttentionArm::Reference => "reference:sparse_attn_v4_bf16",
+        SparseAttentionArm::ScoreReuse => "score_reuse:sparse_attn_v4_scores+probabilities+values",
+        SparseAttentionArm::Sm89Crossover => "sm89_crossover:K<4=reference,K>=4=score_reuse",
+    };
+    let relevant_config_fingerprint = normalized_config_fingerprint(serde_json::json!({
+        "device_attention": {
+            "production": device_attention,
+            "audit_independent_official_host_oracle": device_attention_audit,
+            "fallback_policy": "fail_closed",
+            "request_rope_lut_rows": short_decode_rows,
+            "short_device_decode": device_short_decode,
+        },
+        "execution_layout": "causal_layer_stationary",
+        "fixed_prefetch": fixed_prefetch,
+        "fixed_prefetch_wo_a_decode_arm": fixed_prefetch_wo_a_arm,
+        "fixed_cache": {
+            "device_budget_bytes": parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")?,
+            "host_budget_bytes": parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")?,
+            "raw_mode": optional_one_flag("COLIBRI_V4_RAW_FIXED_CACHE")?,
+        },
+        "l0_pos0_cutpoint": l0_cutpoint,
+        "layer_count": manifests.len(),
+        "model_revision": v4_state::REVISION,
+        "phase_profile": phase_profile,
+        "prompt_ids": token_ids,
+        "prompt_len": prompt_len,
+        "routed": {
+            "expert_slot_reuse": expert_slot_reuse,
+            "qd4": qd4_enabled,
+            "qd4_lanes": qd4_lane_count(qd4_enabled),
+            "qd4_immutable_expert_cache": qd4_immutable_expert_cache,
+            "qd4_immutable_expert_cache_slots": qd4_immutable_expert_cache
+                .then_some(V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS),
+        },
+        "sparse_attention_arm": sparse_attention_arm_label,
+    }))?;
+    let request_rope_lut_h2d_count = usize::from(device_attention);
+    let request_rope_lut_h2d_bytes = device_rope_lut
+        .as_ref()
+        .map_or(0, DeviceRequestRopeLut::num_bytes);
+    let hidden_h2d_count = device_attention_h2d_count
+        .checked_sub(request_rope_lut_h2d_count)
+        .ok_or("device attention hidden H2D count underflow")?;
+    let hidden_h2d_bytes = device_attention_h2d_bytes
+        .checked_sub(request_rope_lut_h2d_bytes)
+        .ok_or("device attention hidden H2D bytes underflow")?;
+    let mut run_header = serde_json::json!({
+        "event": "run",
+        "schema": "colibri-v4-layer-stationary-prefill-v1",
+        "implementation": "rust-cuda",
+        "execution_layout": "causal_layer_stationary",
+        "device_attention_production": device_attention,
+        "device_attention_audit": device_attention_audit,
+        "fixed_prefetch_wo_a_decode_arm": fixed_prefetch_wo_a_arm,
+        "relevant_config_fingerprint": relevant_config_fingerprint,
+        "device_attention_capacity": device_attention_capacity.as_ref().map(|plan| serde_json::json!({
+            "checked_sum_bytes": plan.required_bytes,
+            "qd4_device_bytes": plan.qd4_device_bytes,
+            "qd4_immutable_expert_cache_device_bytes": plan.qd4_immutable_expert_cache_device_bytes,
+            "max_fixed_layer": plan.fixed_layer,
+            "max_fixed_device_bytes": plan.max_fixed_device_bytes,
+            "max_device_token_state_bytes": plan.max_device_token_state_bytes,
+            "device_token_state_count": plan.device_token_state_count,
+            "device_token_state_total_bytes": plan.device_token_state_total_bytes,
+            "rope_lut_bytes": plan.rope_lut_bytes,
+            "rope_lut_status": "device_request_global",
+            "tid2eid_transient_max_bytes": plan.tid2eid_transient_max_bytes,
+            "headroom_bytes": plan.headroom_bytes,
+        })),
+        "routed_expert_slot_reuse": expert_slot_reuse,
+        "routed_qd4_immutable_expert_cache": qd4_immutable_expert_cache,
+        "provenance": provenance,
+        "model_revision": v4_state::REVISION,
+        "prompt_ids": token_ids,
+        "token_ids": token_ids,
+        "emitted_token_ids": token_ids.iter().copied().chain(generated_ids.iter().copied()).collect::<Vec<_>>(),
+        "greedy_steps": greedy_steps,
+        "generated_ids": generated_ids,
+        "generation_mode": if device_short_decode { "id_only_greedy_argmax_short_device_decode" } else { "id_only_greedy_argmax" },
+        "start_pos": 0,
+        "layers": v4_state::V4_LAYER_COUNT,
+        "executed_layers": v4_state::V4_LAYER_COUNT,
+        "model_dir": root,
+        "request_e2e_ns": request_e2e_ns,
+        "request_e2e_definition": if device_short_decode { "prompt input through layer-stationary causal prefill, then full61 short device decode rows and canonical CPU-streamed final logits/argmax after every row" } else { "prompt input through layer-stationary causal prefill and canonical CPU-streamed final logits/argmax" },
+        "final_head": {"mode": "canonical_cpu_streamed_bf16", "invocation": if device_short_decode { "after_last_prompt_position_and_each_short_device_decode_row" } else { "after_last_prompt_position" }, "weight_shard": "model-00063-of-00064.safetensors"},
+        "physical": {
+            "fixed_runtime_loads": manifests.len(),
+            "fixed_runtime_loads_per_layer": 1,
+            "fixed_source_bytes": fixed_source_bytes,
+            "fixed_h2d_bytes": fixed_h2d_bytes,
+            "routed_source_bytes": routed_source_bytes,
+            "routed_h2d_bytes": routed_h2d_bytes,
+            "routed_expert_loads": routed_expert_loads,
+            "strict_audit_arena_bytes": strict_audit_arena_bytes,
+            "short_device_decode": device_short_decode.then(|| serde_json::json!({
+                "positions": (prompt_len..short_decode_rows).collect::<Vec<_>>(),
+                "fixed_runtime_loads": (short_decode_rows - prompt_len) * manifests.len(),
+                "fixed_source_bytes": short_decode_fixed_source_bytes,
+                "fixed_h2d_bytes": short_decode_fixed_h2d_bytes,
+                "routed_source_bytes": short_decode_routed_source_bytes,
+                "routed_h2d_bytes": short_decode_routed_h2d_bytes,
+                "qd4_immutable_cache": false,
+                "semantic_oracle": device_attention_audit.then_some("independent_host_full_layer_oracle").unwrap_or("not_requested"),
+            })),
+            "routed_qd4_immutable_expert_cache": qd4_immutable_cache.as_ref().map(|cache| serde_json::json!({
+                "route_executions": cache.telemetry.route_executions,
+                "expert_union_loads": cache.telemetry.expert_union_loads,
+                "source_loads": cache.telemetry.source_loads,
+                "source_bytes": cache.telemetry.source_bytes,
+                "h2d_loads": cache.telemetry.h2d_loads,
+                "h2d_bytes": cache.telemetry.h2d_bytes,
+                "hits": cache.telemetry.hits,
+                "d2d_copies": cache.telemetry.d2d_copies,
+                "d2d_bytes": cache.telemetry.d2d_bytes,
+                "max_occupancy": cache.telemetry.max_occupancy,
+                "completed_layers": cache.telemetry.completed_layers,
+                "worker_errors": cache.telemetry.worker_errors,
+                "fallbacks": cache.telemetry.fallbacks,
+                "slots": V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS,
+                "eviction": "none",
+            })),
+            "device_attention_dispatches": device_attention_dispatches,
+            "host_attention_fallbacks": device_attention_host_fallbacks,
+            "device_attention": {
+                "dispatches_actual": device_attention_dispatches,
+                "audit_oracle_dispatches_actual": if device_attention_audit {
+                    device_attention_dispatches
+                } else {
+                    0
+                },
+                "host_fallbacks_actual": device_attention_host_fallbacks,
+                "fallback_policy": "fail_closed",
+                "request_rope_lut_setup_ns": device_rope_lut_setup_ns,
+                "transfers": {
+                    "hidden_h2d": {
+                        "count": hidden_h2d_count,
+                        "bytes": hidden_h2d_bytes,
+                    },
+                    "request_rope_lut_h2d": {
+                        "count": request_rope_lut_h2d_count,
+                        "bytes": request_rope_lut_h2d_bytes,
+                    },
+                    "request_rope_lut_d2d": {
+                        "scope": "only request-global RoPE LUT row copies; internal attention/cache D2D is not claimed",
+                        "count": device_attention_rope_lut_d2d_count,
+                        "bytes": device_attention_rope_lut_d2d_bytes,
+                    },
+                    "terminal_after_attention_d2h": {
+                        "count": device_attention_terminal_d2h_count,
+                        "bytes": device_attention_terminal_d2h_bytes,
+                    },
+                    "intermediate_or_audit_d2h": {
+                        "count": device_attention_audit_d2h_count,
+                        "bytes": device_attention_audit_d2h_bytes,
+                    },
+                },
+                "steady_device_temporary_alloc_count": 0,
+                "topk_observed": device_attention_audit,
+            },
+        },
+        "semantic_projection": [
+            "token_position", "token_id", "layer", "compression_ratio", "hidden_bf16_digest",
+            "persistent_state_observed",
+            "kv_cache_bf16_digest", "main_compressed_kv_bf16_digest",
+            "main_compressor_kv_state_f32_digest", "main_compressor_score_state_f32_digest",
+            "indexer_compressed_kv_bf16_digest", "indexer_compressor_kv_state_f32_digest",
+            "indexer_compressor_score_state_f32_digest", "route_ids", "route_weights_f32",
+            "topk_observed", "attention_topk_digest", "attention_topk_per_row", "manifest_contract_range_bytes",
+            "kv_rows_before", "kv_rows_after"
+        ],
+        "sparse_attention_arm": sparse_attention_arm_label,
+        "stop_reason": stop_reason,
+        "eos_token_id": V4_EOS_TOKEN_ID,
+        "max_new_tokens": greedy_steps,
+        "actual_generated_count": generated_ids.len(),
+        "routed_qd4": {
+            "enabled": qd4_enabled,
+            "lanes": qd4_lane_count(qd4_enabled),
+            "startup_setup_ns": qd4_startup_setup_ns,
+            "pinned_host_reserve_bytes": usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES,
+            "device_reserve_bytes": usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES,
+            "immutable_expert_cache": {
+                "enabled": qd4_immutable_expert_cache,
+                "slots": qd4_immutable_expert_cache.then_some(V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS),
+                "pinned_host_reserve_bytes": usize::from(qd4_immutable_expert_cache)
+                    * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+                "device_reserve_bytes": usize::from(qd4_immutable_expert_cache)
+                    * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                "eviction": "none",
+            },
+            "expected_routed_expert_loads": qd4_enabled
+                .then(|| qd4_expected_routed_loads(manifests.len(), prompt_len))
+                .transpose()?,
+        },
+    });
+    if phase_profile {
+        run_header
+            .as_object_mut()
+            .ok_or("stationary run header is not an object")?
+            .insert(
+                "phase_profile".into(),
+                serde_json::json!({
+                    "schema": "colibri-v4-stationary-phase-profile-v4",
+                    "enabled": true,
+                    "top_level_scope_model": "layer_prepare (including nested fixed-load diagnostics), attention (including position-0 device-state setup), router, shared, and routed are exclusive host-wall scopes; nested CUDA event and QD4 lane work sums are not additive",
+                    "layer_scope_count": short_decode_rows * manifests.len(),
+                    "layer_prepare_scope_count": (1 + (short_decode_rows - prompt_len)) * manifests.len(),
+                    "final_scope_count": 1 + short_decode_finals.len(),
+                    "top_level_attributed_ns": phase_profile_top_level_ns,
+                    "layer_outer_ns": phase_profile_layer_outer_ns.saturating_add(one_token_decode_phase_profile_layer_outer_ns),
+                    "final_outer_ns": phase_profile_final_outer_ns.saturating_add(one_token_decode_phase_profile_final_outer_ns),
+                    "profiled_outer_ns": phase_profiled_outer_ns,
+                    "request_unprofiled_gap_ns": phase_profile_request_gap_ns,
+                    "request_e2e_ns": request_e2e_ns,
+                    "closure": "profiled_outer_ns + request_unprofiled_gap_ns == request_e2e_ns",
+                    "short_device_decode_outer": one_token_decode_outer.map(|(prefill_outer_ns, decode_outer_ns)| serde_json::json!({
+                        "prefill_outer_ns": prefill_outer_ns,
+                        "decode_outer_ns": decode_outer_ns,
+                        "decode_layer_outer_ns": one_token_decode_phase_profile_layer_outer_ns,
+                        "decode_final_outer_ns": one_token_decode_phase_profile_final_outer_ns,
+                        "closure": "prefill_outer_ns + decode_outer_ns + request_unprofiled_gap_ns == request_e2e_ns",
+                        "exact": prefill_outer_ns
+                            .saturating_add(decode_outer_ns)
+                            .saturating_add(phase_profile_request_gap_ns)
+                            == request_e2e_ns,
+                    })),
+                    "request_accounting_valid": phase_profile_top_level_ns <= request_e2e_ns
+                        && phase_profiled_outer_ns <= request_e2e_ns
+                        && phase_profiled_outer_ns.saturating_add(phase_profile_request_gap_ns)
+                            == request_e2e_ns,
+                }),
+            );
+    }
+    if fixed_prefetch {
+        let ready_count = fixed_prefetch_records
+            .iter()
+            .filter(|record| record["ready_before_consume"] == true)
+            .count();
+        let consume_wait_ns = fixed_prefetch_records
+            .iter()
+            .try_fold(0_u64, |total, record| {
+                total
+                    .checked_add(
+                        record["consume_wait_ns"]
+                            .as_u64()
+                            .ok_or("fixed prefetch consume_wait_ns is invalid")?,
+                    )
+                    .ok_or("fixed prefetch consume wait total overflow")
+            })?;
+        run_header
+            .as_object_mut()
+            .ok_or("stationary run header is not an object")?
+            .insert(
+                "fixed_prefetch".into(),
+                serde_json::json!({
+                    "mode": "bounded_window_2_cpu_read_decode_then_ordered_boundary_sync_h2d",
+                    "window": {
+                        "depth": FIXED_PREFETCH_WINDOW_DEPTH,
+                        "max_future_host_bytes": fixed_prefetch_max_future_host_bytes,
+                        "reserved_future_host_bytes": fixed_prefetch_max_future_host_bytes
+                            .and_then(|bytes| bytes.checked_mul(FIXED_PREFETCH_WINDOW_DEPTH)),
+                        "host_headroom_bytes": FIXED_PREFETCH_HOST_HEADROOM_BYTES,
+                    },
+                    "summary": {
+                        "transition_count": fixed_prefetch_records.len(),
+                        "ready_count": ready_count,
+                        "consume_wait_ns": consume_wait_ns,
+                    },
+                    "transitions": fixed_prefetch_records,
+                    "top_level_phase_layer_prepare_scope": "main-thread consume wait plus H2D are in layer_prepare; worker read/decode remains asynchronous and is not additive",
+                }),
+            );
+    }
+    if let Some(tokenizer) = tokenizer {
+        let header = run_header
+            .as_object_mut()
+            .ok_or("layer-stationary run header is not an object")?;
+        header.insert("encoded_prompt_ids".into(), serde_json::json!(token_ids));
+        header.insert(
+            "generated_only_decoded_text".into(),
+            serde_json::json!(tokenizer.decode(&generated_ids)?),
+        );
+        let cumulative = token_ids
+            .iter()
+            .copied()
+            .chain(generated_ids.iter().copied())
+            .filter(|&id| id != V4_EOS_TOKEN_ID)
+            .collect::<Vec<_>>();
+        header.insert(
+            "cumulative_decoded_text".into(),
+            serde_json::json!(tokenizer.decode(&cumulative)?),
+        );
+    }
+    if let Some(user) = chat_user {
+        run_header
+            .as_object_mut()
+            .ok_or("layer-stationary run header is not an object")?
+            .extend(serde_json::Map::from_iter([
+                ("chat_user".into(), serde_json::json!(user)),
+                (
+                    "prompt_encoding".into(),
+                    serde_json::json!({
+                        "name": "official_encoding_dsv4",
+                        "mode": "single_user",
+                        "thinking_mode": "chat",
+                        "jinja_template": false,
+                        "tools": false,
+                        "multiturn": false,
+                        "add_special_tokens": false,
+                    }),
+                ),
+            ]));
+    } else if let Some(text) = prompt_text {
+        run_header
+            .as_object_mut()
+            .ok_or("layer-stationary run header is not an object")?
+            .extend(serde_json::Map::from_iter([
+                ("prompt_text".into(), serde_json::json!(text)),
+                (
+                    "tokenizer".into(),
+                    serde_json::json!({
+                        "mode": "raw",
+                        "chat_template": false,
+                        "add_special_tokens": false,
+                    }),
+                ),
+            ]));
+    }
+    writeln!(result.file_mut(), "{run_header}")?;
+    for records in &layer_records {
+        for record in records {
+            writeln!(result.file_mut(), "{record}")?;
+        }
+    }
+    for record in &short_decode_records {
+        writeln!(result.file_mut(), "{record}")?;
+    }
+    let mut final_record = serde_json::json!({
+        "event": "final",
+        "position": prompt_len - 1,
+        "input_id": token_ids[prompt_len - 1],
+        "input_kind": "prompt",
+        "state": if device_attention { "DeviceTokenState" } else { "V4SerialPersistentState" },
+        "head": "canonical_cpu_streamed_bf16",
+        "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
+        "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+        "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+        "argmax": argmax,
+        "status": "PASS",
+    });
+    if let Some(profile) = final_phase_profile {
+        final_record
+            .as_object_mut()
+            .ok_or("stationary final record is not an object")?
+            .insert("phase_profile".into(), profile);
+    }
+    writeln!(result.file_mut(), "{final_record}")?;
+    for (position, input_id, decode_cpu, decode_hidden, decode_profile) in &short_decode_finals {
+        let mut decode_final_record = serde_json::json!({
+            "event": "final",
+            "position": position,
+            "input_id": input_id,
+            "input_kind": "generated",
+            "state": "DeviceTokenState",
+            "head": "canonical_cpu_streamed_bf16",
+            "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&decode_cpu.output.collapsed_bf16)),
+            "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&decode_cpu.output.normalized_bf16)),
+            "logits_f32_digest": format!("{:016x}", fnv1a_f32(&decode_cpu.output.logits_f32)),
+            "input_hidden_bf16_digest": format!("{:016x}", fnv1a_u16(decode_hidden)),
+            "argmax": decode_cpu.output.argmax[0],
+            "status": "PASS",
+        });
+        if let Some(profile) = decode_profile {
+            decode_final_record
+                .as_object_mut()
+                .ok_or("short decode final record is not an object")?
+                .insert("phase_profile".into(), profile.clone());
+        }
+        writeln!(result.file_mut(), "{decode_final_record}")?;
+    }
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"result_jsonl\":{}}}",
+        serde_json::to_string(if device_short_decode {
+            "v4-layer-stationary-short-device-decode"
+        } else {
+            "v4-layer-stationary-prefill"
+        })?,
+        serde_json::to_string(token_ids)?,
+        serde_json::to_string(&generated_ids)?,
+        v4_state::V4_LAYER_COUNT,
+        argmax,
+        serde_json::to_string(&result_path)?,
+    );
+    Ok(())
+}
+
+fn launch_v4_activation_quantize(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
+    const BLOCK: usize = 128;
+    if input.len() == 0 || input.len() % BLOCK != 0 || output.len() != input.len() {
+        return Err("V4 activation quantization requires complete 128-value groups".into());
+    }
+    let elements = u32::try_from(input.len())?;
+    // SAFETY: the validated launch assigns one output element to each thread;
+    // each thread scans its complete 128-value source group before writing.
+    unsafe {
+        module.quantize_v4_activation(stream, LaunchConfig::for_num_elems(elements), input, output)
+    }?;
+    Ok(())
+}
+
+fn launch_v4_fp4_matvec(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<f32>,
+    packed: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Box<dyn Error>> {
+    if rows == 0
+        || rows > v4_expert::V4_MAX_EXPERT_ROWS
+        || in_features % 32 != 0
+        || input.len() != rows * in_features
+        || packed.len() != out_features * in_features / 2
+        || scales.len() != out_features * in_features / 32
+        || output.len() != rows * out_features
+    {
+        return Err("V4 FP4 matvec buffers disagree with the fixed expert layout".into());
+    }
+    let threads = u32::try_from(
+        output
+            .len()
+            .checked_mul(32)
+            .ok_or("V4 matvec launch overflow")?,
+    )?;
+    // SAFETY: each complete warp owns one bounded output element. Host validation
+    // proves the packed-two-value and one-E8M0-per-32-K indexing used by the kernel.
+    unsafe {
+        module.matvec_v4_fp4(
+            stream,
+            LaunchConfig::for_num_elems(threads),
+            input,
+            packed,
+            scales,
+            output,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_swiglu_route(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    gate: &DeviceBuffer<u16>,
+    up: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+    route_weight: f32,
+) -> Result<(), Box<dyn Error>> {
+    if !route_weight.is_finite()
+        || gate.len() == 0
+        || up.len() != gate.len()
+        || output.len() != gate.len()
+    {
+        return Err("V4 SwiGLU route buffers are invalid".into());
+    }
+    // SAFETY: all three equally sized buffers are validated; every thread
+    // writes one output. This is the official FP32 SwiGLU/route then BF16 cast boundary.
+    unsafe {
+        module.swiglu_route_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(gate.len())?),
+            gate,
+            up,
+            output,
+            route_weight,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_bf16_to_f32(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
+    if input.len() == 0 || output.len() != input.len() {
+        return Err("V4 routed contribution output buffers disagree".into());
+    }
+    // SAFETY: validation proves one output slot per BF16 input element.
+    unsafe {
+        module.bf16_to_f32_rows(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len())?),
+            input,
+            output,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_e4m3fn_to_bf16(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    if output.len() < input.len() {
+        return Err("E4M3FN decode scratch is too small".into());
+    }
+    unsafe {
+        module.e4m3fn_to_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len())?),
+            input,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_v4_expert_close(actual: &[f32], expected: &[f32]) {
+    let maximum_error = v4_expert_maximum_error(actual, expected);
+    println!("V4 expert-0 maximum absolute CPU/GPU error: {maximum_error:.6e}");
+}
+
+fn v4_expert_maximum_error(actual: &[f32], expected: &[f32]) -> f32 {
+    assert_eq!(actual.len(), expected.len(), "V4 expert output length");
+    let mut maximum_error = 0.0_f32;
+    for (actual, expected) in actual.iter().zip(expected) {
+        maximum_error = maximum_error.max((actual - expected).abs());
+        let tolerance = 3e-3 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "V4 expert output differs: expected {expected}, got {actual}, tolerance {tolerance}"
+        );
+    }
+    maximum_error
+}
+
+fn run_real_v4_expert0_slice_if_available(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const WARM_REQUESTS: usize = 100;
+    let path = v4_expert_shard()?;
+
+    let range_load_start = std::time::Instant::now();
+    let shard = safetensors::ShardFile::open(&path)?;
+    let weights = v4_expert::RoutedExpert::load_layer(&shard, 0, 0)?;
+    let range_load_elapsed = range_load_start.elapsed();
+    let weight_bytes = weights.h2d_bytes();
+    let route_weight = 0.625;
+    let input = deterministic_v4_bf16(1, 97);
+    v4_expert::validate_input(&input, route_weight)?;
+    let cpu_start = std::time::Instant::now();
+    let expected = v4_expert::forward_cpu(&weights, &input, route_weight)?;
+    let cpu_elapsed = cpu_start.elapsed();
+
+    let slot_start = std::time::Instant::now();
+    let mut slot = ExpertSlot::new(context, module, stream, &weights)?;
+    let slot_elapsed = slot_start.elapsed();
+    drop(weights);
+    let (warmup, _) = slot.execute(&input, route_weight)?;
+    assert_v4_expert_close(&warmup, &expected);
+
+    let mut direct_ns = Vec::with_capacity(WARM_REQUESTS);
+    let mut direct_gpu_ns = Vec::with_capacity(WARM_REQUESTS);
+    let mut direct_error = 0.0_f32;
+    for _ in 0..WARM_REQUESTS {
+        let start = std::time::Instant::now();
+        let (output, gpu_ns) = slot.execute(&input, route_weight)?;
+        direct_ns.push(start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX));
+        direct_gpu_ns.push(gpu_ns);
+        direct_error = direct_error.max(v4_expert_maximum_error(&output, &expected));
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    let (
+        round_trip_ns,
+        worker_ns,
+        gpu_ns,
+        tcp_codec_ns,
+        network_error,
+        request_bytes,
+        response_bytes,
+    ) = std::thread::scope(|scope| -> Result<_, String> {
+        let worker = scope.spawn(move || -> Result<(), String> {
+            let (mut socket, peer) = listener.accept().map_err(|error| error.to_string())?;
+            if !peer.ip().is_loopback() {
+                return Err("loopback smoke accepted a non-loopback peer".into());
+            }
+            socket
+                .set_nodelay(true)
+                .map_err(|error| error.to_string())?;
+            for index in 0..WARM_REQUESTS {
+                let frame =
+                    v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+                let request =
+                    v4_federated::decode_request(&frame).map_err(|error| error.to_string())?;
+                if (request.layer, request.expert, request.rows) != (0, 0, 1)
+                    || (
+                        request.session_epoch,
+                        request.request_id,
+                        request.deadline_ns,
+                    ) != (1, index as u64 + 1, 0)
+                {
+                    return Err("worker rejected the fixed warm-request identity".into());
+                }
+                let worker_start = std::time::Instant::now();
+                let (output, gpu_ns) = slot
+                    .execute(&request.hidden_bf16, request.route_weight)
+                    .map_err(|error| {
+                        eprintln!("V4 resident slot request {index} failed: {error}");
+                        error.to_string()
+                    })?;
+                let worker_ns = worker_start
+                    .elapsed()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                let response =
+                    v4_federated::ExecuteResponse::for_request(&request, worker_ns, gpu_ns, output);
+                let frame =
+                    v4_federated::encode_response(&response).map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        });
+
+        let mut socket =
+            std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+        socket
+            .set_nodelay(true)
+            .map_err(|error| error.to_string())?;
+        let mut request = v4_federated::ExecuteRequest::live(input.clone(), route_weight);
+        let mut round_trip_ns = Vec::with_capacity(WARM_REQUESTS);
+        let mut worker_ns = Vec::with_capacity(WARM_REQUESTS);
+        let mut gpu_ns = Vec::with_capacity(WARM_REQUESTS);
+        let mut tcp_codec_ns = Vec::with_capacity(WARM_REQUESTS);
+        let mut network_error = 0.0_f32;
+        let mut request_bytes = 0;
+        let mut response_bytes = 0;
+        for index in 0..WARM_REQUESTS {
+            request.request_id = index as u64 + 1;
+            let start = std::time::Instant::now();
+            let request_frame =
+                v4_federated::encode_request(&request).map_err(|error| error.to_string())?;
+            v4_federated::send_frame(&mut socket, &request_frame)
+                .map_err(|error| error.to_string())?;
+            let response_frame =
+                v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+            let response = v4_federated::decode_response(&response_frame)
+                .map_err(|error| error.to_string())?;
+            v4_federated::validate_response(&request, &response)
+                .map_err(|error| error.to_string())?;
+            let elapsed_ns = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+            round_trip_ns.push(elapsed_ns);
+            worker_ns.push(response.worker_ns);
+            gpu_ns.push(response.gpu_ns);
+            tcp_codec_ns.push(elapsed_ns.saturating_sub(response.worker_ns));
+            network_error =
+                network_error.max(v4_expert_maximum_error(&response.output_f32, &expected));
+            request_bytes = request_frame.len() + 4;
+            response_bytes = response_frame.len() + 4;
+        }
+        worker
+            .join()
+            .map_err(|_| "loopback worker panicked".to_string())??;
+        Ok((
+            round_trip_ns,
+            worker_ns,
+            gpu_ns,
+            tcp_codec_ns,
+            network_error,
+            request_bytes,
+            response_bytes,
+        ))
+    })
+    .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+    let (direct_median, direct_p95) = median_p95_ms(&direct_ns);
+    let (direct_gpu_median, direct_gpu_p95) = median_p95_ms(&direct_gpu_ns);
+    let (round_trip_median, round_trip_p95) = median_p95_ms(&round_trip_ns);
+    let (worker_median, worker_p95) = median_p95_ms(&worker_ns);
+    let (gpu_median, gpu_p95) = median_p95_ms(&gpu_ns);
+    let (tcp_codec_median, tcp_codec_p95) = median_p95_ms(&tcp_codec_ns);
+    println!(
+        "COLD V4 expert-0: range load={:.3} ms, pinned staging+alloc+weight H2D={:.3} ms, weight H2D={} B, CPU oracle={:.3} ms",
+        range_load_elapsed.as_secs_f64() * 1_000.0,
+        slot_elapsed.as_secs_f64() * 1_000.0,
+        weight_bytes,
+        cpu_elapsed.as_secs_f64() * 1_000.0,
+    );
+    println!(
+        "WARM direct-local n={WARM_REQUESTS}: service median/p95={direct_median:.3}/{direct_p95:.3} ms, CUDA median/p95={direct_gpu_median:.3}/{direct_gpu_p95:.3} ms, max error={direct_error:.6e}",
+    );
+    println!(
+        "WARM loopback n={WARM_REQUESTS}: RTT median/p95={round_trip_median:.3}/{round_trip_p95:.3} ms, worker median/p95={worker_median:.3}/{worker_p95:.3} ms, CUDA median/p95={gpu_median:.3}/{gpu_p95:.3} ms, TCP+codec median/p95={tcp_codec_median:.3}/{tcp_codec_p95:.3} ms, max error={network_error:.6e}",
+    );
+    println!(
+        "WARM loopback bytes/request: input H2D={} B, weight H2D=0 B, TCP request={request_bytes} B, TCP response={response_bytes} B",
+        input.len() * std::mem::size_of::<u16>(),
+    );
+    run_v4_block_certificate_experiment(context, module, stream, &shard)?;
+    run_v4_two_worker_loopback(context, module, &shard, &path, None)?;
+    run_v4_replica_recovery(context, module, &shard, &path)?;
+    Ok(())
+}
+
+fn run_v4_block_certificate_experiment(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    shard: &safetensors::ShardFile,
+) -> Result<(), Box<dyn Error>> {
+    const BLOCK_SIZES: [usize; 7] = [1, 8, 16, 32, 64, 128, 256];
+    const PLACEMENTS: [(&str, [usize; v4_router::V4_TOPK]); 2] = [
+        ("contiguous", [0, 0, 0, 1, 1, 1]),
+        ("round-robin", [0, 1, 0, 1, 0, 1]),
+    ];
+
+    let norm = read_v4_bf16(shard, "layers.0.ffn_norm.weight", &[7_168])?;
+    let gate = read_v4_bf16(shard, "layers.0.ffn.gate.weight", &[384, 7_168])?;
+    println!(
+        "BLOCK_CERT_PREREG train_tokens=0..3 holdout_tokens=4..7 seeds=97+token candidates={BLOCK_SIZES:?} placements=contiguous,round-robin selection=min_train_median_wire_bytes,tie=smaller_block holdout=selected_block_once primary=pooled_holdout_median<=50%_audit_and_zero_mismatch"
+    );
+    println!(
+        "BLOCK_CERT_WIRE audit={}B=6*(16B_vector_header+7168*4B); candidate=owner_grouped_vectors+8B_certificate_header/owner+1B_bound/owner/block+16B_repair_request_header/owner+896B_bitmask/owner+16B_repair_response_header/owner+4B_expert_id_count_header+4B/raw_FP32_repair",
+        v4_certified::AUDIT_WIRE_BYTES
+    );
+    println!(
+        "split,token,seed,placement,block,owners,fp32_mismatch,bf16_mismatch,certified,repair,contained,repaired_mismatch,certificate_bytes,wire_bytes,audit_bytes,wire_over_audit,max_difference,max_expert_error"
+    );
+
+    let mut train_wire: [Vec<usize>; BLOCK_SIZES.len()] = std::array::from_fn(|_| Vec::new());
+    let mut holdout_wire: [Vec<usize>; PLACEMENTS.len()] = std::array::from_fn(|_| Vec::new());
+    let mut selected_block = None;
+    for token_id in 0..8_i64 {
+        if token_id == 4 {
+            let mut best_index = 0;
+            let mut best_score = median_twice_usize(&train_wire[0]);
+            for (index, samples) in train_wire.iter().enumerate() {
+                let score = median_twice_usize(samples);
+                println!(
+                    "BLOCK_CERT_TRAIN block={} n={} median_wire={:.1}B",
+                    BLOCK_SIZES[index],
+                    samples.len(),
+                    score as f64 / 2.0
+                );
+                if score < best_score {
+                    best_index = index;
+                    best_score = score;
+                }
+            }
+            selected_block = Some(BLOCK_SIZES[best_index]);
+            println!(
+                "BLOCK_CERT_SELECTED block={} train_median_wire={:.1}B",
+                BLOCK_SIZES[best_index],
+                best_score as f64 / 2.0
+            );
+        }
+
+        let seed = 97 + usize::try_from(token_id)?;
+        let input = deterministic_v4_bf16(1, seed);
+        let routed_input = v4_router::rmsnorm_bf16(&input, &norm)?;
+        let logits = v4_router::project_gate_logits(&routed_input, &gate)?;
+        let hash_ids = read_v4_hash_rows(shard, "layers.0.ffn.gate.tid2eid", &[token_id])?;
+        let routes = v4_router::select_hash(&logits, &hash_ids)?;
+        println!(
+            "BLOCK_CERT_TOKEN split={} token={} seed={} expert_ids={:?} gate_weights={:?}",
+            if token_id < 4 { "train" } else { "holdout" },
+            token_id,
+            seed,
+            routes.ids,
+            routes.weights
+        );
+
+        let mut contributions = Vec::with_capacity(v4_router::V4_TOPK);
+        let mut maximum_expert_error = 0.0_f32;
+        for (&expert_id, &route_weight) in routes.ids.iter().zip(&routes.weights) {
+            let expert_id = u16::try_from(expert_id)?;
+            let weights = v4_expert::RoutedExpert::load(shard, expert_id)?;
+            let expected = v4_expert::forward_cpu(&weights, &routed_input, route_weight)?;
+            let mut slot = ExpertSlot::new(context, module, stream, &weights)?;
+            let (actual, _) = slot.execute(&routed_input, route_weight)?;
+            maximum_expert_error =
+                maximum_expert_error.max(v4_expert_maximum_error(&actual, &expected));
+            contributions.push(actual);
+        }
+
+        let mut audit_bits = None;
+        for (placement_index, (placement, owners)) in PLACEMENTS.iter().enumerate() {
+            for (block_index, &block_size) in BLOCK_SIZES.iter().enumerate() {
+                if token_id >= 4 && Some(block_size) != selected_block {
+                    continue;
+                }
+                let report = v4_certified::evaluate(&contributions, owners, block_size)?;
+                assert_eq!(
+                    report.bound_contained_lanes,
+                    v4_expert::V4_HIDDEN,
+                    "token={token_id} {placement} block={block_size}: containment"
+                );
+                assert_eq!(
+                    report.repaired_bf16, report.audit_bf16,
+                    "token={token_id} {placement} block={block_size}: repaired bits"
+                );
+                if let Some(expected) = &audit_bits {
+                    assert_eq!(
+                        &report.audit_bf16, expected,
+                        "token={token_id} {placement} block={block_size}: audit bits"
+                    );
+                } else {
+                    audit_bits = Some(report.audit_bf16.clone());
+                }
+                let repaired_mismatch = report
+                    .repaired_bf16
+                    .iter()
+                    .zip(&report.audit_bf16)
+                    .filter(|(actual, expected)| actual != expected)
+                    .count();
+                let wire_bytes = v4_certified::wire_bytes(&report);
+                if token_id < 4 {
+                    train_wire[block_index].push(wire_bytes);
+                } else {
+                    holdout_wire[placement_index].push(wire_bytes);
+                }
+                println!(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6e},{:.6e}",
+                    if token_id < 4 { "train" } else { "holdout" },
+                    token_id,
+                    seed,
+                    placement,
+                    report.block_size,
+                    report.owner_count,
+                    report.grouped_f32_mismatches,
+                    report.grouped_bf16_mismatches,
+                    report.certified_lanes,
+                    report.repair_lanes,
+                    report.bound_contained_lanes,
+                    repaired_mismatch,
+                    report.certificate_bytes,
+                    wire_bytes,
+                    v4_certified::AUDIT_WIRE_BYTES,
+                    wire_bytes as f64 / v4_certified::AUDIT_WIRE_BYTES as f64,
+                    report.maximum_difference,
+                    maximum_expert_error,
+                );
+            }
+        }
+    }
+
+    let pooled: Vec<_> = holdout_wire.iter().flatten().copied().collect();
+    let holdout_score = median_twice_usize(&pooled);
+    for (index, (placement, _)) in PLACEMENTS.iter().enumerate() {
+        println!(
+            "BLOCK_CERT_HOLDOUT placement={placement} block={} n={} median_wire={:.1}B ratio={:.6}",
+            selected_block.unwrap(),
+            holdout_wire[index].len(),
+            median_twice_usize(&holdout_wire[index]) as f64 / 2.0,
+            median_twice_usize(&holdout_wire[index]) as f64
+                / (2.0 * v4_certified::AUDIT_WIRE_BYTES as f64),
+        );
+    }
+    let passes_two_x = holdout_score <= v4_certified::AUDIT_WIRE_BYTES;
+    println!(
+        "BLOCK_CERT_PRIMARY block={} n={} pooled_holdout_median={:.1}B audit={}B ratio={:.6} repaired_mismatch=0 result={}",
+        selected_block.unwrap(),
+        pooled.len(),
+        holdout_score as f64 / 2.0,
+        v4_certified::AUDIT_WIRE_BYTES,
+        holdout_score as f64 / (2.0 * v4_certified::AUDIT_WIRE_BYTES as f64),
+        if passes_two_x {
+            "PASS_2X"
+        } else {
+            "STOP_LT_2X_NO_RETUNE"
+        },
+    );
+    println!(
+        "BLOCK_CERT_EXTERNAL_VALIDITY official DeepSeek-V4-Pro L0 router/hash and L0 FP4 experts; token_ids=0..7 deterministic BF16 rows; one Ada GPU; byte accounting is protocol-model arithmetic, not measured TCP/QUIC latency or multi-worker throughput"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoopbackWireBytes {
+    initial_requests: usize,
+    audit_responses: usize,
+    certified_responses: usize,
+    repair_requests: usize,
+    repair_responses: usize,
+}
+
+impl LoopbackWireBytes {
+    fn total(self) -> usize {
+        self.initial_requests
+            + self.audit_responses
+            + self.certified_responses
+            + self.repair_requests
+            + self.repair_responses
+    }
+
+    fn returned(self) -> usize {
+        self.audit_responses + self.certified_responses + self.repair_responses
+    }
+}
+
+#[derive(Clone)]
+struct LoopbackSample {
+    e2e_ns: u64,
+    worker_ns: u64,
+    codec_tcp_ns: u64,
+    repair_ns: u64,
+    gpu_ns: u64,
+    repair_lanes: usize,
+    bytes: LoopbackWireBytes,
+}
+
+const NETEM_BLOCKS: usize = 4;
+const NETEM_PAIRS_PER_BLOCK: usize = 25;
+
+struct DualBenchConfig {
+    scenario: String,
+    seed: u64,
+    audit_first: [bool; NETEM_BLOCKS],
+}
+
+impl DualBenchConfig {
+    fn from_env() -> Result<Self, Box<dyn Error>> {
+        let scenario =
+            std::env::var("COLIBRI_NETEM_SCENARIO").unwrap_or_else(|_| "baseline".into());
+        if !scenario
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("COLIBRI_NETEM_SCENARIO must be an ASCII identifier".into());
+        }
+        let seed = std::env::var("COLIBRI_NETEM_SEED")
+            .unwrap_or_else(|_| "20260724".into())
+            .parse::<u64>()?;
+        let mut audit_first = [true, true, false, false];
+        let mut state = seed
+            ^ scenario.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+            });
+        for upper in (1..audit_first.len()).rev() {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut mixed = state;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^= mixed >> 31;
+            audit_first.swap(upper, mixed as usize % (upper + 1));
+        }
+        Ok(Self {
+            scenario,
+            seed,
+            audit_first,
+        })
+    }
+}
+
+struct OwnerCold {
+    owner: u8,
+    elapsed_ns: u64,
+    weight_bytes: usize,
+}
+
+const RECOVERY_SAMPLES: u64 = 20;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryCase {
+    AuditBaseline,
+    CertifiedBaseline,
+    AuditF1,
+    CertifiedF1,
+    CertifiedF2,
+    WrongReplicaIdentity,
+    SecondFailure,
+}
+
+impl RecoveryCase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuditBaseline => "audit_baseline",
+            Self::CertifiedBaseline => "certified_baseline",
+            Self::AuditF1 => "audit_F1",
+            Self::CertifiedF1 => "certified_F1",
+            Self::CertifiedF2 => "certified_F2",
+            Self::WrongReplicaIdentity => "negative_wrong_replica_identity",
+            Self::SecondFailure => "negative_second_failure",
+        }
+    }
+
+    fn mode(self) -> v4_federated::OwnerTaskMode {
+        match self {
+            Self::AuditBaseline
+            | Self::AuditF1
+            | Self::WrongReplicaIdentity
+            | Self::SecondFailure => v4_federated::OwnerTaskMode::Audit,
+            Self::CertifiedBaseline | Self::CertifiedF1 | Self::CertifiedF2 => {
+                v4_federated::OwnerTaskMode::Certified
+            }
+        }
+    }
+
+    fn start_id(self) -> u64 {
+        match self {
+            Self::AuditBaseline => 10_000,
+            Self::CertifiedBaseline => 10_020,
+            Self::AuditF1 => 10_040,
+            Self::CertifiedF1 => 10_060,
+            Self::CertifiedF2 => 10_080,
+            Self::WrongReplicaIdentity => 10_100,
+            Self::SecondFailure => 10_101,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryEndpoint {
+    PrimaryA,
+    PrimaryB,
+    ReplicaA,
+}
+
+impl RecoveryEndpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryA => "A",
+            Self::PrimaryB => "B",
+            Self::ReplicaA => "A'",
+        }
+    }
+
+    fn owner(self) -> u8 {
+        match self {
+            Self::PrimaryB => 1,
+            Self::PrimaryA | Self::ReplicaA => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryFault {
+    None,
+    F1,
+    F2,
+    WrongIdentity,
+}
+
+struct RecoverySample {
+    e2e_ns: u64,
+    failover_ns: u64,
+    failovers: usize,
+    bytes: LoopbackWireBytes,
+}
+
+struct RecoveryCold {
+    endpoint: RecoveryEndpoint,
+    elapsed_ns: u64,
+    weight_bytes: usize,
+}
+
+fn run_v4_two_worker_loopback(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    shard: &safetensors::ShardFile,
+    shard_path: &std::path::Path,
+    bench: Option<&DualBenchConfig>,
+) -> Result<(), Box<dyn Error>> {
+    const MEASURED_PAIRS: usize = 100;
+    const EXPECTED_IDS: [u16; v4_router::V4_TOPK] = [254, 222, 371, 378, 245, 279];
+    const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let input = deterministic_v4_bf16(1, 97);
+    let norm = read_v4_bf16(shard, "layers.0.ffn_norm.weight", &[7_168])?;
+    let gate = read_v4_bf16(shard, "layers.0.ffn.gate.weight", &[384, 7_168])?;
+    let routed_input = v4_router::rmsnorm_bf16(&input, &norm)?;
+    let logits = v4_router::project_gate_logits(&routed_input, &gate)?;
+    let hash_ids = read_v4_hash_rows(shard, "layers.0.ffn.gate.tid2eid", &[0])?;
+    let routes = v4_router::select_hash(&logits, &hash_ids)?;
+    let route_ids: [u16; v4_router::V4_TOPK] = routes
+        .ids
+        .iter()
+        .map(|&id| u16::try_from(id))
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| "V4 route ID count changed")?;
+    let route_weights: [f32; v4_router::V4_TOPK] = routes
+        .weights
+        .clone()
+        .try_into()
+        .map_err(|_| "V4 route weight count changed")?;
+    assert_eq!(route_ids, EXPECTED_IDS, "frozen token-0 route IDs");
+
+    let oracle_start = std::time::Instant::now();
+    let mut oracle_contributions = Vec::with_capacity(v4_router::V4_TOPK);
+    for (&expert_id, &weight) in route_ids.iter().zip(&route_weights) {
+        let weights = v4_expert::RoutedExpert::load(shard, expert_id)?;
+        oracle_contributions.push(v4_expert::forward_cpu(&weights, &routed_input, weight)?);
+    }
+    let oracle_bf16 = canonical_audit_bits(&oracle_contributions);
+    let oracle_ns = oracle_start
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    drop(oracle_contributions);
+
+    let owner_ids = [
+        [route_ids[0], route_ids[1], route_ids[2]],
+        [route_ids[3], route_ids[4], route_ids[5]],
+    ];
+    let owner_weights = [
+        [route_weights[0], route_weights[1], route_weights[2]],
+        [route_weights[3], route_weights[4], route_weights[5]],
+    ];
+    let listeners = [
+        std::net::TcpListener::bind(("127.0.0.1", 0))?,
+        std::net::TcpListener::bind(("127.0.0.1", 0))?,
+    ];
+    let addresses = [listeners[0].local_addr()?, listeners[1].local_addr()?];
+    let worker_streams = [context.new_stream()?, context.new_stream()?];
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let audit_first = bench
+        .map(|config| config.audit_first)
+        .unwrap_or([true, false, true, false]);
+    let mut expected_modes = Vec::with_capacity(2 + 2 * MEASURED_PAIRS);
+    expected_modes.extend([
+        v4_federated::OwnerTaskMode::Audit,
+        v4_federated::OwnerTaskMode::Certified,
+    ]);
+    for pair in 0..MEASURED_PAIRS {
+        let first_is_audit = if bench.is_some() {
+            audit_first[pair / NETEM_PAIRS_PER_BLOCK]
+        } else {
+            pair.is_multiple_of(2)
+        };
+        expected_modes.extend(if first_is_audit {
+            [
+                v4_federated::OwnerTaskMode::Audit,
+                v4_federated::OwnerTaskMode::Certified,
+            ]
+        } else {
+            [
+                v4_federated::OwnerTaskMode::Certified,
+                v4_federated::OwnerTaskMode::Audit,
+            ]
+        });
+    }
+
+    let (mut cold, audit_samples, certified_samples, audit_blocks, certified_blocks) =
+        std::thread::scope(|scope| -> Result<_, String> {
+            let mut workers = Vec::with_capacity(2);
+            for (owner, (listener, worker_stream)) in
+                listeners.into_iter().zip(worker_streams).enumerate()
+            {
+                let worker_context = context.clone();
+                let worker_input = routed_input.clone();
+                let worker_path = shard_path.to_owned();
+                let worker_ready = ready_tx.clone();
+                let ids = owner_ids[owner];
+                let weights = owner_weights[owner];
+                let worker_modes = expected_modes.clone();
+                workers.push(scope.spawn(move || {
+                    run_v4_owner_worker(
+                        listener,
+                        worker_context,
+                        module,
+                        worker_stream,
+                        &worker_path,
+                        owner as u8,
+                        ids,
+                        weights,
+                        &worker_input,
+                        worker_modes,
+                        worker_ready,
+                    )
+                }));
+            }
+            drop(ready_tx);
+
+            let mut sockets = [
+                std::net::TcpStream::connect(addresses[0]).map_err(|error| error.to_string())?,
+                std::net::TcpStream::connect(addresses[1]).map_err(|error| error.to_string())?,
+            ];
+            for socket in &sockets {
+                socket
+                    .set_nodelay(true)
+                    .and_then(|_| socket.set_read_timeout(Some(SOCKET_TIMEOUT)))
+                    .and_then(|_| socket.set_write_timeout(Some(SOCKET_TIMEOUT)))
+                    .map_err(|error| error.to_string())?;
+            }
+
+            let mut cold = Vec::with_capacity(2);
+            for _ in 0..2 {
+                cold.push(
+                    ready_rx
+                        .recv_timeout(std::time::Duration::from_secs(120))
+                        .map_err(|error| format!("worker cold-start readiness failed: {error}"))?,
+                );
+            }
+
+            let _ = run_v4_audit_client(
+                &mut sockets,
+                1,
+                owner_ids,
+                owner_weights,
+                &routed_input,
+                &oracle_bf16,
+            )?;
+            let warm_certified = run_v4_certified_client(
+                &mut sockets,
+                2,
+                owner_ids,
+                owner_weights,
+                &routed_input,
+                &oracle_bf16,
+            )?;
+            if warm_certified.repair_lanes == 0 {
+                return Err("frozen certified warmup unexpectedly needed no repair".into());
+            }
+
+            let mut audit_samples = Vec::with_capacity(MEASURED_PAIRS);
+            let mut certified_samples = Vec::with_capacity(MEASURED_PAIRS);
+            let mut audit_blocks: [Vec<LoopbackSample>; NETEM_BLOCKS] =
+                std::array::from_fn(|_| Vec::with_capacity(NETEM_PAIRS_PER_BLOCK));
+            let mut certified_blocks: [Vec<LoopbackSample>; NETEM_BLOCKS] =
+                std::array::from_fn(|_| Vec::with_capacity(NETEM_PAIRS_PER_BLOCK));
+            let mut request_id = 3_u64;
+            for pair in 0..MEASURED_PAIRS {
+                let block = pair / NETEM_PAIRS_PER_BLOCK;
+                if expected_modes[request_id as usize - 1] == v4_federated::OwnerTaskMode::Audit {
+                    let audit = run_v4_audit_client(
+                        &mut sockets,
+                        request_id,
+                        owner_ids,
+                        owner_weights,
+                        &routed_input,
+                        &oracle_bf16,
+                    )?;
+                    audit_blocks[block].push(audit.clone());
+                    audit_samples.push(audit);
+                    request_id += 1;
+                    let certified = run_v4_certified_client(
+                        &mut sockets,
+                        request_id,
+                        owner_ids,
+                        owner_weights,
+                        &routed_input,
+                        &oracle_bf16,
+                    )?;
+                    certified_blocks[block].push(certified.clone());
+                    certified_samples.push(certified);
+                } else {
+                    let certified = run_v4_certified_client(
+                        &mut sockets,
+                        request_id,
+                        owner_ids,
+                        owner_weights,
+                        &routed_input,
+                        &oracle_bf16,
+                    )?;
+                    certified_blocks[block].push(certified.clone());
+                    certified_samples.push(certified);
+                    request_id += 1;
+                    let audit = run_v4_audit_client(
+                        &mut sockets,
+                        request_id,
+                        owner_ids,
+                        owner_weights,
+                        &routed_input,
+                        &oracle_bf16,
+                    )?;
+                    audit_blocks[block].push(audit.clone());
+                    audit_samples.push(audit);
+                }
+                request_id += 1;
+            }
+            drop(sockets);
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| "owner worker panicked".to_string())??;
+            }
+            Ok((
+                cold,
+                audit_samples,
+                certified_samples,
+                audit_blocks,
+                certified_blocks,
+            ))
+        })
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+    cold.sort_by_key(|worker| worker.owner);
+    println!(
+        "DUAL_TCP_FIXED token=0 seed=97 ids={route_ids:?} weights={route_weights:?} placement=A:[0,1,2],B:[3,4,5] block=256 oracle_cpu={:.3}ms",
+        oracle_ns as f64 / 1_000_000.0,
+    );
+    for worker in &cold {
+        println!(
+            "DUAL_TCP_COLD owner={} resident_slots=3 range_load+alloc+one_weight_H2D={:.3}ms weight_H2D={}B",
+            worker.owner,
+            worker.elapsed_ns as f64 / 1_000_000.0,
+            worker.weight_bytes,
+        );
+    }
+
+    let audit_bytes = audit_samples[0].bytes;
+    let certified_bytes = certified_samples[0].bytes;
+    assert!(
+        audit_samples
+            .iter()
+            .all(|sample| sample.bytes == audit_bytes && sample.repair_lanes == 0)
+    );
+    let repair_lanes = certified_samples[0].repair_lanes;
+    assert!(
+        certified_samples.iter().all(|sample| {
+            sample.bytes == certified_bytes && sample.repair_lanes == repair_lanes
+        })
+    );
+    print_loopback_timings("AUDIT", &audit_samples, false);
+    print_loopback_timings("CERTIFIED", &certified_samples, true);
+    println!(
+        "DUAL_TCP_BYTES audit initial_request_double={} audit_responses={} total_bidirectional={} return_side={}; certified initial_request_double={} certified_initial_responses={} repair_requests={} repair_responses={} total_bidirectional={} return_side={}",
+        audit_bytes.initial_requests,
+        audit_bytes.audit_responses,
+        audit_bytes.total(),
+        audit_bytes.returned(),
+        certified_bytes.initial_requests,
+        certified_bytes.certified_responses,
+        certified_bytes.repair_requests,
+        certified_bytes.repair_responses,
+        certified_bytes.total(),
+        certified_bytes.returned(),
+    );
+    println!(
+        "DUAL_TCP_BYTE_RATIOS certified/audit total_bidirectional={:.6} return_side={:.6}; offline 2.187x is not extrapolated to total network bytes",
+        certified_bytes.total() as f64 / audit_bytes.total() as f64,
+        certified_bytes.returned() as f64 / audit_bytes.returned() as f64,
+    );
+    if let Some(config) = bench {
+        let block_order = config
+            .audit_first
+            .iter()
+            .map(|&first| if first { "AB" } else { "BA" })
+            .collect::<Vec<_>>()
+            .join("|");
+        println!(
+            "NETEM_PREREG scenario={} seed={} blocks={} pairs_per_block={} order={} unit=same_GPU_same_resident6_one_protocol_measurement primary=certified_minus_audit_E2E_median",
+            config.scenario, config.seed, NETEM_BLOCKS, NETEM_PAIRS_PER_BLOCK, block_order,
+        );
+        print_netem_result(
+            &config.scenario,
+            config.seed,
+            "audit",
+            &block_order,
+            &audit_samples,
+            &audit_blocks,
+        );
+        print_netem_result(
+            &config.scenario,
+            config.seed,
+            "certified",
+            &block_order,
+            &certified_samples,
+            &certified_blocks,
+        );
+    }
+    let network_scope = if bench.is_some() {
+        "container-loopback netem condition is externally measured"
+    } else {
+        "loopback speed is observational and bandwidth-limited netem remains future validation"
+    };
+    println!(
+        "DUAL_TCP_RESULT audit_n={} certified_n={} repair_lanes={} BF16_mismatch=0 identity=fail_closed order=alternating_AUDIT/CERTIFIED; one GPU with two CUDA streams is protocol/timing simulation, not dual-GPU parallelism; {network_scope}",
+        audit_samples.len(),
+        certified_samples.len(),
+        repair_lanes,
+    );
+    Ok(())
+}
+
+fn print_netem_result(
+    scenario: &str,
+    seed: u64,
+    mode: &str,
+    block_order: &str,
+    samples: &[LoopbackSample],
+    blocks: &[Vec<LoopbackSample>; NETEM_BLOCKS],
+) {
+    let e2e: Vec<_> = samples.iter().map(|sample| sample.e2e_ns).collect();
+    let worker: Vec<_> = samples.iter().map(|sample| sample.worker_ns).collect();
+    let residual: Vec<_> = samples.iter().map(|sample| sample.codec_tcp_ns).collect();
+    let repair: Vec<_> = samples.iter().map(|sample| sample.repair_ns).collect();
+    let cuda: Vec<_> = samples.iter().map(|sample| sample.gpu_ns).collect();
+    let (e2e_median, e2e_p95) = median_p95_ms(&e2e);
+    let (worker_median, worker_p95) = median_p95_ms(&worker);
+    let (residual_median, residual_p95) = median_p95_ms(&residual);
+    let (repair_median, repair_p95) = median_p95_ms(&repair);
+    let (cuda_median, cuda_p95) = median_p95_ms(&cuda);
+    let block_medians = blocks
+        .iter()
+        .map(|block| {
+            let values: Vec<_> = block.iter().map(|sample| sample.e2e_ns).collect();
+            format!("{:.6}", median_p95_ms(&values).0)
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let bytes = samples[0].bytes;
+    println!(
+        "NETEM_RESULT,{scenario},{seed},{mode},{},{e2e_median:.6},{e2e_p95:.6},{worker_median:.6},{worker_p95:.6},{residual_median:.6},{residual_p95:.6},{repair_median:.6},{repair_p95:.6},{cuda_median:.6},{cuda_p95:.6},{},{},{},0,{block_order},{block_medians}",
+        samples.len(),
+        bytes.total(),
+        bytes.returned(),
+        samples[0].repair_lanes,
+    );
+}
+
+fn run_v4_replica_recovery(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    shard: &safetensors::ShardFile,
+    shard_path: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    const EXPECTED_IDS: [u16; v4_router::V4_TOPK] = [254, 222, 371, 378, 245, 279];
+    const CASES: [RecoveryCase; 5] = [
+        RecoveryCase::AuditBaseline,
+        RecoveryCase::CertifiedBaseline,
+        RecoveryCase::AuditF1,
+        RecoveryCase::CertifiedF1,
+        RecoveryCase::CertifiedF2,
+    ];
+
+    let input = deterministic_v4_bf16(1, 97);
+    let norm = read_v4_bf16(shard, "layers.0.ffn_norm.weight", &[7_168])?;
+    let gate = read_v4_bf16(shard, "layers.0.ffn.gate.weight", &[384, 7_168])?;
+    let routed_input = v4_router::rmsnorm_bf16(&input, &norm)?;
+    let logits = v4_router::project_gate_logits(&routed_input, &gate)?;
+    let hash_ids = read_v4_hash_rows(shard, "layers.0.ffn.gate.tid2eid", &[0])?;
+    let routes = v4_router::select_hash(&logits, &hash_ids)?;
+    let route_ids: [u16; v4_router::V4_TOPK] = routes
+        .ids
+        .iter()
+        .map(|&id| u16::try_from(id))
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| "V4 recovery route ID count changed")?;
+    let route_weights: [f32; v4_router::V4_TOPK] = routes
+        .weights
+        .clone()
+        .try_into()
+        .map_err(|_| "V4 recovery route weight count changed")?;
+    assert_eq!(route_ids, EXPECTED_IDS, "frozen recovery route IDs");
+
+    let mut oracle_contributions = Vec::with_capacity(v4_router::V4_TOPK);
+    for (&expert_id, &weight) in route_ids.iter().zip(&route_weights) {
+        let weights = v4_expert::RoutedExpert::load(shard, expert_id)?;
+        oracle_contributions.push(v4_expert::forward_cpu(&weights, &routed_input, weight)?);
+    }
+    let oracle_bf16 = canonical_audit_bits(&oracle_contributions);
+    drop(oracle_contributions);
+    let owner_ids = [
+        [route_ids[0], route_ids[1], route_ids[2]],
+        [route_ids[3], route_ids[4], route_ids[5]],
+    ];
+    let owner_weights = [
+        [route_weights[0], route_weights[1], route_weights[2]],
+        [route_weights[3], route_weights[4], route_weights[5]],
+    ];
+    let endpoints = [
+        RecoveryEndpoint::PrimaryA,
+        RecoveryEndpoint::PrimaryB,
+        RecoveryEndpoint::ReplicaA,
+    ];
+    let listeners = [
+        std::net::TcpListener::bind(("127.0.0.1", 0))?,
+        std::net::TcpListener::bind(("127.0.0.1", 0))?,
+        std::net::TcpListener::bind(("127.0.0.1", 0))?,
+    ];
+    let addresses = [
+        listeners[0].local_addr()?,
+        listeners[1].local_addr()?,
+        listeners[2].local_addr()?,
+    ];
+    let streams = [
+        context.new_stream()?,
+        context.new_stream()?,
+        context.new_stream()?,
+    ];
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    let (mut cold, results) = std::thread::scope(|scope| -> Result<_, String> {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(3);
+        for ((endpoint, listener), stream) in endpoints.into_iter().zip(listeners).zip(streams) {
+            let worker_context = context.clone();
+            let worker_input = routed_input.clone();
+            let worker_path = shard_path.to_owned();
+            let worker_ready = ready_tx.clone();
+            let worker_stop = stop.clone();
+            let owner = endpoint.owner() as usize;
+            let accept_count = match endpoint {
+                RecoveryEndpoint::PrimaryA | RecoveryEndpoint::PrimaryB => 102,
+                RecoveryEndpoint::ReplicaA => 62,
+            };
+            workers.push(scope.spawn(move || {
+                run_v4_recovery_endpoint(
+                    listener,
+                    worker_context,
+                    module,
+                    stream,
+                    &worker_path,
+                    endpoint,
+                    owner_ids[owner],
+                    owner_weights[owner],
+                    &worker_input,
+                    accept_count,
+                    worker_ready,
+                    worker_stop,
+                )
+            }));
+        }
+        drop(ready_tx);
+        let client_result = (|| -> Result<_, String> {
+            let mut cold = Vec::with_capacity(3);
+            for _ in 0..3 {
+                cold.push(
+                    ready_rx
+                        .recv_timeout(std::time::Duration::from_secs(120))
+                        .map_err(|error| format!("recovery endpoint readiness failed: {error}"))?,
+                );
+            }
+
+            let mut results = Vec::with_capacity(CASES.len());
+            for case in CASES {
+                let mut samples = Vec::with_capacity(RECOVERY_SAMPLES as usize);
+                for offset in 0..RECOVERY_SAMPLES {
+                    samples.push(run_v4_recovery_case(
+                        addresses,
+                        case,
+                        case.start_id() + offset,
+                        owner_ids,
+                        owner_weights,
+                        &routed_input,
+                        &oracle_bf16,
+                    )?);
+                }
+                results.push((case, samples));
+            }
+
+            for case in [
+                RecoveryCase::WrongReplicaIdentity,
+                RecoveryCase::SecondFailure,
+            ] {
+                match run_v4_recovery_case(
+                    addresses,
+                    case,
+                    case.start_id(),
+                    owner_ids,
+                    owner_weights,
+                    &routed_input,
+                    &oracle_bf16,
+                ) {
+                    Ok(_) => return Err(format!("{} unexpectedly committed", case.label())),
+                    Err(error) => println!(
+                        "RECOVERY_NEGATIVE case={} result=error commit=false detail={error}",
+                        case.label()
+                    ),
+                }
+            }
+            Ok((cold, results))
+        })();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        for address in addresses {
+            let _ = std::net::TcpStream::connect(address);
+        }
+        let mut worker_error = None;
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    worker_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    worker_error.get_or_insert("recovery endpoint panicked".into());
+                }
+            };
+        }
+        match (client_result, worker_error) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Some(error)) => Err(error),
+            (Ok(result), None) => Ok(result),
+        }
+    })
+    .map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+    cold.sort_by_key(|worker| match worker.endpoint {
+        RecoveryEndpoint::PrimaryA => 0,
+        RecoveryEndpoint::PrimaryB => 1,
+        RecoveryEndpoint::ReplicaA => 2,
+    });
+    println!(
+        "RECOVERY_FIXED token=0 seed=97 activation_hash={:016x} primary=A:[0,1,2],B:[3,4,5] replica=A':[0,1,2] one_failover_max=true",
+        v4_activation_hash(&routed_input),
+    );
+    for worker in cold {
+        println!(
+            "RECOVERY_COLD endpoint={} resident_slots=3 elapsed={:.3}ms weight_H2D={}B",
+            worker.endpoint.label(),
+            worker.elapsed_ns as f64 / 1_000_000.0,
+            worker.weight_bytes,
+        );
+    }
+    for (case, samples) in &results {
+        print_recovery_case(*case, samples);
+    }
+    println!(
+        "RECOVERY_RESULT cases=5 n_per_case={} BF16_mismatch=0 partial_commit=0 negatives=2_fail_closed single_GPU_three_stream_protocol_simulation=true",
+        RECOVERY_SAMPLES,
+    );
+    Ok(())
+}
+
+fn run_v4_recovery_endpoint(
+    listener: std::net::TcpListener,
+    context: std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: std::sync::Arc<CudaStream>,
+    shard_path: &std::path::Path,
+    endpoint: RecoveryEndpoint,
+    expert_ids: [u16; v4_federated::OWNER_EXPERTS],
+    route_weights: [f32; v4_federated::OWNER_EXPERTS],
+    expected_input: &[u16],
+    accept_count: usize,
+    ready: std::sync::mpsc::Sender<RecoveryCold>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let cold_start = std::time::Instant::now();
+    let shard = safetensors::ShardFile::open(shard_path).map_err(|error| error.to_string())?;
+    let mut weight_bytes = 0;
+    let mut slots = Vec::with_capacity(v4_federated::OWNER_EXPERTS);
+    for &expert_id in &expert_ids {
+        let weights =
+            v4_expert::RoutedExpert::load(&shard, expert_id).map_err(|error| error.to_string())?;
+        weight_bytes += weights.h2d_bytes();
+        slots.push(
+            ExpertSlot::new(&context, module, &stream, &weights)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let cold_ns = cold_start
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    // Warm all three resident slots before any measured connection.
+    let _ = execute_v4_owner_slots(&mut slots, expected_input, route_weights)?;
+    ready
+        .send(RecoveryCold {
+            endpoint,
+            elapsed_ns: cold_ns,
+            weight_bytes,
+        })
+        .map_err(|error| error.to_string())?;
+
+    let mut seen = HashSet::with_capacity(accept_count);
+    let mut accepted = 0;
+    while accepted < accept_count {
+        let (mut socket, peer) = listener.accept().map_err(|error| error.to_string())?;
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        accepted += 1;
+        if !peer.ip().is_loopback() {
+            return Err(format!(
+                "recovery endpoint {} accepted non-loopback peer",
+                endpoint.label()
+            ));
+        }
+        let timeout = std::time::Duration::from_secs(30);
+        socket
+            .set_nodelay(true)
+            .and_then(|_| socket.set_read_timeout(Some(timeout)))
+            .and_then(|_| socket.set_write_timeout(Some(timeout)))
+            .map_err(|error| error.to_string())?;
+        let frame = v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+        let task = v4_federated::decode_owner_task(&frame).map_err(|error| error.to_string())?;
+        let request_id = task.identity.request_id;
+        let case = recovery_case_for_id(request_id)
+            .ok_or_else(|| format!("unknown recovery request {request_id}"))?;
+        if !seen.insert(request_id) {
+            return Err(format!(
+                "recovery endpoint {} rejected duplicate request {request_id}",
+                endpoint.label()
+            ));
+        }
+        validate_v4_recovery_task(
+            &task,
+            endpoint,
+            case,
+            expert_ids,
+            route_weights,
+            expected_input,
+        )?;
+        let fault = recovery_fault(endpoint, case);
+        if fault == RecoveryFault::F1 {
+            // Injected only after the full initial task has passed validation.
+            continue;
+        }
+
+        let compute_start = std::time::Instant::now();
+        let (contributions, gpu_ns) =
+            execute_v4_owner_slots(&mut slots, &task.hidden_bf16, task.route_weights)?;
+        match task.mode {
+            v4_federated::OwnerTaskMode::Audit => {
+                let mut identity = task.identity;
+                if fault == RecoveryFault::WrongIdentity {
+                    identity.request_id += 1;
+                }
+                let response = v4_federated::OwnerAuditResponse {
+                    identity,
+                    worker_ns: compute_start
+                        .elapsed()
+                        .as_nanos()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    gpu_ns,
+                    contributions: contributions.into_iter().flatten().collect(),
+                };
+                let frame = v4_federated::encode_owner_audit_response(&response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+            }
+            v4_federated::OwnerTaskMode::Certified => {
+                let refs: Vec<_> = contributions.iter().map(Vec::as_slice).collect();
+                let reduced = v4_certified::reduce_owner(&refs, v4_federated::FROZEN_BLOCK_SIZE)
+                    .map_err(|error| error.to_string())?;
+                let response = v4_federated::OwnerCertifiedResponse {
+                    identity: task.identity.clone(),
+                    worker_ns: compute_start
+                        .elapsed()
+                        .as_nanos()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    gpu_ns,
+                    grouped_f32: reduced.grouped_f32,
+                    bounds: reduced.bounds,
+                };
+                let frame = v4_federated::encode_owner_certified_response(&response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+
+                let repair_frame =
+                    v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+                let repair_request = v4_federated::decode_owner_repair_request(&repair_frame)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::validate_owner_repair_request(&task, &repair_request)
+                    .map_err(|error| error.to_string())?;
+                if fault == RecoveryFault::F2 {
+                    // The complete initial response is now unusable by contract.
+                    continue;
+                }
+                let repair_start = std::time::Instant::now();
+                let repair_lanes = v4_certified::mask_count(&repair_request.mask);
+                let mut values = Vec::with_capacity(v4_federated::OWNER_EXPERTS * repair_lanes);
+                for contribution in &contributions {
+                    for (lane, &value) in contribution.iter().enumerate() {
+                        if v4_certified::mask_contains(&repair_request.mask, lane) {
+                            values.push(value);
+                        }
+                    }
+                }
+                let response = v4_federated::OwnerRepairResponse {
+                    identity: task.identity,
+                    worker_ns: repair_start
+                        .elapsed()
+                        .as_nanos()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    lane_count: u16::try_from(repair_lanes)
+                        .map_err(|_| "recovery repair count exceeds u16".to_string())?,
+                    values,
+                };
+                let frame = v4_federated::encode_owner_repair_response(&response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recovery_case_for_id(request_id: u64) -> Option<RecoveryCase> {
+    match request_id {
+        10_000..=10_019 => Some(RecoveryCase::AuditBaseline),
+        10_020..=10_039 => Some(RecoveryCase::CertifiedBaseline),
+        10_040..=10_059 => Some(RecoveryCase::AuditF1),
+        10_060..=10_079 => Some(RecoveryCase::CertifiedF1),
+        10_080..=10_099 => Some(RecoveryCase::CertifiedF2),
+        10_100 => Some(RecoveryCase::WrongReplicaIdentity),
+        10_101 => Some(RecoveryCase::SecondFailure),
+        _ => None,
+    }
+}
+
+fn recovery_fault(endpoint: RecoveryEndpoint, case: RecoveryCase) -> RecoveryFault {
+    match (endpoint, case) {
+        (
+            RecoveryEndpoint::PrimaryA,
+            RecoveryCase::AuditF1
+            | RecoveryCase::CertifiedF1
+            | RecoveryCase::WrongReplicaIdentity
+            | RecoveryCase::SecondFailure,
+        ) => RecoveryFault::F1,
+        (RecoveryEndpoint::PrimaryA, RecoveryCase::CertifiedF2) => RecoveryFault::F2,
+        (RecoveryEndpoint::ReplicaA, RecoveryCase::WrongReplicaIdentity) => {
+            RecoveryFault::WrongIdentity
+        }
+        (RecoveryEndpoint::ReplicaA, RecoveryCase::SecondFailure) => RecoveryFault::F1,
+        _ => RecoveryFault::None,
+    }
+}
+
+fn validate_v4_recovery_task(
+    task: &v4_federated::OwnerTask,
+    endpoint: RecoveryEndpoint,
+    case: RecoveryCase,
+    expert_ids: [u16; v4_federated::OWNER_EXPERTS],
+    route_weights: [f32; v4_federated::OWNER_EXPERTS],
+    expected_input: &[u16],
+) -> Result<(), String> {
+    let expected_identity =
+        v4_federated::OwnerIdentity::live(endpoint.owner(), task.identity.request_id, expert_ids);
+    if task.identity != expected_identity
+        || task.mode != case.mode()
+        || task
+            .route_weights
+            .iter()
+            .zip(route_weights)
+            .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+        || v4_activation_hash(&task.hidden_bf16) != v4_activation_hash(expected_input)
+        || task.hidden_bf16 != expected_input
+    {
+        return Err(format!(
+            "recovery endpoint {} rejected task identity {}",
+            endpoint.label(),
+            task.identity.request_id
+        ));
+    }
+    Ok(())
+}
+
+fn v4_activation_hash(values: &[u16]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn run_v4_recovery_case(
+    addresses: [std::net::SocketAddr; 3],
+    case: RecoveryCase,
+    request_id: u64,
+    owner_ids: [[u16; v4_federated::OWNER_EXPERTS]; 2],
+    owner_weights: [[f32; v4_federated::OWNER_EXPERTS]; 2],
+    input: &[u16],
+    oracle_bf16: &[u16],
+) -> Result<RecoverySample, String> {
+    let start = std::time::Instant::now();
+    let tasks = owner_tasks(case.mode(), request_id, owner_ids, owner_weights, input);
+    let task_frames = [
+        v4_federated::encode_owner_task(&tasks[0]).map_err(|error| error.to_string())?,
+        v4_federated::encode_owner_task(&tasks[1]).map_err(|error| error.to_string())?,
+    ];
+    let mut bytes = LoopbackWireBytes::default();
+    let mut primary_a = connect_recovery_endpoint(addresses[0])?;
+    let mut primary_b = connect_recovery_endpoint(addresses[1])?;
+    v4_federated::send_frame(&mut primary_a, &task_frames[0]).map_err(|error| error.to_string())?;
+    v4_federated::send_frame(&mut primary_b, &task_frames[1]).map_err(|error| error.to_string())?;
+    bytes.initial_requests += wire_frame_bytes(&task_frames[0]) + wire_frame_bytes(&task_frames[1]);
+
+    match case.mode() {
+        v4_federated::OwnerTaskMode::Audit => run_v4_recovery_audit(
+            primary_a,
+            primary_b,
+            addresses[2],
+            case,
+            start,
+            &tasks,
+            &task_frames,
+            oracle_bf16,
+            bytes,
+        ),
+        v4_federated::OwnerTaskMode::Certified => run_v4_recovery_certified(
+            primary_a,
+            primary_b,
+            addresses[2],
+            case,
+            start,
+            &tasks,
+            &task_frames,
+            oracle_bf16,
+            bytes,
+        ),
+    }
+}
+
+fn run_v4_recovery_audit(
+    mut primary_a: std::net::TcpStream,
+    mut primary_b: std::net::TcpStream,
+    replica_address: std::net::SocketAddr,
+    case: RecoveryCase,
+    start: std::time::Instant,
+    tasks: &[v4_federated::OwnerTask; 2],
+    task_frames: &[Vec<u8>; 2],
+    oracle_bf16: &[u16],
+    mut bytes: LoopbackWireBytes,
+) -> Result<RecoverySample, String> {
+    let primary_result = receive_recovery_audit(&mut primary_a, &tasks[0]);
+    let (b_frame, b_response) = receive_recovery_audit(&mut primary_b, &tasks[1])?;
+    bytes.audit_responses += wire_frame_bytes(&b_frame);
+    let expected_f1 = matches!(
+        case,
+        RecoveryCase::AuditF1 | RecoveryCase::WrongReplicaIdentity | RecoveryCase::SecondFailure
+    );
+    let mut failover_started = None;
+    let mut failovers = 0;
+    let a_response = match primary_result {
+        Ok((frame, response)) => {
+            if expected_f1 {
+                return Err(format!("{} did not inject F1", case.label()));
+            }
+            bytes.audit_responses += wire_frame_bytes(&frame);
+            response
+        }
+        Err(_) => {
+            failovers = 1;
+            failover_started = Some(std::time::Instant::now());
+            let mut replica = connect_recovery_endpoint(replica_address)?;
+            v4_federated::send_frame(&mut replica, &task_frames[0])
+                .map_err(|error| error.to_string())?;
+            bytes.initial_requests += wire_frame_bytes(&task_frames[0]);
+            let (frame, response) = receive_recovery_audit(&mut replica, &tasks[0])?;
+            bytes.audit_responses += wire_frame_bytes(&frame);
+            response
+        }
+    };
+    let actual = audit_bits_from_owner_responses(&[a_response, b_response])?;
+    if actual != oracle_bf16 {
+        return Err(format!(
+            "{} BF16 mismatch count {} before commit",
+            case.label(),
+            bf16_mismatch_count(&actual, oracle_bf16)
+        ));
+    }
+    let expected_failovers = usize::from(expected_f1);
+    if failovers != expected_failovers {
+        return Err(format!(
+            "{} failover count {failovers}, expected {expected_failovers}",
+            case.label()
+        ));
+    }
+    Ok(RecoverySample {
+        e2e_ns: start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+        failover_ns: failover_started
+            .map(|started| started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        failovers,
+        bytes,
+    })
+}
+
+fn run_v4_recovery_certified(
+    mut primary_a: std::net::TcpStream,
+    mut primary_b: std::net::TcpStream,
+    replica_address: std::net::SocketAddr,
+    case: RecoveryCase,
+    start: std::time::Instant,
+    tasks: &[v4_federated::OwnerTask; 2],
+    task_frames: &[Vec<u8>; 2],
+    oracle_bf16: &[u16],
+    mut bytes: LoopbackWireBytes,
+) -> Result<RecoverySample, String> {
+    let primary_result = receive_recovery_certified(&mut primary_a, &tasks[0]);
+    let (b_frame, b_response) = receive_recovery_certified(&mut primary_b, &tasks[1])?;
+    bytes.certified_responses += wire_frame_bytes(&b_frame);
+    let expected_f1 = case == RecoveryCase::CertifiedF1;
+    let mut failovers = 0;
+    let mut failover_started = None;
+    let mut active_a = primary_a;
+    let mut a_response = match primary_result {
+        Ok((frame, response)) => {
+            if expected_f1 {
+                return Err("certified_F1 did not inject F1".into());
+            }
+            bytes.certified_responses += wire_frame_bytes(&frame);
+            response
+        }
+        Err(_) => {
+            failovers = 1;
+            failover_started = Some(std::time::Instant::now());
+            active_a = connect_recovery_endpoint(replica_address)?;
+            v4_federated::send_frame(&mut active_a, &task_frames[0])
+                .map_err(|error| error.to_string())?;
+            bytes.initial_requests += wire_frame_bytes(&task_frames[0]);
+            let (frame, response) = receive_recovery_certified(&mut active_a, &tasks[0])?;
+            bytes.certified_responses += wire_frame_bytes(&frame);
+            response
+        }
+    };
+
+    if case == RecoveryCase::CertifiedF2 {
+        let preliminary = certify_recovery_pair(&a_response, &b_response)?;
+        let trigger = v4_federated::OwnerRepairRequest {
+            identity: tasks[0].identity.clone(),
+            mask: preliminary.repair_mask,
+        };
+        let frame = v4_federated::encode_owner_repair_request(&trigger)
+            .map_err(|error| error.to_string())?;
+        v4_federated::send_frame(&mut active_a, &frame).map_err(|error| error.to_string())?;
+        bytes.repair_requests += wire_frame_bytes(&frame);
+        if receive_recovery_repair(&mut active_a, &tasks[0], &trigger).is_ok() {
+            return Err("certified_F2 primary A returned repair instead of failing".into());
+        }
+        failovers = 1;
+        failover_started = Some(std::time::Instant::now());
+
+        // Discard the primary A group and certificate completely.
+        active_a = connect_recovery_endpoint(replica_address)?;
+        v4_federated::send_frame(&mut active_a, &task_frames[0])
+            .map_err(|error| error.to_string())?;
+        bytes.initial_requests += wire_frame_bytes(&task_frames[0]);
+        let (frame, replica_response) = receive_recovery_certified(&mut active_a, &tasks[0])?;
+        bytes.certified_responses += wire_frame_bytes(&frame);
+        a_response = replica_response;
+    }
+
+    let certification = certify_recovery_pair(&a_response, &b_response)?;
+    let repair_lanes = v4_certified::mask_count(&certification.repair_mask);
+    if repair_lanes == 0 {
+        return Err(format!("{} unexpectedly required no repair", case.label()));
+    }
+    let requests = [
+        v4_federated::OwnerRepairRequest {
+            identity: tasks[0].identity.clone(),
+            mask: certification.repair_mask.clone(),
+        },
+        v4_federated::OwnerRepairRequest {
+            identity: tasks[1].identity.clone(),
+            mask: certification.repair_mask.clone(),
+        },
+    ];
+    let frames = [
+        v4_federated::encode_owner_repair_request(&requests[0])
+            .map_err(|error| error.to_string())?,
+        v4_federated::encode_owner_repair_request(&requests[1])
+            .map_err(|error| error.to_string())?,
+    ];
+    v4_federated::send_frame(&mut active_a, &frames[0]).map_err(|error| error.to_string())?;
+    v4_federated::send_frame(&mut primary_b, &frames[1]).map_err(|error| error.to_string())?;
+    bytes.repair_requests += frames.iter().map(wire_frame_bytes).sum::<usize>();
+    let (a_frame, a_repair) = receive_recovery_repair(&mut active_a, &tasks[0], &requests[0])?;
+    let (b_frame, b_repair) = receive_recovery_repair(&mut primary_b, &tasks[1], &requests[1])?;
+    bytes.repair_responses += wire_frame_bytes(&a_frame) + wire_frame_bytes(&b_frame);
+
+    let mut actual = certification.output_bf16;
+    apply_owner_repairs(
+        &mut actual,
+        &certification.repair_mask,
+        &[a_repair, b_repair],
+    )?;
+    if actual != oracle_bf16 {
+        return Err(format!(
+            "{} BF16 mismatch count {} before commit",
+            case.label(),
+            bf16_mismatch_count(&actual, oracle_bf16)
+        ));
+    }
+    let expected_failovers = usize::from(matches!(
+        case,
+        RecoveryCase::CertifiedF1 | RecoveryCase::CertifiedF2
+    ));
+    if failovers != expected_failovers {
+        return Err(format!(
+            "{} failover count {failovers}, expected {expected_failovers}",
+            case.label()
+        ));
+    }
+    Ok(RecoverySample {
+        e2e_ns: start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+        failover_ns: failover_started
+            .map(|started| started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        failovers,
+        bytes,
+    })
+}
+
+fn connect_recovery_endpoint(address: std::net::SocketAddr) -> Result<std::net::TcpStream, String> {
+    let socket = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+    let timeout = std::time::Duration::from_secs(30);
+    socket
+        .set_nodelay(true)
+        .and_then(|_| socket.set_read_timeout(Some(timeout)))
+        .and_then(|_| socket.set_write_timeout(Some(timeout)))
+        .map_err(|error| error.to_string())?;
+    Ok(socket)
+}
+
+fn receive_recovery_audit(
+    socket: &mut std::net::TcpStream,
+    task: &v4_federated::OwnerTask,
+) -> Result<(Vec<u8>, v4_federated::OwnerAuditResponse), String> {
+    let frame = v4_federated::receive_frame(socket).map_err(|error| error.to_string())?;
+    let response =
+        v4_federated::decode_owner_audit_response(&frame).map_err(|error| error.to_string())?;
+    v4_federated::validate_owner_audit_response(task, &response)
+        .map_err(|error| error.to_string())?;
+    Ok((frame, response))
+}
+
+fn receive_recovery_certified(
+    socket: &mut std::net::TcpStream,
+    task: &v4_federated::OwnerTask,
+) -> Result<(Vec<u8>, v4_federated::OwnerCertifiedResponse), String> {
+    let frame = v4_federated::receive_frame(socket).map_err(|error| error.to_string())?;
+    let response =
+        v4_federated::decode_owner_certified_response(&frame).map_err(|error| error.to_string())?;
+    v4_federated::validate_owner_certified_response(task, &response)
+        .map_err(|error| error.to_string())?;
+    Ok((frame, response))
+}
+
+fn receive_recovery_repair(
+    socket: &mut std::net::TcpStream,
+    task: &v4_federated::OwnerTask,
+    request: &v4_federated::OwnerRepairRequest,
+) -> Result<(Vec<u8>, v4_federated::OwnerRepairResponse), String> {
+    let frame = v4_federated::receive_frame(socket).map_err(|error| error.to_string())?;
+    let response =
+        v4_federated::decode_owner_repair_response(&frame).map_err(|error| error.to_string())?;
+    v4_federated::validate_owner_repair_response(task, request, &response)
+        .map_err(|error| error.to_string())?;
+    Ok((frame, response))
+}
+
+fn certify_recovery_pair(
+    a: &v4_federated::OwnerCertifiedResponse,
+    b: &v4_federated::OwnerCertifiedResponse,
+) -> Result<v4_certified::Certification, String> {
+    v4_certified::certify_owner_groups(
+        &[
+            v4_certified::OwnerReduction {
+                grouped_f32: a.grouped_f32.clone(),
+                bounds: a.bounds.clone(),
+            },
+            v4_certified::OwnerReduction {
+                grouped_f32: b.grouped_f32.clone(),
+                bounds: b.bounds.clone(),
+            },
+        ],
+        v4_federated::FROZEN_BLOCK_SIZE,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn run_v4_owner_worker(
+    listener: std::net::TcpListener,
+    context: std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: std::sync::Arc<CudaStream>,
+    shard_path: &std::path::Path,
+    owner: u8,
+    expert_ids: [u16; v4_federated::OWNER_EXPERTS],
+    route_weights: [f32; v4_federated::OWNER_EXPERTS],
+    expected_input: &[u16],
+    expected_modes: Vec<v4_federated::OwnerTaskMode>,
+    ready: std::sync::mpsc::Sender<OwnerCold>,
+) -> Result<(), String> {
+    let cold_start = std::time::Instant::now();
+    let shard = safetensors::ShardFile::open(shard_path).map_err(|error| error.to_string())?;
+    let mut weight_bytes = 0;
+    let mut slots = Vec::with_capacity(v4_federated::OWNER_EXPERTS);
+    for &expert_id in &expert_ids {
+        let weights =
+            v4_expert::RoutedExpert::load(&shard, expert_id).map_err(|error| error.to_string())?;
+        weight_bytes += weights.h2d_bytes();
+        slots.push(
+            ExpertSlot::new(&context, module, &stream, &weights)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let elapsed_ns = cold_start
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    ready
+        .send(OwnerCold {
+            owner,
+            elapsed_ns,
+            weight_bytes,
+        })
+        .map_err(|error| error.to_string())?;
+
+    let (mut socket, peer) = listener.accept().map_err(|error| error.to_string())?;
+    if !peer.ip().is_loopback() {
+        return Err("owner worker accepted a non-loopback peer".into());
+    }
+    let timeout = std::time::Duration::from_secs(30);
+    socket
+        .set_nodelay(true)
+        .and_then(|_| socket.set_read_timeout(Some(timeout)))
+        .and_then(|_| socket.set_write_timeout(Some(timeout)))
+        .map_err(|error| error.to_string())?;
+
+    for (operation, expected_mode) in expected_modes.into_iter().enumerate() {
+        let request_id = operation as u64 + 1;
+        let frame = v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+        let task = v4_federated::decode_owner_task(&frame).map_err(|error| error.to_string())?;
+        validate_v4_owner_task(
+            &task,
+            owner,
+            request_id,
+            expert_ids,
+            route_weights,
+            expected_input,
+            expected_mode,
+        )?;
+
+        let compute_start = std::time::Instant::now();
+        let (contributions, gpu_ns) =
+            execute_v4_owner_slots(&mut slots, &task.hidden_bf16, task.route_weights)?;
+        match task.mode {
+            v4_federated::OwnerTaskMode::Audit => {
+                let worker_ns = compute_start
+                    .elapsed()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                let response = v4_federated::OwnerAuditResponse {
+                    identity: task.identity,
+                    worker_ns,
+                    gpu_ns,
+                    contributions: contributions.into_iter().flatten().collect(),
+                };
+                let frame = v4_federated::encode_owner_audit_response(&response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+            }
+            v4_federated::OwnerTaskMode::Certified => {
+                let refs: Vec<_> = contributions.iter().map(Vec::as_slice).collect();
+                let reduced = v4_certified::reduce_owner(&refs, v4_federated::FROZEN_BLOCK_SIZE)
+                    .map_err(|error| error.to_string())?;
+                let worker_ns = compute_start
+                    .elapsed()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                let response = v4_federated::OwnerCertifiedResponse {
+                    identity: task.identity.clone(),
+                    worker_ns,
+                    gpu_ns,
+                    grouped_f32: reduced.grouped_f32,
+                    bounds: reduced.bounds,
+                };
+                let frame = v4_federated::encode_owner_certified_response(&response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+
+                let repair_frame =
+                    v4_federated::receive_frame(&mut socket).map_err(|error| error.to_string())?;
+                let repair_request = v4_federated::decode_owner_repair_request(&repair_frame)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::validate_owner_repair_request(&task, &repair_request)
+                    .map_err(|error| error.to_string())?;
+                let repair_start = std::time::Instant::now();
+                let repair_lanes = v4_certified::mask_count(&repair_request.mask);
+                // Repair selects only from this request-local cache; it never
+                // invokes an ExpertSlot again.
+                let mut values = Vec::with_capacity(v4_federated::OWNER_EXPERTS * repair_lanes);
+                for contribution in &contributions {
+                    for (lane, &value) in contribution.iter().enumerate() {
+                        if v4_certified::mask_contains(&repair_request.mask, lane) {
+                            values.push(value);
+                        }
+                    }
+                }
+                let repair_response = v4_federated::OwnerRepairResponse {
+                    identity: task.identity,
+                    worker_ns: repair_start
+                        .elapsed()
+                        .as_nanos()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    lane_count: u16::try_from(repair_lanes)
+                        .map_err(|_| "repair lane count exceeds u16".to_string())?,
+                    values,
+                };
+                let frame = v4_federated::encode_owner_repair_response(&repair_response)
+                    .map_err(|error| error.to_string())?;
+                v4_federated::send_frame(&mut socket, &frame).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_v4_owner_task(
+    task: &v4_federated::OwnerTask,
+    owner: u8,
+    request_id: u64,
+    expert_ids: [u16; v4_federated::OWNER_EXPERTS],
+    route_weights: [f32; v4_federated::OWNER_EXPERTS],
+    expected_input: &[u16],
+    expected_mode: v4_federated::OwnerTaskMode,
+) -> Result<(), String> {
+    let expected_identity = v4_federated::OwnerIdentity::live(owner, request_id, expert_ids);
+    if task.identity != expected_identity
+        || task.mode != expected_mode
+        || task
+            .route_weights
+            .iter()
+            .zip(route_weights)
+            .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+        || task.hidden_bf16 != expected_input
+    {
+        return Err(format!(
+            "owner {owner} rejected duplicate, missing, or wrong task identity {request_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn execute_v4_owner_slots(
+    slots: &mut [ExpertSlot<'_>],
+    input: &[u16],
+    route_weights: [f32; v4_federated::OWNER_EXPERTS],
+) -> Result<(Vec<Vec<f32>>, u64), String> {
+    let mut contributions = Vec::with_capacity(v4_federated::OWNER_EXPERTS);
+    let mut gpu_ns = 0_u64;
+    for (slot, weight) in slots.iter_mut().zip(route_weights) {
+        let (values, elapsed) = slot
+            .execute(input, weight)
+            .map_err(|error| error.to_string())?;
+        contributions.push(values);
+        gpu_ns = gpu_ns.saturating_add(elapsed);
+    }
+    Ok((contributions, gpu_ns))
+}
+
+fn owner_tasks(
+    mode: v4_federated::OwnerTaskMode,
+    request_id: u64,
+    owner_ids: [[u16; v4_federated::OWNER_EXPERTS]; 2],
+    owner_weights: [[f32; v4_federated::OWNER_EXPERTS]; 2],
+    input: &[u16],
+) -> [v4_federated::OwnerTask; 2] {
+    std::array::from_fn(|owner| v4_federated::OwnerTask {
+        identity: v4_federated::OwnerIdentity::live(owner as u8, request_id, owner_ids[owner]),
+        mode,
+        route_weights: owner_weights[owner],
+        hidden_bf16: input.to_vec(),
+    })
+}
+
+fn run_v4_audit_client(
+    sockets: &mut [std::net::TcpStream; 2],
+    request_id: u64,
+    owner_ids: [[u16; v4_federated::OWNER_EXPERTS]; 2],
+    owner_weights: [[f32; v4_federated::OWNER_EXPERTS]; 2],
+    input: &[u16],
+    oracle_bf16: &[u16],
+) -> Result<LoopbackSample, String> {
+    let start = std::time::Instant::now();
+    let tasks = owner_tasks(
+        v4_federated::OwnerTaskMode::Audit,
+        request_id,
+        owner_ids,
+        owner_weights,
+        input,
+    );
+    let frames = [
+        v4_federated::encode_owner_task(&tasks[0]).map_err(|error| error.to_string())?,
+        v4_federated::encode_owner_task(&tasks[1]).map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::send_frame(&mut sockets[owner], &frames[owner])
+            .map_err(|error| error.to_string())?;
+    }
+    let response_frames = [
+        v4_federated::receive_frame(&mut sockets[0]).map_err(|error| error.to_string())?,
+        v4_federated::receive_frame(&mut sockets[1]).map_err(|error| error.to_string())?,
+    ];
+    let responses = [
+        v4_federated::decode_owner_audit_response(&response_frames[0])
+            .map_err(|error| error.to_string())?,
+        v4_federated::decode_owner_audit_response(&response_frames[1])
+            .map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::validate_owner_audit_response(&tasks[owner], &responses[owner])
+            .map_err(|error| error.to_string())?;
+    }
+    // Commit only after both complete responses pass identity validation.
+    let actual = audit_bits_from_owner_responses(&responses)?;
+    if actual != oracle_bf16 {
+        return Err(format!(
+            "audit request {request_id} BF16 mismatch count {}",
+            bf16_mismatch_count(&actual, oracle_bf16)
+        ));
+    }
+    let e2e_ns = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+    let worker_ns = responses
+        .iter()
+        .map(|response| response.worker_ns)
+        .max()
+        .unwrap();
+    Ok(LoopbackSample {
+        e2e_ns,
+        worker_ns,
+        codec_tcp_ns: e2e_ns.saturating_sub(worker_ns),
+        repair_ns: 0,
+        gpu_ns: responses.iter().map(|response| response.gpu_ns).sum(),
+        repair_lanes: 0,
+        bytes: LoopbackWireBytes {
+            initial_requests: frames.iter().map(wire_frame_bytes).sum(),
+            audit_responses: response_frames.iter().map(wire_frame_bytes).sum(),
+            certified_responses: 0,
+            repair_requests: 0,
+            repair_responses: 0,
+        },
+    })
+}
+
+fn run_v4_certified_client(
+    sockets: &mut [std::net::TcpStream; 2],
+    request_id: u64,
+    owner_ids: [[u16; v4_federated::OWNER_EXPERTS]; 2],
+    owner_weights: [[f32; v4_federated::OWNER_EXPERTS]; 2],
+    input: &[u16],
+    oracle_bf16: &[u16],
+) -> Result<LoopbackSample, String> {
+    let start = std::time::Instant::now();
+    let tasks = owner_tasks(
+        v4_federated::OwnerTaskMode::Certified,
+        request_id,
+        owner_ids,
+        owner_weights,
+        input,
+    );
+    let frames = [
+        v4_federated::encode_owner_task(&tasks[0]).map_err(|error| error.to_string())?,
+        v4_federated::encode_owner_task(&tasks[1]).map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::send_frame(&mut sockets[owner], &frames[owner])
+            .map_err(|error| error.to_string())?;
+    }
+    let certified_frames = [
+        v4_federated::receive_frame(&mut sockets[0]).map_err(|error| error.to_string())?,
+        v4_federated::receive_frame(&mut sockets[1]).map_err(|error| error.to_string())?,
+    ];
+    let certified_responses = [
+        v4_federated::decode_owner_certified_response(&certified_frames[0])
+            .map_err(|error| error.to_string())?,
+        v4_federated::decode_owner_certified_response(&certified_frames[1])
+            .map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::validate_owner_certified_response(&tasks[owner], &certified_responses[owner])
+            .map_err(|error| error.to_string())?;
+    }
+    let owner_reductions = certified_responses
+        .iter()
+        .map(|response| v4_certified::OwnerReduction {
+            grouped_f32: response.grouped_f32.clone(),
+            bounds: response.bounds.clone(),
+        })
+        .collect::<Vec<_>>();
+    let certification =
+        v4_certified::certify_owner_groups(&owner_reductions, v4_federated::FROZEN_BLOCK_SIZE)
+            .map_err(|error| error.to_string())?;
+    let repair_lanes = v4_certified::mask_count(&certification.repair_mask);
+    if repair_lanes == 0 {
+        return Err(format!(
+            "certified request {request_id} had no repair phase"
+        ));
+    }
+
+    let repair_start = std::time::Instant::now();
+    let repair_requests = [
+        v4_federated::OwnerRepairRequest {
+            identity: tasks[0].identity.clone(),
+            mask: certification.repair_mask.clone(),
+        },
+        v4_federated::OwnerRepairRequest {
+            identity: tasks[1].identity.clone(),
+            mask: certification.repair_mask.clone(),
+        },
+    ];
+    let repair_request_frames = [
+        v4_federated::encode_owner_repair_request(&repair_requests[0])
+            .map_err(|error| error.to_string())?,
+        v4_federated::encode_owner_repair_request(&repair_requests[1])
+            .map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::send_frame(&mut sockets[owner], &repair_request_frames[owner])
+            .map_err(|error| error.to_string())?;
+    }
+    let repair_response_frames = [
+        v4_federated::receive_frame(&mut sockets[0]).map_err(|error| error.to_string())?,
+        v4_federated::receive_frame(&mut sockets[1]).map_err(|error| error.to_string())?,
+    ];
+    let repair_responses = [
+        v4_federated::decode_owner_repair_response(&repair_response_frames[0])
+            .map_err(|error| error.to_string())?,
+        v4_federated::decode_owner_repair_response(&repair_response_frames[1])
+            .map_err(|error| error.to_string())?,
+    ];
+    for owner in 0..2 {
+        v4_federated::validate_owner_repair_response(
+            &tasks[owner],
+            &repair_requests[owner],
+            &repair_responses[owner],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let repair_ns = repair_start
+        .elapsed()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    // No lane is committed until both repair identities and lengths validate.
+    let mut actual = certification.output_bf16;
+    apply_owner_repairs(&mut actual, &certification.repair_mask, &repair_responses)?;
+    if actual != oracle_bf16 {
+        return Err(format!(
+            "certified request {request_id} BF16 mismatch count {}",
+            bf16_mismatch_count(&actual, oracle_bf16)
+        ));
+    }
+    let e2e_ns = start.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+    let worker_ns = certified_responses
+        .iter()
+        .map(|response| response.worker_ns)
+        .max()
+        .unwrap()
+        .saturating_add(
+            repair_responses
+                .iter()
+                .map(|response| response.worker_ns)
+                .max()
+                .unwrap(),
+        );
+    Ok(LoopbackSample {
+        e2e_ns,
+        worker_ns,
+        codec_tcp_ns: e2e_ns.saturating_sub(worker_ns),
+        repair_ns,
+        gpu_ns: certified_responses
+            .iter()
+            .map(|response| response.gpu_ns)
+            .sum(),
+        repair_lanes,
+        bytes: LoopbackWireBytes {
+            initial_requests: frames.iter().map(wire_frame_bytes).sum(),
+            audit_responses: 0,
+            certified_responses: certified_frames.iter().map(wire_frame_bytes).sum(),
+            repair_requests: repair_request_frames.iter().map(wire_frame_bytes).sum(),
+            repair_responses: repair_response_frames.iter().map(wire_frame_bytes).sum(),
+        },
+    })
+}
+
+fn audit_bits_from_owner_responses(
+    responses: &[v4_federated::OwnerAuditResponse; 2],
+) -> Result<Vec<u16>, String> {
+    let mut routes: [Option<&[f32]>; v4_router::V4_TOPK] = [None; v4_router::V4_TOPK];
+    for response in responses {
+        for (local, values) in response
+            .contributions
+            .chunks_exact(v4_expert::V4_HIDDEN)
+            .enumerate()
+        {
+            let position = response.identity.route_positions[local] as usize;
+            if routes[position].replace(values).is_some() {
+                return Err("duplicate audit route position".into());
+            }
+        }
+    }
+    if routes.iter().any(Option::is_none) {
+        return Err("missing audit route position".into());
+    }
+    let mut output = Vec::with_capacity(v4_expert::V4_HIDDEN);
+    for lane in 0..v4_expert::V4_HIDDEN {
+        let mut sum = 0.0_f32;
+        for values in &routes {
+            sum += values.unwrap()[lane];
+        }
+        output.push(v4_router::f32_to_bf16_rne(sum));
+    }
+    Ok(output)
+}
+
+fn apply_owner_repairs(
+    output: &mut [u16],
+    mask: &[u8],
+    responses: &[v4_federated::OwnerRepairResponse; 2],
+) -> Result<(), String> {
+    if output.len() != v4_expert::V4_HIDDEN {
+        return Err("certified output length changed".into());
+    }
+    let repair_lanes = v4_certified::mask_count(mask);
+    let mut routes: [Option<&[f32]>; v4_router::V4_TOPK] = [None; v4_router::V4_TOPK];
+    for response in responses {
+        for (local, values) in response.values.chunks_exact(repair_lanes).enumerate() {
+            let position = response.identity.route_positions[local] as usize;
+            if routes[position].replace(values).is_some() {
+                return Err("duplicate repair route position".into());
+            }
+        }
+    }
+    if routes.iter().any(Option::is_none) {
+        return Err("missing repair route position".into());
+    }
+    let mut repair_index = 0;
+    for (lane, output) in output.iter_mut().enumerate() {
+        if v4_certified::mask_contains(mask, lane) {
+            let mut sum = 0.0_f32;
+            for values in &routes {
+                sum += values.unwrap()[repair_index];
+            }
+            *output = v4_router::f32_to_bf16_rne(sum);
+            repair_index += 1;
+        }
+    }
+    if repair_index != repair_lanes {
+        return Err("repair mask iteration count changed".into());
+    }
+    Ok(())
+}
+
+fn canonical_audit_bits(contributions: &[Vec<f32>]) -> Vec<u16> {
+    (0..v4_expert::V4_HIDDEN)
+        .map(|lane| {
+            let mut sum = 0.0_f32;
+            for contribution in contributions {
+                sum += contribution[lane];
+            }
+            v4_router::f32_to_bf16_rne(sum)
+        })
+        .collect()
+}
+
+fn bf16_mismatch_count(actual: &[u16], expected: &[u16]) -> usize {
+    actual
+        .iter()
+        .zip(expected)
+        .filter(|(actual, expected)| actual != expected)
+        .count()
+}
+
+fn wire_frame_bytes(frame: &Vec<u8>) -> usize {
+    frame.len() + size_of::<u32>()
+}
+
+fn print_loopback_timings(name: &str, samples: &[LoopbackSample], include_repair: bool) {
+    let e2e: Vec<_> = samples.iter().map(|sample| sample.e2e_ns).collect();
+    let worker: Vec<_> = samples.iter().map(|sample| sample.worker_ns).collect();
+    let codec_tcp: Vec<_> = samples.iter().map(|sample| sample.codec_tcp_ns).collect();
+    let gpu: Vec<_> = samples.iter().map(|sample| sample.gpu_ns).collect();
+    let (e2e_median, e2e_p95) = median_p95_ms(&e2e);
+    let (worker_median, worker_p95) = median_p95_ms(&worker);
+    let (codec_median, codec_p95) = median_p95_ms(&codec_tcp);
+    let (gpu_median, gpu_p95) = median_p95_ms(&gpu);
+    if include_repair {
+        let repair: Vec<_> = samples.iter().map(|sample| sample.repair_ns).collect();
+        let (repair_median, repair_p95) = median_p95_ms(&repair);
+        println!(
+            "DUAL_TCP_{name} n={} E2E_median/p95={e2e_median:.3}/{e2e_p95:.3}ms worker_critical_median/p95={worker_median:.3}/{worker_p95:.3}ms TCP+codec+client_reduce_residual_median/p95={codec_median:.3}/{codec_p95:.3}ms repair_extra_RTT_median/p95={repair_median:.3}/{repair_p95:.3}ms CUDA_total_median/p95={gpu_median:.3}/{gpu_p95:.3}ms",
+            samples.len(),
+        );
+    } else {
+        println!(
+            "DUAL_TCP_{name} n={} E2E_median/p95={e2e_median:.3}/{e2e_p95:.3}ms worker_critical_median/p95={worker_median:.3}/{worker_p95:.3}ms TCP+codec+client_reduce_residual_median/p95={codec_median:.3}/{codec_p95:.3}ms CUDA_total_median/p95={gpu_median:.3}/{gpu_p95:.3}ms",
+            samples.len(),
+        );
+    }
+}
+
+fn print_recovery_case(case: RecoveryCase, samples: &[RecoverySample]) {
+    let e2e: Vec<_> = samples.iter().map(|sample| sample.e2e_ns).collect();
+    let failover: Vec<_> = samples.iter().map(|sample| sample.failover_ns).collect();
+    let (e2e_median, e2e_p95) = median_p95_ms(&e2e);
+    let (failover_median, failover_p95) = median_p95_ms(&failover);
+    let bytes = samples[0].bytes;
+    assert!(
+        samples
+            .iter()
+            .all(|sample| sample.bytes == bytes && sample.failovers == samples[0].failovers)
+    );
+    println!(
+        "RECOVERY_CASE case={} n={} E2E_median/p95={e2e_median:.3}/{e2e_p95:.3}ms failover_count={} failover_latency_median/p95={failover_median:.3}/{failover_p95:.3}ms initial_requests={} audit_responses={} certified_responses={} repair_requests={} repair_responses={} total_bidirectional={} return_side={} BF16_mismatch=0 partial_commit=0",
+        case.label(),
+        samples.len(),
+        samples[0].failovers,
+        bytes.initial_requests,
+        bytes.audit_responses,
+        bytes.certified_responses,
+        bytes.repair_requests,
+        bytes.repair_responses,
+        bytes.total(),
+        bytes.returned(),
+    );
+}
+
+fn median_twice_usize(samples: &[usize]) -> usize {
+    assert!(!samples.is_empty(), "median needs at least one sample");
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    if sorted.len() % 2 == 0 {
+        sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]
+    } else {
+        sorted[sorted.len() / 2] * 2
+    }
+}
+
+fn median_p95_ms(samples: &[u64]) -> (f64, f64) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    let median = (sorted[middle - 1] as f64 + sorted[middle] as f64) / 2.0;
+    let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1] as f64;
+    (median / 1_000_000.0, p95 / 1_000_000.0)
+}
+
+fn median_u64(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        sorted[middle - 1].saturating_add(sorted[middle]) / 2
+    } else {
+        sorted[middle]
+    }
+}
+
+fn median_f64(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
+
+const V4_QD4_LANES: usize = 4;
+const V4_DEVICE_CAPACITY_HEADROOM_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const V4_DEVICE_TOKEN_STATE_MAX_BYTES: usize = 83_863_054;
+const V4_DEVICE_TOKEN_STATE_HCA_BYTES: usize = 40_249_870;
+const V4_REQUEST_ROPE_LUT_ROWS: usize = 5;
+const V4_SHORT_DEVICE_DECODE_MAX_NEW_TOKENS: usize = 5;
+// ponytail: this is a short exact gate, not paged serving; lift only when a
+// semantic gate covers a paged/rolling DeviceTokenState beyond nine rows.
+const V4_SHORT_DEVICE_DECODE_MAX_ROWS: usize = 9;
+
+fn csa_compressed_rows_after(position: usize) -> usize {
+    (position + 1) / 4
+}
+const V4_REQUEST_ROPE_LUT_BYTES: usize =
+    2 * V4_REQUEST_ROPE_LUT_ROWS * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
+const V4_TID2EID_TRANSIENT_MAX_BYTES: usize = v4_router::V4_TOPK * std::mem::size_of::<i64>();
+
+fn device_attention_expected_h2d_bytes(
+    rope_lut_bytes: usize,
+    dispatches: usize,
+) -> Result<usize, Box<dyn Error>> {
+    rope_lut_bytes
+        .checked_add(
+            dispatches
+                .checked_mul(v4_state::HC * v4_state::HIDDEN * std::mem::size_of::<u16>())
+                .ok_or("device attention H2D byte count overflow")?,
+        )
+        .ok_or("device attention H2D byte count overflow".into())
+}
+const V4_QD4_PINNED_HOST_BYTES: usize = V4_QD4_LANES
+    * (v4_expert::V4_ROUTED_EXPERT_BYTES
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+const V4_QD4_DEVICE_BYTES: usize = V4_QD4_LANES
+    * (v4_expert::V4_ROUTED_EXPERT_BYTES
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>()
+        + 3 * v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<u16>()
+        + v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<f32>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+const V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS: usize = 32;
+const V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES: usize = V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+    * (v4_expert::V4_ROUTED_EXPERT_BYTES
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+const V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES: usize = V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+    * (v4_expert::V4_ROUTED_EXPERT_BYTES
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>()
+        + 3 * v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<u16>()
+        + v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<f32>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+
+struct ExpertSlot<'a> {
+    module: &'a kernels::LoadedModule,
+    stream: std::sync::Arc<CudaStream>,
+    w1_host: PinnedHostBuffer<u8>,
+    w1_scale_host: PinnedHostBuffer<u8>,
+    w2_host: PinnedHostBuffer<u8>,
+    w2_scale_host: PinnedHostBuffer<u8>,
+    w3_host: PinnedHostBuffer<u8>,
+    w3_scale_host: PinnedHostBuffer<u8>,
+    input_host: PinnedHostBuffer<u16>,
+    output_host: PinnedHostBuffer<f32>,
+    input_device: DeviceBuffer<u16>,
+    w1_device: DeviceBuffer<u8>,
+    w1_scale_device: DeviceBuffer<u8>,
+    w2_device: DeviceBuffer<u8>,
+    w2_scale_device: DeviceBuffer<u8>,
+    w3_device: DeviceBuffer<u8>,
+    w3_scale_device: DeviceBuffer<u8>,
+    input_quantized: DeviceBuffer<f32>,
+    gate: DeviceBuffer<u16>,
+    up: DeviceBuffer<u16>,
+    routed: DeviceBuffer<u16>,
+    routed_quantized: DeviceBuffer<f32>,
+    output_bf16: DeviceBuffer<u16>,
+    output: DeviceBuffer<f32>,
+    weight_h2d_ms: f64,
+    weight_start: cuda_core::CudaEvent,
+    weight_end: cuda_core::CudaEvent,
+    kernel_start: cuda_core::CudaEvent,
+    kernel_end: cuda_core::CudaEvent,
+    complete: cuda_core::CudaEvent,
+}
+
+impl<'a> ExpertSlot<'a> {
+    fn new(
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+        stream: &std::sync::Arc<CudaStream>,
+        weights: &v4_expert::RoutedExpert,
+    ) -> Result<Self, Box<dyn Error>> {
+        // ponytail: one L0 expert at a time; add slot management only after
+        // measured multi-expert traffic requires it.
+        let w1_host = PinnedHostBuffer::from_slice(context, &weights.w1)?;
+        let w1_scale_host = PinnedHostBuffer::from_slice(context, &weights.w1_scale)?;
+        let w2_host = PinnedHostBuffer::from_slice(context, &weights.w2)?;
+        let w2_scale_host = PinnedHostBuffer::from_slice(context, &weights.w2_scale)?;
+        let w3_host = PinnedHostBuffer::from_slice(context, &weights.w3)?;
+        let w3_scale_host = PinnedHostBuffer::from_slice(context, &weights.w3_scale)?;
+        let input_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
+        let output_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
+        let input_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let mut w1_device = unsafe { DeviceBuffer::uninitialized_async(stream, weights.w1.len())? };
+        let mut w1_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, weights.w1_scale.len())? };
+        let mut w2_device = unsafe { DeviceBuffer::uninitialized_async(stream, weights.w2.len())? };
+        let mut w2_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, weights.w2_scale.len())? };
+        let mut w3_device = unsafe { DeviceBuffer::uninitialized_async(stream, weights.w3.len())? };
+        let mut w3_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, weights.w3_scale.len())? };
+        let weight_h2d_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let weight_h2d_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        weight_h2d_start.record(stream)?;
+        // SAFETY: pinned weight sources live through the synchronized completion
+        // event below; every destination has the exact matching allocation.
+        unsafe {
+            w1_device.copy_from_pinned_host_async(stream, &w1_host)?;
+            w1_scale_device.copy_from_pinned_host_async(stream, &w1_scale_host)?;
+            w2_device.copy_from_pinned_host_async(stream, &w2_host)?;
+            w2_scale_device.copy_from_pinned_host_async(stream, &w2_scale_host)?;
+            w3_device.copy_from_pinned_host_async(stream, &w3_host)?;
+            w3_scale_device.copy_from_pinned_host_async(stream, &w3_scale_host)?;
+        }
+        weight_h2d_end.record(stream)?;
+        weight_h2d_end.synchronize()?;
+        let weight_h2d_ms = weight_h2d_start.elapsed_ms(&weight_h2d_end)? as f64;
+        let input_quantized =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let gate = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let up = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let routed = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let routed_quantized = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let output_bf16 =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let output = unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let kernel_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let kernel_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let complete = context.new_event(None)?;
+        complete.record(stream)?;
+        complete.synchronize()?;
+        Ok(Self {
+            module,
+            stream: stream.clone(),
+            w1_host,
+            w1_scale_host,
+            w2_host,
+            w2_scale_host,
+            w3_host,
+            w3_scale_host,
+            input_host,
+            output_host,
+            input_device,
+            w1_device,
+            w1_scale_device,
+            w2_device,
+            w2_scale_device,
+            w3_device,
+            w3_scale_device,
+            input_quantized,
+            gate,
+            up,
+            routed,
+            routed_quantized,
+            output_bf16,
+            output,
+            weight_h2d_ms,
+            weight_start: weight_h2d_start,
+            weight_end: weight_h2d_end,
+            kernel_start,
+            kernel_end,
+            complete,
+        })
+    }
+
+    fn new_empty(
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+        stream: &std::sync::Arc<CudaStream>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let w1_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_BYTES)?;
+        let w1_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_SCALE_BYTES)?;
+        let w2_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W2_BYTES)?;
+        let w2_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W2_SCALE_BYTES)?;
+        let w3_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_BYTES)?;
+        let w3_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_SCALE_BYTES)?;
+        let input_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
+        let output_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
+        let input_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let w1_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_BYTES)? };
+        let w1_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_SCALE_BYTES)? };
+        let w2_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W2_BYTES)? };
+        let w2_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W2_SCALE_BYTES)? };
+        let w3_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_BYTES)? };
+        let w3_scale_device =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_SCALE_BYTES)? };
+        let input_quantized =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let gate = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let up = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let routed = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let routed_quantized = unsafe {
+            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        };
+        let output_bf16 =
+            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let output = unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let kernel_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let kernel_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let weight_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let weight_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let complete = context.new_event(None)?;
+        complete.record(stream)?;
+        complete.synchronize()?;
+        Ok(Self {
+            module,
+            stream: stream.clone(),
+            w1_host,
+            w1_scale_host,
+            w2_host,
+            w2_scale_host,
+            w3_host,
+            w3_scale_host,
+            input_host,
+            output_host,
+            input_device,
+            w1_device,
+            w1_scale_device,
+            w2_device,
+            w2_scale_device,
+            w3_device,
+            w3_scale_device,
+            input_quantized,
+            gate,
+            up,
+            routed,
+            routed_quantized,
+            output_bf16,
+            output,
+            weight_h2d_ms: 0.0,
+            weight_start,
+            weight_end,
+            kernel_start,
+            kernel_end,
+            complete,
+        })
+    }
+
+    fn load_range_execute_into(
+        &mut self,
+        shard: &safetensors::ShardFile,
+        plan: &v4_expert::RoutedExpertRangePlan,
+        input: &[u16],
+        route_weight: f32,
+        output: &mut [f32],
+        profile_origin: Option<std::time::Instant>,
+        profile_submit_ns: Option<u64>,
+    ) -> Result<RoutedLaneExecution, Box<dyn Error>> {
+        let mut timeline = profile_origin.map(|origin| RoutedLaneTimeline {
+            submit_ns: profile_submit_ns.unwrap_or_else(|| timeline_elapsed_ns(origin)),
+            read_start_ns: timeline_elapsed_ns(origin),
+            read_end_ns: 0,
+            h2d_enqueued_ns: 0,
+            kernel_enqueued_ns: 0,
+            d2h_enqueued_ns: 0,
+            complete_ns: 0,
+            h2d_event_ns: 0,
+            kernel_event_ns: 0,
+        });
+        let read_started = std::time::Instant::now();
+        plan.read_into(
+            shard,
+            [
+                self.w1_host.as_mut_slice(),
+                self.w1_scale_host.as_mut_slice(),
+                self.w2_host.as_mut_slice(),
+                self.w2_scale_host.as_mut_slice(),
+                self.w3_host.as_mut_slice(),
+                self.w3_scale_host.as_mut_slice(),
+            ],
+        )?;
+        let read_ns = u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.read_end_ns = timeline_elapsed_ns(profile_origin.expect("timeline origin"));
+        }
+        self.weight_start.record(&self.stream)?;
+        unsafe {
+            self.w1_device
+                .copy_from_pinned_host_async(&self.stream, &self.w1_host)?;
+            self.w1_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w1_scale_host)?;
+            self.w2_device
+                .copy_from_pinned_host_async(&self.stream, &self.w2_host)?;
+            self.w2_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w2_scale_host)?;
+            self.w3_device
+                .copy_from_pinned_host_async(&self.stream, &self.w3_host)?;
+            self.w3_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w3_scale_host)?;
+        }
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.h2d_enqueued_ns =
+                timeline_elapsed_ns(profile_origin.expect("timeline origin"));
+        }
+        self.weight_end.record(&self.stream)?;
+        let kernel_ns = self.execute_into(
+            input,
+            route_weight,
+            output,
+            timeline.as_mut(),
+            profile_origin,
+        )?;
+        self.weight_end.synchronize()?;
+        let h2d_ns = (self.weight_start.elapsed_ms(&self.weight_end)? as f64 * 1_000_000.0) as u64;
+        if let Some(timeline) = timeline.as_mut() {
+            timeline.h2d_event_ns = h2d_ns;
+            timeline.kernel_event_ns = kernel_ns;
+        }
+        Ok(RoutedLaneExecution {
+            read_ns,
+            h2d_ns,
+            kernel_ns,
+            timeline,
+        })
+    }
+
+    fn execute(
+        &mut self,
+        input: &[u16],
+        route_weight: f32,
+    ) -> Result<(Vec<f32>, u64), Box<dyn Error>> {
+        let mut output = vec![0.0_f32; v4_expert::V4_HIDDEN];
+        let gpu_ns = self.execute_into(input, route_weight, &mut output, None, None)?;
+        Ok((output, gpu_ns))
+    }
+
+    fn execute_into(
+        &mut self,
+        input: &[u16],
+        route_weight: f32,
+        output: &mut [f32],
+        mut timeline: Option<&mut RoutedLaneTimeline>,
+        profile_origin: Option<std::time::Instant>,
+    ) -> Result<u64, Box<dyn Error>> {
+        if v4_expert::validate_input(input, route_weight)? != 1 {
+            return Err("resident expert slot accepts exactly one row".into());
+        }
+        if output.len() != v4_expert::V4_HIDDEN {
+            return Err("resident expert output requires one complete hidden row".into());
+        }
+        self.stream.context().bind_to_thread()?;
+        self.input_host.as_mut_slice().copy_from_slice(input);
+        // SAFETY: the input stager and all device buffers remain owned by this
+        // slot until the reused completion event synchronizes below.
+        unsafe {
+            self.input_device
+                .copy_from_pinned_host_async(&self.stream, &self.input_host)?;
+        }
+        if let (Some(timeline), Some(origin)) = (timeline.as_deref_mut(), profile_origin) {
+            timeline.kernel_enqueued_ns = timeline_elapsed_ns(origin);
+        }
+        self.kernel_start.record(&self.stream)?;
+        launch_v4_activation_quantize(
+            self.module,
+            &self.stream,
+            &self.input_device,
+            &mut self.input_quantized,
+        )?;
+        launch_v4_fp4_matvec(
+            self.module,
+            &self.stream,
+            &self.input_quantized,
+            &self.w1_device,
+            &self.w1_scale_device,
+            &mut self.gate,
+            1,
+            v4_expert::V4_EXPERT_INTERMEDIATE,
+            v4_expert::V4_HIDDEN,
+        )?;
+        launch_v4_fp4_matvec(
+            self.module,
+            &self.stream,
+            &self.input_quantized,
+            &self.w3_device,
+            &self.w3_scale_device,
+            &mut self.up,
+            1,
+            v4_expert::V4_EXPERT_INTERMEDIATE,
+            v4_expert::V4_HIDDEN,
+        )?;
+        launch_v4_swiglu_route(
+            self.module,
+            &self.stream,
+            &self.gate,
+            &self.up,
+            &mut self.routed,
+            route_weight,
+        )?;
+        launch_v4_activation_quantize(
+            self.module,
+            &self.stream,
+            &self.routed,
+            &mut self.routed_quantized,
+        )?;
+        launch_v4_fp4_matvec(
+            self.module,
+            &self.stream,
+            &self.routed_quantized,
+            &self.w2_device,
+            &self.w2_scale_device,
+            &mut self.output_bf16,
+            1,
+            v4_expert::V4_HIDDEN,
+            v4_expert::V4_EXPERT_INTERMEDIATE,
+        )?;
+        launch_v4_bf16_to_f32(
+            self.module,
+            &self.stream,
+            &self.output_bf16,
+            &mut self.output,
+        )?;
+        self.kernel_end.record(&self.stream)?;
+        // SAFETY: output_host stays exclusively borrowed until `complete`
+        // proves the D2H copy has finished.
+        unsafe {
+            self.output
+                .copy_to_pinned_host_async(&self.stream, &mut self.output_host)?;
+        }
+        if let (Some(timeline), Some(origin)) = (timeline.as_deref_mut(), profile_origin) {
+            timeline.d2h_enqueued_ns = timeline_elapsed_ns(origin);
+        }
+        self.complete.record(&self.stream)?;
+        self.complete.synchronize()?;
+        if let (Some(timeline), Some(origin)) = (timeline.as_deref_mut(), profile_origin) {
+            timeline.complete_ns = timeline_elapsed_ns(origin);
+        }
+        let gpu_ns = (self.kernel_start.elapsed_ms(&self.kernel_end)? as f64 * 1_000_000.0) as u64;
+        output.copy_from_slice(self.output_host.as_slice());
+        Ok(gpu_ns)
+    }
+
+    fn copy_weight_tensors_from(
+        &mut self,
+        source: &Self,
+        stream: &CudaStream,
+    ) -> Result<(), Box<dyn Error>> {
+        self.w1_device
+            .copy_from_device_async(&source.w1_device, stream)?;
+        self.w1_scale_device
+            .copy_from_device_async(&source.w1_scale_device, stream)?;
+        self.w2_device
+            .copy_from_device_async(&source.w2_device, stream)?;
+        self.w2_scale_device
+            .copy_from_device_async(&source.w2_scale_device, stream)?;
+        self.w3_device
+            .copy_from_device_async(&source.w3_device, stream)?;
+        self.w3_scale_device
+            .copy_from_device_async(&source.w3_scale_device, stream)?;
+        Ok(())
+    }
+}
+
+struct Qd4ImmutableCacheLease<'a> {
+    expert: u16,
+    slot: ExpertSlot<'a>,
+    miss: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Qd4ImmutableExpertCacheTelemetry {
+    route_executions: usize,
+    expert_union_loads: usize,
+    source_loads: usize,
+    source_bytes: usize,
+    h2d_loads: usize,
+    h2d_bytes: usize,
+    hits: usize,
+    d2d_copies: usize,
+    d2d_bytes: usize,
+    max_occupancy: usize,
+    completed_layers: usize,
+    worker_errors: usize,
+    fallbacks: usize,
+}
+
+struct Qd4ImmutableExpertCache<'a> {
+    free: Vec<ExpertSlot<'a>>,
+    layer: Option<usize>,
+    resident: BTreeMap<u16, ExpertSlot<'a>>,
+    telemetry: Qd4ImmutableExpertCacheTelemetry,
+}
+
+impl<'a> Qd4ImmutableExpertCache<'a> {
+    fn new(
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+    ) -> Result<Self, Box<dyn Error>> {
+        let cache_stream = context.new_stream()?;
+        let free = (0..V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS)
+            .map(|_| ExpertSlot::new_empty(context, module, &cache_stream))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        Ok(Self {
+            free,
+            layer: None,
+            resident: BTreeMap::new(),
+            telemetry: Qd4ImmutableExpertCacheTelemetry::default(),
+        })
+    }
+
+    fn begin_layer(&mut self, layer: usize) -> Result<(), Box<dyn Error>> {
+        if self.layer.is_some()
+            || !self.resident.is_empty()
+            || self.free.len() != V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        {
+            return Err(
+                "QD4 immutable expert cache crossed a layer boundary before completion".into(),
+            );
+        }
+        self.layer = Some(layer);
+        Ok(())
+    }
+
+    fn lease_routes(
+        &mut self,
+        layer: usize,
+        routes: &v4_router::RouterSelection,
+    ) -> Result<[Qd4ImmutableCacheLease<'a>; v4_router::V4_TOPK], Box<dyn Error>> {
+        if self.layer != Some(layer) {
+            return Err(
+                "QD4 immutable expert cache route layer does not match its active layer".into(),
+            );
+        }
+        let mut seen = BTreeSet::new();
+        let leases = routes
+            .ids
+            .iter()
+            .map(|&id| {
+                let expert = u16::try_from(id)?;
+                if !seen.insert(expert) {
+                    return Err("QD4 immutable expert cache route IDs must be unique".into());
+                }
+                if let Some(slot) = self.resident.remove(&expert) {
+                    self.telemetry.hits = self.telemetry.hits.saturating_add(1);
+                    Ok(Qd4ImmutableCacheLease {
+                        expert,
+                        slot,
+                        miss: false,
+                    })
+                } else {
+                    let slot = self
+                        .free
+                        .pop()
+                        .ok_or("QD4 immutable expert cache free pool exhausted")?;
+                    self.telemetry.expert_union_loads =
+                        self.telemetry.expert_union_loads.saturating_add(1);
+                    Ok(Qd4ImmutableCacheLease {
+                        expert,
+                        slot,
+                        miss: true,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        leases
+            .try_into()
+            .map_err(|_| "QD4 immutable expert cache route count changed".into())
+    }
+
+    fn return_lease(
+        &mut self,
+        layer: usize,
+        lease: Qd4ImmutableCacheLease<'a>,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.layer != Some(layer) {
+            return Err(
+                "QD4 immutable expert cache return layer does not match active layer".into(),
+            );
+        }
+        if self.resident.insert(lease.expert, lease.slot).is_some() {
+            return Err("QD4 immutable expert cache returned duplicate expert identity".into());
+        }
+        self.telemetry.d2d_copies = self.telemetry.d2d_copies.saturating_add(1);
+        self.telemetry.d2d_bytes = self
+            .telemetry
+            .d2d_bytes
+            .saturating_add(v4_expert::V4_ROUTED_EXPERT_BYTES);
+        Ok(())
+    }
+
+    fn record_batch(&mut self, misses: usize) {
+        self.telemetry.route_executions = self
+            .telemetry
+            .route_executions
+            .saturating_add(v4_router::V4_TOPK);
+        self.telemetry.source_loads = self.telemetry.source_loads.saturating_add(misses);
+        self.telemetry.source_bytes = self
+            .telemetry
+            .source_bytes
+            .saturating_add(misses.saturating_mul(v4_expert::V4_ROUTED_EXPERT_BYTES));
+        self.telemetry.h2d_loads = self.telemetry.h2d_loads.saturating_add(misses);
+        self.telemetry.h2d_bytes = self
+            .telemetry
+            .h2d_bytes
+            .saturating_add(misses.saturating_mul(v4_expert::V4_ROUTED_EXPERT_BYTES));
+    }
+
+    fn finish_layer(&mut self, layer: usize) -> Result<(), Box<dyn Error>> {
+        if self.layer != Some(layer)
+            || self.free.len() + self.resident.len() != V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        {
+            return Err("QD4 immutable expert cache layer did not return all slot leases".into());
+        }
+        if self.resident.len() > V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS {
+            return Err("QD4 immutable expert cache layer exceeded 32-slot occupancy".into());
+        }
+        self.telemetry.max_occupancy = self.telemetry.max_occupancy.max(self.resident.len());
+        self.telemetry.completed_layers = self.telemetry.completed_layers.saturating_add(1);
+        self.free
+            .extend(std::mem::take(&mut self.resident).into_values());
+        self.layer = None;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RoutedReplaySample {
+    inclusive_ns: u64,
+    setup_ns: u64,
+    read_ns: u64,
+    read_wall_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    lane_occupancy: f64,
+    submit_ns: [u64; v4_router::V4_TOPK],
+    ready_ns: [u64; v4_router::V4_TOPK],
+    timeline: Option<RoutedQd4Timeline>,
+}
+
+#[derive(Clone)]
+struct RoutedLaneTimeline {
+    submit_ns: u64,
+    read_start_ns: u64,
+    read_end_ns: u64,
+    h2d_enqueued_ns: u64,
+    kernel_enqueued_ns: u64,
+    d2h_enqueued_ns: u64,
+    complete_ns: u64,
+    h2d_event_ns: u64,
+    kernel_event_ns: u64,
+}
+
+#[derive(Clone)]
+struct RoutedQd4Timeline {
+    lanes: [Option<RoutedLaneTimeline>; v4_router::V4_TOPK],
+    canonical_reduction_start_ns: u64,
+    canonical_reduction_end_ns: u64,
+}
+
+impl RoutedQd4Timeline {
+    fn as_json(&self) -> serde_json::Value {
+        let lanes = self
+            .lanes
+            .iter()
+            .map(|lane| {
+                lane.as_ref().map(|lane| {
+                    serde_json::json!({
+                        "submit_ns": lane.submit_ns,
+                        "read": {"start_ns": lane.read_start_ns, "end_ns": lane.read_end_ns},
+                        "h2d_enqueued_ns": lane.h2d_enqueued_ns,
+                        "kernel_enqueued_ns": lane.kernel_enqueued_ns,
+                        "d2h_enqueued_ns": lane.d2h_enqueued_ns,
+                        "complete_ns": lane.complete_ns,
+                        "h2d_event_ns": lane.h2d_event_ns,
+                        "kernel_event_ns": lane.kernel_event_ns,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "lanes": lanes,
+            "canonical_reduction": {
+                "start_ns": self.canonical_reduction_start_ns,
+                "end_ns": self.canonical_reduction_end_ns,
+            },
+        })
+    }
+}
+
+struct RoutedLaneExecution {
+    read_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    timeline: Option<RoutedLaneTimeline>,
+}
+
+struct Qd4RoutedRun<'a> {
+    output: Vec<u16>,
+    contributions: Option<Vec<Vec<f32>>>,
+    sample: RoutedReplaySample,
+    cache_miss_count: usize,
+    cache_leases: Vec<Qd4ImmutableCacheLease<'a>>,
+}
+
+fn run_serial_routed_replay(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    shard: &safetensors::ShardFile,
+    layer: usize,
+    input: &[u16],
+    routes: &v4_router::RouterSelection,
+    shared: &[f32],
+) -> Result<(Vec<u16>, RoutedReplaySample), Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let mut contributions = Vec::with_capacity(v4_router::V4_TOPK);
+    let mut setup_ns = 0_u64;
+    let mut read_ns = 0_u64;
+    let mut h2d_ns = 0_u64;
+    let mut kernel_ns = 0_u64;
+    for route_slot in 0..v4_router::V4_TOPK {
+        let expert_id = u16::try_from(routes.ids[route_slot])?;
+        let expert = v4_expert::RoutedExpert::load_layer(shard, layer, expert_id)?;
+        read_ns = read_ns.saturating_add((expert.read_ms * 1_000_000.0) as u64);
+        let setup_started = std::time::Instant::now();
+        let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
+        setup_ns = setup_ns
+            .saturating_add(u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        h2d_ns = h2d_ns.saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
+        let (output, expert_kernel_ns) = slot.execute(input, routes.weights[route_slot])?;
+        kernel_ns = kernel_ns.saturating_add(expert_kernel_ns);
+        contributions.push((expert_id, output));
+    }
+    let routed = contributions
+        .iter()
+        .map(|(expert, output)| (*expert, output.as_slice()))
+        .collect::<Vec<_>>();
+    let output = v4_expert::reduce_moe_canonical(&routed, shared)?;
+    let inclusive_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok((
+        output,
+        RoutedReplaySample {
+            inclusive_ns,
+            setup_ns,
+            read_ns,
+            read_wall_ns: read_ns,
+            h2d_ns,
+            kernel_ns,
+            lane_occupancy: 0.25,
+            submit_ns: [0; v4_router::V4_TOPK],
+            ready_ns: [0; v4_router::V4_TOPK],
+            timeline: None,
+        },
+    ))
+}
+
+struct RoutedLaneJob<J> {
+    route_slot: usize,
+    iteration_started: std::time::Instant,
+    profile_submit_ns: Option<u64>,
+    payload: J,
+}
+
+struct RoutedLaneDone<J> {
+    route_slot: usize,
+    read_ns: u64,
+    read_ready_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    ready_ns: u64,
+    job_ns: u64,
+    timeline: Option<RoutedLaneTimeline>,
+    cache_lease: J,
+}
+
+struct SupervisedLaneDone<T> {
+    lane: usize,
+    value: T,
+}
+
+struct SupervisedQd4Batch<T> {
+    iteration_started: std::time::Instant,
+    submit_ns: [u64; v4_router::V4_TOPK],
+    completions: Vec<T>,
+}
+
+fn run_supervised_qd4_batches<W, T, R, J>(
+    workers: Vec<W>,
+    batches: usize,
+    timeout: std::time::Duration,
+    profile_origin: Option<std::time::Instant>,
+    mut make_job: impl FnMut(usize) -> Result<J, String>,
+    work: impl Fn(&mut W, usize, RoutedLaneJob<J>) -> Result<T, String> + Sync,
+    mut finish: impl FnMut(usize, SupervisedQd4Batch<T>) -> Result<R, String>,
+) -> Result<Vec<R>, String>
+where
+    W: Send,
+    T: Send,
+    J: Send,
+{
+    if workers.is_empty() || workers.len() > v4_router::V4_TOPK || batches == 0 {
+        return Err("QD4 supervisor received an invalid lane/batch count".into());
+    }
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) =
+            std::sync::mpsc::channel::<Result<SupervisedLaneDone<T>, String>>();
+        let mut senders = Vec::with_capacity(workers.len());
+        let mut handles = Vec::with_capacity(workers.len());
+        for (lane, mut worker) in workers.into_iter().enumerate() {
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<RoutedLaneJob<J>>(1);
+            senders.push(job_tx);
+            let worker_done = done_tx.clone();
+            let worker_work = &work;
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                while let Ok(job) = job_rx.recv() {
+                    match worker_work(&mut worker, lane, job) {
+                        Ok(value) => worker_done
+                            .send(Ok(SupervisedLaneDone { lane, value }))
+                            .map_err(|error| error.to_string())?,
+                        Err(error) => {
+                            let _ = worker_done.send(Err(error.clone()));
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        drop(done_tx);
+
+        let scheduled = (|| {
+            let mut results = Vec::with_capacity(batches);
+            for batch in 0..batches {
+                let iteration_started = std::time::Instant::now();
+                let mut submit_ns = [0_u64; v4_router::V4_TOPK];
+                let mut next_route = 0_usize;
+                for sender in &senders {
+                    submit_ns[next_route] =
+                        u64::try_from(iteration_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    sender
+                        .send(RoutedLaneJob {
+                            route_slot: next_route,
+                            iteration_started,
+                            profile_submit_ns: profile_origin.map(timeline_elapsed_ns),
+                            payload: make_job(next_route)?,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    next_route += 1;
+                }
+                let mut completions = Vec::with_capacity(v4_router::V4_TOPK);
+                for _ in 0..v4_router::V4_TOPK {
+                    let done = match done_rx.recv_timeout(timeout) {
+                        Ok(result) => result?,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            return Err(format!(
+                                "QD4 batch {batch} timed out waiting for a lane result"
+                            ));
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(format!("QD4 batch {batch} lost a lane result channel"));
+                        }
+                    };
+                    if next_route < v4_router::V4_TOPK {
+                        submit_ns[next_route] =
+                            u64::try_from(iteration_started.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX);
+                        senders[done.lane]
+                            .send(RoutedLaneJob {
+                                route_slot: next_route,
+                                iteration_started,
+                                profile_submit_ns: profile_origin.map(timeline_elapsed_ns),
+                                payload: make_job(next_route)?,
+                            })
+                            .map_err(|error| error.to_string())?;
+                        next_route += 1;
+                    }
+                    completions.push(done.value);
+                }
+                results.push(finish(
+                    batch,
+                    SupervisedQd4Batch {
+                        iteration_started,
+                        submit_ns,
+                        completions,
+                    },
+                )?);
+            }
+            Ok(results)
+        })();
+
+        drop(senders);
+        let mut worker_failure = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    worker_failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    worker_failure.get_or_insert("QD4 lane worker panicked".into());
+                }
+            };
+        }
+        match (scheduled, worker_failure) {
+            (Ok(results), None) => Ok(results),
+            (Ok(_), Some(error)) => Err(error),
+            (Err(error), None) => Err(error),
+            (Err(error), Some(worker)) => Err(format!("{error}; {worker}")),
+        }
+    })
+}
+
+fn run_qd4_routed_replays(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    shard: &safetensors::ShardFile,
+    input: &[u16],
+    routes: &v4_router::RouterSelection,
+    shared: &[f32],
+    plans: &[v4_expert::RoutedExpertRangePlan; v4_router::V4_TOPK],
+    expected: &[u16],
+    trials: usize,
+) -> Result<(u64, Vec<RoutedReplaySample>), Box<dyn Error>> {
+    const LANES: usize = 4;
+    let setup_started = std::time::Instant::now();
+    let lanes = (0..LANES)
+        .map(|_| {
+            let stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let startup_setup_ns = u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let outputs = (0..v4_router::V4_TOPK)
+        .map(|_| std::sync::Mutex::new(vec![0.0_f32; v4_expert::V4_HIDDEN]))
+        .collect::<Vec<_>>();
+    let samples = run_supervised_qd4_batches(
+        lanes,
+        trials + 1,
+        std::time::Duration::from_secs(30),
+        None,
+        |_| Ok(()),
+        |lane, _lane_index, job| {
+            let job_started = std::time::Instant::now();
+            let read_started_ns =
+                u64::try_from(job.iteration_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let mut output = outputs[job.route_slot]
+                .lock()
+                .map_err(|_| "QD4 output mutex poisoned".to_owned())?;
+            lane.load_range_execute_into(
+                shard,
+                &plans[job.route_slot],
+                input,
+                routes.weights[job.route_slot],
+                &mut output,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())
+            .map(|execution| RoutedLaneDone {
+                route_slot: job.route_slot,
+                read_ns: execution.read_ns,
+                read_ready_ns: read_started_ns.saturating_add(execution.read_ns),
+                h2d_ns: execution.h2d_ns,
+                kernel_ns: execution.kernel_ns,
+                ready_ns: u64::try_from(job.iteration_started.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX),
+                job_ns: u64::try_from(job_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                timeline: execution.timeline,
+                cache_lease: job.payload,
+            })
+        },
+        |trial, batch| {
+            let mut submit_ns = [0_u64; v4_router::V4_TOPK];
+            let mut ready_ns = [0_u64; v4_router::V4_TOPK];
+            let mut read_ns = 0_u64;
+            let mut read_wall_ns = 0_u64;
+            let mut h2d_ns = 0_u64;
+            let mut kernel_ns = 0_u64;
+            let mut lane_job_ns = 0_u64;
+            submit_ns.copy_from_slice(&batch.submit_ns);
+            for done in batch.completions {
+                ready_ns[done.route_slot] = done.ready_ns;
+                read_ns = read_ns.saturating_add(done.read_ns);
+                read_wall_ns = read_wall_ns.max(done.read_ready_ns);
+                h2d_ns = h2d_ns.saturating_add(done.h2d_ns);
+                kernel_ns = kernel_ns.saturating_add(done.kernel_ns);
+                lane_job_ns = lane_job_ns.saturating_add(done.job_ns);
+            }
+            let guards: [std::sync::MutexGuard<'_, Vec<f32>>; v4_router::V4_TOPK] =
+                std::array::from_fn(|index| outputs[index].lock().unwrap());
+            let routed: [(u16, &[f32]); v4_router::V4_TOPK] = std::array::from_fn(|index| {
+                (
+                    u16::try_from(routes.ids[index]).unwrap(),
+                    guards[index].as_slice(),
+                )
+            });
+            let actual = v4_expert::reduce_moe_canonical(&routed, shared)
+                .map_err(|error| error.to_string())?;
+            if actual != expected {
+                return Err(format!("QD4 trial {trial} changed canonical routed output"));
+            }
+            let inclusive_ns =
+                u64::try_from(batch.iteration_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            Ok((trial > 0).then_some(RoutedReplaySample {
+                inclusive_ns,
+                setup_ns: 0,
+                read_ns,
+                read_wall_ns,
+                h2d_ns,
+                kernel_ns,
+                lane_occupancy: lane_job_ns as f64 / (inclusive_ns as f64 * LANES as f64),
+                submit_ns,
+                ready_ns,
+                timeline: None,
+            }))
+        },
+    )?
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok((startup_setup_ns, samples))
+}
+
+fn run_qd4_routed_once<'module>(
+    lanes: &mut [ExpertSlot<'module>],
+    mut immutable_cache: Option<&mut Qd4ImmutableExpertCache<'module>>,
+    shard: &safetensors::ShardFile,
+    layer: usize,
+    input: &[u16],
+    routes: &v4_router::RouterSelection,
+    shared: &[f32],
+    plans: &[v4_expert::RoutedExpertRangePlan; v4_router::V4_TOPK],
+    profile_origin: Option<std::time::Instant>,
+    capture_contributions: bool,
+) -> Result<Qd4RoutedRun<'module>, Box<dyn Error>> {
+    if lanes.len() != 4 {
+        return Err("QD4 execution requires exactly four persistent lanes".into());
+    }
+    let mut cache_leases = immutable_cache
+        .as_deref_mut()
+        .map(|cache| {
+            cache
+                .lease_routes(layer, routes)
+                .map(|leases| leases.map(Some))
+        })
+        .transpose()?;
+    let outputs = (0..v4_router::V4_TOPK)
+        .map(|_| std::sync::Mutex::new(vec![0.0_f32; v4_expert::V4_HIDDEN]))
+        .collect::<Vec<_>>();
+    let lane_refs = lanes.iter_mut().collect::<Vec<_>>();
+    let mut batches = run_supervised_qd4_batches(
+        lane_refs,
+        1,
+        std::time::Duration::from_secs(30),
+        profile_origin,
+        |route_slot| match cache_leases.as_mut() {
+            Some(leases) => leases[route_slot].take().map(Some).ok_or_else(|| {
+                "QD4 immutable expert cache lease disappeared before dispatch".into()
+            }),
+            None => Ok(None),
+        },
+        |lane, _lane_index, job| {
+            let route_slot = job.route_slot;
+            let job_started = std::time::Instant::now();
+            let read_started_ns =
+                u64::try_from(job.iteration_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let mut output = outputs[route_slot]
+                .lock()
+                .map_err(|_| "QD4 output mutex poisoned".to_owned())?;
+            let (execution, cache_lease) = match job.payload {
+                Some(lease) if !lease.miss => {
+                    let lane_stream = lane.stream.clone();
+                    lane.copy_weight_tensors_from(&lease.slot, &lane_stream)
+                        .map_err(|error| error.to_string())?;
+                    let kernel_ns = lane
+                        .execute_into(input, routes.weights[route_slot], &mut output, None, None)
+                        .map_err(|error| error.to_string())?;
+                    (
+                        RoutedLaneExecution {
+                            read_ns: 0,
+                            h2d_ns: 0,
+                            kernel_ns,
+                            timeline: None,
+                        },
+                        Some(lease),
+                    )
+                }
+                Some(mut lease) => {
+                    let execution = lane
+                        .load_range_execute_into(
+                            shard,
+                            &plans[route_slot],
+                            input,
+                            routes.weights[route_slot],
+                            &mut output,
+                            profile_origin,
+                            job.profile_submit_ns,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let lane_stream = lane.stream.clone();
+                    lease
+                        .slot
+                        .copy_weight_tensors_from(lane, &lane_stream)
+                        .map_err(|error| error.to_string())?;
+                    lane_stream
+                        .synchronize()
+                        .map_err(|error| error.to_string())?;
+                    (execution, Some(lease))
+                }
+                None => (
+                    lane.load_range_execute_into(
+                        shard,
+                        &plans[route_slot],
+                        input,
+                        routes.weights[route_slot],
+                        &mut output,
+                        profile_origin,
+                        job.profile_submit_ns,
+                    )
+                    .map_err(|error| error.to_string())?,
+                    None,
+                ),
+            };
+            Ok::<_, String>(execution).map(|execution| RoutedLaneDone {
+                route_slot,
+                read_ns: execution.read_ns,
+                read_ready_ns: read_started_ns.saturating_add(execution.read_ns),
+                h2d_ns: execution.h2d_ns,
+                kernel_ns: execution.kernel_ns,
+                ready_ns: u64::try_from(job.iteration_started.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX),
+                job_ns: u64::try_from(job_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                timeline: execution.timeline,
+                cache_lease,
+            })
+        },
+        |_, batch| {
+            let mut ready_ns = [0_u64; v4_router::V4_TOPK];
+            let mut lane_timeline: [Option<RoutedLaneTimeline>; v4_router::V4_TOPK] =
+                std::array::from_fn(|_| None);
+            let mut read_ns = 0_u64;
+            let mut read_wall_ns = 0_u64;
+            let mut h2d_ns = 0_u64;
+            let mut kernel_ns = 0_u64;
+            let mut lane_job_ns = 0_u64;
+            let mut cache_miss_count = 0_usize;
+            let mut returned_leases = Vec::new();
+            for done in batch.completions {
+                ready_ns[done.route_slot] = done.ready_ns;
+                read_ns = read_ns.saturating_add(done.read_ns);
+                read_wall_ns = read_wall_ns.max(done.read_ready_ns);
+                h2d_ns = h2d_ns.saturating_add(done.h2d_ns);
+                kernel_ns = kernel_ns.saturating_add(done.kernel_ns);
+                lane_job_ns = lane_job_ns.saturating_add(done.job_ns);
+                lane_timeline[done.route_slot] = done.timeline;
+                if let Some(lease) = done.cache_lease {
+                    cache_miss_count = cache_miss_count.saturating_add(usize::from(lease.miss));
+                    returned_leases.push(lease);
+                }
+            }
+            let guards: [std::sync::MutexGuard<'_, Vec<f32>>; v4_router::V4_TOPK] =
+                std::array::from_fn(|index| outputs[index].lock().unwrap());
+            let routed: [(u16, &[f32]); v4_router::V4_TOPK] = std::array::from_fn(|index| {
+                (
+                    u16::try_from(routes.ids[index]).unwrap(),
+                    guards[index].as_slice(),
+                )
+            });
+            let canonical_reduction_start_ns = profile_origin.map(timeline_elapsed_ns);
+            let output = v4_expert::reduce_moe_canonical(&routed, shared)
+                .map_err(|error| error.to_string())?;
+            let canonical_reduction_end_ns = profile_origin.map(timeline_elapsed_ns);
+            let inclusive_ns =
+                u64::try_from(batch.iteration_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let contributions = capture_contributions.then(|| {
+                guards
+                    .iter()
+                    .map(|contribution| contribution.to_vec())
+                    .collect()
+            });
+            Ok(Qd4RoutedRun {
+                output,
+                contributions,
+                sample: RoutedReplaySample {
+                    inclusive_ns,
+                    setup_ns: 0,
+                    read_ns,
+                    read_wall_ns,
+                    h2d_ns,
+                    kernel_ns,
+                    lane_occupancy: lane_job_ns as f64 / (inclusive_ns as f64 * 4.0),
+                    submit_ns: batch.submit_ns,
+                    ready_ns,
+                    timeline: canonical_reduction_start_ns
+                        .zip(canonical_reduction_end_ns)
+                        .map(
+                            |(canonical_reduction_start_ns, canonical_reduction_end_ns)| {
+                                RoutedQd4Timeline {
+                                    lanes: lane_timeline,
+                                    canonical_reduction_start_ns,
+                                    canonical_reduction_end_ns,
+                                }
+                            },
+                        ),
+                },
+                cache_miss_count,
+                cache_leases: returned_leases,
+            })
+        },
+    )?;
+    let mut run = batches.pop().ok_or("QD4 supervisor returned no batch")?;
+    if let Some(cache) = immutable_cache {
+        for lease in std::mem::take(&mut run.cache_leases) {
+            cache.return_lease(layer, lease)?;
+        }
+        cache.record_batch(run.cache_miss_count);
+    }
+    Ok(run)
+}
+
+fn routed_replay_json(sample: &RoutedReplaySample) -> serde_json::Value {
+    serde_json::json!({
+        "inclusive_ns": sample.inclusive_ns,
+        "setup_ns": sample.setup_ns,
+        "read_ns": sample.read_ns,
+        "read_wall_ns": sample.read_wall_ns,
+        "h2d_ns": sample.h2d_ns,
+        "kernel_ns": sample.kernel_ns,
+        "lane_occupancy": sample.lane_occupancy,
+        "submit_ns": sample.submit_ns,
+        "ready_ns": sample.ready_ns,
+    })
+}
+
+fn routed_metric(
+    samples: &[RoutedReplaySample],
+    get: impl Fn(&RoutedReplaySample) -> u64,
+) -> (f64, f64) {
+    let values = samples.iter().map(get).collect::<Vec<_>>();
+    median_p95_ms(&values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_run_routed_qd4_benchmark(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    shard: &safetensors::ShardFile,
+    layer: usize,
+    input: &[u16],
+    routes: &v4_router::RouterSelection,
+    shared: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("COLIBRI_V4_ROUTED_QD4_BENCH").as_deref() != Some(std::ffi::OsStr::new("1"))
+        || !matches!(layer, 3 | 4)
+    {
+        return Ok(());
+    }
+    let trials = std::env::var("COLIBRI_V4_ROUTED_QD4_TRIALS")
+        .unwrap_or_else(|_| "30".into())
+        .parse::<usize>()?;
+    if trials < 30 || input.len() != v4_state::HIDDEN || routes.ids.len() != v4_router::V4_TOPK {
+        return Err("QD4 benchmark requires >=30 trials and one complete real route row".into());
+    }
+    let plans: [v4_expert::RoutedExpertRangePlan; v4_router::V4_TOPK] = routes
+        .ids
+        .iter()
+        .map(|&expert| v4_expert::RoutedExpertRangePlan::new(shard, layer, u16::try_from(expert)?))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+        .try_into()
+        .map_err(|_| "QD4 route plan count changed")?;
+    let (expected, cold_serial) =
+        run_serial_routed_replay(context, module, stream, shard, layer, input, routes, shared)?;
+    let mut serial = Vec::with_capacity(trials);
+    for _ in 0..trials {
+        let (actual, sample) =
+            run_serial_routed_replay(context, module, stream, shard, layer, input, routes, shared)?;
+        if actual != expected {
+            return Err("serial fixed-route replay changed canonical output".into());
+        }
+        serial.push(sample);
+    }
+    let (startup_setup_ns, qd4) = run_qd4_routed_replays(
+        context, module, shard, input, routes, shared, &plans, &expected, trials,
+    )?;
+    let (serial_inclusive_p50_ms, serial_inclusive_p95_ms) =
+        routed_metric(&serial, |sample| sample.inclusive_ns);
+    let (qd4_inclusive_p50_ms, qd4_inclusive_p95_ms) =
+        routed_metric(&qd4, |sample| sample.inclusive_ns);
+    let (serial_setup_p50_ms, serial_setup_p95_ms) =
+        routed_metric(&serial, |sample| sample.setup_ns);
+    let (qd4_setup_p50_ms, qd4_setup_p95_ms) = routed_metric(&qd4, |sample| sample.setup_ns);
+    let (qd4_read_p50_ms, qd4_read_p95_ms) = routed_metric(&qd4, |sample| sample.read_wall_ns);
+    let (qd4_h2d_p50_ms, qd4_h2d_p95_ms) = routed_metric(&qd4, |sample| sample.h2d_ns);
+    let (qd4_kernel_p50_ms, qd4_kernel_p95_ms) = routed_metric(&qd4, |sample| sample.kernel_ns);
+    let read_gbps = v4_expert::V4_ROUTED_EXPERT_BYTES as f64 * v4_router::V4_TOPK as f64
+        / (qd4_read_p50_ms / 1_000.0)
+        / 1e9;
+    let inclusive_improvement = 1.0 - qd4_inclusive_p50_ms / serial_inclusive_p50_ms;
+    let setup_improvement = 1.0 - qd4_setup_p50_ms / serial_setup_p50_ms;
+    let pass = inclusive_improvement >= 0.20
+        && setup_improvement >= 0.80
+        && read_gbps >= 4.9
+        && qd4_inclusive_p95_ms <= serial_inclusive_p95_ms;
+    let path = std::env::var_os("COLIBRI_V4_ROUTED_QD4_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_ROUTED_QD4_RESULT_JSONL")?;
+    let mut result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        result,
+        "{}",
+        serde_json::json!({
+            "event": "routed_qd4_benchmark",
+            "layer": layer,
+            "compression_ratio": v4_state::compression_ratio_for_layer(layer)?.get(),
+            "trials": trials,
+            "route_ids": routes.ids,
+            "route_weights_f32": routes.weights,
+            "range_expert_ids": plans.iter().map(|plan| plan.expert_id).collect::<Vec<_>>(),
+            "range_bytes_per_expert": v4_expert::V4_ROUTED_EXPERT_BYTES,
+            "range_bytes_per_replay": v4_expert::V4_ROUTED_EXPERT_BYTES * v4_router::V4_TOPK,
+            "output_bf16_digest": format!("{:016x}", fnv1a_u16(&expected)),
+            "cold_serial": routed_replay_json(&cold_serial),
+            "startup_lane_setup_ns": startup_setup_ns,
+            "pinned_host_bytes": v4_expert::V4_ROUTED_EXPERT_BYTES * 4,
+            "device_weight_bytes": v4_expert::V4_ROUTED_EXPERT_BYTES * 4,
+            "steady_lane_alloc_count": 0,
+            "serial": serial.iter().map(routed_replay_json).collect::<Vec<_>>(),
+            "qd4": qd4.iter().map(routed_replay_json).collect::<Vec<_>>(),
+            "summary": {
+                "serial_inclusive_p50_ms": serial_inclusive_p50_ms,
+                "serial_inclusive_p95_ms": serial_inclusive_p95_ms,
+                "qd4_inclusive_p50_ms": qd4_inclusive_p50_ms,
+                "qd4_inclusive_p95_ms": qd4_inclusive_p95_ms,
+                "inclusive_improvement": inclusive_improvement,
+                "serial_setup_p50_ms": serial_setup_p50_ms,
+                "serial_setup_p95_ms": serial_setup_p95_ms,
+                "qd4_setup_p50_ms": qd4_setup_p50_ms,
+                "qd4_setup_p95_ms": qd4_setup_p95_ms,
+                "setup_improvement": setup_improvement,
+                "qd4_read_p50_ms": qd4_read_p50_ms,
+                "qd4_read_p95_ms": qd4_read_p95_ms,
+                "read_gbps": read_gbps,
+                "qd4_h2d_p50_ms": qd4_h2d_p50_ms,
+                "qd4_h2d_p95_ms": qd4_h2d_p95_ms,
+                "qd4_kernel_p50_ms": qd4_kernel_p50_ms,
+                "qd4_kernel_p95_ms": qd4_kernel_p95_ms,
+                "pass": pass,
+            },
+        })
+    )?;
+    result.sync_all()?;
+    Ok(())
+}
+
+fn run_real_v4_fp4_slice_if_available(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    let path = v4_expert_shard()?;
+    let shard = safetensors::ShardFile::open(path)?;
+    let weight_name = "layers.0.ffn.experts.0.w1.weight";
+    let scale_name = "layers.0.ffn.experts.0.w1.scale";
+    let weight = shard.tensor(weight_name)?;
+    let scale = shard.tensor(scale_name)?;
+    if weight.dtype != safetensors::TensorDtype::Fp4E2M1x2
+        || scale.dtype != safetensors::TensorDtype::F8E8M0
+        || weight.shape.len() != 2
+        || scale.shape != [weight.shape[0], weight.shape[1] / 16]
+    {
+        return Err("real V4 FP4 weight/scale metadata disagrees with the official layout".into());
+    }
+    let mut packed = [0_u8; 16];
+    let mut scales = [0_u8; 1];
+    shard.read_at(weight_name, 0, &mut packed)?;
+    shard.read_at(scale_name, 0, &mut scales)?;
+    assert_eq!(
+        packed,
+        [
+            0xd2, 0x25, 0x19, 0x21, 0x19, 0x94, 0xac, 0x5b, 0xbb, 0x29, 0x18, 0xaa, 0xba, 0xe3,
+            0xcd, 0x43,
+        ],
+        "pinned V4 expert range"
+    );
+    assert_eq!(scales, [0x79], "pinned V4 E8M0 scale");
+    let layout = v4_fp4::Fp4E2M1x2Layout::new(&packed, &scales, 1, 32)?;
+    let mut expected = [0.0; 32];
+    layout.decode_block(0, 0, &mut expected)?;
+    let official = [
+        0.015625, -0.046875, 0.046875, 0.015625, -0.0078125, 0.0078125, 0.0078125, 0.015625,
+        -0.0078125, 0.0078125, 0.03125, -0.0078125, -0.03125, -0.015625, -0.0234375, 0.046875,
+        -0.0234375, -0.0234375, -0.0078125, 0.015625, 0.0, 0.0078125, -0.015625, -0.015625,
+        -0.015625, -0.0234375, 0.0234375, -0.0625, -0.046875, -0.03125, 0.0234375, 0.03125,
+    ];
+    assert_close("decode_v4_fp4_real_cpu", &expected, &official);
+    let device_packed = DeviceBuffer::from_host(stream, &packed)?;
+    let device_scales = DeviceBuffer::from_host(stream, &scales)?;
+    let mut device_output = DeviceBuffer::from_host(stream, &vec![0.0f32; expected.len()])?;
+    launch_v4_fp4_decode(
+        module,
+        stream,
+        &device_packed,
+        &device_scales,
+        &mut device_output,
+        layout,
+    )?;
+    assert_close(
+        "decode_v4_fp4_real_slice",
+        &device_output.to_host_vec(stream)?,
+        &expected,
+    );
+    println!("PASS: real V4 FP4 first 32-value range matches CPU and GPU decoding");
+    Ok(())
+}
+
+fn read_v4_bf16(
+    shard: &safetensors::ShardFile,
+    name: &str,
+    shape: &[u64],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let info = shard.tensor(name)?;
+    if info.dtype != safetensors::TensorDtype::Bf16 || info.shape != shape {
+        return Err(format!("{name} metadata does not match the pinned V4 BF16 layout").into());
+    }
+    let mut bytes = vec![0_u8; usize::try_from(info.byte_len)?];
+    shard.read_at(name, 0, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect())
+}
+
+fn read_v4_f32(
+    shard: &safetensors::ShardFile,
+    name: &str,
+    shape: &[u64],
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let info = shard.tensor(name)?;
+    if info.dtype != safetensors::TensorDtype::F32 || info.shape != shape {
+        return Err(format!("{name} metadata does not match the pinned V4 F32 layout").into());
+    }
+    let mut bytes = vec![0_u8; usize::try_from(info.byte_len)?];
+    shard.read_at(name, 0, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect())
+}
+
+fn read_v4_hash_rows(
+    shard: &safetensors::ShardFile,
+    name: &str,
+    input_ids: &[i64],
+) -> Result<Vec<i64>, Box<dyn Error>> {
+    let info = shard.tensor(name)?;
+    if info.dtype != safetensors::TensorDtype::I64 || info.shape != [129_280, 6] {
+        return Err(format!("{name} metadata does not match the pinned V4 hash table").into());
+    }
+    let mut result = Vec::with_capacity(input_ids.len() * v4_router::V4_TOPK);
+    for &input_id in input_ids {
+        if !(0..129_280).contains(&input_id) {
+            return Err(format!("V4 token id {input_id} is outside the hash table").into());
+        }
+        let mut row = [0_u8; v4_router::V4_TOPK * 8];
+        shard.read_at(name, input_id as u64 * row.len() as u64, &mut row)?;
+        result.extend(
+            row.chunks_exact(8)
+                .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap())),
+        );
+    }
+    Ok(result)
+}
+
+fn load_layer_hash_ids(
+    model_dir: &std::path::Path,
+    layer: usize,
+    input_ids: &[i64],
+) -> Result<Vec<i64>, Box<dyn Error>> {
+    if layer >= 3 {
+        return Ok(Vec::new());
+    }
+    let shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    read_v4_hash_rows(
+        &shard,
+        &format!("layers.{layer}.ffn.gate.tid2eid"),
+        input_ids,
+    )
+}
+
+fn deterministic_v4_bf16(rows: usize, seed: usize) -> Vec<u16> {
+    (0..rows * v4_router::V4_HIDDEN)
+        .map(|index| {
+            let value = ((index.wrapping_mul(17).wrapping_add(seed) % 113) as f32 - 56.0) / 64.0;
+            v4_router::f32_to_bf16_rne(value)
+        })
+        .collect()
+}
+
+fn assert_router_selection_close(
+    name: &str,
+    actual: &v4_router::RouterSelection,
+    expected: &v4_router::RouterSelection,
+) {
+    assert_eq!(actual.ids, expected.ids, "{name}: selected expert IDs");
+    assert_close(name, &actual.weights, &expected.weights);
+    for weights in actual.weights.chunks_exact(v4_router::V4_TOPK) {
+        assert_close(name, &[weights.iter().sum()], &[v4_router::V4_ROUTE_SCALE]);
+    }
+}
+
+fn run_real_v4_state_slice_if_available(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    let root = v4_model_dir()?;
+    let state = v4_state::load(&root, &v4_state::IDS)?;
+    let rows = v4_state::IDS.len();
+    let rows_u32 = u32::try_from(rows)?;
+    let linear_rows_u32 = rows_u32
+        .checked_mul(32)
+        .ok_or("mHC linear launch overflow")?;
+    let fixture = v4_state::fixture_stages()?;
+    let cpu_mixes = v4_state::mhc_linear_cpu(&state, rows)?;
+    let cpu = v4_state::mhc_sinkhorn_cpu(&state, &cpu_mixes, rows)?;
+    println!("V4 mHC stage isolation A=CPUlinear+CPUsinkhorn");
+    report_v4_state_f32("A mixes/fixture", &cpu_mixes, &fixture.mixes);
+    report_v4_state_f32("A pre/fixture", &cpu.pre, &fixture.pre);
+    report_v4_state_f32("A post/fixture", &cpu.post, &fixture.post);
+    report_v4_state_f32("A comb/fixture", &cpu.comb, &fixture.comb);
+    report_v4_state_bf16("A collapsed/fixture", &cpu.collapsed, &fixture.collapsed);
+    report_v4_state_trace(
+        "A sinkhorn/fixture",
+        &cpu.sinkhorn_trace,
+        &fixture.sinkhorn_trace,
+    );
+    report_v4_state_invariants("A sinkhorn", &cpu.sinkhorn_trace);
+    let mut repeated = Vec::with_capacity(4 * 4 * v4_state::HIDDEN);
+    for row in state.embedding.chunks_exact(v4_state::HIDDEN) {
+        for _ in 0..4 {
+            repeated.extend_from_slice(row);
+        }
+    }
+    let input = DeviceBuffer::from_host(stream, &repeated)?;
+    let hc_fn = DeviceBuffer::from_host(stream, &state.hc_fn)?;
+    let hc_scale = DeviceBuffer::from_host(stream, &state.hc_scale)?;
+    let hc_base = DeviceBuffer::from_host(stream, &state.hc_base)?;
+    let norm = DeviceBuffer::from_host(stream, &state.attn_norm)?;
+    let cpu_mixes_device = DeviceBuffer::from_host(stream, &cpu_mixes)?;
+    let mut gpu_mixes = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::MIX])?;
+    let mut scalar_mixes = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::MIX])?;
+    unsafe {
+        module.mhc_linear_v4_bf16_scalar(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &input,
+            &hc_fn,
+            &mut scalar_mixes,
+        )?;
+    }
+    unsafe {
+        module.mhc_linear_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(linear_rows_u32),
+            &input,
+            &hc_fn,
+            &mut gpu_mixes,
+        )?;
+    }
+    let gpu_mixes_host = gpu_mixes.to_host_vec(stream)?;
+    let scalar_mixes_host = scalar_mixes.to_host_vec(stream)?;
+    if gpu_mixes_host
+        .iter()
+        .zip(&scalar_mixes_host)
+        .any(|(candidate, scalar)| candidate.to_bits() != scalar.to_bits())
+    {
+        return Err("SM89 mHC linear candidate diverged from same-revision scalar oracle".into());
+    }
+    println!("V4 mHC stage isolation B=GPUlinear+CPUsinkhorn");
+    report_v4_state_f32("B mixes/fixture", &gpu_mixes_host, &fixture.mixes);
+    let c = v4_state::mhc_sinkhorn_cpu(&state, &gpu_mixes_host, rows)?;
+    report_v4_state_f32("B pre/fixture", &c.pre, &fixture.pre);
+    report_v4_state_f32("B post/fixture", &c.post, &fixture.post);
+    report_v4_state_f32("B comb/fixture", &c.comb, &fixture.comb);
+    report_v4_state_bf16("B collapsed/fixture", &c.collapsed, &fixture.collapsed);
+    report_v4_state_trace(
+        "B sinkhorn/fixture",
+        &c.sinkhorn_trace,
+        &fixture.sinkhorn_trace,
+    );
+    report_v4_state_invariants("B sinkhorn", &c.sinkhorn_trace);
+
+    let mut b_pre = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC])?;
+    let mut b_post = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC])?;
+    let mut b_comb =
+        DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC * v4_state::HC])?;
+    let mut b_collapsed = DeviceBuffer::from_host(stream, &vec![0_u16; rows * v4_state::HIDDEN])?;
+    let mut b_trace = DeviceBuffer::from_host(
+        stream,
+        &vec![0_f32; rows * 41 * v4_state::HC * v4_state::HC],
+    )?;
+    unsafe {
+        module.mhc_sinkhorn_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &input,
+            &cpu_mixes_device,
+            &hc_scale,
+            &hc_base,
+            &mut b_pre,
+            &mut b_post,
+            &mut b_comb,
+            &mut b_collapsed,
+            &mut b_trace,
+        )?;
+    }
+    println!("V4 mHC stage isolation C=CPUlinear+GPUsinkhorn");
+    report_v4_state_f32("C pre/fixture", &b_pre.to_host_vec(stream)?, &fixture.pre);
+    report_v4_state_f32(
+        "C post/fixture",
+        &b_post.to_host_vec(stream)?,
+        &fixture.post,
+    );
+    report_v4_state_f32(
+        "C comb/fixture",
+        &b_comb.to_host_vec(stream)?,
+        &fixture.comb,
+    );
+    report_v4_state_bf16(
+        "C collapsed/fixture",
+        &b_collapsed.to_host_vec(stream)?,
+        &fixture.collapsed,
+    );
+    let b_trace_host = b_trace.to_host_vec(stream)?;
+    report_v4_state_trace("C sinkhorn/fixture", &b_trace_host, &fixture.sinkhorn_trace);
+    report_v4_state_invariants("C sinkhorn", &b_trace_host);
+
+    let mut d_pre = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC])?;
+    let mut d_post = DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC])?;
+    let mut d_comb =
+        DeviceBuffer::from_host(stream, &vec![0_f32; rows * v4_state::HC * v4_state::HC])?;
+    let mut d_collapsed = DeviceBuffer::from_host(stream, &vec![0_u16; rows * v4_state::HIDDEN])?;
+    let mut d_trace = DeviceBuffer::from_host(
+        stream,
+        &vec![0_f32; rows * 41 * v4_state::HC * v4_state::HC],
+    )?;
+    unsafe {
+        module.mhc_sinkhorn_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &input,
+            &gpu_mixes,
+            &hc_scale,
+            &hc_base,
+            &mut d_pre,
+            &mut d_post,
+            &mut d_comb,
+            &mut d_collapsed,
+            &mut d_trace,
+        )?;
+    }
+    println!("V4 mHC stage isolation D=GPUlinear+GPUsinkhorn");
+    let d_pre_host = d_pre.to_host_vec(stream)?;
+    let d_post_host = d_post.to_host_vec(stream)?;
+    let d_comb_host = d_comb.to_host_vec(stream)?;
+    let (_, mixes_max) = report_v4_state_f32("D mixes/fixture", &gpu_mixes_host, &fixture.mixes);
+    let (_, pre_max) = report_v4_state_f32("D pre/fixture", &d_pre_host, &fixture.pre);
+    let (_, post_max) = report_v4_state_f32("D post/fixture", &d_post_host, &fixture.post);
+    let (_, comb_max) = report_v4_state_f32("D comb/fixture", &d_comb_host, &fixture.comb);
+    let d_collapsed_host = d_collapsed.to_host_vec(stream)?;
+    let (collapsed_mismatches, _) =
+        report_v4_state_bf16("D collapsed/fixture", &d_collapsed_host, &fixture.collapsed);
+    let d_trace_host = d_trace.to_host_vec(stream)?;
+    report_v4_state_trace("D sinkhorn/fixture", &d_trace_host, &fixture.sinkhorn_trace);
+    report_v4_state_invariants("D sinkhorn", &d_trace_host);
+    let mhc_max = mixes_max.max(pre_max).max(post_max).max(comb_max);
+    if mhc_max > 1e-7
+        || collapsed_mismatches != 0
+        || gpu_mixes_host
+            .iter()
+            .chain(&d_pre_host)
+            .chain(&d_post_host)
+            .chain(&d_comb_host)
+            .chain(&d_trace_host)
+            .any(|value| !value.is_finite())
+    {
+        return Err("Rust GPU mHC canonical-compatible gate failed".into());
+    }
+
+    let cpu_fixture_norm = v4_router::rmsnorm_bf16(&fixture.collapsed, &state.attn_norm)?;
+    let fixture_collapsed_device = DeviceBuffer::from_host(stream, &fixture.collapsed)?;
+    let mut gpu_fixture_norm =
+        DeviceBuffer::from_host(stream, &vec![0_u16; rows * v4_state::HIDDEN])?;
+    unsafe {
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &fixture_collapsed_device,
+            &norm,
+            &mut gpu_fixture_norm,
+            v4_state::HIDDEN as u32,
+        )?;
+    }
+    println!("V4 attn-norm isolated on fixture collapsed input");
+    report_v4_state_bf16("norm CPU/fixture", &cpu_fixture_norm, &fixture.norm);
+    let gpu_fixture_norm_host = gpu_fixture_norm.to_host_vec(stream)?;
+    let (norm_mismatches, _) =
+        report_v4_state_bf16("norm GPU/fixture", &gpu_fixture_norm_host, &fixture.norm);
+    if norm_mismatches != 0 {
+        return Err("Rust GPU mHC attn RMSNorm gate failed".into());
+    }
+
+    unsafe {
+        module.mhc_linear_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(linear_rows_u32),
+            &input,
+            &hc_fn,
+            &mut gpu_mixes,
+        )?;
+        module.mhc_sinkhorn_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &input,
+            &gpu_mixes,
+            &hc_scale,
+            &hc_base,
+            &mut d_pre,
+            &mut d_post,
+            &mut d_comb,
+            &mut d_collapsed,
+            &mut d_trace,
+        )?;
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(rows_u32),
+            &fixture_collapsed_device,
+            &norm,
+            &mut gpu_fixture_norm,
+            v4_state::HIDDEN as u32,
+        )?;
+    }
+    let deterministic = gpu_mixes
+        .to_host_vec(stream)?
+        .iter()
+        .zip(&gpu_mixes_host)
+        .all(|(left, right)| left.to_bits() == right.to_bits())
+        && d_pre
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&d_pre_host)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && d_post
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&d_post_host)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && d_comb
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&d_comb_host)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && d_collapsed.to_host_vec(stream)? == d_collapsed_host
+        && d_trace
+            .to_host_vec(stream)?
+            .iter()
+            .zip(&d_trace_host)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        && gpu_fixture_norm.to_host_vec(stream)? == gpu_fixture_norm_host;
+    if !deterministic {
+        return Err("Rust GPU mHC repeat was not raw-bit deterministic".into());
+    }
+    let mut mhc_hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in d_pre_host.iter().chain(&d_post_host).chain(&d_comb_host) {
+        for byte in value.to_bits().to_le_bytes() {
+            mhc_hash = (mhc_hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let h2d = input.len() * 2
+        + hc_fn.len() * 4
+        + hc_scale.len() * 4
+        + hc_base.len() * 4
+        + norm.len() * 2
+        + cpu_mixes_device.len() * 4
+        + gpu_mixes.len() * 4
+        + scalar_mixes.len() * 4
+        + b_pre.len() * 4
+        + b_post.len() * 4
+        + b_comb.len() * 4
+        + b_collapsed.len() * 2
+        + b_trace.len() * 4
+        + d_pre.len() * 4
+        + d_post.len() * 4
+        + d_comb.len() * 4
+        + d_collapsed.len() * 2
+        + d_trace.len() * 4
+        + fixture_collapsed_device.len() * 2
+        + gpu_fixture_norm.len() * 2;
+    println!(
+        "PASS: real V4 L0 mHC canonical-compatible on sm89, max_abs={mhc_max:.9e}, finite=true, deterministic=true, collapsed_bits=exact, norm_bits=exact, fnv1a={mhc_hash:016x}, range={} B, actual H2D={} B",
+        state.range_bytes, h2d,
+    );
+    Ok(())
+}
+
+fn report_v4_state_bf16(name: &str, actual: &[u16], expected: &[u16]) -> (usize, f32) {
+    assert_eq!(actual.len(), expected.len(), "{name}: length");
+    let mut mismatches = 0;
+    let mut max = 0.0_f32;
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let delta = (v4_router::bf16_to_f32(actual) - v4_router::bf16_to_f32(expected)).abs();
+        max = max.max(delta);
+        mismatches += (actual != expected) as usize;
+    }
+    println!("{name}: mismatches={mismatches}, max_abs={max:.6e}");
+    (mismatches, max)
+}
+
+fn report_v4_state_f32(name: &str, actual: &[f32], expected: &[f32]) -> (usize, f32) {
+    assert_eq!(actual.len(), expected.len(), "{name}: length");
+    let mut mismatches = 0;
+    let mut max = 0.0_f32;
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let delta = (actual - expected).abs();
+        max = max.max(delta);
+        mismatches += (actual.to_bits() != expected.to_bits()) as usize;
+    }
+    println!("{name}: mismatches={mismatches}, max_abs={max:.6e}");
+    (mismatches, max)
+}
+
+fn report_v4_state_trace(name: &str, actual: &[f32], expected: &[f32]) {
+    const STAGES: usize = 41;
+    const CELLS: usize = v4_state::HC * v4_state::HC;
+    assert_eq!(actual.len(), expected.len(), "{name}: trace lengths");
+    for stage in 0..STAGES {
+        let label = match stage {
+            0 => "comb_logits".to_owned(),
+            1 => "after_softmax_eps".to_owned(),
+            n if n % 2 == 0 => format!("col_{:02}", (n - 2) / 2),
+            n => format!("row_{:02}", (n - 3) / 2),
+        };
+        let mut bit_mismatches = 0;
+        let mut max = 0.0_f32;
+        for (a, b) in actual
+            .chunks_exact(STAGES * CELLS)
+            .zip(expected.chunks_exact(STAGES * CELLS))
+        {
+            for (&actual, &expected) in a[stage * CELLS..][..CELLS]
+                .iter()
+                .zip(&b[stage * CELLS..][..CELLS])
+            {
+                bit_mismatches += (actual.to_bits() != expected.to_bits()) as usize;
+                max = max.max((actual - expected).abs());
+            }
+        }
+        println!("{name} {label}: bit_mismatches={bit_mismatches}, max_abs={max:.6e}");
+    }
+}
+
+fn report_v4_state_invariants(name: &str, trace: &[f32]) {
+    const CELLS: usize = v4_state::HC * v4_state::HC;
+    for stage in 2..=40 {
+        let column = stage % 2 == 0;
+        let mut max_deviation = 0.0_f32;
+        for row in trace.chunks_exact(41 * CELLS) {
+            let matrix = &row[stage * CELLS..][..CELLS];
+            for axis in 0..v4_state::HC {
+                let sum: f32 = (0..v4_state::HC)
+                    .map(|other| {
+                        if column {
+                            matrix[other * v4_state::HC + axis]
+                        } else {
+                            matrix[axis * v4_state::HC + other]
+                        }
+                    })
+                    .sum();
+                max_deviation = max_deviation.max((sum - 1.0).abs());
+            }
+        }
+        let label = if column {
+            format!("col_{:02}", (stage - 2) / 2)
+        } else {
+            format!("row_{:02}", (stage - 3) / 2)
+        };
+        println!("{name} {label} sum_max_deviation={max_deviation:.6e}");
+    }
+}
+
+fn run_real_v4_fp8_projection_slice_if_available(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const WARM_REQUESTS: usize = 100;
+    let root = v4_model_dir()?;
+    let fixture = v4_state::fp8_projection_fixture()?;
+    let range_start = std::time::Instant::now();
+    let projections = v4_state::load_fp8_projections(&root)?;
+    let range_elapsed = range_start.elapsed();
+    let activation = v4_state::quantize_fp8_activation(&fixture.input_bf16, v4_state::IDS.len())?;
+    let cpu_start = std::time::Instant::now();
+    let wq_cpu = v4_state::project_fp8_cpu(&projections.wq_a, &activation)?;
+    let wkv_cpu = v4_state::project_fp8_cpu(&projections.wkv, &activation)?;
+    let wq_b_activation =
+        v4_state::quantize_fp8_activation(&fixture.q_norm_bf16, v4_state::IDS.len())?;
+    let wq_b_cpu = v4_state::project_fp8_linear_cpu(&projections.wq_b, &wq_b_activation)?;
+    let q_head_rms_cpu = v4_state::query_head_rms_bf16(&wq_b_cpu.bf16)?;
+    let query_freqs = v4_state::query_freqs_cis_pos0_3();
+    let q_rope_cpu = v4_state::query_rope_bf16(&q_head_rms_cpu, &query_freqs)?;
+    let kv_ready_cpu = v4_state::finalize_kv_cpu(&fixture.kv_norm_bf16, &query_freqs)?;
+    let cpu_elapsed = cpu_start.elapsed();
+
+    let input_host = PinnedHostBuffer::from_slice(context, &fixture.input_bf16)?;
+    let q_fixture_host = PinnedHostBuffer::from_slice(context, &fixture.q_norm_bf16)?;
+    let kv_fixture_host = PinnedHostBuffer::from_slice(context, &fixture.kv_norm_bf16)?;
+    let query_freqs_host = PinnedHostBuffer::from_slice(context, &query_freqs)?;
+    let wq_weight_host = PinnedHostBuffer::from_slice(context, &projections.wq_a.matrix.weight)?;
+    let wq_scale_host = PinnedHostBuffer::from_slice(context, &projections.wq_a.matrix.scale)?;
+    let q_norm_host = PinnedHostBuffer::from_slice(context, &projections.wq_a.norm)?;
+    let wq_b_weight_host = PinnedHostBuffer::from_slice(context, &projections.wq_b.weight)?;
+    let wq_b_scale_host = PinnedHostBuffer::from_slice(context, &projections.wq_b.scale)?;
+    let wkv_weight_host = PinnedHostBuffer::from_slice(context, &projections.wkv.matrix.weight)?;
+    let wkv_scale_host = PinnedHostBuffer::from_slice(context, &projections.wkv.matrix.scale)?;
+    let kv_norm_host = PinnedHostBuffer::from_slice(context, &projections.wkv.norm)?;
+    let mut input = unsafe { DeviceBuffer::uninitialized_async(stream, fixture.input_bf16.len())? };
+    let mut q_fixture =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.q_norm_bf16.len())? };
+    let mut kv_fixture =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.kv_norm_bf16.len())? };
+    let mut query_freqs_device =
+        unsafe { DeviceBuffer::uninitialized_async(stream, query_freqs.len())? };
+    let mut wq_weight =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wq_a.matrix.weight.len())? };
+    let mut wq_scale =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wq_a.matrix.scale.len())? };
+    let mut q_norm =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wq_a.norm.len())? };
+    let mut wq_b_weight =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wq_b.weight.len())? };
+    let mut wq_b_scale =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wq_b.scale.len())? };
+    let mut wkv_weight =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wkv.matrix.weight.len())? };
+    let mut wkv_scale =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wkv.matrix.scale.len())? };
+    let mut kv_norm =
+        unsafe { DeviceBuffer::uninitialized_async(stream, projections.wkv.norm.len())? };
+    let h2d_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let h2d_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    h2d_start.record(stream)?;
+    // SAFETY: every pinned source remains alive through h2d_end synchronization,
+    // and each destination allocation has the exact same element count.
+    unsafe {
+        input.copy_from_pinned_host_async(stream, &input_host)?;
+        q_fixture.copy_from_pinned_host_async(stream, &q_fixture_host)?;
+        kv_fixture.copy_from_pinned_host_async(stream, &kv_fixture_host)?;
+        query_freqs_device.copy_from_pinned_host_async(stream, &query_freqs_host)?;
+        wq_weight.copy_from_pinned_host_async(stream, &wq_weight_host)?;
+        wq_scale.copy_from_pinned_host_async(stream, &wq_scale_host)?;
+        q_norm.copy_from_pinned_host_async(stream, &q_norm_host)?;
+        wq_b_weight.copy_from_pinned_host_async(stream, &wq_b_weight_host)?;
+        wq_b_scale.copy_from_pinned_host_async(stream, &wq_b_scale_host)?;
+        wkv_weight.copy_from_pinned_host_async(stream, &wkv_weight_host)?;
+        wkv_scale.copy_from_pinned_host_async(stream, &wkv_scale_host)?;
+        kv_norm.copy_from_pinned_host_async(stream, &kv_norm_host)?;
+    }
+    h2d_end.record(stream)?;
+    h2d_end.synchronize()?;
+    let h2d_ms = h2d_start.elapsed_ms(&h2d_end)? as f64;
+    let h2d_bytes = projections.range_bytes
+        + fixture.input_bf16.len() * 2
+        + fixture.q_norm_bf16.len() * 2
+        + fixture.kv_norm_bf16.len() * 2
+        + query_freqs.len() * 4;
+
+    let rows = v4_state::IDS.len();
+    let blocks = v4_state::HIDDEN / v4_state::FP8_BLOCK;
+    let mut input_fp8 =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.input_bf16.len())? };
+    let mut input_scale = unsafe { DeviceBuffer::uninitialized_async(stream, rows * blocks)? };
+    let mut wq_f32 = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wq_a.matrix.out_features)?
+    };
+    let mut wq_bf16 = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wq_a.matrix.out_features)?
+    };
+    let mut q_normalized = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wq_a.matrix.out_features)?
+    };
+    let mut wq_b_input_fp8 =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.q_norm_bf16.len())? };
+    let mut wq_b_input_scale = unsafe {
+        DeviceBuffer::uninitialized_async(
+            stream,
+            rows * projections.wq_b.in_features / v4_state::FP8_BLOCK,
+        )?
+    };
+    let mut wq_b_f32 =
+        unsafe { DeviceBuffer::uninitialized_async(stream, rows * projections.wq_b.out_features)? };
+    let mut wq_b_bf16 =
+        unsafe { DeviceBuffer::uninitialized_async(stream, rows * projections.wq_b.out_features)? };
+    let mut q_head_rms =
+        unsafe { DeviceBuffer::uninitialized_async(stream, rows * projections.wq_b.out_features)? };
+    let mut q_rope =
+        unsafe { DeviceBuffer::uninitialized_async(stream, rows * projections.wq_b.out_features)? };
+    let mut unit_norm = unsafe { DeviceBuffer::<u16>::uninitialized_async(stream, 0)? };
+    let mut wkv_f32 = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wkv.matrix.out_features)?
+    };
+    let mut wkv_bf16 = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wkv.matrix.out_features)?
+    };
+    let mut kv_normalized = unsafe {
+        DeviceBuffer::uninitialized_async(stream, rows * projections.wkv.matrix.out_features)?
+    };
+    let mut kv_rope =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.kv_norm_bf16.len())? };
+    let mut kv_ready =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.kv_norm_bf16.len())? };
+    let mut kv_scales =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.kv_scale_e8m0.len())? };
+    let mut empty_fp8 = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, 0)? };
+    let mut causal_topk =
+        unsafe { DeviceBuffer::uninitialized_async(stream, fixture.causal_topk_i32.len())? };
+    let kv_cache = DeviceBuffer::<u16>::zeroed(stream, fixture.cache_initial_bf16.len())?;
+
+    // SAFETY: fixed pinned V4 shapes prove all slice lengths and launch counts.
+    unsafe {
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rows * blocks)?),
+            &input,
+            &mut input_fp8,
+            &mut input_scale,
+            &mut unit_norm,
+            u32::try_from(v4_state::HIDDEN)?,
+            u32::try_from(v4_state::HIDDEN)?,
+            u32::try_from(v4_state::FP8_BLOCK)?,
+        )?;
+        launch_v4_fp8_matvec(
+            module,
+            stream,
+            &input_fp8,
+            &input_scale,
+            &wq_weight,
+            &wq_scale,
+            &mut wq_f32,
+            &mut wq_bf16,
+            projections.wq_a.matrix.in_features,
+            projections.wq_a.matrix.out_features,
+            false,
+        )?;
+        launch_v4_fp8_matvec(
+            module,
+            stream,
+            &input_fp8,
+            &input_scale,
+            &wkv_weight,
+            &wkv_scale,
+            &mut wkv_f32,
+            &mut wkv_bf16,
+            projections.wkv.matrix.in_features,
+            projections.wkv.matrix.out_features,
+            false,
+        )?;
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rows)?),
+            &wq_bf16,
+            &q_norm,
+            &mut q_normalized,
+            u32::try_from(projections.wq_a.matrix.out_features)?,
+        )?;
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rows)?),
+            &wkv_bf16,
+            &kv_norm,
+            &mut kv_normalized,
+            u32::try_from(projections.wkv.matrix.out_features)?,
+        )?;
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(wq_b_input_scale.len())?),
+            &q_fixture,
+            &mut wq_b_input_fp8,
+            &mut wq_b_input_scale,
+            &mut unit_norm,
+            u32::try_from(projections.wq_b.in_features)?,
+            u32::try_from(projections.wq_b.in_features)?,
+            u32::try_from(v4_state::FP8_BLOCK)?,
+        )?;
+        launch_v4_fp8_matvec(
+            module,
+            stream,
+            &wq_b_input_fp8,
+            &wq_b_input_scale,
+            &wq_b_weight,
+            &wq_b_scale,
+            &mut wq_b_f32,
+            &mut wq_b_bf16,
+            projections.wq_b.in_features,
+            projections.wq_b.out_features,
+            true,
+        )?;
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rows * v4_state::Q_HEADS)?),
+            &wq_b_bf16,
+            &unit_norm,
+            &mut q_head_rms,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+        )?;
+        module.rope_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(q_rope.len())?),
+            &q_head_rms,
+            &query_freqs_device,
+            &mut q_rope,
+            u32::try_from(v4_state::Q_HEADS)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+        )?;
+        launch_v4_kv_ready(
+            module,
+            stream,
+            &kv_fixture,
+            &query_freqs_device,
+            &mut kv_rope,
+            &mut kv_ready,
+            &mut empty_fp8,
+            &mut kv_scales,
+            &mut causal_topk,
+        )?;
+    }
+
+    let input_fp8_host = input_fp8.to_host_vec(stream)?;
+    let input_scale_host = input_scale.to_host_vec(stream)?;
+    let activation_mismatches = report_v4_state_u8(
+        "FP8 activation GPU/fixture",
+        &input_fp8_host,
+        &fixture.activation,
+    );
+    let scale_mismatches = report_v4_state_u8(
+        "E8M0 activation scale GPU/fixture",
+        &input_scale_host,
+        &fixture.activation_scale,
+    );
+    let wq_gpu_f32 = wq_f32.to_host_vec(stream)?;
+    let wq_gpu_bf16 = wq_bf16.to_host_vec(stream)?;
+    let q_normalized_host = q_normalized.to_host_vec(stream)?;
+    let wkv_gpu_f32 = wkv_f32.to_host_vec(stream)?;
+    let wkv_gpu_bf16 = wkv_bf16.to_host_vec(stream)?;
+    let kv_normalized_host = kv_normalized.to_host_vec(stream)?;
+    let wq_b_input_fp8_host = wq_b_input_fp8.to_host_vec(stream)?;
+    let wq_b_input_scale_host = wq_b_input_scale.to_host_vec(stream)?;
+    let wq_b_gpu_f32 = wq_b_f32.to_host_vec(stream)?;
+    let wq_b_gpu_bf16 = wq_b_bf16.to_host_vec(stream)?;
+    let q_head_rms_gpu = q_head_rms.to_host_vec(stream)?;
+    let q_rope_gpu = q_rope.to_host_vec(stream)?;
+    let kv_rope_gpu = kv_rope.to_host_vec(stream)?;
+    let kv_ready_gpu = kv_ready.to_host_vec(stream)?;
+    let kv_scales_gpu = kv_scales.to_host_vec(stream)?;
+    let causal_topk_gpu = causal_topk.to_host_vec(stream)?;
+    let kv_cache_initial_gpu = kv_cache.to_host_vec(stream)?;
+    let (_, wq_cpu_raw_max) =
+        report_v4_state_f32("wq_a CPU/fixture raw", &wq_cpu.raw_f32, &fixture.wq_f32);
+    let (wq_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_a CPU/fixture BF16", &wq_cpu.bf16, &fixture.wq_bf16);
+    let (_, q_cpu_max) = report_v4_state_bf16(
+        "q_norm CPU/fixture",
+        &wq_cpu.norm_bf16,
+        &fixture.q_norm_bf16,
+    );
+    let (_, wq_gpu_raw_max) =
+        report_v4_state_f32("wq_a GPU/fixture raw", &wq_gpu_f32, &fixture.wq_f32);
+    report_v4_state_f32("wq_a GPU/CPU raw", &wq_gpu_f32, &wq_cpu.raw_f32);
+    let (wq_gpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_a GPU/fixture BF16", &wq_gpu_bf16, &fixture.wq_bf16);
+    let (wq_gpu_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_a GPU/CPU BF16", &wq_gpu_bf16, &wq_cpu.bf16);
+    let (_, q_gpu_max) = report_v4_state_bf16(
+        "q_norm GPU/fixture",
+        &q_normalized_host,
+        &fixture.q_norm_bf16,
+    );
+    let (q_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("q_norm GPU/CPU", &q_normalized_host, &wq_cpu.norm_bf16);
+    let (_, wkv_cpu_raw_max) =
+        report_v4_state_f32("wkv CPU/fixture raw", &wkv_cpu.raw_f32, &fixture.wkv_f32);
+    let (wkv_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wkv CPU/fixture BF16", &wkv_cpu.bf16, &fixture.wkv_bf16);
+    let (_, kv_cpu_max) = report_v4_state_bf16(
+        "kv_norm CPU/fixture",
+        &wkv_cpu.norm_bf16,
+        &fixture.kv_norm_bf16,
+    );
+    let (_, wkv_gpu_raw_max) =
+        report_v4_state_f32("wkv GPU/fixture raw", &wkv_gpu_f32, &fixture.wkv_f32);
+    report_v4_state_f32("wkv GPU/CPU raw", &wkv_gpu_f32, &wkv_cpu.raw_f32);
+    let (wkv_gpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wkv GPU/fixture BF16", &wkv_gpu_bf16, &fixture.wkv_bf16);
+    let (wkv_gpu_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wkv GPU/CPU BF16", &wkv_gpu_bf16, &wkv_cpu.bf16);
+    let (_, kv_gpu_max) = report_v4_state_bf16(
+        "kv_norm GPU/fixture",
+        &kv_normalized_host,
+        &fixture.kv_norm_bf16,
+    );
+    let (kv_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("kv_norm GPU/CPU", &kv_normalized_host, &wkv_cpu.norm_bf16);
+    let wq_b_activation_mismatches = report_v4_state_u8(
+        "wq_b activation GPU/fixture",
+        &wq_b_input_fp8_host,
+        &fixture.wq_b_activation,
+    );
+    let wq_b_scale_mismatches = report_v4_state_u8(
+        "wq_b activation scale GPU/fixture",
+        &wq_b_input_scale_host,
+        &fixture.wq_b_activation_scale,
+    );
+    let (_, wq_b_cpu_raw_max) =
+        report_v4_state_f32("wq_b CPU/fixture raw", &wq_b_cpu.raw_f32, &fixture.wq_b_f32);
+    let (wq_b_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_b CPU/fixture BF16", &wq_b_cpu.bf16, &fixture.wq_b_bf16);
+    let (_, wq_b_gpu_raw_max) =
+        report_v4_state_f32("wq_b GPU/fixture raw", &wq_b_gpu_f32, &fixture.wq_b_f32);
+    report_v4_state_f32("wq_b GPU/CPU raw", &wq_b_gpu_f32, &wq_b_cpu.raw_f32);
+    let (wq_b_gpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_b GPU/fixture BF16", &wq_b_gpu_bf16, &fixture.wq_b_bf16);
+    let (wq_b_gpu_cpu_bf16_mismatches, _) =
+        report_v4_state_bf16("wq_b GPU/CPU BF16", &wq_b_gpu_bf16, &wq_b_cpu.bf16);
+    let (q_head_cpu_mismatches, _) = report_v4_state_bf16(
+        "query head RMS CPU/fixture",
+        &q_head_rms_cpu,
+        &fixture.q_head_rms_bf16,
+    );
+    let (q_head_gpu_mismatches, _) = report_v4_state_bf16(
+        "query head RMS GPU/fixture",
+        &q_head_rms_gpu,
+        &fixture.q_head_rms_bf16,
+    );
+    let (q_head_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("query head RMS GPU/CPU", &q_head_rms_gpu, &q_head_rms_cpu);
+    let (_, query_freqs_max) = report_v4_state_f32(
+        "query frequencies CPU/fixture",
+        &query_freqs,
+        &fixture.freqs_cis_f32_pairs,
+    );
+    let (q_rope_cpu_mismatches, _) =
+        report_v4_state_bf16("query RoPE CPU/fixture", &q_rope_cpu, &fixture.q_rope_bf16);
+    let (q_rope_gpu_mismatches, _) =
+        report_v4_state_bf16("query RoPE GPU/fixture", &q_rope_gpu, &fixture.q_rope_bf16);
+    let (q_rope_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("query RoPE GPU/CPU", &q_rope_gpu, &q_rope_cpu);
+    let (kv_rope_cpu_mismatches, _) = report_v4_state_bf16(
+        "KV RoPE CPU/fixture",
+        &kv_ready_cpu.rope_bf16,
+        &fixture.kv_rope_bf16,
+    );
+    let kv_scale_cpu_mismatches = report_v4_state_u8(
+        "KV E8M0 scale CPU/fixture",
+        &kv_ready_cpu.scale_e8m0,
+        &fixture.kv_scale_e8m0,
+    );
+    let (kv_ready_cpu_mismatches, _) = report_v4_state_bf16(
+        "KV ready CPU/fixture",
+        &kv_ready_cpu.ready_bf16,
+        &fixture.kv_ready_bf16,
+    );
+    let topk_cpu_mismatches = report_v4_state_i32(
+        "causal top-k CPU/fixture",
+        &kv_ready_cpu.causal_topk_i32,
+        &fixture.causal_topk_i32,
+    );
+    let (kv_rope_gpu_mismatches, _) =
+        report_v4_state_bf16("KV RoPE GPU/fixture", &kv_rope_gpu, &fixture.kv_rope_bf16);
+    let (kv_rope_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("KV RoPE GPU/CPU", &kv_rope_gpu, &kv_ready_cpu.rope_bf16);
+    let kv_scale_gpu_mismatches = report_v4_state_u8(
+        "KV E8M0 scale GPU/fixture",
+        &kv_scales_gpu,
+        &fixture.kv_scale_e8m0,
+    );
+    let (kv_ready_gpu_mismatches, _) = report_v4_state_bf16(
+        "KV ready GPU/fixture",
+        &kv_ready_gpu,
+        &fixture.kv_ready_bf16,
+    );
+    let (kv_ready_gpu_cpu_mismatches, _) =
+        report_v4_state_bf16("KV ready GPU/CPU", &kv_ready_gpu, &kv_ready_cpu.ready_bf16);
+    let kv_rope_tail_unchanged = (0..rows).all(|row| {
+        let tail = row * v4_state::Q_HEAD_DIM + v4_state::Q_HEAD_DIM - v4_state::Q_ROPE_DIM;
+        kv_ready_gpu[tail..tail + v4_state::Q_ROPE_DIM]
+            == kv_rope_gpu[tail..tail + v4_state::Q_ROPE_DIM]
+    });
+    let topk_gpu_mismatches = report_v4_state_i32(
+        "causal top-k GPU/fixture",
+        &causal_topk_gpu,
+        &fixture.causal_topk_i32,
+    );
+    let (kv_cache_initial_mismatches, _) = report_v4_state_bf16(
+        "KV cache initial GPU/fixture",
+        &kv_cache_initial_gpu,
+        &fixture.cache_initial_bf16,
+    );
+    let rope_prefix_unchanged = (0..rows * v4_state::Q_HEADS).all(|position_head| {
+        let start = position_head * v4_state::Q_HEAD_DIM;
+        q_rope_gpu[start..start + v4_state::Q_HEAD_DIM - v4_state::Q_ROPE_DIM]
+            == q_head_rms_gpu[start..start + v4_state::Q_HEAD_DIM - v4_state::Q_ROPE_DIM]
+    });
+    let rope_position_zero_unchanged = q_rope_gpu[..v4_state::Q_HEADS * v4_state::Q_HEAD_DIM]
+        == q_head_rms_gpu[..v4_state::Q_HEADS * v4_state::Q_HEAD_DIM];
+    println!(
+        "query RoPE invariants: prefix_448_unchanged={rope_prefix_unchanged}, position_0_unchanged={rope_position_zero_unchanged}"
+    );
+    println!("KV fake-quant invariant: rotary_tail_64_unchanged={kv_rope_tail_unchanged}");
+    if activation_mismatches != 0
+        || scale_mismatches != 0
+        || wq_cpu_raw_max != 0.0
+        || wq_cpu_bf16_mismatches != 0
+        || q_cpu_max > 2.45e-4
+        || wq_gpu_raw_max > 1e-6
+        || wq_gpu_bf16_mismatches != 0
+        || wq_gpu_cpu_bf16_mismatches != 0
+        || q_gpu_max > 2.45e-4
+        || q_gpu_cpu_mismatches != 0
+        || wkv_cpu_raw_max != 0.0
+        || wkv_cpu_bf16_mismatches != 0
+        || kv_cpu_max != 0.0
+        || wkv_gpu_raw_max > 1e-6
+        || wkv_gpu_bf16_mismatches != 0
+        || wkv_gpu_cpu_bf16_mismatches != 0
+        || kv_gpu_max != 0.0
+        || kv_gpu_cpu_mismatches != 0
+        || wq_b_activation_mismatches != 0
+        || wq_b_scale_mismatches != 0
+        || wq_b_cpu_raw_max != 0.0
+        || wq_b_cpu_bf16_mismatches != 0
+        || wq_b_gpu_raw_max > 1e-6
+        || wq_b_gpu_bf16_mismatches != 0
+        || wq_b_gpu_cpu_bf16_mismatches != 0
+        || q_head_cpu_mismatches != 0
+        || q_head_gpu_mismatches != 0
+        || q_head_gpu_cpu_mismatches != 0
+        || query_freqs_max > 1e-6
+        || q_rope_cpu_mismatches != 0
+        || q_rope_gpu_mismatches != 0
+        || q_rope_gpu_cpu_mismatches != 0
+        || kv_rope_cpu_mismatches != 0
+        || kv_scale_cpu_mismatches != 0
+        || kv_ready_cpu_mismatches != 0
+        || topk_cpu_mismatches != 0
+        || kv_rope_gpu_mismatches != 0
+        || kv_rope_gpu_cpu_mismatches != 0
+        || kv_scale_gpu_mismatches != 0
+        || kv_ready_gpu_mismatches != 0
+        || kv_ready_gpu_cpu_mismatches != 0
+        || topk_gpu_mismatches != 0
+        || kv_cache_initial_mismatches != 0
+        || !kv_rope_tail_unchanged
+        || !rope_prefix_unchanged
+        || !rope_position_zero_unchanged
+    {
+        return Err("V4 FP8 projection/Phase A correctness gate failed before cache write".into());
+    }
+
+    let mut kv_cache_cpu = v4_state::V4KvCache::new();
+    if kv_cache_cpu.as_slice() != fixture.cache_initial_bf16 {
+        return Err("V4 CPU KV cache initial gate failed".into());
+    }
+    kv_cache_cpu.commit(&kv_ready_cpu.ready_bf16, 1, 0, rows)?;
+    if kv_cache_cpu.as_slice() != fixture.cache_after_bf16 {
+        return Err("V4 CPU KV cache Phase B gate failed".into());
+    }
+    let kv_cache_cpu_after = kv_cache_cpu.as_slice().to_vec();
+    kv_cache_cpu.commit(&kv_ready_cpu.ready_bf16, 1, 0, rows)?;
+    if kv_cache_cpu.as_slice() != kv_cache_cpu_after {
+        return Err("V4 CPU KV cache repeat was not idempotent".into());
+    }
+
+    let kv_commit_bytes =
+        v4_state::preflight_kv_cache_commit(kv_cache.len(), kv_ready.len(), 1, 0, rows)?;
+    // SAFETY: preflight proves the one permitted contiguous cache write fits
+    // both fixed BF16 buffers. Phase A has passed its exact gate above.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            kv_cache.cu_deviceptr(),
+            kv_ready.cu_deviceptr(),
+            kv_commit_bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    let kv_cache_after_gpu = kv_cache.to_host_vec(stream)?;
+    let (kv_cache_after_mismatches, _) = report_v4_state_bf16(
+        "KV cache after GPU/fixture",
+        &kv_cache_after_gpu,
+        &fixture.cache_after_bf16,
+    );
+    let kv_cache_prefix_matches = kv_cache_after_gpu[..kv_ready_gpu.len()] == kv_ready_gpu[..];
+    let kv_cache_tail_zero = kv_cache_after_gpu[kv_ready_gpu.len()..]
+        .iter()
+        .all(|&bits| bits == 0);
+    let kv_cache_compressed_zero = kv_cache_after_gpu[v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM..]
+        .iter()
+        .all(|&bits| bits == 0);
+
+    // An exact repeat is byte-idempotent; no alternate payload reaches this raw copy.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            kv_cache.cu_deviceptr(),
+            kv_ready.cu_deviceptr(),
+            kv_commit_bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    let kv_cache_repeat_gpu = kv_cache.to_host_vec(stream)?;
+    let kv_cache_repeat_idempotent = kv_cache_repeat_gpu == kv_cache_after_gpu;
+    let invalid_rejected = v4_state::preflight_kv_cache_commit(
+        kv_cache.len(),
+        kv_ready.len(),
+        1,
+        v4_state::KV_WINDOW - 1,
+        rows,
+    )
+    .is_err();
+    let kv_cache_after_reject_gpu = kv_cache.to_host_vec(stream)?;
+    let invalid_unchanged = kv_cache_after_reject_gpu == kv_cache_after_gpu;
+    println!(
+        "KV cache invariants: prefix_matches={kv_cache_prefix_matches}, tail_zero={kv_cache_tail_zero}, compressed_zero={kv_cache_compressed_zero}, repeat_idempotent={kv_cache_repeat_idempotent}, invalid_rejected={invalid_rejected}, invalid_unchanged={invalid_unchanged}"
+    );
+    if kv_cache_after_mismatches != 0
+        || !kv_cache_prefix_matches
+        || !kv_cache_tail_zero
+        || !kv_cache_compressed_zero
+        || !kv_cache_repeat_idempotent
+        || !invalid_rejected
+        || !invalid_unchanged
+    {
+        return Err("V4 KV cache Phase B correctness gate failed".into());
+    }
+
+    let wq_samples = benchmark_v4_fp8_matvec(
+        context,
+        module,
+        stream,
+        &input_fp8,
+        &input_scale,
+        &wq_weight,
+        &wq_scale,
+        &mut wq_f32,
+        &mut wq_bf16,
+        projections.wq_a.matrix.in_features,
+        projections.wq_a.matrix.out_features,
+        false,
+        WARM_REQUESTS,
+    )?;
+    let wkv_samples = benchmark_v4_fp8_matvec(
+        context,
+        module,
+        stream,
+        &input_fp8,
+        &input_scale,
+        &wkv_weight,
+        &wkv_scale,
+        &mut wkv_f32,
+        &mut wkv_bf16,
+        projections.wkv.matrix.in_features,
+        projections.wkv.matrix.out_features,
+        false,
+        WARM_REQUESTS,
+    )?;
+    let wq_b_samples = benchmark_v4_fp8_matvec(
+        context,
+        module,
+        stream,
+        &wq_b_input_fp8,
+        &wq_b_input_scale,
+        &wq_b_weight,
+        &wq_b_scale,
+        &mut wq_b_f32,
+        &mut wq_b_bf16,
+        projections.wq_b.in_features,
+        projections.wq_b.out_features,
+        true,
+        WARM_REQUESTS,
+    )?;
+    let kv_ready_samples = benchmark_v4_kv_ready(
+        context,
+        module,
+        stream,
+        &kv_fixture,
+        &query_freqs_device,
+        &mut kv_rope,
+        &mut kv_ready,
+        &mut empty_fp8,
+        &mut kv_scales,
+        &mut causal_topk,
+        WARM_REQUESTS,
+    )?;
+    let kv_commit_samples = benchmark_v4_kv_commit(
+        context,
+        stream,
+        &kv_ready,
+        &kv_cache,
+        kv_commit_bytes,
+        WARM_REQUESTS,
+    )?;
+    let (wq_median, wq_p95) = median_p95_ms(&wq_samples);
+    let (wkv_median, wkv_p95) = median_p95_ms(&wkv_samples);
+    let (wq_b_median, wq_b_p95) = median_p95_ms(&wq_b_samples);
+    let (kv_ready_median, kv_ready_p95) = median_p95_ms(&kv_ready_samples);
+    let (kv_commit_median, kv_commit_p95) = median_p95_ms(&kv_commit_samples);
+    let wq_gbps = (rows
+        * (projections.wq_a.matrix.weight.len() + projections.wq_a.matrix.scale.len()))
+        as f64
+        / (wq_median * 1_000_000.0);
+    let wkv_gbps =
+        (rows * (projections.wkv.matrix.weight.len() + projections.wkv.matrix.scale.len())) as f64
+            / (wkv_median * 1_000_000.0);
+    let wq_b_gbps = (rows * (projections.wq_b.weight.len() + projections.wq_b.scale.len())) as f64
+        / (wq_b_median * 1_000_000.0);
+    println!(
+        "V4_FP8_COLD range={:.3}ms bytes={} H2D={:.3}ms bytes={} CPU_oracle={:.3}ms",
+        range_elapsed.as_secs_f64() * 1_000.0,
+        projections.range_bytes,
+        h2d_ms,
+        h2d_bytes,
+        cpu_elapsed.as_secs_f64() * 1_000.0,
+    );
+    println!(
+        "V4_FP8_WARM wq_a rows={rows} n={WARM_REQUESTS} kernel_median/p95={wq_median:.3}/{wq_p95:.3}ms effective_weight_read={wq_gbps:.3}GB/s"
+    );
+    println!(
+        "V4_FP8_WARM wkv rows={rows} n={WARM_REQUESTS} kernel_median/p95={wkv_median:.3}/{wkv_p95:.3}ms effective_weight_read={wkv_gbps:.3}GB/s"
+    );
+    println!(
+        "V4_FP8_WARM wq_b rows={rows} n={WARM_REQUESTS} kernel_median/p95={wq_b_median:.3}/{wq_b_p95:.3}ms effective_weight_read={wq_b_gbps:.3}GB/s"
+    );
+    println!(
+        "V4_KV_PHASE_A_WARM rows={rows} n={WARM_REQUESTS} rope_fake_quant_topk_median/p95={kv_ready_median:.3}/{kv_ready_p95:.3}ms"
+    );
+    println!(
+        "V4_KV_PHASE_B_WARM bytes={kv_commit_bytes} n={WARM_REQUESTS} single_copy_median/p95={kv_commit_median:.3}/{kv_commit_p95:.3}ms"
+    );
+    println!(
+        "PROVISIONAL: correctness-first V4 L0 FP8 projections; no performance optimization claim"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_v4_kv_ready(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    freqs: &DeviceBuffer<f32>,
+    rope: &mut DeviceBuffer<u16>,
+    ready: &mut DeviceBuffer<u16>,
+    empty_fp8: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    topk: &mut DeviceBuffer<i32>,
+) -> Result<(), Box<dyn Error>> {
+    // SAFETY: the caller provides the frozen [1,4,512] KV boundary, the
+    // position-0..3 frequencies, and exact-size disjoint outputs.
+    unsafe {
+        module.rope_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rope.len())?),
+            input,
+            freqs,
+            rope,
+            1,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+        )?;
+        cuda_core::memory::memcpy_dtod_async(
+            ready.cu_deviceptr(),
+            rope.cu_deviceptr(),
+            rope.num_bytes(),
+            stream.cu_stream(),
+        )?;
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scales.len())?),
+            rope,
+            empty_fp8,
+            scales,
+            ready,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+            u32::try_from(v4_state::Q_HEAD_DIM - v4_state::Q_ROPE_DIM)?,
+            64,
+        )?;
+        module.causal_topk_v4_i32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(topk.len())?),
+            topk,
+        )?;
+    }
+    Ok(())
+}
+
+unsafe fn launch_v4_fp8_matvec(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<u8>,
+    weight: &DeviceBuffer<u8>,
+    weight_scales: &DeviceBuffer<u8>,
+    output_f32: &mut DeviceBuffer<f32>,
+    output_bf16: &mut DeviceBuffer<u16>,
+    in_features: usize,
+    out_features: usize,
+    strict_k_order: bool,
+) -> Result<(), Box<dyn Error>> {
+    if in_features % 128 == 0 && out_features % 8 == 0 {
+        let rows = input.len() / in_features;
+        let threads = rows
+            .checked_mul(out_features / 8)
+            .and_then(|tiles| tiles.checked_mul(32))
+            .ok_or("FP8 MMA projection launch overflow")?;
+        // SAFETY: caller provides validated FP8 buffers; the launch contains
+        // complete warps and one warp owns each 8-wide output tile.
+        unsafe {
+            module.matvec_v4_fp8_mma(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(threads)?),
+                input,
+                input_scales,
+                weight,
+                weight_scales,
+                output_f32,
+                output_bf16,
+                u32::try_from(in_features)?,
+                u32::try_from(out_features)?,
+            )
+        }?;
+        return Ok(());
+    }
+    let threads = output_f32
+        .len()
+        .checked_mul(32)
+        .ok_or("FP8 projection launch overflow")?;
+    // SAFETY: caller provides the validated pinned V4 projection buffers.
+    unsafe {
+        module.matvec_v4_fp8(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(threads)?),
+            input,
+            input_scales,
+            weight,
+            weight_scales,
+            output_f32,
+            output_bf16,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+            strict_k_order,
+        )
+    }?;
+    Ok(())
+}
+
+struct DeviceFp8Matrix {
+    weight: DeviceBuffer<u8>,
+    scale: DeviceBuffer<u8>,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl DeviceFp8Matrix {
+    fn new(stream: &CudaStream, matrix: &v4_state::Fp8Matrix) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            weight: DeviceBuffer::from_host(stream, &matrix.weight)?,
+            scale: DeviceBuffer::from_host(stream, &matrix.scale)?,
+            in_features: matrix.in_features,
+            out_features: matrix.out_features,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.weight.num_bytes() + self.scale.num_bytes()
+    }
+}
+
+struct DeviceLayerIndexer {
+    wq_b: DeviceFp8Matrix,
+    weights_proj: DeviceBuffer<u16>,
+    compressor_wkv: DeviceBuffer<u16>,
+    compressor_wgate: DeviceBuffer<u16>,
+    compressor_ape: DeviceBuffer<f32>,
+    compressor_norm: DeviceBuffer<u16>,
+}
+
+struct LayerDeviceWeights {
+    layer: usize,
+    compression_ratio: v4_state::CompressionRatio,
+    hc_attn_fn: DeviceBuffer<f32>,
+    hc_attn_base: DeviceBuffer<f32>,
+    hc_attn_scale: DeviceBuffer<f32>,
+    attn_norm: DeviceBuffer<u16>,
+    wq_a: DeviceFp8Matrix,
+    q_norm: DeviceBuffer<u16>,
+    wq_b: DeviceFp8Matrix,
+    wkv: DeviceFp8Matrix,
+    kv_norm: DeviceBuffer<u16>,
+    compressor_wkv: DeviceBuffer<u16>,
+    compressor_wgate: DeviceBuffer<u16>,
+    compressor_ape: DeviceBuffer<f32>,
+    compressor_norm: DeviceBuffer<u16>,
+    indexer: Option<DeviceLayerIndexer>,
+    attn_sink: DeviceBuffer<f32>,
+    wo_a: DeviceBuffer<u16>,
+    wo_b: DeviceFp8Matrix,
+    hc_ffn_fn: DeviceBuffer<f32>,
+    hc_ffn_base: DeviceBuffer<f32>,
+    hc_ffn_scale: DeviceBuffer<f32>,
+    ffn_norm: DeviceBuffer<u16>,
+    gate: DeviceBuffer<u16>,
+    router_bias: DeviceBuffer<f32>,
+    hash_router: bool,
+    shared_w1: DeviceFp8Matrix,
+    shared_w2: DeviceFp8Matrix,
+    shared_w3: DeviceFp8Matrix,
+}
+
+impl LayerDeviceWeights {
+    fn new_l0(
+        stream: &CudaStream,
+        state: &v4_state::L0State,
+        projections: &v4_state::L0Fp8Projections,
+        compressor: &v4_state::CompressorWeights,
+        tail: &v4_state::L0TailWeights,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            layer: 0,
+            compression_ratio: v4_state::CompressionRatio::Hca128,
+            hc_attn_fn: DeviceBuffer::from_host(stream, &state.hc_fn)?,
+            hc_attn_base: DeviceBuffer::from_host(stream, &state.hc_base)?,
+            hc_attn_scale: DeviceBuffer::from_host(stream, &state.hc_scale)?,
+            attn_norm: DeviceBuffer::from_host(stream, &state.attn_norm)?,
+            wq_a: DeviceFp8Matrix::new(stream, &projections.wq_a.matrix)?,
+            q_norm: DeviceBuffer::from_host(stream, &projections.wq_a.norm)?,
+            wq_b: DeviceFp8Matrix::new(stream, &projections.wq_b)?,
+            wkv: DeviceFp8Matrix::new(stream, &projections.wkv.matrix)?,
+            kv_norm: DeviceBuffer::from_host(stream, &projections.wkv.norm)?,
+            compressor_wkv: DeviceBuffer::from_host(stream, &compressor.wkv_bf16)?,
+            compressor_wgate: DeviceBuffer::from_host(stream, &compressor.wgate_bf16)?,
+            compressor_ape: DeviceBuffer::from_host(stream, &compressor.ape_f32)?,
+            compressor_norm: DeviceBuffer::from_host(
+                stream,
+                &vec![v4_router::f32_to_bf16_rne(1.0); v4_state::Q_HEAD_DIM],
+            )?,
+            indexer: None,
+            attn_sink: DeviceBuffer::from_host(stream, &tail.attn_sink)?,
+            wo_a: DeviceBuffer::from_host(stream, &tail.wo_a_bf16)?,
+            wo_b: DeviceFp8Matrix::new(stream, &tail.wo_b)?,
+            hc_ffn_fn: DeviceBuffer::from_host(stream, &tail.hc_ffn_fn)?,
+            hc_ffn_base: DeviceBuffer::from_host(stream, &tail.hc_ffn_base)?,
+            hc_ffn_scale: DeviceBuffer::from_host(stream, &tail.hc_ffn_scale)?,
+            ffn_norm: DeviceBuffer::from_host(stream, &tail.ffn_norm)?,
+            gate: DeviceBuffer::from_host(stream, &tail.gate)?,
+            router_bias: DeviceBuffer::from_host(
+                stream,
+                &vec![0.0_f32; v4_router::V4_ROUTED_EXPERTS],
+            )?,
+            hash_router: true,
+            shared_w1: DeviceFp8Matrix::new(stream, &tail.shared.w1)?,
+            shared_w2: DeviceFp8Matrix::new(stream, &tail.shared.w2)?,
+            shared_w3: DeviceFp8Matrix::new(stream, &tail.shared.w3)?,
+        })
+    }
+
+    fn new_layer(
+        stream: &CudaStream,
+        state: &v4_state::LayerStateWeights,
+        projections: &v4_state::L0Fp8Projections,
+        tail: &v4_state::L0TailWeights,
+    ) -> Result<Self, Box<dyn Error>> {
+        if tail.wo_a_raw.is_some() {
+            return Err("raw wo_a requires the production GPU decode upload path".into());
+        }
+        Self::new_layer_with_wo_a(stream, state, projections, tail, None)
+    }
+
+    fn new_layer_with_wo_a(
+        stream: &CudaStream,
+        state: &v4_state::LayerStateWeights,
+        projections: &v4_state::L0Fp8Projections,
+        tail: &v4_state::L0TailWeights,
+        wo_a: Option<DeviceBuffer<u16>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let (router_bias, hash_router) = match &state.router {
+            v4_state::LayerRouterWeights::Hash { .. } => {
+                (vec![0.0_f32; v4_router::V4_ROUTED_EXPERTS], true)
+            }
+            v4_state::LayerRouterWeights::Learned { bias } => (bias.clone(), false),
+        };
+        let indexer = state
+            .indexer
+            .as_ref()
+            .map(|indexer| {
+                Ok::<_, Box<dyn Error>>(DeviceLayerIndexer {
+                    wq_b: DeviceFp8Matrix::new(stream, &indexer.wq_b)?,
+                    weights_proj: DeviceBuffer::from_host(stream, &indexer.weights_proj_bf16)?,
+                    compressor_wkv: DeviceBuffer::from_host(stream, &indexer.compressor.wkv_bf16)?,
+                    compressor_wgate: DeviceBuffer::from_host(
+                        stream,
+                        &indexer.compressor.wgate_bf16,
+                    )?,
+                    compressor_ape: DeviceBuffer::from_host(stream, &indexer.compressor.ape_f32)?,
+                    compressor_norm: DeviceBuffer::from_host(
+                        stream,
+                        &indexer.compressor.norm_bf16,
+                    )?,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            layer: state.layer,
+            compression_ratio: state.compression_ratio,
+            hc_attn_fn: DeviceBuffer::from_host(stream, &state.hc_fn)?,
+            hc_attn_base: DeviceBuffer::from_host(stream, &state.hc_base)?,
+            hc_attn_scale: DeviceBuffer::from_host(stream, &state.hc_scale)?,
+            attn_norm: DeviceBuffer::from_host(stream, &state.attn_norm)?,
+            wq_a: DeviceFp8Matrix::new(stream, &projections.wq_a.matrix)?,
+            q_norm: DeviceBuffer::from_host(stream, &projections.wq_a.norm)?,
+            wq_b: DeviceFp8Matrix::new(stream, &projections.wq_b)?,
+            wkv: DeviceFp8Matrix::new(stream, &projections.wkv.matrix)?,
+            kv_norm: DeviceBuffer::from_host(stream, &projections.wkv.norm)?,
+            compressor_wkv: DeviceBuffer::from_host(stream, &state.compressor.wkv_bf16)?,
+            compressor_wgate: DeviceBuffer::from_host(stream, &state.compressor.wgate_bf16)?,
+            compressor_ape: DeviceBuffer::from_host(stream, &state.compressor.ape_f32)?,
+            compressor_norm: DeviceBuffer::from_host(stream, &state.compressor.norm_bf16)?,
+            indexer,
+            attn_sink: DeviceBuffer::from_host(stream, &tail.attn_sink)?,
+            wo_a: match wo_a {
+                Some(wo_a) => wo_a,
+                None => DeviceBuffer::from_host(stream, &tail.wo_a_bf16)?,
+            },
+            wo_b: DeviceFp8Matrix::new(stream, &tail.wo_b)?,
+            hc_ffn_fn: DeviceBuffer::from_host(stream, &tail.hc_ffn_fn)?,
+            hc_ffn_base: DeviceBuffer::from_host(stream, &tail.hc_ffn_base)?,
+            hc_ffn_scale: DeviceBuffer::from_host(stream, &tail.hc_ffn_scale)?,
+            ffn_norm: DeviceBuffer::from_host(stream, &state.ffn_norm)?,
+            gate: DeviceBuffer::from_host(stream, &state.gate)?,
+            router_bias: DeviceBuffer::from_host(stream, &router_bias)?,
+            hash_router,
+            shared_w1: DeviceFp8Matrix::new(stream, &tail.shared.w1)?,
+            shared_w2: DeviceFp8Matrix::new(stream, &tail.shared.w2)?,
+            shared_w3: DeviceFp8Matrix::new(stream, &tail.shared.w3)?,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.hc_attn_fn.num_bytes()
+            + self.hc_attn_base.num_bytes()
+            + self.hc_attn_scale.num_bytes()
+            + self.attn_norm.num_bytes()
+            + self.wq_a.num_bytes()
+            + self.q_norm.num_bytes()
+            + self.wq_b.num_bytes()
+            + self.wkv.num_bytes()
+            + self.kv_norm.num_bytes()
+            + self.compressor_wkv.num_bytes()
+            + self.compressor_wgate.num_bytes()
+            + self.compressor_ape.num_bytes()
+            + self.compressor_norm.num_bytes()
+            + self.indexer.as_ref().map_or(0, |indexer| {
+                indexer.wq_b.num_bytes()
+                    + indexer.weights_proj.num_bytes()
+                    + indexer.compressor_wkv.num_bytes()
+                    + indexer.compressor_wgate.num_bytes()
+                    + indexer.compressor_ape.num_bytes()
+                    + indexer.compressor_norm.num_bytes()
+            })
+            + self.attn_sink.num_bytes()
+            + self.wo_a.num_bytes()
+            + self.wo_b.num_bytes()
+            + self.hc_ffn_fn.num_bytes()
+            + self.hc_ffn_base.num_bytes()
+            + self.hc_ffn_scale.num_bytes()
+            + self.ffn_norm.num_bytes()
+            + self.gate.num_bytes()
+            + self.router_bias.num_bytes()
+            + self.shared_w1.num_bytes()
+            + self.shared_w2.num_bytes()
+            + self.shared_w3.num_bytes()
+    }
+
+    fn num_bytes_without_wo_a(&self) -> usize {
+        self.num_bytes() - self.wo_a.num_bytes()
+    }
+
+    fn shared_num_bytes(&self) -> usize {
+        self.shared_w1.num_bytes() + self.shared_w2.num_bytes() + self.shared_w3.num_bytes()
+    }
+
+    fn dense_num_bytes(&self) -> usize {
+        self.num_bytes() - self.shared_num_bytes()
+    }
+}
+
+struct LoadedLayerRuntime {
+    weights: LayerDeviceWeights,
+    expert_shard: safetensors::ShardFile,
+}
+
+struct RawLoadedLayerRuntime {
+    runtime: LoadedLayerRuntime,
+    wo_a_raw: DeviceBuffer<u8>,
+    resident_bytes: usize,
+}
+
+struct RawDecodedLayerHost {
+    host: DecodedLayerHost,
+    wo_a_raw: Vec<u8>,
+    resident_bytes: usize,
+}
+
+struct DecodedLayerHost {
+    state: v4_state::LayerStateWeights,
+    projections: v4_state::L0Fp8Projections,
+    tail: v4_state::L0TailWeights,
+}
+
+struct FixedPrefetchedHost {
+    layer: usize,
+    host: DecodedLayerHost,
+    telemetry: FixedLoadTelemetry,
+    worker_start_ns: u64,
+    worker_end_ns: u64,
+    host_bytes: usize,
+}
+
+struct FixedPrefetchTask<'scope> {
+    layer: usize,
+    transition: Option<FixedPrefetchTransition>,
+    worker: std::thread::ScopedJoinHandle<'scope, Result<FixedPrefetchedHost, String>>,
+}
+
+struct FixedPrefetchTransition {
+    from_layer: usize,
+    compute_start_ns: u64,
+    compute_end_ns: u64,
+}
+
+fn fixed_prefetch_transition_json(
+    current_layer: usize,
+    next_layer: usize,
+    telemetry: &FixedLoadTelemetry,
+    worker_start_ns: u64,
+    worker_end_ns: u64,
+    host_bytes: usize,
+    compute_start_ns: u64,
+    compute_end_ns: u64,
+    consume_start_ns: u64,
+    window_depth: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if next_layer != current_layer + 1
+        || worker_end_ns < worker_start_ns
+        || compute_end_ns < compute_start_ns
+    {
+        return Err("invalid one-layer-ahead fixed prefetch schedule".into());
+    }
+    let overlap_start_ns = worker_start_ns.max(compute_start_ns);
+    let overlap_end_ns = worker_end_ns.min(compute_end_ns);
+    Ok(serde_json::json!({
+        "from_layer": current_layer,
+        "to_layer": next_layer,
+        "window_depth": window_depth,
+        "worker_start_ns": worker_start_ns,
+        "worker_end_ns": worker_end_ns,
+        "host_prefetched_bytes": host_bytes,
+        "prefetched_read_alloc_ns": telemetry.fixed_read_alloc_ns,
+        "prefetched_decode_ns": telemetry.fixed_decode_ns,
+        "ready_before_consume": worker_end_ns <= consume_start_ns,
+        "consume_wait_ns": worker_end_ns.saturating_sub(consume_start_ns),
+        "overlap_ns": overlap_end_ns.saturating_sub(overlap_start_ns),
+    }))
+}
+
+impl DecodedLayerHost {
+    fn source_bytes(&self) -> usize {
+        fn matrix(matrix: &v4_state::Fp8Matrix) -> usize {
+            matrix.weight.len() + matrix.scale.len()
+        }
+        fn compressor(weights: &v4_state::LayerCompressorWeights) -> usize {
+            (weights.wkv_bf16.len() + weights.wgate_bf16.len() + weights.norm_bf16.len()) * 2
+                + weights.ape_f32.len() * 4
+        }
+        let state = &self.state;
+        let state_bytes = (state.hc_fn.len() + state.hc_base.len() + state.hc_scale.len()) * 4
+            + state.attn_norm.len() * 2
+            + compressor(&state.compressor)
+            + state.indexer.as_ref().map_or(0, |indexer| {
+                matrix(&indexer.wq_b)
+                    + indexer.weights_proj_bf16.len() * 2
+                    + compressor(&indexer.compressor)
+            })
+            + (state.ffn_norm.len() + state.gate.len()) * 2
+            + match &state.router {
+                v4_state::LayerRouterWeights::Hash { ids } => ids.len() * 8,
+                v4_state::LayerRouterWeights::Learned { bias } => bias.len() * 4,
+            };
+        // The state and tail loaders currently read ffn_norm and gate twice, but
+        // source_range_bytes is the unique fixed source-tensor footprint.
+        let duplicated_tail_bytes =
+            (self.tail.ffn_norm.len() + self.tail.gate.len()) * std::mem::size_of::<u16>();
+        state_bytes + self.projections.range_bytes + self.tail.source_range_bytes
+            - duplicated_tail_bytes
+    }
+
+    fn num_bytes(&self) -> usize {
+        fn matrix(matrix: &v4_state::Fp8Matrix) -> usize {
+            matrix.weight.len() + matrix.scale.len()
+        }
+        fn compressor(weights: &v4_state::LayerCompressorWeights) -> usize {
+            (weights.wkv_bf16.len() + weights.wgate_bf16.len() + weights.norm_bf16.len()) * 2
+                + weights.ape_f32.len() * 4
+        }
+        let state = &self.state;
+        let state_bytes = (state.hc_fn.len() + state.hc_base.len() + state.hc_scale.len()) * 4
+            + state.attn_norm.len() * 2
+            + compressor(&state.compressor)
+            + state.indexer.as_ref().map_or(0, |indexer| {
+                matrix(&indexer.wq_b)
+                    + indexer.weights_proj_bf16.len() * 2
+                    + compressor(&indexer.compressor)
+            })
+            + (state.ffn_norm.len() + state.gate.len()) * 2
+            + match &state.router {
+                v4_state::LayerRouterWeights::Hash { ids } => ids.len() * 8,
+                v4_state::LayerRouterWeights::Learned { bias } => bias.len() * 4,
+            };
+        let projections = &self.projections;
+        let projection_bytes = matrix(&projections.wq_a.matrix)
+            + projections.wq_a.norm.len() * 2
+            + matrix(&projections.wq_b)
+            + matrix(&projections.wkv.matrix)
+            + projections.wkv.norm.len() * 2;
+        let tail = &self.tail;
+        let tail_bytes = tail.attn_sink.len() * 4
+            + tail.wo_a_bf16.len() * 2
+            + tail.wo_a_raw.as_ref().map_or(0, Vec::len)
+            + matrix(&tail.wo_b)
+            + (tail.hc_ffn_fn.len() + tail.hc_ffn_base.len() + tail.hc_ffn_scale.len()) * 4
+            + (tail.ffn_norm.len() + tail.gate.len()) * 2
+            + matrix(&tail.shared.w1)
+            + matrix(&tail.shared.w2)
+            + matrix(&tail.shared.w3);
+        state_bytes + projection_bytes + tail_bytes
+    }
+}
+
+#[derive(Clone)]
+struct FixedTensorPlan {
+    name: String,
+    dtype: String,
+    shape: Vec<u64>,
+    source_bytes: usize,
+    decoded_bytes: usize,
+}
+
+#[derive(Clone)]
+struct FixedLayerPlan {
+    layer: usize,
+    tensors: Vec<FixedTensorPlan>,
+    device_bytes: usize,
+    raw_device_bytes: usize,
+    host_bytes: usize,
+    raw_host_bytes: usize,
+    device_saved_ns: u64,
+    host_saved_ns: u64,
+}
+
+#[derive(Default)]
+struct FixedLoadTelemetry {
+    fixed_read_alloc_ns: u64,
+    fixed_decode_ns: u64,
+    fixed_h2d_ns: u64,
+    fixed_h2d_bytes: usize,
+    fixed_source_bytes: usize,
+    raw_read_ns: u64,
+    raw_source_bytes: usize,
+    raw_h2d_ns: u64,
+    raw_h2d_bytes: usize,
+    cache_status: &'static str,
+}
+
+struct FixedLayerCache {
+    plan: Vec<FixedLayerPlan>,
+    device_selected: Vec<bool>,
+    host_selected: Vec<bool>,
+    device: Vec<Option<LoadedLayerRuntime>>,
+    raw_device: Vec<Option<RawLoadedLayerRuntime>>,
+    raw_host: Vec<Option<RawDecodedLayerHost>>,
+    raw_scratch: Option<DeviceBuffer<u16>>,
+    raw_mode: bool,
+    host: Vec<Option<DecodedLayerHost>>,
+    device_budget_bytes: usize,
+    host_budget_bytes: usize,
+    device_resident_bytes: usize,
+    host_resident_bytes: usize,
+    device_hits: usize,
+    host_hits: usize,
+    misses: usize,
+}
+
+fn parse_gib_budget(name: &str) -> Result<usize, Box<dyn Error>> {
+    let value = match std::env::var(name) {
+        Ok(value) => value.parse::<f64>()?,
+        Err(std::env::VarError::NotPresent) => 0.0,
+        Err(error) => return Err(error.into()),
+    };
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{name} must be a finite non-negative GiB value").into());
+    }
+    Ok((value * 1024.0 * 1024.0 * 1024.0) as usize)
+}
+
+fn select_fixed_cache_layers(
+    plans: &[FixedLayerPlan],
+    budget: usize,
+    already_selected: &[bool],
+    device: bool,
+    raw_device: bool,
+) -> Vec<bool> {
+    let mut order = (0..plans.len())
+        .filter(|&index| !already_selected[index])
+        .collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let left_saved = if device {
+            plans[left].device_saved_ns
+        } else {
+            plans[left].host_saved_ns
+        };
+        let right_saved = if device {
+            plans[right].device_saved_ns
+        } else {
+            plans[right].host_saved_ns
+        };
+        let left_bytes = if device {
+            if raw_device {
+                plans[left].raw_device_bytes
+            } else {
+                plans[left].device_bytes
+            }
+        } else {
+            if raw_device {
+                plans[left].raw_host_bytes
+            } else {
+                plans[left].host_bytes
+            }
+        };
+        let right_bytes = if device {
+            if raw_device {
+                plans[right].raw_device_bytes
+            } else {
+                plans[right].device_bytes
+            }
+        } else {
+            if raw_device {
+                plans[right].raw_host_bytes
+            } else {
+                plans[right].host_bytes
+            }
+        };
+        (right_saved as u128 * left_bytes as u128)
+            .cmp(&(left_saved as u128 * right_bytes as u128))
+            .then_with(|| plans[left].layer.cmp(&plans[right].layer))
+    });
+    let mut selected = vec![false; plans.len()];
+    let mut used = 0_usize;
+    for index in order {
+        let bytes = if device {
+            if raw_device {
+                plans[index].raw_device_bytes
+            } else {
+                plans[index].device_bytes
+            }
+        } else {
+            if raw_device {
+                plans[index].raw_host_bytes
+            } else {
+                plans[index].host_bytes
+            }
+        };
+        if used.checked_add(bytes).is_some_and(|next| next <= budget) {
+            selected[index] = true;
+            used += bytes;
+        }
+    }
+    selected
+}
+
+fn preflight_cache_budget(
+    requested: usize,
+    available: usize,
+    headroom: usize,
+    name: &str,
+) -> usize {
+    let effective = requested.min(available.saturating_sub(headroom));
+    if effective < requested {
+        eprintln!(
+            "CACHE_PREFLIGHT_FALLBACK {name} requested_bytes={requested} effective_bytes={effective} available_bytes={available} headroom_bytes={headroom}"
+        );
+    }
+    effective
+}
+
+fn host_available_bytes() -> Result<usize, Box<dyn Error>> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or("MemAvailable is missing from /proc/meminfo")?
+        .parse::<usize>()?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| "MemAvailable byte count overflow".into())
+}
+
+fn device_available_bytes() -> Result<usize, Box<dyn Error>> {
+    let (mut free, mut total) = (0_usize, 0_usize);
+    let result = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    if result != 0 {
+        return Err(format!("cuMemGetInfo_v2 failed with {result:?}").into());
+    }
+    Ok(free)
+}
+
+fn fixed_layer_tensor_plan(
+    model_dir: &std::path::Path,
+    layer: usize,
+) -> Result<(Vec<FixedTensorPlan>, usize, usize), Box<dyn Error>> {
+    let shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    let prefix = format!("layers.{layer}.");
+    let mut tensors = shard
+        .tensors_with_prefix(&prefix)
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.contains(".ffn.experts.")
+                && !name.ends_with(".ffn.gate.tid2eid")
+                && !name.ends_with(".attn.wo_a.scale")
+        })
+        .map(|(name, info)| {
+            let source_bytes = usize::try_from(info.byte_len)?;
+            let decoded_wo_a = name.ends_with(".attn.wo_a.weight");
+            Ok::<_, Box<dyn Error>>(FixedTensorPlan {
+                name,
+                dtype: if decoded_wo_a {
+                    format!("{:?}->Bf16", info.dtype)
+                } else {
+                    format!("{:?}", info.dtype)
+                },
+                shape: info.shape,
+                source_bytes,
+                decoded_bytes: if decoded_wo_a {
+                    source_bytes.checked_mul(2).ok_or("decoded wo_a overflow")?
+                } else {
+                    source_bytes
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if layer < 3 {
+        tensors.push(FixedTensorPlan {
+            name: format!("layers.{layer}.ffn.gate.synthetic_zero_bias"),
+            dtype: "F32".into(),
+            shape: vec![u64::try_from(v4_router::V4_ROUTED_EXPERTS)?],
+            source_bytes: 0,
+            decoded_bytes: v4_router::V4_ROUTED_EXPERTS * 4,
+        });
+    }
+    let device_bytes = tensors.iter().try_fold(0_usize, |sum, tensor| {
+        sum.checked_add(tensor.decoded_bytes)
+            .ok_or("fixed tensor byte sum overflow")
+    })?;
+    let wo_a_source_bytes = tensors
+        .iter()
+        .find(|tensor| tensor.name.ends_with(".attn.wo_a.weight"))
+        .ok_or("fixed tensor plan is missing wo_a.weight")?
+        .source_bytes;
+    let wo_a_scale = shard.tensor(&format!("layers.{layer}.attn.wo_a.scale"))?;
+    if wo_a_scale.dtype != safetensors::TensorDtype::F8E8M0 || wo_a_scale.shape != [128, 32] {
+        return Err(format!("layer {layer} wo_a.scale metadata contract mismatch").into());
+    }
+    Ok((tensors, device_bytes, wo_a_source_bytes))
+}
+
+fn max_fixed_layer_device_bytes(
+    model_dir: &std::path::Path,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    (0..v4_state::V4_LAYER_COUNT)
+        .map(|layer| {
+            let (_, device_bytes, _) = fixed_layer_tensor_plan(model_dir, layer)?;
+            Ok((layer, device_bytes))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+        .into_iter()
+        .max_by_key(|&(_, bytes)| bytes)
+        .ok_or_else(|| "fixed layer metadata plan is empty".into())
+}
+
+struct DeviceAttentionCapacityPlan {
+    qd4_device_bytes: usize,
+    qd4_immutable_expert_cache_device_bytes: usize,
+    fixed_layer: usize,
+    max_fixed_device_bytes: usize,
+    max_device_token_state_bytes: usize,
+    hca_device_token_state_bytes: usize,
+    device_token_state_count: usize,
+    device_token_state_total_bytes: usize,
+    rope_lut_bytes: usize,
+    tid2eid_transient_max_bytes: usize,
+    headroom_bytes: usize,
+    required_bytes: usize,
+}
+
+fn device_attention_capacity_plan(
+    model_dir: &std::path::Path,
+    qd4_enabled: bool,
+    qd4_immutable_expert_cache: bool,
+    request_rope_rows: usize,
+) -> Result<DeviceAttentionCapacityPlan, Box<dyn Error>> {
+    let (fixed_layer, max_fixed_device_bytes) = max_fixed_layer_device_bytes(model_dir)?;
+    let qd4_device_bytes = usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES;
+    let qd4_immutable_expert_cache_device_bytes =
+        usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES;
+    if !(V4_REQUEST_ROPE_LUT_ROWS..=V4_SHORT_DEVICE_DECODE_MAX_ROWS).contains(&request_rope_rows) {
+        return Err("device-attention capacity rows are outside the short-decode ceiling".into());
+    }
+    let short_device_decode = request_rope_rows > V4_REQUEST_ROPE_LUT_ROWS;
+    let rope_lut_bytes = 2 * request_rope_rows * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
+    let tid2eid_transient_max_bytes = V4_TID2EID_TRANSIENT_MAX_BYTES;
+    let manifests = v4_state::serial_layer_manifests(0)?;
+    let (hca_states, csa_states) =
+        manifests
+            .iter()
+            .fold((0_usize, 0_usize), |(hca, csa), manifest| {
+                match manifest.compression_ratio {
+                    v4_state::CompressionRatio::Hca128 => (hca + 1, csa),
+                    v4_state::CompressionRatio::Csa4 => (hca, csa + 1),
+                }
+            });
+    let device_token_state_count = if short_device_decode {
+        manifests.len()
+    } else {
+        2
+    };
+    let device_token_state_total_bytes = if short_device_decode {
+        hca_states
+            .checked_mul(V4_DEVICE_TOKEN_STATE_HCA_BYTES)
+            .and_then(|bytes| {
+                csa_states
+                    .checked_mul(V4_DEVICE_TOKEN_STATE_MAX_BYTES)
+                    .and_then(|csa_bytes| bytes.checked_add(csa_bytes))
+            })
+            .ok_or("device attention persistent-state byte overflow")?
+    } else {
+        V4_DEVICE_TOKEN_STATE_MAX_BYTES + V4_DEVICE_TOKEN_STATE_HCA_BYTES
+    };
+    let required_bytes = [
+        qd4_device_bytes,
+        qd4_immutable_expert_cache_device_bytes,
+        max_fixed_device_bytes,
+        device_token_state_total_bytes,
+        rope_lut_bytes,
+        tid2eid_transient_max_bytes,
+        V4_DEVICE_CAPACITY_HEADROOM_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or("device-attention capacity ledger overflow")
+    })?;
+    Ok(DeviceAttentionCapacityPlan {
+        qd4_device_bytes,
+        qd4_immutable_expert_cache_device_bytes,
+        fixed_layer,
+        max_fixed_device_bytes,
+        max_device_token_state_bytes: V4_DEVICE_TOKEN_STATE_MAX_BYTES,
+        hca_device_token_state_bytes: V4_DEVICE_TOKEN_STATE_HCA_BYTES,
+        device_token_state_count,
+        device_token_state_total_bytes,
+        rope_lut_bytes,
+        tid2eid_transient_max_bytes,
+        headroom_bytes: V4_DEVICE_CAPACITY_HEADROOM_BYTES,
+        required_bytes,
+    })
+}
+
+fn validate_device_attention_capacity(
+    model_dir: &std::path::Path,
+    qd4_enabled: bool,
+    qd4_immutable_expert_cache: bool,
+    request_rope_rows: usize,
+    available_bytes: usize,
+) -> Result<DeviceAttentionCapacityPlan, Box<dyn Error>> {
+    let plan = device_attention_capacity_plan(
+        model_dir,
+        qd4_enabled,
+        qd4_immutable_expert_cache,
+        request_rope_rows,
+    )?;
+    if available_bytes < plan.required_bytes {
+        return Err(format!(
+            "device attention capacity requires {} bytes (QD4={} immutable_cache={} max_fixed={} layer={} states={} state_bytes={} max_state={} hca_state={} rope_lut={} tid2eid_transient={} headroom={}), but cuMemGetInfo reports {} free",
+            plan.required_bytes,
+            plan.qd4_device_bytes,
+            plan.qd4_immutable_expert_cache_device_bytes,
+            plan.max_fixed_device_bytes,
+            plan.fixed_layer,
+            plan.device_token_state_count,
+            plan.device_token_state_total_bytes,
+            plan.max_device_token_state_bytes,
+            plan.hca_device_token_state_bytes,
+            plan.rope_lut_bytes,
+            plan.tid2eid_transient_max_bytes,
+            plan.headroom_bytes,
+            available_bytes,
+        )
+        .into());
+    }
+    Ok(plan)
+}
+
+fn fixed_layer_plans(
+    model_dir: &std::path::Path,
+    layers: &[usize],
+    baseline_path: &std::path::Path,
+) -> Result<Vec<FixedLayerPlan>, Box<dyn Error>> {
+    let mut baseline = vec![None; v4_state::V4_LAYER_COUNT];
+    for line in std::fs::read_to_string(baseline_path)?.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        if value.get("event").and_then(|value| value.as_str()) != Some("layer") {
+            continue;
+        }
+        let layer = usize::try_from(
+            value
+                .get("layer")
+                .and_then(|value| value.as_u64())
+                .ok_or("baseline layer record is missing layer")?,
+        )?;
+        let bench = value
+            .get("bench")
+            .and_then(|value| value.as_object())
+            .ok_or("baseline layer record is missing bench telemetry")?;
+        baseline[layer] = Some((
+            bench["fixed_read_alloc_ns"]
+                .as_u64()
+                .ok_or("baseline fixed_read_alloc_ns is invalid")?,
+            bench["fixed_decode_ns"]
+                .as_u64()
+                .ok_or("baseline fixed_decode_ns is invalid")?,
+            bench["fixed_h2d_ns"]
+                .as_u64()
+                .ok_or("baseline fixed_h2d_ns is invalid")?,
+            usize::try_from(
+                bench["fixed_h2d_bytes"]
+                    .as_u64()
+                    .ok_or("baseline fixed_h2d_bytes is invalid")?,
+            )?,
+        ));
+    }
+    layers
+        .iter()
+        .map(|&layer| {
+            let (read_alloc_ns, decode_ns, h2d_ns, expected_device_bytes) =
+                baseline[layer].ok_or("baseline does not cover every cache candidate layer")?;
+            let (tensors, device_bytes, wo_a_source_bytes) =
+                fixed_layer_tensor_plan(model_dir, layer)?;
+            let raw_device_bytes = device_bytes
+                .checked_sub(wo_a_source_bytes)
+                .ok_or("raw fixed device byte sum overflow")?;
+            if device_bytes != expected_device_bytes {
+                return Err(format!(
+                    "layer {layer} fixed manifest bytes {device_bytes} != baseline {expected_device_bytes}"
+                )
+                .into());
+            }
+            let host_bytes = fixed_layer_decoded_host_bytes(layer, device_bytes)?;
+            let raw_host_bytes = host_bytes
+                .checked_sub(wo_a_source_bytes)
+                .ok_or("raw fixed host byte sum overflow")?;
+            Ok(FixedLayerPlan {
+                layer,
+                tensors,
+                device_bytes,
+                raw_device_bytes,
+                host_bytes,
+                raw_host_bytes,
+                device_saved_ns: read_alloc_ns
+                    .saturating_add(decode_ns)
+                    .saturating_add(h2d_ns),
+                host_saved_ns: read_alloc_ns.saturating_add(decode_ns),
+            })
+        })
+        .collect()
+}
+
+impl FixedLayerCache {
+    fn from_env(
+        model_dir: &std::path::Path,
+        executed_layers: usize,
+        device_reserve_bytes: usize,
+        host_reserve_bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<Self, Box<dyn Error>> {
+        const HOST_HEADROOM: usize = 4 * 1024 * 1024 * 1024;
+        const RAW_SCRATCH_BYTES: usize = 128 * 1024 * 1024;
+        let requested_device = parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")?;
+        let requested_host = parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")?;
+        let raw_mode = match std::env::var_os("COLIBRI_V4_RAW_FIXED_CACHE") {
+            None => false,
+            Some(value) if value == "1" => true,
+            Some(_) => return Err("COLIBRI_V4_RAW_FIXED_CACHE must be exactly 1 when set".into()),
+        };
+        let device_budget_bytes = preflight_cache_budget(
+            requested_device,
+            device_available_bytes()?,
+            V4_DEVICE_CAPACITY_HEADROOM_BYTES
+                .saturating_add(device_reserve_bytes)
+                .saturating_add(usize::from(raw_mode) * RAW_SCRATCH_BYTES),
+            "device",
+        );
+        let host_budget_bytes = preflight_cache_budget(
+            requested_host,
+            host_available_bytes()?,
+            HOST_HEADROOM.saturating_add(host_reserve_bytes),
+            "host",
+        );
+        let baseline_path =
+            std::env::var_os("COLIBRI_V4_FIXED_CACHE_BASELINE_JSONL").map(std::path::PathBuf::from);
+        if baseline_path.is_none() && device_budget_bytes == 0 && host_budget_bytes == 0 {
+            return Ok(Self {
+                device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+                raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+                raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+                raw_scratch: None,
+                raw_mode,
+                host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+                plan: Vec::new(),
+                device_selected: Vec::new(),
+                host_selected: Vec::new(),
+                device_budget_bytes,
+                host_budget_bytes,
+                device_resident_bytes: 0,
+                host_resident_bytes: 0,
+                device_hits: 0,
+                host_hits: 0,
+                misses: 0,
+            });
+        }
+        let candidate_layers = match std::env::var("COLIBRI_V4_FIXED_CACHE_CANDIDATE_LAYERS") {
+            Ok(value) => value
+                .split(',')
+                .map(str::trim)
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(std::env::VarError::NotPresent) => (0..executed_layers).collect(),
+            Err(error) => return Err(error.into()),
+        };
+        if candidate_layers.is_empty()
+            || candidate_layers
+                .iter()
+                .any(|&layer| layer >= executed_layers)
+        {
+            return Err("fixed cache candidate layers must be non-empty executed layers".into());
+        }
+        let baseline_path = baseline_path
+            .ok_or("set COLIBRI_V4_FIXED_CACHE_BASELINE_JSONL for fixed cache planning")?;
+        let plan = fixed_layer_plans(model_dir, &candidate_layers, &baseline_path)?;
+        let none_selected = vec![false; plan.len()];
+        let device_selected =
+            select_fixed_cache_layers(&plan, device_budget_bytes, &none_selected, true, raw_mode);
+        let host_selected =
+            select_fixed_cache_layers(&plan, host_budget_bytes, &device_selected, false, raw_mode);
+        let raw_scratch = if raw_mode
+            && (device_selected.iter().any(|&selected| selected)
+                || host_selected.iter().any(|&selected| selected))
+        {
+            Some(DeviceBuffer::<u16>::zeroed(
+                stream,
+                RAW_SCRATCH_BYTES / std::mem::size_of::<u16>(),
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            raw_scratch,
+            raw_mode,
+            host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
+            plan,
+            device_selected,
+            host_selected,
+            device_budget_bytes,
+            host_budget_bytes,
+            device_resident_bytes: 0,
+            host_resident_bytes: 0,
+            device_hits: 0,
+            host_hits: 0,
+            misses: 0,
+        })
+    }
+
+    fn selected(&self, layer: usize) -> (bool, bool, &FixedLayerPlan) {
+        let index = self
+            .plan
+            .iter()
+            .position(|candidate| candidate.layer == layer)
+            .expect("cache access layer must be in the startup plan");
+        (
+            self.device_selected[index],
+            self.host_selected[index],
+            &self.plan[index],
+        )
+    }
+
+    fn access<R>(
+        &mut self,
+        model_dir: &std::path::Path,
+        layer: usize,
+        token_ids: &[i64],
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        run: impl FnOnce(&LoadedLayerRuntime) -> Result<R, Box<dyn Error>>,
+    ) -> Result<(R, FixedLoadTelemetry), Box<dyn Error>> {
+        let candidate = self.plan.iter().any(|candidate| candidate.layer == layer);
+        if !candidate {
+            let (runtime, telemetry) = load_layer_runtime(model_dir, layer, token_ids, stream)?;
+            self.misses += 1;
+            return Ok((run(&runtime)?, telemetry));
+        }
+        let (device_selected, host_selected, plan) = self.selected(layer);
+        let decoded_device_bytes = plan.device_bytes;
+        let planned_device_bytes = if self.raw_mode {
+            plan.raw_device_bytes
+        } else {
+            decoded_device_bytes
+        };
+        let decoded_host_bytes = plan.host_bytes;
+        let planned_host_bytes = if self.raw_mode {
+            plan.raw_host_bytes
+        } else {
+            decoded_host_bytes
+        };
+        if self.raw_mode && device_selected && self.raw_device[layer].is_some() {
+            self.device_hits += 1;
+            let mut cached = self.raw_device[layer]
+                .take()
+                .ok_or("raw device cache entry disappeared")?;
+            let mut scratch = self
+                .raw_scratch
+                .take()
+                .ok_or("raw fixed cache scratch disappeared")?;
+            let decode_started = std::time::Instant::now();
+            launch_e4m3fn_to_bf16(module, stream, &cached.wo_a_raw, &mut scratch)?;
+            stream.synchronize()?;
+            let fixed_decode_ns =
+                u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            std::mem::swap(&mut cached.runtime.weights.wo_a, &mut scratch);
+            let result = run(&cached.runtime);
+            std::mem::swap(&mut cached.runtime.weights.wo_a, &mut scratch);
+            self.raw_scratch = Some(scratch);
+            self.raw_device[layer] = Some(cached);
+            return Ok((
+                result?,
+                FixedLoadTelemetry {
+                    fixed_decode_ns,
+                    cache_status: "raw_device_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        if !self.raw_mode && device_selected && self.device[layer].is_some() {
+            self.device_hits += 1;
+            return Ok((
+                run(self.device[layer].as_ref().unwrap())?,
+                FixedLoadTelemetry {
+                    cache_status: "device_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        if self.raw_mode && host_selected && self.raw_host[layer].is_some() {
+            self.host_hits += 1;
+            let cached = self.raw_host[layer]
+                .take()
+                .ok_or("raw host cache entry disappeared")?;
+            let mut scratch = self
+                .raw_scratch
+                .take()
+                .ok_or("raw fixed cache scratch disappeared")?;
+            let h2d_started = std::time::Instant::now();
+            let mut runtime = upload_layer_runtime(model_dir, layer, &cached.host, stream)?;
+            stream.synchronize()?;
+            let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let fixed_h2d_bytes = runtime.weights.num_bytes();
+            let raw_h2d_started = std::time::Instant::now();
+            let wo_a_raw = DeviceBuffer::from_host(stream, &cached.wo_a_raw)?;
+            stream.synchronize()?;
+            let raw_h2d_ns =
+                u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let raw_h2d_bytes = wo_a_raw.num_bytes();
+            let decode_started = std::time::Instant::now();
+            launch_e4m3fn_to_bf16(module, stream, &wo_a_raw, &mut scratch)?;
+            stream.synchronize()?;
+            let fixed_decode_ns =
+                u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
+            let result = run(&runtime);
+            std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
+            self.raw_scratch = Some(scratch);
+            self.raw_host[layer] = Some(cached);
+            return Ok((
+                result?,
+                FixedLoadTelemetry {
+                    fixed_decode_ns,
+                    fixed_h2d_ns,
+                    fixed_h2d_bytes,
+                    raw_h2d_ns,
+                    raw_h2d_bytes,
+                    cache_status: "raw_host_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        if !self.raw_mode && host_selected && self.host[layer].is_some() {
+            self.host_hits += 1;
+            let h2d_started = std::time::Instant::now();
+            let runtime =
+                upload_layer_runtime(model_dir, layer, self.host[layer].as_ref().unwrap(), stream)?;
+            if bench_telemetry_enabled() {
+                stream.synchronize()?;
+            }
+            let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            return Ok((
+                run(&runtime)?,
+                FixedLoadTelemetry {
+                    fixed_h2d_ns,
+                    fixed_h2d_bytes: runtime.weights.num_bytes(),
+                    cache_status: "host_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            ));
+        }
+        let (host, mut telemetry) = load_layer_host(model_dir, layer, token_ids)?;
+        self.misses += 1;
+        if host.num_bytes() != decoded_host_bytes {
+            return Err(format!(
+                "layer {layer} decoded host bytes {} != plan {decoded_host_bytes}",
+                host.num_bytes()
+            )
+            .into());
+        }
+        let h2d_started = std::time::Instant::now();
+        let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
+        if bench_telemetry_enabled() {
+            stream.synchronize()?;
+        }
+        telemetry.fixed_h2d_ns =
+            u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        telemetry.fixed_h2d_bytes = runtime.weights.num_bytes();
+        let expected_fill_bytes = if self.raw_mode {
+            decoded_device_bytes
+        } else {
+            planned_device_bytes
+        };
+        if telemetry.fixed_h2d_bytes != expected_fill_bytes {
+            return Err(format!(
+                "layer {layer} device bytes {} != fill plan {expected_fill_bytes}",
+                telemetry.fixed_h2d_bytes
+            )
+            .into());
+        }
+        if self.raw_mode && device_selected {
+            let result = run(&runtime);
+            let (raw, raw_read_ns, raw_source_bytes, raw_h2d_ns, raw_h2d_bytes) =
+                into_raw_layer_runtime(model_dir, layer, runtime, stream)?;
+            telemetry.raw_read_ns = raw_read_ns;
+            telemetry.raw_source_bytes = raw_source_bytes;
+            telemetry.raw_h2d_ns = raw_h2d_ns;
+            telemetry.raw_h2d_bytes = raw_h2d_bytes;
+            if raw.resident_bytes != planned_device_bytes {
+                return Err(format!(
+                    "layer {layer} raw device bytes {} != plan {planned_device_bytes}",
+                    raw.resident_bytes
+                )
+                .into());
+            }
+            telemetry.cache_status = "raw_device_fill";
+            self.device_resident_bytes += raw.resident_bytes;
+            self.raw_device[layer] = Some(raw);
+            Ok((result?, telemetry))
+        } else if device_selected {
+            telemetry.cache_status = "device_fill";
+            self.device_resident_bytes += telemetry.fixed_h2d_bytes;
+            self.device[layer] = Some(runtime);
+            Ok((run(self.device[layer].as_ref().unwrap())?, telemetry))
+        } else if self.raw_mode && host_selected {
+            let result = run(&runtime);
+            let (raw, raw_read_ns, raw_source_bytes) = into_raw_layer_host(model_dir, layer, host)?;
+            telemetry.raw_read_ns = raw_read_ns;
+            telemetry.raw_source_bytes = raw_source_bytes;
+            if raw.resident_bytes != planned_host_bytes {
+                return Err(format!(
+                    "layer {layer} raw host bytes {} != plan {planned_host_bytes}",
+                    raw.resident_bytes
+                )
+                .into());
+            }
+            telemetry.cache_status = "raw_host_fill";
+            self.host_resident_bytes += raw.resident_bytes;
+            self.raw_host[layer] = Some(raw);
+            Ok((result?, telemetry))
+        } else if host_selected {
+            telemetry.cache_status = "host_fill";
+            self.host_resident_bytes += host.num_bytes();
+            self.host[layer] = Some(host);
+            Ok((run(&runtime)?, telemetry))
+        } else {
+            telemetry.cache_status = "miss";
+            Ok((run(&runtime)?, telemetry))
+        }
+    }
+}
+
+fn bench_telemetry_enabled() -> bool {
+    std::env::var_os("COLIBRI_V4_BENCH_TELEMETRY").as_deref() == Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+}
+
+fn load_layer_host(
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+) -> Result<(DecodedLayerHost, FixedLoadTelemetry), Box<dyn Error>> {
+    load_layer_host_inner(model_dir, layer, token_ids, false)
+}
+
+fn load_layer_host_raw_wo_a(
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+) -> Result<(DecodedLayerHost, FixedLoadTelemetry), Box<dyn Error>> {
+    load_layer_host_inner(model_dir, layer, token_ids, true)
+}
+
+fn load_layer_host_inner(
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+    raw_wo_a: bool,
+) -> Result<(DecodedLayerHost, FixedLoadTelemetry), Box<dyn Error>> {
+    let read_started = std::time::Instant::now();
+    let state = v4_state::load_layer_state_weights(model_dir, layer, token_ids)?;
+    let projections = v4_state::load_layer_fp8_projections(model_dir, layer)?;
+    let tail = if raw_wo_a {
+        v4_state::load_layer_tail_raw(model_dir, layer)?
+    } else {
+        v4_state::load_layer_tail(model_dir, layer)?
+    };
+    let fixed_decode_ns = (tail.wo_a_decode_ms * 1_000_000.0) as u64;
+    let fixed_read_alloc_ns = u64::try_from(read_started.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(fixed_decode_ns);
+    let host = DecodedLayerHost {
+        state,
+        projections,
+        tail,
+    };
+    let fixed_source_bytes = host.source_bytes();
+    Ok((
+        host,
+        FixedLoadTelemetry {
+            fixed_read_alloc_ns,
+            fixed_decode_ns,
+            fixed_source_bytes,
+            cache_status: "miss",
+            ..FixedLoadTelemetry::default()
+        },
+    ))
+}
+
+fn upload_layer_runtime(
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    stream: &CudaStream,
+) -> Result<LoadedLayerRuntime, Box<dyn Error>> {
+    let expert_shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    let weights =
+        LayerDeviceWeights::new_layer(stream, &host.state, &host.projections, &host.tail)?;
+    Ok(LoadedLayerRuntime {
+        weights,
+        expert_shard,
+    })
+}
+
+fn upload_layer_runtime_raw_wo_a(
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry), Box<dyn Error>> {
+    let raw = host
+        .tail
+        .wo_a_raw
+        .as_deref()
+        .ok_or("raw wo_a upload received a decoded host payload")?;
+    let raw_h2d_started = std::time::Instant::now();
+    let raw_wo_a = DeviceBuffer::from_host(stream, raw)?;
+    let raw_h2d_ns = u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let raw_h2d_bytes = raw_wo_a.num_bytes();
+    let decode_started = std::time::Instant::now();
+    let mut wo_a = DeviceBuffer::zeroed(stream, raw_wo_a.len())?;
+    launch_e4m3fn_to_bf16(module, stream, &raw_wo_a, &mut wo_a)?;
+    stream.synchronize()?;
+    let fixed_decode_ns = u64::try_from(decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let fixed_h2d_started = std::time::Instant::now();
+    let expert_shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    let weights = LayerDeviceWeights::new_layer_with_wo_a(
+        stream,
+        &host.state,
+        &host.projections,
+        &host.tail,
+        Some(wo_a),
+    )?;
+    let fixed_h2d_ns = raw_h2d_ns
+        .saturating_add(u64::try_from(fixed_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    let fixed_h2d_bytes = raw_h2d_bytes
+        .checked_add(weights.num_bytes_without_wo_a())
+        .ok_or("raw wo_a fixed H2D byte count overflow")?;
+    Ok((
+        LoadedLayerRuntime {
+            weights,
+            expert_shard,
+        },
+        FixedLoadTelemetry {
+            fixed_decode_ns,
+            fixed_h2d_ns,
+            fixed_h2d_bytes,
+            raw_h2d_ns,
+            raw_h2d_bytes,
+            cache_status: "prefetched_blocking_h2d",
+            ..FixedLoadTelemetry::default()
+        },
+    ))
+}
+
+fn read_raw_wo_a(
+    model_dir: &std::path::Path,
+    layer: usize,
+) -> Result<(Vec<u8>, u64, usize), Box<dyn Error>> {
+    let shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    let weight_name = format!("layers.{layer}.attn.wo_a.weight");
+    let scale_name = format!("layers.{layer}.attn.wo_a.scale");
+    let weight_info = shard.tensor(&weight_name)?;
+    let scale_info = shard.tensor(&scale_name)?;
+    if weight_info.dtype != safetensors::TensorDtype::F8E4M3
+        || scale_info.dtype != safetensors::TensorDtype::F8E8M0
+        || weight_info.shape.len() != 2
+        || scale_info.shape
+            != [
+                weight_info.shape[0] / u64::try_from(v4_state::FP8_BLOCK)?,
+                weight_info.shape[1] / u64::try_from(v4_state::FP8_BLOCK)?,
+            ]
+    {
+        return Err(format!("layer {layer} raw wo_a dtype contract mismatch").into());
+    }
+    let mut weight = vec![0_u8; usize::try_from(weight_info.byte_len)?];
+    let read_started = std::time::Instant::now();
+    shard.read_at_mode(&weight_name, 0, &mut weight, stream_read_mode_from_env()?)?;
+    let read_ns = u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let source_bytes = weight.len();
+    Ok((weight, read_ns, source_bytes))
+}
+
+fn stream_read_mode_from_env() -> Result<safetensors::RangeReadMode, Box<dyn Error>> {
+    match std::env::var("COLIBRI_V4_STREAM_READ_MODE") {
+        Ok(value) if value == "buffered" => Ok(safetensors::RangeReadMode::Buffered),
+        Ok(value) if value == "fadvise" => Ok(safetensors::RangeReadMode::Fadvise),
+        Ok(value) if value == "direct" => Ok(safetensors::RangeReadMode::Direct),
+        Ok(_) => Err("COLIBRI_V4_STREAM_READ_MODE must be buffered, fadvise, or direct".into()),
+        Err(std::env::VarError::NotPresent) => Ok(safetensors::RangeReadMode::Buffered),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn into_raw_layer_runtime(
+    model_dir: &std::path::Path,
+    layer: usize,
+    mut runtime: LoadedLayerRuntime,
+    stream: &CudaStream,
+) -> Result<(RawLoadedLayerRuntime, u64, usize, u64, usize), Box<dyn Error>> {
+    let (weight, raw_read_ns, raw_source_bytes) = read_raw_wo_a(model_dir, layer)?;
+    if runtime.weights.wo_a.len() != weight.len() {
+        return Err(format!("layer {layer} raw wo_a shape contract mismatch").into());
+    }
+    let raw_h2d_started = std::time::Instant::now();
+    let wo_a_raw = DeviceBuffer::from_host(stream, &weight)?;
+    stream.synchronize()?;
+    let raw_h2d_ns = u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let raw_h2d_bytes = wo_a_raw.num_bytes();
+    let decoded_wo_a =
+        std::mem::replace(&mut runtime.weights.wo_a, DeviceBuffer::zeroed(stream, 0)?);
+    drop(decoded_wo_a);
+    let resident_bytes = runtime.weights.num_bytes() + wo_a_raw.num_bytes();
+    Ok((
+        RawLoadedLayerRuntime {
+            runtime,
+            wo_a_raw,
+            resident_bytes,
+        },
+        raw_read_ns,
+        raw_source_bytes,
+        raw_h2d_ns,
+        raw_h2d_bytes,
+    ))
+}
+
+fn into_raw_layer_host(
+    model_dir: &std::path::Path,
+    layer: usize,
+    mut host: DecodedLayerHost,
+) -> Result<(RawDecodedLayerHost, u64, usize), Box<dyn Error>> {
+    let (wo_a_raw, raw_read_ns, raw_source_bytes) = read_raw_wo_a(model_dir, layer)?;
+    if host.tail.wo_a_bf16.len() != wo_a_raw.len() {
+        return Err(format!("layer {layer} raw host wo_a shape contract mismatch").into());
+    }
+    drop(std::mem::take(&mut host.tail.wo_a_bf16));
+    let resident_bytes = host.num_bytes() + wo_a_raw.len();
+    Ok((
+        RawDecodedLayerHost {
+            host,
+            wo_a_raw,
+            resident_bytes,
+        },
+        raw_read_ns,
+        raw_source_bytes,
+    ))
+}
+
+fn load_layer_runtime(
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+    stream: &CudaStream,
+) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry), Box<dyn Error>> {
+    let (host, mut telemetry) = load_layer_host(model_dir, layer, token_ids)?;
+    let h2d_started = std::time::Instant::now();
+    let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
+    if bench_telemetry_enabled() {
+        stream.synchronize()?;
+    }
+    telemetry.fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    telemetry.fixed_h2d_bytes = runtime.weights.num_bytes();
+    Ok((runtime, telemetry))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct B2LayerDigest {
+    layer: usize,
+    route_ids: Vec<i32>,
+    route_weight_bits: Vec<u32>,
+    attention_topk_digest: u64,
+    hidden_digest: u64,
+    kv_digest: u64,
+    main_kv_state_digest: u64,
+    main_score_state_digest: u64,
+    indexer_kv_state_digest: Option<u64>,
+    indexer_score_state_digest: Option<u64>,
+}
+
+impl B2LayerDigest {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "layer": self.layer,
+            "route_ids": self.route_ids,
+            "route_weight_bits": self.route_weight_bits,
+            "attention_topk_digest": format!("{:016x}", self.attention_topk_digest),
+            "hidden_digest": format!("{:016x}", self.hidden_digest),
+            "kv_digest": format!("{:016x}", self.kv_digest),
+            "main_kv_state_digest": format!("{:016x}", self.main_kv_state_digest),
+            "main_score_state_digest": format!("{:016x}", self.main_score_state_digest),
+            "indexer_kv_state_digest": self.indexer_kv_state_digest.map(|value| format!("{value:016x}")),
+            "indexer_score_state_digest": self.indexer_score_state_digest.map(|value| format!("{value:016x}")),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct B2RequestResult {
+    layers: Vec<B2LayerDigest>,
+    output_digest: u64,
+}
+
+#[derive(Default)]
+struct B2Physical {
+    fixed_source_bytes: usize,
+    fixed_h2d_bytes: usize,
+    routed_source_bytes: usize,
+    routed_h2d_bytes: usize,
+}
+
+impl B2Physical {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "fixed_source_bytes": self.fixed_source_bytes,
+            "fixed_h2d_bytes": self.fixed_h2d_bytes,
+            "routed_source_bytes": self.routed_source_bytes,
+            "routed_h2d_bytes": self.routed_h2d_bytes,
+        })
+    }
+}
+
+struct B2RawRuntime {
+    raw: RawLoadedLayerRuntime,
+    fixed_source_bytes: usize,
+    fixed_h2d_bytes: usize,
+}
+
+fn load_b2_raw_runtime(
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_id: i64,
+    stream: &CudaStream,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
+    let (host, telemetry) = load_layer_host(model_dir, layer, &[token_id])?;
+    let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
+    let decoded_h2d_bytes = runtime.weights.num_bytes();
+    let (raw, _, raw_source_bytes, _, raw_h2d_bytes) =
+        into_raw_layer_runtime(model_dir, layer, runtime, stream)?;
+    Ok(B2RawRuntime {
+        fixed_source_bytes: telemetry.fixed_source_bytes + raw_source_bytes,
+        fixed_h2d_bytes: decoded_h2d_bytes + raw_h2d_bytes,
+        raw,
+    })
+}
+
+fn run_b2_layer(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    runtime: &LoadedLayerRuntime,
+    lanes: &mut [ExpertSlot<'_>],
+    hash_ids: &[i64],
+    hidden: &[u16],
+    token_id: i64,
+    persistent: &mut v4_state::V4SerialPersistentState,
+) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
+    let layer = runtime.weights.layer;
+    let mut result = None;
+    persistent.transaction(layer, |state| {
+        let run = run_real_layer_rows(
+            context,
+            module,
+            stream,
+            runtime,
+            Some(lanes),
+            None,
+            None,
+            hash_ids,
+            hidden,
+            &[token_id],
+            0,
+            Some(state),
+            None,
+            None,
+            false,
+            None,
+            false,
+            None,
+        )?;
+        let main = state.compressor();
+        let indexer = state.indexer();
+        let digest = B2LayerDigest {
+            layer,
+            route_ids: run.routes.ids.clone(),
+            route_weight_bits: run
+                .routes
+                .weights
+                .iter()
+                .map(|value| value.to_bits())
+                .collect(),
+            attention_topk_digest: run.attention_topk_digest,
+            hidden_digest: fnv1a_u16(&run.output),
+            kv_digest: fnv1a_u16(state.kv_bf16()),
+            main_kv_state_digest: fnv1a_f32(main.kv()),
+            main_score_state_digest: fnv1a_f32(main.score()),
+            indexer_kv_state_digest: indexer.map(|value| fnv1a_f32(value.kv())),
+            indexer_score_state_digest: indexer.map(|value| fnv1a_f32(value.score())),
+        };
+        result = Some((run.output, digest, run.stage));
+        Ok(())
+    })?;
+    result.ok_or_else(|| "B2 layer transaction produced no result".into())
+}
+
+fn prepare_b2_prefix(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_id: i64,
+    lanes: &mut [ExpertSlot<'_>],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let mut hidden = prepare_b2_initial_hidden(model_dir, token_id)?;
+    let mut persistent = v4_state::V4SerialPersistentState::new(1)?;
+    for layer in 0..3 {
+        let (runtime, _) = load_layer_runtime(model_dir, layer, &[token_id], stream)?;
+        let hash_ids = load_layer_hash_ids(model_dir, layer, &[token_id])?;
+        let mut next = None;
+        persistent.transaction(layer, |state| {
+            next = Some(
+                run_real_layer_rows(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    Some(lanes),
+                    None,
+                    None,
+                    &hash_ids,
+                    &hidden,
+                    &[token_id],
+                    0,
+                    Some(state),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    None,
+                )?
+                .output,
+            );
+            Ok(())
+        })?;
+        hidden = next.ok_or("B2 prefix transaction produced no output")?;
+    }
+    Ok(hidden)
+}
+
+fn prepare_b2_initial_hidden(
+    model_dir: &std::path::Path,
+    token_id: i64,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let embedding = v4_state::load(model_dir, &[token_id])?.embedding;
+    let mut hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+    for _ in 0..v4_state::HC {
+        hidden.extend_from_slice(&embedding);
+    }
+    Ok(hidden)
+}
+
+fn prepare_two_token_prefix(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: [i64; 2],
+    lanes: &mut [ExpertSlot<'_>],
+) -> Result<[Vec<u16>; 2], Box<dyn Error>> {
+    let mut hidden = token_ids
+        .map(|token_id| v4_state::load(model_dir, &[token_id]).map(|state| state.embedding))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|embedding| {
+            let mut row = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+            for _ in 0..v4_state::HC {
+                row.extend_from_slice(&embedding);
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let mut persistent = v4_state::V4SerialPersistentState::new(2)?;
+    for layer in 0..3 {
+        let (runtime, _) = load_layer_runtime(model_dir, layer, &token_ids, stream)?;
+        let hash_ids = load_layer_hash_ids(model_dir, layer, &token_ids)?;
+        for position in 0..2 {
+            let row_hash_ids = if runtime.weights.hash_router {
+                &hash_ids[position * v4_router::V4_TOPK..(position + 1) * v4_router::V4_TOPK]
+            } else {
+                &[]
+            };
+            let mut next = None;
+            persistent.transaction(layer, |state| {
+                next = Some(
+                    run_real_layer_rows(
+                        context,
+                        module,
+                        stream,
+                        &runtime,
+                        Some(lanes),
+                        None,
+                        None,
+                        row_hash_ids,
+                        &hidden[position],
+                        &[token_ids[position]],
+                        position,
+                        Some(state),
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                        None,
+                    )?
+                    .output,
+                );
+                Ok(())
+            })?;
+            hidden[position] = next.ok_or("two-token prefix produced no output")?;
+        }
+    }
+    hidden
+        .try_into()
+        .map_err(|_| "two-token prefix changed row count".into())
+}
+
+fn process_peak_rss_bytes() -> Result<usize, Box<dyn Error>> {
+    let kib = std::fs::read_to_string("/proc/self/status")?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or("VmHWM is missing from /proc/self/status")?
+        .parse::<usize>()?;
+    Ok(kib.saturating_mul(1024))
+}
+
+fn device_used_bytes() -> Result<usize, Box<dyn Error>> {
+    let (mut free, mut total) = (0_usize, 0_usize);
+    let result = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    if result != 0 {
+        return Err(format!("cuMemGetInfo_v2 failed with {result:?}").into());
+    }
+    Ok(total.saturating_sub(free))
+}
+
+fn run_b2_serial_request(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_id: i64,
+    layers: &[usize],
+    initial_hidden: &[u16],
+    lanes: &mut [ExpertSlot<'_>],
+    scratch: &mut DeviceBuffer<u16>,
+    physical: &mut B2Physical,
+    peak_device_bytes: &mut usize,
+) -> Result<B2RequestResult, Box<dyn Error>> {
+    let mut hidden = initial_hidden.to_vec();
+    let mut persistent = v4_state::V4SerialPersistentState::new(1)?;
+    let mut digests = Vec::with_capacity(layers.len());
+    for &layer in layers {
+        let mut loaded = load_b2_raw_runtime(model_dir, layer, token_id, stream)?;
+        let hash_ids = load_layer_hash_ids(model_dir, layer, &[token_id])?;
+        physical.fixed_source_bytes += loaded.fixed_source_bytes;
+        physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+        *peak_device_bytes = (*peak_device_bytes).max(device_used_bytes()?);
+        launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
+        stream.synchronize()?;
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        let run = run_b2_layer(
+            context,
+            module,
+            stream,
+            &loaded.raw.runtime,
+            lanes,
+            &hash_ids,
+            &hidden,
+            token_id,
+            &mut persistent,
+        );
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        let (next, digest, stage) = run?;
+        physical.routed_source_bytes += stage.routed_source_bytes;
+        physical.routed_h2d_bytes += stage.routed_h2d_bytes;
+        hidden = next;
+        digests.push(digest);
+    }
+    Ok(B2RequestResult {
+        layers: digests,
+        output_digest: fnv1a_u16(&hidden),
+    })
+}
+
+struct B2ArmRun<const REQUESTS: usize> {
+    results: [B2RequestResult; REQUESTS],
+    physical: B2Physical,
+    total_ns: u64,
+    completion_ns: [u64; REQUESTS],
+    service_latency_ns: [u64; REQUESTS],
+}
+
+fn run_b2_serial_requests<const REQUESTS: usize>(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: [i64; REQUESTS],
+    initial_hidden: &[Vec<u16>; REQUESTS],
+    layers: &[usize],
+    lanes: &mut [ExpertSlot<'_>],
+    scratch: &mut DeviceBuffer<u16>,
+    peak_device_bytes: &mut usize,
+) -> Result<B2ArmRun<REQUESTS>, Box<dyn Error>> {
+    let mut physical = B2Physical::default();
+    let started = std::time::Instant::now();
+    let mut results = Vec::with_capacity(REQUESTS);
+    let mut completion_ns = [0_u64; REQUESTS];
+    let mut service_latency_ns = [0_u64; REQUESTS];
+    for request in 0..REQUESTS {
+        let service_started = std::time::Instant::now();
+        results.push(run_b2_serial_request(
+            context,
+            module,
+            stream,
+            model_dir,
+            token_ids[request],
+            layers,
+            &initial_hidden[request],
+            lanes,
+            scratch,
+            &mut physical,
+            peak_device_bytes,
+        )?);
+        completion_ns[request] = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        service_latency_ns[request] =
+            u64::try_from(service_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let total_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(B2ArmRun {
+        results: results
+            .try_into()
+            .map_err(|_| "layer-stationary serial request count changed")?,
+        physical,
+        total_ns,
+        completion_ns,
+        service_latency_ns,
+    })
+}
+
+fn run_b2_serial_pair(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: [i64; 2],
+    initial_hidden: &[Vec<u16>; 2],
+    lanes: &mut [ExpertSlot<'_>],
+    scratch: &mut DeviceBuffer<u16>,
+    peak_device_bytes: &mut usize,
+) -> Result<B2ArmRun<2>, Box<dyn Error>> {
+    run_b2_serial_requests(
+        context,
+        module,
+        stream,
+        model_dir,
+        token_ids,
+        initial_hidden,
+        &[3, 4],
+        lanes,
+        scratch,
+        peak_device_bytes,
+    )
+}
+
+fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: [i64; REQUESTS],
+    initial_hidden: &[Vec<u16>; REQUESTS],
+    layers: &[usize],
+    lanes: &mut [ExpertSlot<'_>],
+    scratch: &mut DeviceBuffer<u16>,
+    peak_device_bytes: &mut usize,
+) -> Result<B2ArmRun<REQUESTS>, Box<dyn Error>> {
+    let mut hidden: [Vec<u16>; REQUESTS] =
+        std::array::from_fn(|request| initial_hidden[request].clone());
+    let mut state = (0..REQUESTS)
+        .map(|_| v4_state::V4SerialPersistentState::new(1))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut digests = (0..REQUESTS)
+        .map(|_| Vec::with_capacity(layers.len()))
+        .collect::<Vec<Vec<B2LayerDigest>>>();
+    let mut physical = B2Physical::default();
+    let mut completion_ns = [0_u64; REQUESTS];
+    let mut service_started_ns = [None; REQUESTS];
+    let mut service_latency_ns = [0_u64; REQUESTS];
+    let started = std::time::Instant::now();
+    let first_layer = *layers
+        .first()
+        .ok_or("layer-stationary layers must be non-empty")?;
+    let last_layer = *layers
+        .last()
+        .ok_or("layer-stationary layers must be non-empty")?;
+    if layers.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+        return Err("layer-stationary layers must be contiguous".into());
+    }
+    for &layer in layers {
+        let mut loaded = load_b2_raw_runtime(model_dir, layer, token_ids[0], stream)?;
+        let hash_ids = load_layer_hash_ids(model_dir, layer, &token_ids)?;
+        physical.fixed_source_bytes += loaded.fixed_source_bytes;
+        physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+        *peak_device_bytes = (*peak_device_bytes).max(device_used_bytes()?);
+        launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
+        stream.synchronize()?;
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        let mut layer_error = None;
+        for request in 0..REQUESTS {
+            if layer == first_layer {
+                service_started_ns[request] =
+                    Some(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            }
+            match run_b2_layer(
+                context,
+                module,
+                stream,
+                &loaded.raw.runtime,
+                lanes,
+                if loaded.raw.runtime.weights.hash_router {
+                    &hash_ids[request * v4_router::V4_TOPK..(request + 1) * v4_router::V4_TOPK]
+                } else {
+                    &[]
+                },
+                &hidden[request],
+                token_ids[request],
+                &mut state[request],
+            ) {
+                Ok((next, digest, stage)) => {
+                    physical.routed_source_bytes += stage.routed_source_bytes;
+                    physical.routed_h2d_bytes += stage.routed_h2d_bytes;
+                    hidden[request] = next;
+                    digests[request].push(digest);
+                    if layer == last_layer {
+                        completion_ns[request] =
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        service_latency_ns[request] = completion_ns[request].saturating_sub(
+                            service_started_ns[request].ok_or(
+                                "layer-stationary request completed before service started",
+                            )?,
+                        );
+                    }
+                }
+                Err(error) => {
+                    layer_error = Some(error);
+                    break;
+                }
+            }
+        }
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        if let Some(error) = layer_error {
+            return Err(error);
+        }
+    }
+    let total_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(B2ArmRun {
+        results: (0..REQUESTS)
+            .map(|request| B2RequestResult {
+                layers: std::mem::take(&mut digests[request]),
+                output_digest: fnv1a_u16(&hidden[request]),
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| "layer-stationary batch request count changed")?,
+        physical,
+        total_ns,
+        completion_ns,
+        service_latency_ns,
+    })
+}
+
+fn run_b2_batch_pair(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: [i64; 2],
+    initial_hidden: &[Vec<u16>; 2],
+    lanes: &mut [ExpertSlot<'_>],
+    scratch: &mut DeviceBuffer<u16>,
+    peak_device_bytes: &mut usize,
+) -> Result<B2ArmRun<2>, Box<dyn Error>> {
+    run_b2_layer_stationary_requests(
+        context,
+        module,
+        stream,
+        model_dir,
+        token_ids,
+        initial_hidden,
+        &[3, 4],
+        lanes,
+        scratch,
+        peak_device_bytes,
+    )
+}
+
+fn b2_serial_first(repeat: usize) -> bool {
+    matches!(repeat % 4, 0 | 3)
+}
+
+fn expert_union_json<const REQUESTS: usize>(
+    results: &[B2RequestResult; REQUESTS],
+    layers: &[usize],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        layers
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, layer)| {
+                let mut union = results
+                    .iter()
+                    .flat_map(|request| request.layers[index].route_ids.iter().copied())
+                    .collect::<Vec<_>>();
+                union.sort_unstable();
+                union.dedup();
+                let union_experts = union.len();
+                serde_json::json!({
+                    "layer": layer,
+                    "expert_ids": union,
+                    "union_experts": union_experts,
+                    "logical_union_source_bytes": union_experts * v4_expert::V4_ROUTED_EXPERT_BYTES,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn run_real_v4_b2_layer_stationary(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let repeats = std::env::var("COLIBRI_V4_B2_REPEATS")
+        .unwrap_or_else(|_| "20".into())
+        .parse::<usize>()?;
+    if repeats < 20 {
+        return Err("COLIBRI_V4_B2_REPEATS must be at least 20".into());
+    }
+    let result_path = std::env::var_os("COLIBRI_V4_B2_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_B2_RESULT_JSONL")?;
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let model_dir = v4_model_dir()?;
+    let token_ids = [0_i64, 1_i64];
+    let mut lanes = (0..V4_QD4_LANES)
+        .map(|_| {
+            let lane_stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &lane_stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let initial_hidden = [
+        prepare_b2_prefix(
+            context,
+            module,
+            stream,
+            &model_dir,
+            token_ids[0],
+            &mut lanes,
+        )?,
+        prepare_b2_prefix(
+            context,
+            module,
+            stream,
+            &model_dir,
+            token_ids[1],
+            &mut lanes,
+        )?,
+    ];
+    let mut scratch =
+        DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
+    let mut output = std::fs::File::create(&result_path)?;
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-b2-layer-stationary-v2",
+            "provenance": benchmark_provenance()?,
+            "token_e2e_ns": serde_json::Value::Null,
+            "model_revision": v4_state::REVISION,
+            "layers": [3, 4],
+            "requests": [
+                {"token_id": token_ids[0], "position": 0},
+                {"token_id": token_ids[1], "position": 0},
+            ],
+            "repeats": repeats,
+            "tseq_definition": "serial_total for both independent requests",
+            "speedup_definition": "serial_total_ns / batch_total_ns",
+            "arm_order_schedule": "ABBA, A=serial_then_batch, B=batch_then_serial",
+            "raw_scratch_bytes": scratch.num_bytes(),
+            "qd4_lanes": V4_QD4_LANES,
+        })
+    )?;
+    let mut oracle: Option<[B2RequestResult; 2]> = None;
+    let mut serial_samples = Vec::with_capacity(repeats);
+    let mut batch_samples = Vec::with_capacity(repeats);
+    let mut serial_first_samples = Vec::with_capacity(repeats);
+    let mut peak_device_bytes = device_used_bytes()?;
+    for repeat in 0..repeats {
+        let serial_first = b2_serial_first(repeat);
+        let (serial, batch) = if serial_first {
+            let serial = run_b2_serial_pair(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            let batch = run_b2_batch_pair(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            (serial, batch)
+        } else {
+            let batch = run_b2_batch_pair(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            let serial = run_b2_serial_pair(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            (serial, batch)
+        };
+        if batch.results != serial.results {
+            return Err(format!("B2 repeat {repeat} changed per-request canonical state").into());
+        }
+        if let Some(expected) = &oracle {
+            if expected != &serial.results {
+                return Err(format!("B2 repeat {repeat} changed the fixed request oracle").into());
+            }
+        } else {
+            oracle = Some(serial.results.clone());
+        }
+        serial_samples.push(serial.total_ns);
+        batch_samples.push(batch.total_ns);
+        serial_first_samples.push(serial_first);
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "repeat",
+                "repeat": repeat,
+                "arm_order": if serial_first { "serial_then_batch" } else { "batch_then_serial" },
+                "serial_total_ns": serial.total_ns,
+                "serial_completion_ns": serial.completion_ns,
+                "batch_total_ns": batch.total_ns,
+                "batch_service_latency_ns": batch.total_ns,
+                "batch_completion_ns": batch.completion_ns,
+                "throughput_speedup": serial.total_ns as f64 / batch.total_ns as f64,
+                "serial_physical": serial.physical.json(),
+                "batch_physical": batch.physical.json(),
+                "expert_union": expert_union_json(&batch.results, &[3, 4]),
+                "requests": batch.results.iter().enumerate().map(|(request, result)| serde_json::json!({
+                    "request": request,
+                    "token_id": token_ids[request],
+                    "position": 0,
+                    "output_digest": format!("{:016x}", result.output_digest),
+                    "layers": result.layers.iter().map(B2LayerDigest::json).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "peak_host_rss_bytes": process_peak_rss_bytes()?,
+                "peak_device_used_bytes": peak_device_bytes,
+            })
+        )?;
+    }
+    let speedups = serial_samples
+        .iter()
+        .zip(&batch_samples)
+        .map(|(&serial, &batch)| serial as f64 / batch as f64)
+        .collect::<Vec<_>>();
+    let serial_median_ns = median_u64(&serial_samples);
+    let batch_median_ns = median_u64(&batch_samples);
+    let speedup = serial_median_ns as f64 / batch_median_ns as f64;
+    let status = if speedup >= 1.2 { "PASS" } else { "KILL" };
+    let stratum = |serial_first: bool| {
+        let indexes = serial_first_samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value == serial_first).then_some(index))
+            .collect::<Vec<_>>();
+        let serial = indexes
+            .iter()
+            .map(|&index| serial_samples[index])
+            .collect::<Vec<_>>();
+        let batch = indexes
+            .iter()
+            .map(|&index| batch_samples[index])
+            .collect::<Vec<_>>();
+        let serial_median = median_u64(&serial);
+        let batch_median = median_u64(&batch);
+        serde_json::json!({
+            "repeats": indexes.len(),
+            "serial_total_median_ns": serial_median,
+            "batch_total_median_ns": batch_median,
+            "throughput_speedup": serial_median as f64 / batch_median as f64,
+        })
+    };
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": status,
+            "serial_total_median_ns": serial_median_ns,
+            "batch_total_median_ns": batch_median_ns,
+            "throughput_speedup": speedup,
+            "repeat_speedup_median": median_f64(&speedups),
+            "order_strata": {
+                "serial_then_batch": stratum(true),
+                "batch_then_serial": stratum(false),
+            },
+            "repeats": repeats,
+            "canonical_exact": true,
+            "peak_host_rss_bytes": process_peak_rss_bytes()?,
+            "peak_device_used_bytes": peak_device_bytes,
+        })
+    )?;
+    println!(
+        "{{\"status\":\"{status}\",\"mode\":\"v4-b2-layer-stationary\",\"speedup\":{speedup:.6},\"result_jsonl\":\"{}\"}}",
+        result_path.display()
+    );
+    Ok(())
+}
+
+fn run_real_v4_b4_layer_stationary(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    full61: bool,
+) -> Result<(), Box<dyn Error>> {
+    let repeats_key = if full61 {
+        "COLIBRI_V4_B4_FULL61_REPEATS"
+    } else {
+        "COLIBRI_V4_B4_REPEATS"
+    };
+    let repeats = std::env::var(repeats_key)
+        .unwrap_or_else(|_| if full61 { "4" } else { "12" }.into())
+        .parse::<usize>()?;
+    let required_repeats = if full61 { 4 } else { 12 };
+    if repeats != required_repeats {
+        return Err(
+            format!("{repeats_key} must be exactly {required_repeats} for this B4 gate").into(),
+        );
+    }
+    let result_key = if full61 {
+        "COLIBRI_V4_B4_FULL61_RESULT_JSONL"
+    } else {
+        "COLIBRI_V4_B4_RESULT_JSONL"
+    };
+    let result_path = std::env::var_os(result_key)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| format!("set {result_key}"))?;
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let model_dir = v4_model_dir()?;
+    let token_ids = [0_i64, 1, 2, 3];
+    let layers = if full61 {
+        (0..61).collect::<Vec<_>>()
+    } else {
+        vec![3, 4]
+    };
+    let mut lanes = (0..V4_QD4_LANES)
+        .map(|_| {
+            let lane_stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &lane_stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let initial_hidden = if full61 {
+        [
+            prepare_b2_initial_hidden(&model_dir, token_ids[0])?,
+            prepare_b2_initial_hidden(&model_dir, token_ids[1])?,
+            prepare_b2_initial_hidden(&model_dir, token_ids[2])?,
+            prepare_b2_initial_hidden(&model_dir, token_ids[3])?,
+        ]
+    } else {
+        [
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[0],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[1],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[2],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[3],
+                &mut lanes,
+            )?,
+        ]
+    };
+    let mut scratch =
+        DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
+    let mut output = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&result_path)
+        .map_err(|error| {
+            format!(
+                "refusing to overwrite B4 result artifact {}: {error}",
+                result_path.display()
+            )
+        })?;
+    let arm_order_realized = (0..repeats)
+        .map(|repeat| if b2_serial_first(repeat) { "A" } else { "B" })
+        .collect::<Vec<_>>();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": if full61 { "colibri-v4-b4-full61-layer-stationary-v2" } else { "colibri-v4-b4-layer-stationary-v1" },
+            "provenance": benchmark_provenance()?,
+            "model_revision": v4_state::REVISION,
+            "layers": layers,
+            "requests": token_ids.map(|token_id| serde_json::json!({"token_id": token_id, "position": 0})),
+            "warmup_pairs": 1,
+            "repeats": repeats,
+            "tseq_definition": "serial_total for four independent requests",
+            "speedup_definition": "serial4_total_ns / batch4_total_ns",
+            "arm_order_schedule": "ABBA, A=serial4_then_batch4, B=batch4_then_serial4",
+            "arm_order_realized": arm_order_realized,
+            "gate": {
+                "exact_pairs": required_repeats,
+                "median_speedup_min": if full61 { 2.0 } else { 1.80 },
+                "positive_pairs_min": if full61 { 4 } else { 10 },
+                "batch_makespan_p95_not_above_serial": !full61,
+            },
+            "raw_scratch_bytes": scratch.num_bytes(),
+            "qd4_lanes": V4_QD4_LANES,
+        })
+    )?;
+    let mut peak_device_bytes = device_used_bytes()?;
+    let warm_layers = if full61 { vec![3, 4] } else { layers.clone() };
+    let warm_hidden = if full61 {
+        [
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[0],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[1],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[2],
+                &mut lanes,
+            )?,
+            prepare_b2_prefix(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids[3],
+                &mut lanes,
+            )?,
+        ]
+    } else {
+        initial_hidden.clone()
+    };
+    let warm_serial = run_b2_serial_requests(
+        context,
+        module,
+        stream,
+        &model_dir,
+        token_ids,
+        &warm_hidden,
+        &warm_layers,
+        &mut lanes,
+        &mut scratch,
+        &mut peak_device_bytes,
+    )?;
+    let warm_batch = run_b2_layer_stationary_requests(
+        context,
+        module,
+        stream,
+        &model_dir,
+        token_ids,
+        &warm_hidden,
+        &warm_layers,
+        &mut lanes,
+        &mut scratch,
+        &mut peak_device_bytes,
+    )?;
+    if warm_batch.results != warm_serial.results {
+        return Err("B4 warmup changed per-request canonical state".into());
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "warmup",
+            "serial_total_ns": warm_serial.total_ns,
+            "batch_total_ns": warm_batch.total_ns,
+            "canonical_exact": true,
+            "serial_physical": warm_serial.physical.json(),
+            "batch_physical": warm_batch.physical.json(),
+            "requests": warm_batch.results.iter().enumerate().map(|(request, result)| serde_json::json!({
+                "request": request,
+                "token_id": token_ids[request],
+                "position": 0,
+                "output_digest": format!("{:016x}", result.output_digest),
+                "layers": result.layers.iter().map(B2LayerDigest::json).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "peak_host_rss_bytes": process_peak_rss_bytes()?,
+            "peak_device_used_bytes": peak_device_bytes,
+        })
+    )?;
+    let mut oracle: Option<[B2RequestResult; 4]> = None;
+    let mut serial_samples = Vec::with_capacity(repeats);
+    let mut batch_samples = Vec::with_capacity(repeats);
+    let mut serial_first_samples = Vec::with_capacity(repeats);
+    let mut positive_pairs = 0_usize;
+    for repeat in 0..repeats {
+        let serial_first = b2_serial_first(repeat);
+        let (serial, batch) = if serial_first {
+            let serial = run_b2_serial_requests(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &layers,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            let batch = run_b2_layer_stationary_requests(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &layers,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            (serial, batch)
+        } else {
+            let batch = run_b2_layer_stationary_requests(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &layers,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            let serial = run_b2_serial_requests(
+                context,
+                module,
+                stream,
+                &model_dir,
+                token_ids,
+                &initial_hidden,
+                &layers,
+                &mut lanes,
+                &mut scratch,
+                &mut peak_device_bytes,
+            )?;
+            (serial, batch)
+        };
+        if batch.results != serial.results {
+            return Err(format!(
+                "B4{} repeat {repeat} changed per-request canonical state",
+                if full61 { " full61" } else { "" }
+            )
+            .into());
+        }
+        if let Some(expected) = &oracle {
+            if expected != &serial.results {
+                return Err(format!(
+                    "B4{} repeat {repeat} changed the fixed request oracle",
+                    if full61 { " full61" } else { "" }
+                )
+                .into());
+            }
+        } else {
+            oracle = Some(serial.results.clone());
+        }
+        let speedup = serial.total_ns as f64 / batch.total_ns as f64;
+        if speedup > 1.0 {
+            positive_pairs += 1;
+        }
+        serial_samples.push(serial.total_ns);
+        batch_samples.push(batch.total_ns);
+        serial_first_samples.push(serial_first);
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "repeat",
+                "repeat": repeat,
+                "arm_order": if serial_first { "serial4_then_batch4" } else { "batch4_then_serial4" },
+                "serial_total_ns": serial.total_ns,
+                "serial_completion_ns": serial.completion_ns,
+                "serial_service_latency_ns": serial.service_latency_ns,
+                "batch_total_ns": batch.total_ns,
+                "batch_completion_ns": batch.completion_ns,
+                "batch_service_latency_ns": batch.service_latency_ns,
+                "throughput_speedup": speedup,
+                "serial_physical": serial.physical.json(),
+                "batch_physical": batch.physical.json(),
+                "expert_union": expert_union_json(&batch.results, &layers),
+                "requests": batch.results.iter().enumerate().map(|(request, result)| serde_json::json!({
+                    "request": request,
+                    "token_id": token_ids[request],
+                    "position": 0,
+                    "output_digest": format!("{:016x}", result.output_digest),
+                    "layers": result.layers.iter().map(B2LayerDigest::json).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "peak_host_rss_bytes": process_peak_rss_bytes()?,
+                "peak_device_used_bytes": peak_device_bytes,
+            })
+        )?;
+    }
+    let p95 = |samples: &[u64]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        sorted[(sorted.len() * 95).div_ceil(100) - 1]
+    };
+    let serial_median_ns = median_u64(&serial_samples);
+    let batch_median_ns = median_u64(&batch_samples);
+    let speedup = serial_median_ns as f64 / batch_median_ns as f64;
+    let serial_p95_ns = p95(&serial_samples);
+    let batch_p95_ns = p95(&batch_samples);
+    let status = if speedup >= if full61 { 2.0 } else { 1.80 }
+        && positive_pairs >= if full61 { 4 } else { 10 }
+        && (full61 || batch_p95_ns <= serial_p95_ns)
+    {
+        "GO"
+    } else {
+        "KILL"
+    };
+    let stratum = |serial_first: bool| {
+        let indexes = serial_first_samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value == serial_first).then_some(index))
+            .collect::<Vec<_>>();
+        let serial = indexes
+            .iter()
+            .map(|&index| serial_samples[index])
+            .collect::<Vec<_>>();
+        let batch = indexes
+            .iter()
+            .map(|&index| batch_samples[index])
+            .collect::<Vec<_>>();
+        let serial_median = median_u64(&serial);
+        let batch_median = median_u64(&batch);
+        serde_json::json!({
+            "repeats": indexes.len(),
+            "serial4_total_median_ns": serial_median,
+            "batch4_total_median_ns": batch_median,
+            "throughput_speedup": serial_median as f64 / batch_median as f64,
+        })
+    };
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": status,
+            "serial4_total_median_ns": serial_median_ns,
+            "serial4_total_p95_ns": serial_p95_ns,
+            "batch4_total_median_ns": batch_median_ns,
+            "batch4_total_p95_ns": batch_p95_ns,
+            "throughput_speedup": speedup,
+            "repeat_speedup_median": median_f64(&serial_samples.iter().zip(&batch_samples).map(|(&serial, &batch)| serial as f64 / batch as f64).collect::<Vec<_>>()),
+            "positive_pairs": positive_pairs,
+            "canonical_exact_pairs": repeats,
+            "canonical_exact": true,
+            "order_strata": {
+                "serial4_then_batch4": stratum(true),
+                "batch4_then_serial4": stratum(false),
+            },
+            "arm_order_schedule": "ABBA, A=serial4_then_batch4, B=batch4_then_serial4",
+            "arm_order_realized": arm_order_realized,
+            "repeats": repeats,
+            "peak_host_rss_bytes": process_peak_rss_bytes()?,
+            "peak_device_used_bytes": peak_device_bytes,
+        })
+    )?;
+    println!(
+        "{{\"status\":\"{status}\",\"mode\":\"{}\",\"speedup\":{speedup:.6},\"result_jsonl\":\"{}\"}}",
+        if full61 {
+            "v4-b4-full61-layer-stationary"
+        } else {
+            "v4-b4-layer-stationary"
+        },
+        result_path.display()
+    );
+    Ok(())
+}
+
+struct MhcGpuOutput {
+    collapsed: Vec<u16>,
+    post: Vec<f32>,
+    comb: Vec<f32>,
+    telemetry: MhcTelemetry,
+}
+
+#[derive(Default)]
+struct MhcTelemetry {
+    wall_ns: u64,
+    input_alloc_h2d_sync_ns: u64,
+    workspace_alloc_sync_ns: u64,
+    workspace_init_gpu_ns: u64,
+    mixing_linear_sync_ns: u64,
+    mixing_linear_gpu_ns: u64,
+    sinkhorn_normalize_collapse_sync_ns: u64,
+    sinkhorn_normalize_collapse_gpu_ns: u64,
+    output_d2h_sync_ns: u64,
+    other_ns: u64,
+}
+
+impl MhcTelemetry {
+    fn accounted_wall_ns(&self) -> u64 {
+        self.input_alloc_h2d_sync_ns
+            .saturating_add(self.workspace_alloc_sync_ns)
+            .saturating_add(self.mixing_linear_sync_ns)
+            .saturating_add(self.sinkhorn_normalize_collapse_sync_ns)
+            .saturating_add(self.output_d2h_sync_ns)
+            .saturating_add(self.other_ns)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_l0_mhc_pre_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    hc_fn: &DeviceBuffer<f32>,
+    hc_scale: &DeviceBuffer<f32>,
+    hc_base: &DeviceBuffer<f32>,
+    mixes: &mut DeviceBuffer<f32>,
+    pre: &mut DeviceBuffer<f32>,
+    post: &mut DeviceBuffer<f32>,
+    comb: &mut DeviceBuffer<f32>,
+    collapsed: &mut DeviceBuffer<u16>,
+    trace: &mut DeviceBuffer<f32>,
+    mut telemetry: Option<&mut MhcTelemetry>,
+) -> Result<(), Box<dyn Error>> {
+    let row_width = v4_state::HC * v4_state::HIDDEN;
+    if input.is_empty()
+        || !input.len().is_multiple_of(row_width)
+        || mixes.len() != input.len() / row_width * v4_state::MIX
+        || pre.len() != input.len() / row_width * v4_state::HC
+        || post.len() != pre.len()
+        || comb.len() != pre.len() * v4_state::HC
+        || collapsed.len() != input.len() / v4_state::HC
+        || trace.len() != input.len() / row_width * 41 * v4_state::HC * v4_state::HC
+    {
+        return Err("device mHC workspace contract mismatch".into());
+    }
+    let rows = u32::try_from(input.len() / row_width)?;
+    let linear_launch =
+        LaunchConfig::for_num_elems(rows.checked_mul(32).ok_or("mHC linear launch overflow")?);
+    let row_launch = LaunchConfig::for_num_elems(rows);
+    let profile = telemetry.is_some();
+    let events = profile
+        .then(|| {
+            Ok::<_, Box<dyn Error>>((
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+            ))
+        })
+        .transpose()?;
+    let mixing_started = std::time::Instant::now();
+    if let Some((start, _)) = events.as_ref() {
+        start.record(stream)?;
+    }
+    // SAFETY: each kernel owns one validated row and every output is disjoint.
+    unsafe {
+        module.mhc_linear_v4_bf16(stream, linear_launch, input, hc_fn, mixes)?;
+    }
+    if let Some((start, end)) = events.as_ref() {
+        end.record(stream)?;
+        end.synchronize()?;
+        let telemetry = telemetry.as_deref_mut().expect("profile has mHC telemetry");
+        telemetry.mixing_linear_gpu_ns = (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+        telemetry.mixing_linear_sync_ns =
+            u64::try_from(mixing_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let sinkhorn_started = std::time::Instant::now();
+    if let Some((start, _)) = events.as_ref() {
+        start.record(stream)?;
+    }
+    // SAFETY: each kernel owns one validated row and every output is disjoint.
+    unsafe {
+        module.mhc_sinkhorn_v4_bf16(
+            stream, row_launch, input, mixes, hc_scale, hc_base, pre, post, comb, collapsed, trace,
+        )?;
+    }
+    if let Some((start, end)) = events.as_ref() {
+        end.record(stream)?;
+        end.synchronize()?;
+        let telemetry = telemetry.as_deref_mut().expect("profile has mHC telemetry");
+        telemetry.sinkhorn_normalize_collapse_gpu_ns =
+            (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+        telemetry.sinkhorn_normalize_collapse_sync_ns =
+            u64::try_from(sinkhorn_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    Ok(())
+}
+
+fn run_l0_mhc_pre(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    hc_fn: &DeviceBuffer<f32>,
+    hc_scale: &DeviceBuffer<f32>,
+    hc_base: &DeviceBuffer<f32>,
+) -> Result<MhcGpuOutput, Box<dyn Error>> {
+    let row_width = v4_state::HC * v4_state::HIDDEN;
+    if input.len() % row_width != 0 || input.is_empty() {
+        return Err("L0 mHC input is not complete rows".into());
+    }
+    let started = std::time::Instant::now();
+    let profile = bench_telemetry_enabled();
+    let mut telemetry = MhcTelemetry::default();
+    let rows = input.len() / row_width;
+    let input_started = std::time::Instant::now();
+    let input = DeviceBuffer::from_host(stream, input)?;
+    if profile {
+        telemetry.input_alloc_h2d_sync_ns =
+            u64::try_from(input_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let workspace_started = std::time::Instant::now();
+    let workspace_events = profile
+        .then(|| {
+            Ok::<_, Box<dyn Error>>((
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+            ))
+        })
+        .transpose()?;
+    if let Some((start, _)) = workspace_events.as_ref() {
+        start.record(stream)?;
+    }
+    let mut mixes = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::MIX)?;
+    let mut pre = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC)?;
+    let mut post = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC)?;
+    let mut comb = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC * v4_state::HC)?;
+    let mut collapsed = DeviceBuffer::<u16>::zeroed(stream, rows * v4_state::HIDDEN)?;
+    let mut trace = DeviceBuffer::<f32>::zeroed(stream, rows * 41 * v4_state::HC * v4_state::HC)?;
+    if let Some((start, end)) = workspace_events.as_ref() {
+        end.record(stream)?;
+        end.synchronize()?;
+        telemetry.workspace_init_gpu_ns = (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+        telemetry.workspace_alloc_sync_ns =
+            u64::try_from(workspace_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    run_l0_mhc_pre_device_into(
+        module,
+        stream,
+        &input,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        &mut mixes,
+        &mut pre,
+        &mut post,
+        &mut comb,
+        &mut collapsed,
+        &mut trace,
+        profile.then_some(&mut telemetry),
+    )?;
+    let d2h_started = std::time::Instant::now();
+    let collapsed = collapsed.to_host_vec(stream)?;
+    let post = post.to_host_vec(stream)?;
+    let comb = comb.to_host_vec(stream)?;
+    if profile {
+        telemetry.output_d2h_sync_ns =
+            u64::try_from(d2h_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    telemetry.wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    telemetry.other_ns = telemetry
+        .wall_ns
+        .saturating_sub(telemetry.accounted_wall_ns());
+    Ok(MhcGpuOutput {
+        collapsed,
+        post,
+        comb,
+        telemetry,
+    })
+}
+
+fn run_l0_rmsnorm_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    norm: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+    width: usize,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(width)
+        || (!norm.is_empty() && norm.len() != width)
+        || output.len() != input.len()
+    {
+        return Err("device RMSNorm workspace contract mismatch".into());
+    }
+    // SAFETY: complete fixed-width rows and equally sized output were checked.
+    unsafe {
+        module.rmsnorm_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len() / width)?),
+            input,
+            norm,
+            output,
+            u32::try_from(width)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_rmsnorm(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    norm: &DeviceBuffer<u16>,
+    width: usize,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    if input.is_empty() || input.len() % width != 0 || (!norm.is_empty() && norm.len() != width) {
+        return Err("L0 RMSNorm shape mismatch".into());
+    }
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
+    run_l0_rmsnorm_device_into(module, stream, &input, norm, &mut output, width)?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_l0_fp8_linear_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    matrix: &DeviceFp8Matrix,
+    quantized: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    dequantized: &mut DeviceBuffer<u16>,
+    output_f32: &mut DeviceBuffer<f32>,
+    output_bf16: &mut DeviceBuffer<u16>,
+    strict_k_order: bool,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(matrix.in_features)
+        || !matrix.in_features.is_multiple_of(v4_state::FP8_BLOCK)
+    {
+        return Err("device FP8 linear input contract mismatch".into());
+    }
+    let rows = input.len() / matrix.in_features;
+    if quantized.len() != input.len()
+        || scales.len() != rows * matrix.in_features / v4_state::FP8_BLOCK
+        || !dequantized.is_empty()
+        || output_f32.len() != rows * matrix.out_features
+        || output_bf16.len() != output_f32.len()
+    {
+        return Err("device FP8 linear workspace contract mismatch".into());
+    }
+    // SAFETY: all activation groups and matrix/output geometries were checked.
+    unsafe {
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scales.len())?),
+            input,
+            quantized,
+            scales,
+            dequantized,
+            u32::try_from(matrix.in_features)?,
+            u32::try_from(matrix.in_features)?,
+            u32::try_from(v4_state::FP8_BLOCK)?,
+        )?;
+        launch_v4_fp8_matvec(
+            module,
+            stream,
+            quantized,
+            scales,
+            &matrix.weight,
+            &matrix.scale,
+            output_f32,
+            output_bf16,
+            matrix.in_features,
+            matrix.out_features,
+            strict_k_order,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_fp8_linear(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    matrix: &DeviceFp8Matrix,
+    strict_k_order: bool,
+) -> Result<(Vec<f32>, Vec<u16>), Box<dyn Error>> {
+    if input.is_empty()
+        || input.len() % matrix.in_features != 0
+        || matrix.in_features % v4_state::FP8_BLOCK != 0
+    {
+        return Err("L0 FP8 linear input shape mismatch".into());
+    }
+    let rows = input.len() / matrix.in_features;
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut quantized = DeviceBuffer::<u8>::zeroed(stream, input.len())?;
+    let mut scales =
+        DeviceBuffer::<u8>::zeroed(stream, rows * matrix.in_features / v4_state::FP8_BLOCK)?;
+    let mut dequantized = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let mut output_f32 = DeviceBuffer::<f32>::zeroed(stream, rows * matrix.out_features)?;
+    let mut output_bf16 = DeviceBuffer::<u16>::zeroed(stream, rows * matrix.out_features)?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &input,
+        matrix,
+        &mut quantized,
+        &mut scales,
+        &mut dequantized,
+        &mut output_f32,
+        &mut output_bf16,
+        strict_k_order,
+    )?;
+    Ok((
+        output_f32.to_host_vec(stream)?,
+        output_bf16.to_host_vec(stream)?,
+    ))
+}
+
+fn maybe_write_v4_audit_u16(
+    layer: usize,
+    stage: &str,
+    values: &[u16],
+) -> Result<(), Box<dyn Error>> {
+    let Some(requested_layer) = std::env::var_os("COLIBRI_V4_AUDIT_LAYER") else {
+        return Ok(());
+    };
+    if requested_layer.to_string_lossy().parse::<usize>()? != layer
+        || std::env::var("COLIBRI_V4_AUDIT_STAGE").as_deref() != Ok(stage)
+    {
+        return Ok(());
+    }
+    let path = std::env::var_os("COLIBRI_V4_AUDIT_PATH")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_AUDIT_PATH when requesting a V4 audit stage")?;
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    for &bits in values {
+        output.write_all(&bits.to_le_bytes())?;
+    }
+    output.sync_all()?;
+    println!(
+        "{{\"event\":\"v4_audit\",\"layer\":{layer},\"stage\":{},\"elements\":{},\"digest\":\"{:016x}\",\"path\":{}}}",
+        serde_json::to_string(stage)?,
+        values.len(),
+        fnv1a_u16(values),
+        serde_json::to_string(&path)?
+    );
+    Ok(())
+}
+
+fn maybe_write_v4_audit_f32(
+    layer: usize,
+    stage: &str,
+    values: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let Some(requested_layer) = std::env::var_os("COLIBRI_V4_AUDIT_LAYER") else {
+        return Ok(());
+    };
+    if requested_layer.to_string_lossy().parse::<usize>()? != layer
+        || std::env::var("COLIBRI_V4_AUDIT_STAGE").as_deref() != Ok(stage)
+    {
+        return Ok(());
+    }
+    let path = std::env::var_os("COLIBRI_V4_AUDIT_PATH")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_AUDIT_PATH when requesting a V4 audit stage")?;
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    for &value in values {
+        output.write_all(&value.to_bits().to_le_bytes())?;
+    }
+    output.sync_all()?;
+    Ok(())
+}
+
+fn run_l0_rope(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    freqs: &[f32],
+    heads: usize,
+    inverse: bool,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    run_rope(
+        module,
+        stream,
+        input,
+        freqs,
+        heads,
+        v4_state::Q_HEAD_DIM,
+        inverse,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rope(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    freqs: &[f32],
+    heads: usize,
+    head_dim: usize,
+    inverse: bool,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let row_width = heads * head_dim;
+    if input.is_empty()
+        || input.len() % row_width != 0
+        || head_dim < v4_state::Q_ROPE_DIM
+        || freqs.len() != input.len() / row_width * v4_state::Q_ROPE_DIM
+    {
+        return Err("L0 RoPE shape mismatch".into());
+    }
+    let mut freqs = freqs.to_vec();
+    if inverse {
+        for sine in freqs.iter_mut().skip(1).step_by(2) {
+            *sine = -*sine;
+        }
+    }
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let freqs = DeviceBuffer::from_host(stream, &freqs)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
+    run_rope_device_into(module, stream, &input, &freqs, &mut output, heads, head_dim)?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+fn run_rope_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    freqs: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<u16>,
+    heads: usize,
+    head_dim: usize,
+) -> Result<(), Box<dyn Error>> {
+    let row_width = heads * head_dim;
+    if input.is_empty()
+        || !input.len().is_multiple_of(row_width)
+        || head_dim < v4_state::Q_ROPE_DIM
+        || freqs.len() != input.len() / row_width * v4_state::Q_ROPE_DIM
+        || output.len() != input.len()
+    {
+        return Err("device RoPE workspace contract mismatch".into());
+    }
+    // SAFETY: kernel checks the same fixed head and frequency geometry.
+    unsafe {
+        module.rope_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            input,
+            freqs,
+            output,
+            u32::try_from(heads)?,
+            u32::try_from(head_dim)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_kv_quantize_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    empty: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(v4_state::Q_HEAD_DIM)
+        || !empty.is_empty()
+        || scales.len() != input.len() / v4_state::Q_HEAD_DIM * 7
+        || output.len() != input.len()
+    {
+        return Err("device KV quantization workspace contract mismatch".into());
+    }
+    // SAFETY: the full-row copy preserves the 64-value RoPE tail; the kernel
+    // then overwrites exactly seven complete 64-value non-RoPE groups.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            output.cu_deviceptr(),
+            input.cu_deviceptr(),
+            input.num_bytes(),
+            stream.cu_stream(),
+        )?;
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scales.len())?),
+            input,
+            empty,
+            scales,
+            output,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+            u32::try_from(v4_state::Q_HEAD_DIM - v4_state::Q_ROPE_DIM)?,
+            64,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_kv_quantize(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    if input.is_empty() || input.len() % v4_state::Q_HEAD_DIM != 0 {
+        return Err("L0 KV quantization shape mismatch".into());
+    }
+    let rows = input.len() / v4_state::Q_HEAD_DIM;
+    let mut output = DeviceBuffer::from_host(stream, input)?;
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut empty = DeviceBuffer::<u8>::zeroed(stream, 0)?;
+    let mut scales = DeviceBuffer::<u8>::zeroed(stream, rows * 7)?;
+    run_l0_kv_quantize_device_into(module, stream, &input, &mut empty, &mut scales, &mut output)?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+fn run_layer_compressor(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weights: &LayerDeviceWeights,
+    start_pos: usize,
+    cublas: Option<&cublas_exact::CublasExact>,
+    strict_scratch: Option<&mut StrictCompressorScratch>,
+) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    let ratio = weights.compression_ratio.get();
+    if weights.compressor_ape.len() % ratio != 0 {
+        return Err("layer Compressor APE shape mismatch".into());
+    }
+    let outputs = weights.compressor_ape.len() / ratio;
+    if weights.compressor_wkv.len() != outputs * v4_state::HIDDEN
+        || weights.compressor_wgate.len() != outputs * v4_state::HIDDEN
+    {
+        return Err("layer Compressor weight shape mismatch".into());
+    }
+    if strict_compressor_enabled() {
+        if let Some(scratch) = strict_scratch {
+            return scratch.run_from_device(
+                stream,
+                input,
+                &weights.compressor_wkv,
+                &weights.compressor_wgate,
+                &weights.compressor_ape,
+                outputs,
+                ratio,
+                start_pos,
+            );
+        }
+        // The pinned official oracle dispatches this projection through cuBLAS
+        // SGEMM.  Its reduction tree is observable in the committed FP32 state,
+        // so the strict trace path must use the same pinned library.
+        let owned;
+        let cublas = if let Some(cublas) = cublas {
+            cublas
+        } else {
+            owned = cublas_exact::CublasExact::load()?;
+            &owned
+        };
+        return run_compressor_official_cublas_from_device(
+            &cublas,
+            stream,
+            input,
+            &weights.compressor_wkv,
+            &weights.compressor_wgate,
+            &weights.compressor_ape,
+            outputs,
+            ratio,
+            start_pos,
+        );
+    }
+    run_compressor(
+        module,
+        stream,
+        input,
+        &weights.compressor_wkv,
+        &weights.compressor_wgate,
+        &weights.compressor_ape,
+        outputs,
+        ratio,
+        start_pos,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_compressor(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    wkv: &DeviceBuffer<u16>,
+    wgate: &DeviceBuffer<u16>,
+    ape: &DeviceBuffer<f32>,
+    outputs: usize,
+    ratio: usize,
+    start_pos: usize,
+) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    if input.is_empty()
+        || input.len() % v4_state::HIDDEN != 0
+        || outputs == 0
+        || wkv.len() != outputs * v4_state::HIDDEN
+        || wgate.len() != outputs * v4_state::HIDDEN
+        || ape.len() != ratio * outputs
+    {
+        return Err("layer Compressor input/weight geometry mismatch".into());
+    }
+    let rows = input.len() / v4_state::HIDDEN;
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut kv = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
+    let mut score = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
+    let mut score_plus_ape = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
+    run_compressor_device_into(
+        module,
+        stream,
+        &input,
+        wkv,
+        wgate,
+        ape,
+        &mut kv,
+        &mut score,
+        &mut score_plus_ape,
+        outputs,
+        ratio,
+        start_pos,
+    )?;
+    Ok(v4_state::CompressorPrepared {
+        kv_f32: kv.to_host_vec(stream)?,
+        score_f32: score.to_host_vec(stream)?,
+        score_plus_ape_f32: score_plus_ape.to_host_vec(stream)?,
+    })
+}
+
+fn run_l0_compressor_official_cublas(
+    cublas: &cublas_exact::CublasExact,
+    stream: &CudaStream,
+    input_bf16: &[u16],
+    weights: &v4_state::CompressorWeights,
+) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    run_compressor_official_cublas_host(
+        cublas,
+        stream,
+        input_bf16,
+        &weights.wkv_bf16,
+        &weights.wgate_bf16,
+        &weights.ape_f32,
+        v4_state::Q_HEAD_DIM,
+        v4_state::COMPRESS_RATIO,
+        0,
+    )
+}
+
+struct StrictCompressorArena {
+    outputs: usize,
+    ratio: usize,
+    wkv_bf16: Vec<u16>,
+    wgate_bf16: Vec<u16>,
+    ape_f32: Vec<f32>,
+    input_f32: Vec<f32>,
+    wkv_f32: Vec<f32>,
+    wgate_f32: Vec<f32>,
+    kv_f32: Vec<f32>,
+    score_f32: Vec<f32>,
+    score_plus_ape_f32: Vec<f32>,
+    input_device: DeviceBuffer<f32>,
+    wkv_device: DeviceBuffer<f32>,
+    wgate_device: DeviceBuffer<f32>,
+    workspace: DeviceBuffer<u8>,
+    kv_device: DeviceBuffer<f32>,
+    score_device: DeviceBuffer<f32>,
+}
+
+impl StrictCompressorArena {
+    fn new(stream: &CudaStream, outputs: usize, ratio: usize) -> Result<Self, Box<dyn Error>> {
+        let weights = outputs
+            .checked_mul(v4_state::HIDDEN)
+            .ok_or("strict Compressor arena weight size overflow")?;
+        let ape = outputs
+            .checked_mul(ratio)
+            .ok_or("strict Compressor arena APE size overflow")?;
+        Ok(Self {
+            outputs,
+            ratio,
+            wkv_bf16: vec![0; weights],
+            wgate_bf16: vec![0; weights],
+            ape_f32: vec![0.0; ape],
+            input_f32: vec![0.0; v4_state::HIDDEN],
+            wkv_f32: vec![0.0; weights],
+            wgate_f32: vec![0.0; weights],
+            kv_f32: vec![0.0; outputs],
+            score_f32: vec![0.0; outputs],
+            score_plus_ape_f32: vec![0.0; outputs],
+            input_device: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            wkv_device: DeviceBuffer::zeroed(stream, weights)?,
+            wgate_device: DeviceBuffer::zeroed(stream, weights)?,
+            workspace: DeviceBuffer::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?,
+            kv_device: DeviceBuffer::zeroed(stream, outputs)?,
+            score_device: DeviceBuffer::zeroed(stream, outputs)?,
+        })
+    }
+
+    fn host_bytes_for(outputs: usize, ratio: usize) -> Result<usize, Box<dyn Error>> {
+        let weights = outputs
+            .checked_mul(v4_state::HIDDEN)
+            .ok_or("strict Compressor host arena weight size overflow")?;
+        weights
+            .checked_mul(2 * std::mem::size_of::<u16>() + 2 * std::mem::size_of::<f32>())
+            .and_then(|bytes| bytes.checked_add(v4_state::HIDDEN * std::mem::size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_add(outputs * ratio * std::mem::size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_add(outputs * 3 * std::mem::size_of::<f32>()))
+            .ok_or_else(|| "strict Compressor host arena size overflow".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_from_device(
+        &mut self,
+        cublas: &cublas_exact::CublasExact,
+        stream: &CudaStream,
+        input_bf16: &[u16],
+        wkv: &DeviceBuffer<u16>,
+        wgate: &DeviceBuffer<u16>,
+        ape: &DeviceBuffer<f32>,
+        outputs: usize,
+        ratio: usize,
+        start_pos: usize,
+    ) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+        if input_bf16.len() != v4_state::HIDDEN
+            || outputs != self.outputs
+            || ratio != self.ratio
+            || wkv.len() != self.wkv_bf16.len()
+            || wgate.len() != self.wgate_bf16.len()
+            || ape.len() != self.ape_f32.len()
+        {
+            return Err("strict Compressor reusable arena geometry mismatch".into());
+        }
+        wkv.copy_to_host(stream, &mut self.wkv_bf16)?;
+        wgate.copy_to_host(stream, &mut self.wgate_bf16)?;
+        ape.copy_to_host(stream, &mut self.ape_f32)?;
+        for (dst, &src) in self.input_f32.iter_mut().zip(input_bf16) {
+            *dst = f32::from_bits(u32::from(src) << 16);
+        }
+        for (dst, &src) in self.wkv_f32.iter_mut().zip(&self.wkv_bf16) {
+            *dst = f32::from_bits(u32::from(src) << 16);
+        }
+        for (dst, &src) in self.wgate_f32.iter_mut().zip(&self.wgate_bf16) {
+            *dst = f32::from_bits(u32::from(src) << 16);
+        }
+        self.input_device.copy_from_host(stream, &self.input_f32)?;
+        self.wkv_device.copy_from_host(stream, &self.wkv_f32)?;
+        self.wgate_device.copy_from_host(stream, &self.wgate_f32)?;
+        let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
+        let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
+        let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
+        cublas.sgemm_mn1(
+            stream_pointer,
+            device_mut(self.workspace.cu_deviceptr()),
+            self.workspace.num_bytes(),
+            device_const(self.wkv_device.cu_deviceptr()),
+            device_const(self.input_device.cu_deviceptr()),
+            device_mut(self.kv_device.cu_deviceptr()),
+            outputs,
+            v4_state::HIDDEN,
+        )?;
+        cublas.sgemm_mn1(
+            stream_pointer,
+            device_mut(self.workspace.cu_deviceptr()),
+            self.workspace.num_bytes(),
+            device_const(self.wgate_device.cu_deviceptr()),
+            device_const(self.input_device.cu_deviceptr()),
+            device_mut(self.score_device.cu_deviceptr()),
+            outputs,
+            v4_state::HIDDEN,
+        )?;
+        self.kv_device.copy_to_host(stream, &mut self.kv_f32)?;
+        self.score_device
+            .copy_to_host(stream, &mut self.score_f32)?;
+        let ape_offset = start_pos
+            .checked_rem(ratio)
+            .and_then(|row| row.checked_mul(outputs))
+            .ok_or("strict Compressor APE offset overflow")?;
+        for ((dst, &score), &ape) in self
+            .score_plus_ape_f32
+            .iter_mut()
+            .zip(&self.score_f32)
+            .zip(&self.ape_f32[ape_offset..][..outputs])
+        {
+            *dst = score + ape;
+        }
+        if self
+            .kv_f32
+            .iter()
+            .chain(&self.score_f32)
+            .chain(&self.score_plus_ape_f32)
+            .any(|value| !value.is_finite())
+        {
+            return Err("strict cuBLAS Compressor produced non-finite output".into());
+        }
+        Ok(v4_state::CompressorPrepared {
+            kv_f32: self.kv_f32.clone(),
+            score_f32: self.score_f32.clone(),
+            score_plus_ape_f32: self.score_plus_ape_f32.clone(),
+        })
+    }
+}
+
+struct StrictCompressorScratch {
+    hca_cublas: cublas_exact::CublasExact,
+    csa_cublas: cublas_exact::CublasExact,
+    hca: StrictCompressorArena,
+    csa: StrictCompressorArena,
+    csa_indexer: StrictCompressorArena,
+}
+
+impl StrictCompressorScratch {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            hca_cublas: cublas_exact::CublasExact::load()?,
+            csa_cublas: cublas_exact::CublasExact::load()?,
+            hca: StrictCompressorArena::new(stream, 512, 128)?,
+            csa: StrictCompressorArena::new(stream, 1_024, 4)?,
+            csa_indexer: StrictCompressorArena::new(stream, 256, 4)?,
+        })
+    }
+
+    fn host_bytes() -> Result<usize, Box<dyn Error>> {
+        [
+            StrictCompressorArena::host_bytes_for(512, 128)?,
+            StrictCompressorArena::host_bytes_for(1_024, 4)?,
+            StrictCompressorArena::host_bytes_for(256, 4)?,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |sum, bytes| sum.checked_add(bytes))
+        .ok_or_else(|| "strict Compressor scratch host size overflow".into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_from_device(
+        &mut self,
+        stream: &CudaStream,
+        input_bf16: &[u16],
+        wkv: &DeviceBuffer<u16>,
+        wgate: &DeviceBuffer<u16>,
+        ape: &DeviceBuffer<f32>,
+        outputs: usize,
+        ratio: usize,
+        start_pos: usize,
+    ) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+        match (outputs, ratio) {
+            (512, 128) => self.hca.run_from_device(
+                &self.hca_cublas,
+                stream,
+                input_bf16,
+                wkv,
+                wgate,
+                ape,
+                outputs,
+                ratio,
+                start_pos,
+            ),
+            (1_024, 4) => self.csa.run_from_device(
+                &self.csa_cublas,
+                stream,
+                input_bf16,
+                wkv,
+                wgate,
+                ape,
+                outputs,
+                ratio,
+                start_pos,
+            ),
+            (256, 4) => self.csa_indexer.run_from_device(
+                &self.csa_cublas,
+                stream,
+                input_bf16,
+                wkv,
+                wgate,
+                ape,
+                outputs,
+                ratio,
+                start_pos,
+            ),
+            _ => Err("strict Compressor scratch received unsupported layout".into()),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_compressor_official_cublas_from_device(
+    cublas: &cublas_exact::CublasExact,
+    stream: &CudaStream,
+    input: &[u16],
+    wkv: &DeviceBuffer<u16>,
+    wgate: &DeviceBuffer<u16>,
+    ape: &DeviceBuffer<f32>,
+    outputs: usize,
+    ratio: usize,
+    start_pos: usize,
+) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    run_compressor_official_cublas_host(
+        cublas,
+        stream,
+        input,
+        &wkv.to_host_vec(stream)?,
+        &wgate.to_host_vec(stream)?,
+        &ape.to_host_vec(stream)?,
+        outputs,
+        ratio,
+        start_pos,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_compressor_official_cublas_host(
+    cublas: &cublas_exact::CublasExact,
+    stream: &CudaStream,
+    input_bf16: &[u16],
+    wkv_bf16: &[u16],
+    wgate_bf16: &[u16],
+    ape_f32: &[f32],
+    outputs: usize,
+    ratio: usize,
+    start_pos: usize,
+) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    if input_bf16.len() != v4_state::HIDDEN
+        || outputs == 0
+        || !matches!(ratio, 4 | 128)
+        || wkv_bf16.len() != outputs * v4_state::HIDDEN
+        || wgate_bf16.len() != outputs * v4_state::HIDDEN
+        || ape_f32.len() != ratio * outputs
+    {
+        return Err("official cuBLAS Compressor geometry mismatch".into());
+    }
+    let to_f32 = |values: &[u16]| {
+        values
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect::<Vec<_>>()
+    };
+    let input = DeviceBuffer::from_host(stream, &to_f32(input_bf16))?;
+    let wkv = DeviceBuffer::from_host(stream, &to_f32(wkv_bf16))?;
+    let wgate = DeviceBuffer::from_host(stream, &to_f32(wgate_bf16))?;
+    let workspace = DeviceBuffer::<u8>::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?;
+    let kv = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
+    let score = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
+    let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
+    let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
+    let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
+    cublas.sgemm_mn1(
+        stream_pointer,
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(wkv.cu_deviceptr()),
+        device_const(input.cu_deviceptr()),
+        device_mut(kv.cu_deviceptr()),
+        outputs,
+        v4_state::HIDDEN,
+    )?;
+    cublas.sgemm_mn1(
+        stream_pointer,
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(wgate.cu_deviceptr()),
+        device_const(input.cu_deviceptr()),
+        device_mut(score.cu_deviceptr()),
+        outputs,
+        v4_state::HIDDEN,
+    )?;
+    let kv_f32 = kv.to_host_vec(stream)?;
+    let score_f32 = score.to_host_vec(stream)?;
+    let score_plus_ape_f32 = score_f32
+        .iter()
+        .zip(&ape_f32[start_pos % ratio * outputs..][..outputs])
+        .map(|(&score, &ape)| score + ape)
+        .collect::<Vec<_>>();
+    if kv_f32
+        .iter()
+        .chain(&score_f32)
+        .chain(&score_plus_ape_f32)
+        .any(|value| !value.is_finite())
+    {
+        return Err("official cuBLAS L0 Compressor produced non-finite output".into());
+    }
+    Ok(v4_state::CompressorPrepared {
+        kv_f32,
+        score_f32,
+        score_plus_ape_f32,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_compressor_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    wkv: &DeviceBuffer<u16>,
+    wgate: &DeviceBuffer<u16>,
+    ape: &DeviceBuffer<f32>,
+    kv: &mut DeviceBuffer<f32>,
+    score: &mut DeviceBuffer<f32>,
+    score_plus_ape: &mut DeviceBuffer<f32>,
+    outputs: usize,
+    ratio: usize,
+    start_pos: usize,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(v4_state::HIDDEN)
+        || outputs == 0
+        || wkv.len() != outputs * v4_state::HIDDEN
+        || wgate.len() != outputs * v4_state::HIDDEN
+        || ape.len() != ratio * outputs
+        || kv.len() != input.len() / v4_state::HIDDEN * outputs
+        || score.len() != kv.len()
+        || score_plus_ape.len() != kv.len()
+    {
+        return Err("device Compressor workspace contract mismatch".into());
+    }
+    // SAFETY: the explicit layer geometry and output rows are disjoint.
+    unsafe {
+        module.compressor_v4_bf16_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(kv.len())?),
+            input,
+            wkv,
+            wgate,
+            ape,
+            kv,
+            score,
+            score_plus_ape,
+            u32::try_from(start_pos)?,
+            u32::try_from(v4_state::HIDDEN)?,
+            u32::try_from(outputs)?,
+            u32::try_from(ratio)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn l0_pos0_compressor_probe_enabled(layer: usize, start_pos: usize) -> bool {
+    layer == 0
+        && start_pos == 0
+        && std::env::var_os("COLIBRI_V4_L0_POS0_CUTPOINT").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+}
+
+fn strict_compressor_enabled() -> bool {
+    [
+        "COLIBRI_V4_FULL61_B1",
+        "COLIBRI_V4_DEVICE_TOKEN_STATE_GATE",
+        "COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE",
+    ]
+    .into_iter()
+    .any(|name| std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1")))
+}
+
+fn print_l0_pos0_compressor_probe(source: &str, kv: &[f32], score: &[f32], score_plus_ape: &[f32]) {
+    let digests = (fnv1a_f32(kv), fnv1a_f32(score), fnv1a_f32(score_plus_ape));
+    println!(
+        "COLIBRI_L0_POS0_COMPRESSOR_PRECOMMIT={}",
+        serde_json::json!({
+            "source": source,
+            "kv_f32_digest": format!("{:016x}", digests.0),
+            "score_f32_digest": format!("{:016x}", digests.1),
+            "score_plus_ape_f32_digest": format!("{:016x}", digests.2),
+        })
+    );
+}
+
+fn run_bf16_linear_f32(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weight: &DeviceBuffer<u16>,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    if input.is_empty()
+        || input.len() % in_features != 0
+        || weight.len() != in_features * out_features
+    {
+        return Err("layer BF16 projection geometry mismatch".into());
+    }
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut output = DeviceBuffer::<f32>::zeroed(stream, input.len() / in_features * out_features)?;
+    // SAFETY: one thread owns each output and scans a complete validated row.
+    unsafe {
+        module.linear_v4_bf16_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            &input,
+            weight,
+            &mut output,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+        )?;
+    }
+    Ok(output.to_host_vec(stream)?)
+}
+
+struct CsaIndexerPrepared {
+    q_f32: Vec<f32>,
+    weights_f32: Vec<f32>,
+    compressor: v4_state::CompressorPrepared,
+}
+
+fn run_csa_indexer_projections(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    attention_input: &[u16],
+    q_lora: &[u16],
+    freqs: &[f32],
+    indexer: &DeviceLayerIndexer,
+    start_pos: usize,
+    cublas: Option<&cublas_exact::CublasExact>,
+    strict_scratch: Option<&mut StrictCompressorScratch>,
+) -> Result<CsaIndexerPrepared, Box<dyn Error>> {
+    let rows = attention_input.len() / v4_state::HIDDEN;
+    if rows == 0
+        || attention_input.len() != rows * v4_state::HIDDEN
+        || q_lora.len() != rows * 1_536
+        || freqs.len() != rows * v4_state::Q_ROPE_DIM
+    {
+        return Err("CSA indexer projection input contract mismatch".into());
+    }
+    let (_, q) = run_l0_fp8_linear(module, stream, q_lora, &indexer.wq_b, true)?;
+    let q = run_rope(module, stream, &q, freqs, 64, 128, false)?;
+    let q_f32 = v4_state::rotate_fp4_sim_bf16(&q, rows * 64, 128)?;
+    let mut weights_f32 = run_bf16_linear_f32(
+        module,
+        stream,
+        attention_input,
+        &indexer.weights_proj,
+        v4_state::HIDDEN,
+        64,
+    )?;
+    let scale = 1.0_f32 / (128.0_f32 * 64.0).sqrt();
+    for weight in &mut weights_f32 {
+        *weight *= scale;
+    }
+    let compressor = if strict_compressor_enabled() {
+        if let Some(scratch) = strict_scratch {
+            scratch.run_from_device(
+                stream,
+                attention_input,
+                &indexer.compressor_wkv,
+                &indexer.compressor_wgate,
+                &indexer.compressor_ape,
+                256,
+                4,
+                start_pos,
+            )?
+        } else {
+            let owned;
+            let cublas = if let Some(cublas) = cublas {
+                cublas
+            } else {
+                owned = cublas_exact::CublasExact::load()?;
+                &owned
+            };
+            run_compressor_official_cublas_from_device(
+                cublas,
+                stream,
+                attention_input,
+                &indexer.compressor_wkv,
+                &indexer.compressor_wgate,
+                &indexer.compressor_ape,
+                256,
+                4,
+                start_pos,
+            )?
+        }
+    } else {
+        run_compressor(
+            module,
+            stream,
+            attention_input,
+            &indexer.compressor_wkv,
+            &indexer.compressor_wgate,
+            &indexer.compressor_ape,
+            256,
+            4,
+            start_pos,
+        )?
+    };
+    Ok(CsaIndexerPrepared {
+        q_f32,
+        weights_f32,
+        compressor,
+    })
+}
+
+fn run_indexer_topk_gpu(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q_f32: &[f32],
+    weights_f32: &[f32],
+    kv_bf16: &[u16],
+    rows: usize,
+    valid_keys: &[usize],
+    offset: usize,
+) -> Result<(Vec<i32>, u64), Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let keys = kv_bf16.len() / 128;
+    if rows == 0
+        || keys == 0
+        || kv_bf16.len() != keys * 128
+        || q_f32.len() != rows * 64 * 128
+        || weights_f32.len() != rows * 64
+        || valid_keys.len() != rows
+        || valid_keys.iter().any(|&valid| valid > keys)
+    {
+        return Err("CSA GPU indexer top-k input contract mismatch".into());
+    }
+    let kv_f32 = kv_bf16
+        .iter()
+        .map(|&bits| v4_router::bf16_to_f32(bits))
+        .collect::<Vec<_>>();
+    let q = DeviceBuffer::from_host(stream, q_f32)?;
+    let kv = DeviceBuffer::from_host(stream, &kv_f32)?;
+    let weights = DeviceBuffer::from_host(stream, weights_f32)?;
+    let mut scores = DeviceBuffer::<f32>::zeroed(stream, rows * keys)?;
+    // SAFETY: score geometry is fully checked and each thread owns one row/key.
+    unsafe {
+        module.indexer_scores_v4_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scores.len())?),
+            &q,
+            &kv,
+            &weights,
+            &mut scores,
+            u32::try_from(rows)?,
+            64,
+            128,
+            u32::try_from(keys)?,
+        )?;
+    }
+    let topk = keys.min(v4_state::INDEX_TOPK);
+    let valid = DeviceBuffer::from_host(
+        stream,
+        &valid_keys
+            .iter()
+            .map(|&value| u32::try_from(value))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    let mut selected = DeviceBuffer::<i32>::zeroed(stream, rows * topk)?;
+    // SAFETY: deterministic rank scans are bounded by validated score/key counts.
+    unsafe {
+        module.indexer_topk_v4_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(selected.len())?),
+            &scores,
+            &valid,
+            &mut selected,
+            u32::try_from(rows)?,
+            u32::try_from(keys)?,
+            u32::try_from(topk)?,
+            u32::try_from(offset)?,
+        )?;
+    }
+    let output = selected.to_host_vec(stream)?;
+    Ok((
+        output,
+        started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
+    ))
+}
+
+fn run_l0_sparse_attention(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &[u16],
+    kv: &[u16],
+    attn_sink: &DeviceBuffer<f32>,
+    start_pos: usize,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    if q.is_empty() || q.len() % row_width != 0 {
+        return Err("L0 sparse attention query shape mismatch".into());
+    }
+    let rows = q.len() / row_width;
+    let topk = v4_state::build_hca_sparse_topk(rows, start_pos, v4_state::KV_WINDOW, 128)?;
+    run_sparse_attention(module, stream, q, kv, attn_sink, &topk)
+}
+
+fn run_sparse_attention(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &[u16],
+    kv: &[u16],
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &v4_state::SparseTopk,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let rows = q.len() / row_width;
+    if q.is_empty()
+        || q.len() % row_width != 0
+        || topk.rows != rows
+        || topk.indices.len() != rows * topk.per_row
+        || kv.len() % v4_state::Q_HEAD_DIM != 0
+    {
+        return Err("layer sparse attention geometry mismatch".into());
+    }
+    let q = DeviceBuffer::from_host(stream, q)?;
+    let kv = DeviceBuffer::from_host(stream, kv)?;
+    let topk_device = DeviceBuffer::from_host(stream, &topk.indices)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, q.len())?;
+    run_sparse_attention_device_into(
+        module,
+        stream,
+        &q,
+        &kv,
+        attn_sink,
+        &topk_device,
+        &mut output,
+        topk.per_row,
+    )?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+fn sparse_attention_arm_from_env() -> Result<SparseAttentionArm, Box<dyn Error>> {
+    match std::env::var_os("COLIBRI_V4_SPARSE_ATTN_ARM") {
+        None => Ok(SparseAttentionArm::Sm89Crossover),
+        Some(value) if value == "reference" => Ok(SparseAttentionArm::Reference),
+        Some(value) if value == "score_reuse" => Ok(SparseAttentionArm::ScoreReuse),
+        Some(value) if value == "sm89_crossover" => Ok(SparseAttentionArm::Sm89Crossover),
+        Some(_) => Err(
+            "COLIBRI_V4_SPARSE_ATTN_ARM must be reference, score_reuse, or sm89_crossover".into(),
+        ),
+    }
+}
+
+fn run_sparse_attention_score_reuse(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &[u16],
+    kv: &[u16],
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &v4_state::SparseTopk,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let rows = q.len() / row_width;
+    if q.is_empty()
+        || q.len() % row_width != 0
+        || topk.rows != rows
+        || topk.indices.len() != rows * topk.per_row
+        || kv.len() % v4_state::Q_HEAD_DIM != 0
+    {
+        return Err("score-reuse sparse attention geometry mismatch".into());
+    }
+    let q = DeviceBuffer::from_host(stream, q)?;
+    let kv = DeviceBuffer::from_host(stream, kv)?;
+    let topk_device = DeviceBuffer::from_host(stream, &topk.indices)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, q.len())?;
+    let mut scratch = SparseAttentionScoreReuseScratch::new(stream, rows, topk.per_row)?;
+    run_sparse_attention_score_reuse_device_into(
+        module,
+        stream,
+        &q,
+        &kv,
+        attn_sink,
+        &topk_device,
+        &mut output,
+        &mut scratch,
+        topk.per_row,
+    )?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sparse_attention_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &DeviceBuffer<u16>,
+    kv: &DeviceBuffer<u16>,
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &DeviceBuffer<i32>,
+    output: &mut DeviceBuffer<u16>,
+    topk_per_row: usize,
+) -> Result<(), Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    if q.is_empty()
+        || !q.len().is_multiple_of(row_width)
+        || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
+        || topk_per_row == 0
+        || topk.len() != q.len() / row_width * topk_per_row
+        || output.len() != q.len()
+    {
+        return Err("device sparse attention workspace contract mismatch".into());
+    }
+    // SAFETY: one output thread scans only validated top-k cache indices.
+    unsafe {
+        module.sparse_attn_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            q,
+            kv,
+            attn_sink,
+            topk,
+            output,
+            u32::try_from(topk_per_row)?,
+        )?;
+    }
+    Ok(())
+}
+
+struct SparseAttentionScoreReuseScratch {
+    scores: DeviceBuffer<f32>,
+    probabilities: DeviceBuffer<f32>,
+    denominators: DeviceBuffer<f32>,
+    valid_counts: DeviceBuffer<u32>,
+}
+
+impl SparseAttentionScoreReuseScratch {
+    fn new(stream: &CudaStream, rows: usize, topk_per_row: usize) -> Result<Self, Box<dyn Error>> {
+        let score_len = rows
+            .checked_mul(v4_state::Q_HEADS)
+            .and_then(|value| value.checked_mul(topk_per_row))
+            .ok_or("sparse attention score scratch length overflow")?;
+        let head_len = rows
+            .checked_mul(v4_state::Q_HEADS)
+            .ok_or("sparse attention head scratch length overflow")?;
+        Ok(Self {
+            scores: DeviceBuffer::zeroed(stream, score_len)?,
+            probabilities: DeviceBuffer::zeroed(stream, score_len)?,
+            denominators: DeviceBuffer::zeroed(stream, head_len)?,
+            valid_counts: DeviceBuffer::zeroed(stream, head_len)?,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.scores.num_bytes()
+            + self.probabilities.num_bytes()
+            + self.denominators.num_bytes()
+            + self.valid_counts.num_bytes()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sparse_attention_reference_state_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &DeviceBuffer<u16>,
+    kv: &DeviceBuffer<u16>,
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &DeviceBuffer<i32>,
+    scratch: &mut SparseAttentionScoreReuseScratch,
+    topk_per_row: usize,
+) -> Result<(), Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let rows = q.len() / row_width;
+    let score_len = rows
+        .checked_mul(v4_state::Q_HEADS)
+        .and_then(|value| value.checked_mul(topk_per_row))
+        .ok_or("sparse attention reference-state length overflow")?;
+    let head_len = rows
+        .checked_mul(v4_state::Q_HEADS)
+        .ok_or("sparse attention reference-state head length overflow")?;
+    if q.is_empty()
+        || q.len() != rows * row_width
+        || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
+        || attn_sink.len() != v4_state::Q_HEADS
+        || topk_per_row == 0
+        || topk.len() != rows * topk_per_row
+        || scratch.scores.len() != score_len
+        || scratch.probabilities.len() != score_len
+        || scratch.denominators.len() != head_len
+        || scratch.valid_counts.len() != head_len
+    {
+        return Err("reference-state sparse attention workspace contract mismatch".into());
+    }
+    // SAFETY: this probe is scalar-equivalent instrumentation: one head
+    // preserves both score scans and all original floating-point orders.
+    unsafe {
+        module.sparse_attn_v4_reference_state(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(head_len)?),
+            q,
+            kv,
+            attn_sink,
+            topk,
+            &mut scratch.scores,
+            &mut scratch.probabilities,
+            &mut scratch.denominators,
+            &mut scratch.valid_counts,
+            u32::try_from(topk_per_row)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sparse_attention_score_reuse_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q: &DeviceBuffer<u16>,
+    kv: &DeviceBuffer<u16>,
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &DeviceBuffer<i32>,
+    output: &mut DeviceBuffer<u16>,
+    scratch: &mut SparseAttentionScoreReuseScratch,
+    topk_per_row: usize,
+) -> Result<(), Box<dyn Error>> {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let rows = q.len() / row_width;
+    let score_len = rows
+        .checked_mul(v4_state::Q_HEADS)
+        .and_then(|value| value.checked_mul(topk_per_row))
+        .ok_or("sparse attention score launch length overflow")?;
+    let head_len = rows
+        .checked_mul(v4_state::Q_HEADS)
+        .ok_or("sparse attention probability launch length overflow")?;
+    if q.is_empty()
+        || q.len() != rows * row_width
+        || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
+        || topk_per_row == 0
+        || topk.len() != rows * topk_per_row
+        || output.len() != q.len()
+        || scratch.scores.len() != score_len
+        || scratch.probabilities.len() != score_len
+        || scratch.denominators.len() != head_len
+        || scratch.valid_counts.len() != head_len
+    {
+        return Err("score-reuse sparse attention workspace contract mismatch".into());
+    }
+    // SAFETY: each phase has a disjoint output; the next phase consumes the
+    // preceding phase in the same stream, preserving the scalar reference's
+    // score, max, probability, denominator, and numerator orders.
+    unsafe {
+        module.sparse_attn_v4_scores(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(score_len)?),
+            q,
+            kv,
+            topk,
+            &mut scratch.scores,
+            u32::try_from(topk_per_row)?,
+        )?;
+        module.sparse_attn_v4_probabilities(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(head_len)?),
+            &scratch.scores,
+            kv,
+            attn_sink,
+            topk,
+            &mut scratch.probabilities,
+            &mut scratch.denominators,
+            &mut scratch.valid_counts,
+            u32::try_from(topk_per_row)?,
+        )?;
+        module.sparse_attn_v4_values(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            kv,
+            topk,
+            &scratch.probabilities,
+            &scratch.denominators,
+            &scratch.valid_counts,
+            output,
+            u32::try_from(topk_per_row)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_wo_a_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    weight: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    let input_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let output_width = v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    if input.is_empty()
+        || !input.len().is_multiple_of(input_width)
+        || output.len() != input.len() / input_width * output_width
+    {
+        return Err("device wo_a workspace contract mismatch".into());
+    }
+    // SAFETY: resident grouped matrix and fixed row widths were checked.
+    unsafe {
+        module.wo_a_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            input,
+            weight,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_wo_a(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weight: &DeviceBuffer<u16>,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let input_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let output_width = v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    if input.is_empty() || input.len() % input_width != 0 {
+        return Err("L0 wo_a input shape mismatch".into());
+    }
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len() / input_width * output_width)?;
+    run_l0_wo_a_device_into(module, stream, &input, weight, &mut output)?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_l0_hc_post_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    branch: &DeviceBuffer<u16>,
+    residual: &DeviceBuffer<u16>,
+    post: &DeviceBuffer<f32>,
+    comb: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    if branch.is_empty()
+        || !branch.len().is_multiple_of(v4_state::HIDDEN)
+        || residual.len() != branch.len() * v4_state::HC
+        || post.len() != branch.len() / v4_state::HIDDEN * v4_state::HC
+        || comb.len() != post.len() * v4_state::HC
+        || output.len() != residual.len()
+    {
+        return Err("device HC post workspace contract mismatch".into());
+    }
+    // SAFETY: complete row/HC shapes prove unique output ownership.
+    unsafe {
+        module.hc_post_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            branch,
+            residual,
+            post,
+            comb,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_l0_hc_post(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    branch: &[u16],
+    residual: &[u16],
+    post: &[f32],
+    comb: &[f32],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    if branch.is_empty()
+        || branch.len() % v4_state::HIDDEN != 0
+        || residual.len() != branch.len() * v4_state::HC
+    {
+        return Err("L0 HC post shape mismatch".into());
+    }
+    let branch = DeviceBuffer::from_host(stream, branch)?;
+    let residual = DeviceBuffer::from_host(stream, residual)?;
+    let post = DeviceBuffer::from_host(stream, post)?;
+    let comb = DeviceBuffer::from_host(stream, comb)?;
+    let mut output = DeviceBuffer::<u16>::zeroed(stream, residual.len())?;
+    run_l0_hc_post_device_into(
+        module,
+        stream,
+        &branch,
+        &residual,
+        &post,
+        &comb,
+        &mut output,
+    )?;
+    Ok(output.to_host_vec(stream)?)
+}
+
+fn run_layer_router(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weights: &LayerDeviceWeights,
+    hash_ids: &[i64],
+) -> Result<LayerRouterRun, Box<dyn Error>> {
+    if input.is_empty() || !input.len().is_multiple_of(v4_state::HIDDEN) {
+        return Err("layer router host input mismatch".into());
+    }
+    let rows = input.len() / v4_state::HIDDEN;
+    if (weights.hash_router && hash_ids.len() != rows * v4_router::V4_TOPK)
+        || (!weights.hash_router && !hash_ids.is_empty())
+    {
+        return Err("layer router mode/input mismatch".into());
+    }
+    let profile = bench_telemetry_enabled();
+    let mut telemetry = RouterTelemetry::default();
+    let alloc_h2d_started = std::time::Instant::now();
+    let input = DeviceBuffer::from_host(stream, input)?;
+    let hash_ids_device = DeviceBuffer::from_host(stream, hash_ids)?;
+    if profile {
+        telemetry.alloc_h2d_sync_ns =
+            u64::try_from(alloc_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let workspace_alloc_started = std::time::Instant::now();
+    let mut normalized_device = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
+    let mut logits = DeviceBuffer::<f32>::zeroed(stream, rows * v4_router::V4_ROUTED_EXPERTS)?;
+    let mut ids = DeviceBuffer::<i32>::zeroed(stream, rows * v4_router::V4_TOPK)?;
+    let mut route_weights = DeviceBuffer::<f32>::zeroed(stream, rows * v4_router::V4_TOPK)?;
+    if profile {
+        telemetry.workspace_alloc_ns =
+            u64::try_from(workspace_alloc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let kernel_select_started = std::time::Instant::now();
+    let events = profile
+        .then(|| {
+            Ok::<_, Box<dyn Error>>((
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                input
+                    .context()
+                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+            ))
+        })
+        .transpose()?;
+    if let Some((start, _)) = events.as_ref() {
+        start.record(stream)?;
+    }
+    run_layer_router_device_into(
+        module,
+        stream,
+        &input,
+        weights,
+        &hash_ids_device,
+        &mut normalized_device,
+        &mut logits,
+        &mut ids,
+        &mut route_weights,
+    )?;
+    if let Some((start, end)) = events.as_ref() {
+        end.record(stream)?;
+        end.synchronize()?;
+        telemetry.kernel_select_gpu_ns = (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+        telemetry.kernel_select_sync_ns =
+            u64::try_from(kernel_select_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let d2h_started = std::time::Instant::now();
+    let normalized = normalized_device.to_host_vec(stream)?;
+    let routes = v4_router::RouterSelection {
+        ids: ids.to_host_vec(stream)?,
+        weights: route_weights.to_host_vec(stream)?,
+    };
+    if profile {
+        telemetry.d2h_sync_ns = u64::try_from(d2h_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    Ok(LayerRouterRun {
+        input: normalized,
+        routes,
+        telemetry,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_layer_router_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    weights: &LayerDeviceWeights,
+    hash_ids: &DeviceBuffer<i64>,
+    normalized: &mut DeviceBuffer<u16>,
+    logits: &mut DeviceBuffer<f32>,
+    ids: &mut DeviceBuffer<i32>,
+    route_weights: &mut DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty() || !input.len().is_multiple_of(v4_state::HIDDEN) {
+        return Err("device router input contract mismatch".into());
+    }
+    let rows = input.len() / v4_state::HIDDEN;
+    if normalized.len() != input.len()
+        || logits.len() != rows * v4_router::V4_ROUTED_EXPERTS
+        || ids.len() != rows * v4_router::V4_TOPK
+        || route_weights.len() != ids.len()
+        || (weights.hash_router && hash_ids.len() != ids.len())
+        || (!weights.hash_router && !hash_ids.is_empty())
+    {
+        return Err("device router workspace contract mismatch".into());
+    }
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        input,
+        &weights.ffn_norm,
+        normalized,
+        v4_state::HIDDEN,
+    )?;
+    let launch = LaunchConfig::for_num_elems(u32::try_from(rows)?);
+    // SAFETY: the fixed gate matrix and selected router mode satisfy both kernels.
+    unsafe {
+        module.gate_logits_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(logits.len())?),
+            normalized,
+            &weights.gate,
+            logits,
+        )?;
+        module.select_v4_router(
+            stream,
+            launch,
+            logits,
+            &weights.router_bias,
+            hash_ids,
+            ids,
+            route_weights,
+            u32::from(weights.hash_router),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_layer_shared_expert(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weights: &LayerDeviceWeights,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let (_, gate) = run_l0_fp8_linear(module, stream, input, &weights.shared_w1, false)?;
+    let (_, up) = run_l0_fp8_linear(module, stream, input, &weights.shared_w3, false)?;
+    let gate = DeviceBuffer::from_host(stream, &gate)?;
+    let up = DeviceBuffer::from_host(stream, &up)?;
+    let mut activated = DeviceBuffer::<u16>::zeroed(stream, gate.len())?;
+    launch_v4_swiglu_route(module, stream, &gate, &up, &mut activated, 1.0)?;
+    let activated = activated.to_host_vec(stream)?;
+    let (_, output) = run_l0_fp8_linear(module, stream, &activated, &weights.shared_w2, false)?;
+    Ok(output.into_iter().map(v4_router::bf16_to_f32).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_layer_attention_state(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    weights: &LayerDeviceWeights,
+    state: &mut v4_state::V4LayerPersistentState,
+    kv: &[u16],
+    compressor: &v4_state::CompressorPrepared,
+    indexer: Option<&CsaIndexerPrepared>,
+    start_pos: usize,
+) -> Result<(v4_state::SparseTopk, u64), Box<dyn Error>> {
+    let rows = kv.len() / v4_state::Q_HEAD_DIM;
+    let compressor_width = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+        1_024
+    } else {
+        v4_state::Q_HEAD_DIM
+    };
+    if rows == 0
+        || kv.len() != rows * v4_state::Q_HEAD_DIM
+        || compressor.kv_f32.len() != rows * compressor_width
+        || compressor.score_f32.len() != rows * compressor_width
+        || compressor.score_plus_ape_f32.len() != rows * compressor_width
+        || (weights.compression_ratio == v4_state::CompressionRatio::Csa4) != indexer.is_some()
+    {
+        return Err(format!(
+            "layer {} attention state input contract mismatch",
+            weights.layer
+        )
+        .into());
+    }
+    let ratio = weights.compression_ratio.get();
+    for row in 0..rows {
+        let absolute = start_pos + row;
+        state.append_kv_row(
+            absolute,
+            &kv[row * v4_state::Q_HEAD_DIM..(row + 1) * v4_state::Q_HEAD_DIM],
+        )?;
+        let main_range = row * compressor_width..(row + 1) * compressor_width;
+        let main_pool = state.commit_compressor_row_and_pool(
+            absolute,
+            &v4_state::CompressorPrepared {
+                kv_f32: compressor.kv_f32[main_range.clone()].to_vec(),
+                score_f32: compressor.score_f32[main_range.clone()].to_vec(),
+                score_plus_ape_f32: compressor.score_plus_ape_f32[main_range].to_vec(),
+            },
+        )?;
+        let index_pool = if let Some(indexer) = indexer {
+            let range = row * 256..(row + 1) * 256;
+            state.commit_indexer_row_and_pool(
+                absolute,
+                &v4_state::CompressorPrepared {
+                    kv_f32: indexer.compressor.kv_f32[range.clone()].to_vec(),
+                    score_f32: indexer.compressor.score_f32[range.clone()].to_vec(),
+                    score_plus_ape_f32: indexer.compressor.score_plus_ape_f32[range].to_vec(),
+                },
+            )?
+        } else {
+            None
+        };
+        match (main_pool, index_pool) {
+            (None, None) => {}
+            (Some(main), None)
+                if weights.compression_ratio == v4_state::CompressionRatio::Hca128 =>
+            {
+                let main = main
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let main = run_l0_rmsnorm(
+                    module,
+                    stream,
+                    &main,
+                    &weights.compressor_norm,
+                    v4_state::Q_HEAD_DIM,
+                )?;
+                let position = absolute + 1 - ratio;
+                let main = run_l0_rope(
+                    module,
+                    stream,
+                    &main,
+                    &v4_state::compressed_rope_freqs(position),
+                    1,
+                    false,
+                )?;
+                let main = run_l0_kv_quantize(module, stream, &main)?;
+                state.append_compressed_kv_row(absolute / ratio, &main)?;
+            }
+            (Some(main), Some(index))
+                if weights.compression_ratio == v4_state::CompressionRatio::Csa4 =>
+            {
+                let indexer_weights = weights
+                    .indexer
+                    .as_ref()
+                    .ok_or("CSA indexer device weights disappeared")?;
+                let position = absolute + 1 - ratio;
+                let freqs = v4_state::compressed_rope_freqs(position);
+                let main = main
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let main = run_l0_rmsnorm(
+                    module,
+                    stream,
+                    &main,
+                    &weights.compressor_norm,
+                    v4_state::Q_HEAD_DIM,
+                )?;
+                let main = run_l0_rope(module, stream, &main, &freqs, 1, false)?;
+                let main = run_l0_kv_quantize(module, stream, &main)?;
+                state.append_compressed_kv_row(absolute / ratio, &main)?;
+
+                let index = index
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let index = run_l0_rmsnorm(
+                    module,
+                    stream,
+                    &index,
+                    &indexer_weights.compressor_norm,
+                    128,
+                )?;
+                let index = run_rope(module, stream, &index, &freqs, 1, 128, false)?;
+                let index = v4_state::rotate_fp4_sim_bf16(&index, 1, 128)?
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                state.append_indexer_kv_row(absolute / ratio, &index)?;
+            }
+            _ => {
+                return Err(format!(
+                    "layer {} compressor/indexer boundary commit diverged",
+                    weights.layer
+                )
+                .into());
+            }
+        }
+    }
+
+    if weights.compression_ratio == v4_state::CompressionRatio::Hca128 {
+        return Ok((
+            v4_state::build_hca_sparse_topk(rows, start_pos, v4_state::KV_WINDOW, ratio)?,
+            0,
+        ));
+    }
+    let (window, window_per_row) = v4_state::window_topk_cpu(rows, start_pos, v4_state::KV_WINDOW)?;
+    let keys = state.indexer_kv_bf16().len() / 128;
+    if keys == 0 {
+        return Ok((
+            v4_state::SparseTopk {
+                indices: window,
+                rows,
+                per_row: window_per_row,
+                window_per_row,
+                compressed_per_row: 0,
+            },
+            0,
+        ));
+    }
+    let indexer = indexer.ok_or("CSA indexer projection result disappeared")?;
+    let valid_keys = (0..rows)
+        .map(|row| (start_pos + row + 1) / ratio)
+        .collect::<Vec<_>>();
+    let (compressed, indexer_topk_gpu_ns) = run_indexer_topk_gpu(
+        module,
+        stream,
+        &indexer.q_f32,
+        &indexer.weights_f32,
+        state.indexer_kv_bf16(),
+        rows,
+        &valid_keys,
+        v4_state::KV_WINDOW,
+    )?;
+    let compressed_per_row = compressed.len() / rows;
+    let mut indices = Vec::with_capacity(rows * (window_per_row + compressed_per_row));
+    for row in 0..rows {
+        indices.extend_from_slice(&window[row * window_per_row..(row + 1) * window_per_row]);
+        indices.extend_from_slice(
+            &compressed[row * compressed_per_row..(row + 1) * compressed_per_row],
+        );
+    }
+    Ok((
+        v4_state::SparseTopk {
+            indices,
+            rows,
+            per_row: window_per_row + compressed_per_row,
+            window_per_row,
+            compressed_per_row,
+        },
+        indexer_topk_gpu_ns,
+    ))
+}
+
+#[derive(Default)]
+struct LayerStageTelemetry {
+    layer_prepare_ns: u64,
+    layer_prepare_count: usize,
+    attention_ns: u64,
+    device_state_setup_ns: u64,
+    device_state_setup_count: usize,
+    device_state_reset_cuda_ns: u64,
+    device_state_reset_calls: usize,
+    attention_audit_oracle_ns: u64,
+    attention_hidden_h2d_count: usize,
+    attention_hidden_h2d_bytes: usize,
+    attention_rope_lut_d2d_count: usize,
+    attention_rope_lut_d2d_bytes: usize,
+    attention_terminal_d2h_count: usize,
+    attention_terminal_d2h_bytes: usize,
+    attention_intermediate_or_audit_d2h_count: usize,
+    attention_intermediate_or_audit_d2h_bytes: usize,
+    attention_steady_device_temporary_alloc_count: usize,
+    router_ns: u64,
+    router_mhc_ns: u64,
+    router_mhc_input_alloc_h2d_sync_ns: u64,
+    router_mhc_workspace_alloc_sync_ns: u64,
+    router_mhc_workspace_init_gpu_ns: u64,
+    router_mhc_mixing_linear_sync_ns: u64,
+    router_mhc_mixing_linear_gpu_ns: u64,
+    router_mhc_sinkhorn_normalize_collapse_sync_ns: u64,
+    router_mhc_sinkhorn_normalize_collapse_gpu_ns: u64,
+    router_mhc_output_d2h_sync_ns: u64,
+    router_mhc_other_ns: u64,
+    router_host_prep_ns: u64,
+    router_alloc_h2d_sync_ns: u64,
+    router_workspace_alloc_ns: u64,
+    router_kernel_select_sync_ns: u64,
+    router_kernel_select_gpu_ns: u64,
+    router_d2h_sync_ns: u64,
+    router_other_ns: u64,
+    shared_ns: u64,
+    routed_ns: u64,
+    routed_read_ns: u64,
+    routed_alloc_ns: u64,
+    routed_setup_ns: u64,
+    routed_h2d_ns: u64,
+    routed_kernel_ns: u64,
+    commit_ns: u64,
+    routed_source_bytes: usize,
+    routed_h2d_bytes: usize,
+    routed_expert_loads: usize,
+    routed_parallel_batch_wall_ns: Option<u64>,
+    routed_parallel_read_horizon_ns: Option<u64>,
+}
+
+impl LayerStageTelemetry {
+    fn router_accounted_ns(&self) -> u64 {
+        self.router_mhc_ns
+            .saturating_add(self.router_host_prep_ns)
+            .saturating_add(self.router_alloc_h2d_sync_ns)
+            .saturating_add(self.router_workspace_alloc_ns)
+            .saturating_add(self.router_kernel_select_sync_ns)
+            .saturating_add(self.router_d2h_sync_ns)
+            .saturating_add(self.router_other_ns)
+    }
+}
+
+fn stationary_layer_phase_profile_json(
+    request_start_ns: u64,
+    request_end_ns: u64,
+    fixed: Option<&FixedLoadTelemetry>,
+    stage: &LayerStageTelemetry,
+    indexer_topk_gpu_ns: u64,
+    routed_parallel: bool,
+) -> Result<(serde_json::Value, u64, u64), Box<dyn Error>> {
+    if request_end_ns < request_start_ns {
+        return Err("stationary phase profile layer span is not monotonic".into());
+    }
+    let fixed_wall_ns = fixed.map_or(0, |fixed| {
+        fixed
+            .fixed_read_alloc_ns
+            .saturating_add(fixed.fixed_decode_ns)
+            .saturating_add(fixed.fixed_h2d_ns)
+    });
+    if stage.layer_prepare_count > 1
+        || (stage.layer_prepare_count == 0 && stage.layer_prepare_ns != 0)
+        || (stage.layer_prepare_count == 1 && fixed_wall_ns > stage.layer_prepare_ns)
+    {
+        return Err("stationary layer-prepare accounting is invalid".into());
+    }
+    let attention_wall_ns = stage
+        .device_state_setup_ns
+        .saturating_add(stage.attention_ns)
+        .saturating_add(stage.commit_ns)
+        .saturating_add(stage.attention_audit_oracle_ns);
+    let top_level_attributed_ns = stage
+        .layer_prepare_ns
+        .saturating_add(attention_wall_ns)
+        .saturating_add(stage.router_ns)
+        .saturating_add(stage.shared_ns)
+        .saturating_add(stage.routed_ns);
+    let outer_wall_ns = request_end_ns - request_start_ns;
+    if top_level_attributed_ns > outer_wall_ns {
+        return Err("stationary phase profile top-level scopes exceed layer outer span".into());
+    }
+    let routed_wall_diagnostics = [
+        stage.routed_read_ns,
+        stage.routed_alloc_ns,
+        stage.routed_setup_ns,
+    ];
+    if routed_wall_diagnostics
+        .iter()
+        .any(|&diagnostic| diagnostic > stage.routed_ns)
+    {
+        return Err("stationary routed diagnostic exceeds its opaque parent scope".into());
+    }
+    if !routed_parallel
+        && (stage.routed_h2d_ns > stage.routed_ns || stage.routed_kernel_ns > stage.routed_ns)
+    {
+        return Err("stationary routed diagnostic exceeds its opaque parent scope".into());
+    }
+    if stage.router_mhc_ns > stage.router_ns
+        || stage.router_host_prep_ns > stage.router_ns
+        || stage.router_alloc_h2d_sync_ns > stage.router_ns
+        || stage.router_workspace_alloc_ns > stage.router_ns
+        || stage.router_kernel_select_sync_ns > stage.router_ns
+        || stage.router_d2h_sync_ns > stage.router_ns
+        || stage.router_other_ns > stage.router_ns
+        || indexer_topk_gpu_ns > attention_wall_ns
+    {
+        return Err("stationary nested diagnostic exceeds its parent scope".into());
+    }
+    let fixed_load = fixed.map(|fixed| {
+        serde_json::json!({
+            "wall_ns": fixed_wall_ns,
+            "cache_status": fixed.cache_status,
+            "read_alloc_ns": fixed.fixed_read_alloc_ns,
+            "decode_ns": fixed.fixed_decode_ns,
+            "h2d_ns": fixed.fixed_h2d_ns,
+            "source_bytes": fixed.fixed_source_bytes,
+            "h2d_bytes": fixed.fixed_h2d_bytes,
+            "raw_read_ns": fixed.raw_read_ns,
+            "raw_source_bytes": fixed.raw_source_bytes,
+            "raw_h2d_ns": fixed.raw_h2d_ns,
+            "raw_h2d_bytes": fixed.raw_h2d_bytes,
+        })
+    });
+    let layer_prepare = (stage.layer_prepare_count == 1).then(|| {
+        serde_json::json!({
+            "wall_ns": stage.layer_prepare_ns,
+            "count": stage.layer_prepare_count,
+            "scope": "main-thread current-layer consume/load through fixed device runtime and hash IDs ready; prefetch worker work is not additive, while any consume wait is included",
+            "fixed_load": fixed_load,
+        })
+    });
+    let routed = if routed_parallel {
+        let batch_wall_ns = stage
+            .routed_parallel_batch_wall_ns
+            .ok_or("parallel routed profile is missing batch wall time")?;
+        let read_completion_horizon_ns = stage
+            .routed_parallel_read_horizon_ns
+            .ok_or("parallel routed profile is missing read completion horizon")?;
+        if stage.routed_read_ns != read_completion_horizon_ns
+            || read_completion_horizon_ns > batch_wall_ns
+            || batch_wall_ns > stage.routed_ns
+        {
+            return Err("parallel routed wall accounting is invalid".into());
+        }
+        serde_json::json!({
+            "wall_ns": stage.routed_ns,
+            "parallel_lanes": {
+                "lane_count": V4_QD4_LANES,
+                "route_job_count": v4_router::V4_TOPK,
+                "batch_wall_ns": batch_wall_ns,
+                "read_completion_horizon_ns": read_completion_horizon_ns,
+                "h2d_event_work_sum_ns": stage.routed_h2d_ns,
+                "kernel_event_work_sum_ns": stage.routed_kernel_ns,
+            },
+            "diagnostics": {
+                "alloc_ns": stage.routed_alloc_ns,
+                "setup_ns": stage.routed_setup_ns,
+                "source_bytes": stage.routed_source_bytes,
+                "h2d_bytes": stage.routed_h2d_bytes,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "wall_ns": stage.routed_ns,
+            "diagnostics": {
+                "read_ns": stage.routed_read_ns,
+                "alloc_ns": stage.routed_alloc_ns,
+                "setup_ns": stage.routed_setup_ns,
+                "h2d_ns": stage.routed_h2d_ns,
+                "kernel_ns": stage.routed_kernel_ns,
+                "source_bytes": stage.routed_source_bytes,
+                "h2d_bytes": stage.routed_h2d_bytes,
+            },
+        })
+    };
+    Ok((
+        serde_json::json!({
+            "schema": "colibri-v4-stationary-phase-profile-v4",
+            "clock": "monotonic_host_ns; nested CUDA event durations are diagnostics only",
+            "outer": {
+                "request_start_ns": request_start_ns,
+                "request_end_ns": request_end_ns,
+                "wall_ns": outer_wall_ns,
+            },
+            "top_level": {
+                "layer_prepare": layer_prepare,
+                "attention": {
+                    "wall_ns": attention_wall_ns,
+                    "execution_ns": stage.attention_ns,
+                    "state_commit_ns": stage.commit_ns,
+                    "audit_oracle_ns": stage.attention_audit_oracle_ns,
+                    "device_state_setup": {
+                        "wall_ns": stage.device_state_setup_ns,
+                        "count": stage.device_state_setup_count,
+                        "state_reset": {
+                            "cuda_event_ns": stage.device_state_reset_cuda_ns,
+                            "calls": stage.device_state_reset_calls,
+                        },
+                    },
+                    "transfers": {
+                        "hidden_h2d": {
+                            "count": stage.attention_hidden_h2d_count,
+                            "bytes": stage.attention_hidden_h2d_bytes,
+                        },
+                        "request_rope_lut_d2d": {
+                            "scope": "only request-global RoPE LUT row copies; internal attention/cache D2D is not claimed",
+                            "count": stage.attention_rope_lut_d2d_count,
+                            "bytes": stage.attention_rope_lut_d2d_bytes,
+                        },
+                        "terminal_after_attention_d2h": {
+                            "count": stage.attention_terminal_d2h_count,
+                            "bytes": stage.attention_terminal_d2h_bytes,
+                        },
+                        "intermediate_or_audit_d2h": {
+                            "count": stage.attention_intermediate_or_audit_d2h_count,
+                            "bytes": stage.attention_intermediate_or_audit_d2h_bytes,
+                        },
+                    },
+                    "temporary": {
+                        "steady_device_alloc_count": stage.attention_steady_device_temporary_alloc_count,
+                    },
+                    "diagnostics": {"indexer_topk_gpu_ns": indexer_topk_gpu_ns},
+                },
+                "router": {
+                    "wall_ns": stage.router_ns,
+                    "diagnostics": {
+                        "mhc_wall_ns": stage.router_mhc_ns,
+                        "mhc_input_alloc_h2d_sync_ns": stage.router_mhc_input_alloc_h2d_sync_ns,
+                        "mhc_workspace_alloc_sync_ns": stage.router_mhc_workspace_alloc_sync_ns,
+                        "mhc_workspace_init_gpu_ns": stage.router_mhc_workspace_init_gpu_ns,
+                        "mhc_mixing_linear_sync_ns": stage.router_mhc_mixing_linear_sync_ns,
+                        "mhc_mixing_linear_gpu_ns": stage.router_mhc_mixing_linear_gpu_ns,
+                        "mhc_sinkhorn_normalize_collapse_sync_ns": stage.router_mhc_sinkhorn_normalize_collapse_sync_ns,
+                        "mhc_sinkhorn_normalize_collapse_gpu_ns": stage.router_mhc_sinkhorn_normalize_collapse_gpu_ns,
+                        "mhc_output_d2h_sync_ns": stage.router_mhc_output_d2h_sync_ns,
+                        "mhc_other_ns": stage.router_mhc_other_ns,
+                        "host_prep_ns": stage.router_host_prep_ns,
+                        "alloc_h2d_sync_ns": stage.router_alloc_h2d_sync_ns,
+                        "workspace_alloc_ns": stage.router_workspace_alloc_ns,
+                        "kernel_select_sync_ns": stage.router_kernel_select_sync_ns,
+                        "kernel_select_gpu_ns": stage.router_kernel_select_gpu_ns,
+                        "d2h_sync_ns": stage.router_d2h_sync_ns,
+                        "other_ns": stage.router_other_ns,
+                    },
+                },
+                "shared": {"wall_ns": stage.shared_ns},
+                "routed": routed,
+            },
+            "top_level_attributed_ns": top_level_attributed_ns,
+            "unattributed_gap_ns": outer_wall_ns - top_level_attributed_ns,
+            "closure": {
+                "equation": "top_level_attributed_ns + unattributed_gap_ns == outer.wall_ns",
+                "exact": true,
+            },
+        }),
+        top_level_attributed_ns,
+        outer_wall_ns,
+    ))
+}
+
+fn stationary_phase_profile_outer_accounting(
+    layer_outer_ns: u64,
+    final_outer_ns: u64,
+    request_e2e_ns: u64,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let profiled_outer_ns = layer_outer_ns.saturating_add(final_outer_ns);
+    if profiled_outer_ns > request_e2e_ns {
+        return Err("stationary phase profile outer scopes exceed request E2E".into());
+    }
+    Ok((profiled_outer_ns, request_e2e_ns - profiled_outer_ns))
+}
+
+fn stationary_one_token_phase_profile_outer_accounting(
+    prefill_layer_outer_ns: u64,
+    prefill_final_outer_ns: u64,
+    decode_layer_outer_ns: u64,
+    decode_final_outer_ns: u64,
+    request_e2e_ns: u64,
+) -> Result<(u64, u64, u64, u64), Box<dyn Error>> {
+    let prefill_outer_ns = prefill_layer_outer_ns
+        .checked_add(prefill_final_outer_ns)
+        .ok_or("one-token phase profile prefill outer overflow")?;
+    let decode_outer_ns = decode_layer_outer_ns
+        .checked_add(decode_final_outer_ns)
+        .ok_or("one-token phase profile decode outer overflow")?;
+    let profiled_outer_ns = prefill_outer_ns
+        .checked_add(decode_outer_ns)
+        .ok_or("one-token phase profile request outer overflow")?;
+    if profiled_outer_ns > request_e2e_ns {
+        return Err("one-token phase profile outer scopes exceed request E2E".into());
+    }
+    Ok((
+        prefill_outer_ns,
+        decode_outer_ns,
+        profiled_outer_ns,
+        request_e2e_ns - profiled_outer_ns,
+    ))
+}
+
+fn stationary_final_phase_profile_json(
+    request_start_ns: u64,
+    request_end_ns: u64,
+    fixed_read_ns: u64,
+    cpu_wall_ns: u64,
+    cpu_streamed_weight_read_ns: u64,
+    routed_parallel: bool,
+) -> Result<(serde_json::Value, u64), Box<dyn Error>> {
+    if request_end_ns < request_start_ns {
+        return Err("stationary phase profile final span is not monotonic".into());
+    }
+    let outer_wall_ns = request_end_ns - request_start_ns;
+    let top_level_attributed_ns = fixed_read_ns.saturating_add(cpu_wall_ns);
+    if top_level_attributed_ns > outer_wall_ns || cpu_streamed_weight_read_ns > cpu_wall_ns {
+        return Err("stationary phase profile final accounting is invalid".into());
+    }
+    Ok((
+        serde_json::json!({
+            "schema": "colibri-v4-stationary-phase-profile-v3",
+            "clock": "monotonic_host_ns; streamed weight read is nested in cpu wall",
+            "routed_parallel": routed_parallel,
+            "outer": {
+                "request_start_ns": request_start_ns,
+                "request_end_ns": request_end_ns,
+                "wall_ns": outer_wall_ns,
+            },
+            "top_level": {
+                "fixed": {"wall_ns": fixed_read_ns},
+                "cpu_final": {
+                    "wall_ns": cpu_wall_ns,
+                    "diagnostics": {"streamed_weight_read_ns": cpu_streamed_weight_read_ns},
+                },
+            },
+            "top_level_attributed_ns": top_level_attributed_ns,
+            "unattributed_gap_ns": outer_wall_ns - top_level_attributed_ns,
+            "closure": {
+                "equation": "top_level_attributed_ns + unattributed_gap_ns == outer.wall_ns",
+                "exact": true,
+            },
+        }),
+        top_level_attributed_ns,
+    ))
+}
+
+#[derive(Default)]
+struct RouterTelemetry {
+    alloc_h2d_sync_ns: u64,
+    workspace_alloc_ns: u64,
+    kernel_select_sync_ns: u64,
+    kernel_select_gpu_ns: u64,
+    d2h_sync_ns: u64,
+}
+
+struct LayerRouterRun {
+    input: Vec<u16>,
+    routes: v4_router::RouterSelection,
+    telemetry: RouterTelemetry,
+}
+
+struct RealLayerRun {
+    output: Vec<u16>,
+    attention_output: Vec<u16>,
+    routes: v4_router::RouterSelection,
+    attention_topk: Option<Vec<i32>>,
+    attention_topk_digest: u64,
+    attention_topk_per_row: usize,
+    device_transfer: Option<DeviceAttentionTransfer>,
+    indexer_topk_gpu_ns: u64,
+    stage: LayerStageTelemetry,
+    critical_path_timeline: Option<CriticalPathTimeline>,
+    routed_audit: Option<RoutedExecutionAudit>,
+}
+
+/// Gate-only routed values. The production path leaves this absent so it does
+/// not retain six expert outputs after canonical reduction.
+struct RoutedExecutionAudit {
+    after_attention_digest: u64,
+    ffn_input_digest: u64,
+    shared_digest: u64,
+    moe_digest: u64,
+    contributions: Vec<Vec<f32>>,
+}
+
+struct CriticalPathTimeline {
+    origin: std::time::Instant,
+    fixed_ready_ns: u64,
+    attention_start_ns: u64,
+    attention_end_ns: u64,
+    router_start_ns: u64,
+    router_end_ns: u64,
+    shared_start_ns: u64,
+    shared_end_ns: u64,
+    routed_start_ns: u64,
+    routed_end_ns: u64,
+    hc_post_start_ns: u64,
+    hc_post_end_ns: u64,
+    output_ready_ns: u64,
+    attention_commit_ns: u64,
+    routed: Option<RoutedQd4Timeline>,
+}
+
+impl CriticalPathTimeline {
+    fn new(origin: std::time::Instant) -> Self {
+        let fixed_ready_ns = timeline_elapsed_ns(origin);
+        Self {
+            origin,
+            fixed_ready_ns,
+            attention_start_ns: fixed_ready_ns,
+            attention_end_ns: fixed_ready_ns,
+            router_start_ns: fixed_ready_ns,
+            router_end_ns: fixed_ready_ns,
+            shared_start_ns: fixed_ready_ns,
+            shared_end_ns: fixed_ready_ns,
+            routed_start_ns: fixed_ready_ns,
+            routed_end_ns: fixed_ready_ns,
+            hc_post_start_ns: fixed_ready_ns,
+            hc_post_end_ns: fixed_ready_ns,
+            output_ready_ns: fixed_ready_ns,
+            attention_commit_ns: 0,
+            routed: None,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        timeline_elapsed_ns(self.origin)
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "clock": "monotonic_host_ns; CUDA event durations are nested diagnostics, not cross-stream timestamps",
+            "fixed_ready_ns": self.fixed_ready_ns,
+            "attention": {"start_ns": self.attention_start_ns, "end_ns": self.attention_end_ns, "state_commit_ns": self.attention_commit_ns},
+            "router": {"start_ns": self.router_start_ns, "end_ns": self.router_end_ns},
+            "shared": {"start_ns": self.shared_start_ns, "end_ns": self.shared_end_ns},
+            "routed": self.routed.as_ref().map(RoutedQd4Timeline::as_json),
+            "routed_scope": {"start_ns": self.routed_start_ns, "end_ns": self.routed_end_ns},
+            "hc_post": {"start_ns": self.hc_post_start_ns, "end_ns": self.hc_post_end_ns},
+            "output_ready_ns": self.output_ready_ns,
+        })
+    }
+}
+
+fn timeline_elapsed_ns(origin: std::time::Instant) -> u64 {
+    u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+struct RealAttentionRun {
+    output: Vec<u16>,
+    topk: Option<Vec<i32>>,
+    stage_digests: Vec<(&'static str, u64)>,
+    attention_topk_digest: u64,
+    attention_topk_per_row: usize,
+    indexer_topk_gpu_ns: u64,
+    attention_ns: u64,
+    commit_ns: u64,
+    device_transfer: Option<DeviceAttentionTransfer>,
+}
+
+#[derive(Default)]
+struct DeviceAttentionTransfer {
+    h2d_count: usize,
+    h2d_bytes: usize,
+    rope_lut_d2d_count: usize,
+    rope_lut_d2d_bytes: usize,
+    terminal_d2h_count: usize,
+    terminal_d2h_bytes: usize,
+    intermediate_or_audit_d2h_count: usize,
+    intermediate_or_audit_d2h_bytes: usize,
+}
+
+struct DeviceCompressorRows {
+    kv: DeviceBuffer<f32>,
+    score: DeviceBuffer<f32>,
+    score_plus_ape: DeviceBuffer<f32>,
+    persistent_kv: DeviceBuffer<f32>,
+    persistent_score: DeviceBuffer<f32>,
+}
+
+struct DeviceExactCompressorScratch {
+    cublas: cublas_exact::CublasExact,
+    workspace: DeviceBuffer<u8>,
+    input: DeviceBuffer<f32>,
+    wkv: DeviceBuffer<f32>,
+    wgate: DeviceBuffer<f32>,
+    indexer_wkv: Option<DeviceBuffer<f32>>,
+    indexer_wgate: Option<DeviceBuffer<f32>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SparseAttentionArm {
+    Reference,
+    ScoreReuse,
+    Sm89Crossover,
+}
+
+const SM89_SCORE_REUSE_MIN_TOPK: usize = 4;
+
+impl SparseAttentionArm {
+    fn uses_score_reuse(self, topk_per_row: usize) -> bool {
+        matches!(self, Self::ScoreReuse)
+            || matches!(self, Self::Sm89Crossover) && topk_per_row >= SM89_SCORE_REUSE_MIN_TOPK
+    }
+}
+
+struct DeviceTokenState {
+    layer: usize,
+    committed_rows: usize,
+    compressor_width: usize,
+    hc_hidden: DeviceBuffer<u16>,
+    freqs: DeviceBuffer<f32>,
+    inverse_freqs: DeviceBuffer<f32>,
+    compressed_freqs: DeviceBuffer<f32>,
+    mixes: DeviceBuffer<f32>,
+    pre: DeviceBuffer<f32>,
+    post: DeviceBuffer<f32>,
+    comb: DeviceBuffer<f32>,
+    trace: DeviceBuffer<f32>,
+    collapsed: DeviceBuffer<u16>,
+    attn_input: DeviceBuffer<u16>,
+    fp8_7168: DeviceBuffer<u8>,
+    fp8_7168_scales: DeviceBuffer<u8>,
+    fp8_1536: DeviceBuffer<u8>,
+    fp8_1536_scales: DeviceBuffer<u8>,
+    fp8_16384: DeviceBuffer<u8>,
+    fp8_16384_scales: DeviceBuffer<u8>,
+    empty_u8: DeviceBuffer<u8>,
+    empty_u16: DeviceBuffer<u16>,
+    q_lora_f32: DeviceBuffer<f32>,
+    q_lora_raw: DeviceBuffer<u16>,
+    q_lora: DeviceBuffer<u16>,
+    q_f32: DeviceBuffer<f32>,
+    q_raw: DeviceBuffer<u16>,
+    q_norm: DeviceBuffer<u16>,
+    q_rope: DeviceBuffer<u16>,
+    kv_f32: DeviceBuffer<f32>,
+    kv_raw: DeviceBuffer<u16>,
+    kv_norm: DeviceBuffer<u16>,
+    kv_rope: DeviceBuffer<u16>,
+    kv_ready: DeviceBuffer<u16>,
+    kv_scales: DeviceBuffer<u8>,
+    kv_cache: DeviceBuffer<u16>,
+    compressor: DeviceCompressorRows,
+    exact_compressor: Option<DeviceExactCompressorScratch>,
+    indexer_compressor: Option<DeviceCompressorRows>,
+    compressed_pool: DeviceBuffer<f32>,
+    compressed_bf16: DeviceBuffer<u16>,
+    compressed_norm: DeviceBuffer<u16>,
+    compressed_rope: DeviceBuffer<u16>,
+    compressed_ready: DeviceBuffer<u16>,
+    compressed_scales: DeviceBuffer<u8>,
+    compressed_cache: DeviceBuffer<u16>,
+    indexer_pool: DeviceBuffer<f32>,
+    indexer_bf16: DeviceBuffer<u16>,
+    indexer_norm: DeviceBuffer<u16>,
+    indexer_rope: DeviceBuffer<u16>,
+    indexer_ready: DeviceBuffer<u16>,
+    indexer_cache: DeviceBuffer<u16>,
+    indexer_query_raw: DeviceBuffer<u16>,
+    indexer_query_rope: DeviceBuffer<u16>,
+    indexer_query_fp4: DeviceBuffer<u16>,
+    indexer_query_f32: DeviceBuffer<f32>,
+    indexer_weights_f32: DeviceBuffer<f32>,
+    indexer_kv_f32: DeviceBuffer<f32>,
+    indexer_scores: DeviceBuffer<f32>,
+    indexer_valid: DeviceBuffer<u32>,
+    indexer_selected: DeviceBuffer<i32>,
+    topk_csa: Vec<DeviceBuffer<i32>>,
+    attention_cache: DeviceBuffer<u16>,
+    compressed_rows: usize,
+    topk_raw: Vec<DeviceBuffer<i32>>,
+    sparse: DeviceBuffer<u16>,
+    sparse_pos0: SparseAttentionScoreReuseScratch,
+    sparse_pos1: SparseAttentionScoreReuseScratch,
+    sparse_csa: SparseAttentionScoreReuseScratch,
+    sparse_inverse: DeviceBuffer<u16>,
+    wo_a: DeviceBuffer<u16>,
+    attention_f32: DeviceBuffer<f32>,
+    attention: DeviceBuffer<u16>,
+    after_attention: DeviceBuffer<u16>,
+}
+
+struct DeviceRequestRopeLut {
+    values: DeviceBuffer<f32>,
+    rows: usize,
+}
+
+impl DeviceRequestRopeLut {
+    fn new(stream: &CudaStream, rows: usize) -> Result<Self, Box<dyn Error>> {
+        if !(V4_REQUEST_ROPE_LUT_ROWS..=V4_SHORT_DEVICE_DECODE_MAX_ROWS).contains(&rows) {
+            return Err("request RoPE LUT rows are outside the supported decode ceiling".into());
+        }
+        let forward = (0..rows)
+            .flat_map(v4_state::compressed_rope_freqs)
+            .collect::<Vec<_>>();
+        let mut inverse = forward.clone();
+        for sine in inverse.iter_mut().skip(1).step_by(2) {
+            *sine = -*sine;
+        }
+        let mut values = forward;
+        values.extend(inverse);
+        if values.len() * std::mem::size_of::<f32>()
+            != 2 * rows * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>()
+        {
+            return Err("request RoPE LUT byte contract mismatch".into());
+        }
+        Ok(Self {
+            values: DeviceBuffer::from_host(stream, &values)?,
+            rows,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.values.num_bytes()
+    }
+
+    fn copy_forward_row(
+        &self,
+        stream: &CudaStream,
+        position: usize,
+        destination: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.copy_row(stream, position, destination)
+    }
+
+    fn copy_inverse_row(
+        &self,
+        stream: &CudaStream,
+        position: usize,
+        destination: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.copy_row(stream, self.rows + position, destination)
+    }
+
+    fn copy_row(
+        &self,
+        stream: &CudaStream,
+        position: usize,
+        destination: &DeviceBuffer<f32>,
+    ) -> Result<(), Box<dyn Error>> {
+        if position >= 2 * self.rows || destination.len() != v4_state::Q_ROPE_DIM {
+            return Err("request RoPE LUT row copy contract mismatch".into());
+        }
+        unsafe {
+            copy_device_range(
+                stream,
+                destination,
+                0,
+                &self.values,
+                position * v4_state::Q_ROPE_DIM,
+                v4_state::Q_ROPE_DIM,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl DeviceCompressorRows {
+    fn new(
+        stream: &CudaStream,
+        width: usize,
+        capacity_rows: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            kv: DeviceBuffer::zeroed(stream, width)?,
+            score: DeviceBuffer::zeroed(stream, width)?,
+            score_plus_ape: DeviceBuffer::zeroed(stream, width)?,
+            persistent_kv: DeviceBuffer::zeroed(stream, capacity_rows * width)?,
+            persistent_score: DeviceBuffer::from_host(
+                stream,
+                &vec![f32::NEG_INFINITY; capacity_rows * width],
+            )?,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.kv.num_bytes()
+            + self.score.num_bytes()
+            + self.score_plus_ape.num_bytes()
+            + self.persistent_kv.num_bytes()
+            + self.persistent_score.num_bytes()
+    }
+
+    fn reset_persistent(
+        &mut self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+    ) -> Result<usize, Box<dyn Error>> {
+        zero_device_buffer(stream, &self.persistent_kv)?;
+        // SAFETY: one checked thread writes each persistent score element.
+        unsafe {
+            module.fill_f32(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(self.persistent_score.len())?),
+                &mut self.persistent_score,
+                f32::NEG_INFINITY,
+            )?;
+        }
+        Ok(2)
+    }
+}
+
+fn zero_device_buffer<T>(
+    stream: &CudaStream,
+    buffer: &DeviceBuffer<T>,
+) -> Result<(), Box<dyn Error>> {
+    if !buffer.is_empty() {
+        // SAFETY: the complete owned device range is reset in stream order.
+        unsafe {
+            cuda_core::memory::memset_d8_async(
+                buffer.cu_deviceptr(),
+                0,
+                buffer.num_bytes(),
+                stream.cu_stream(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl DeviceExactCompressorScratch {
+    fn new(stream: &CudaStream, weights: &LayerDeviceWeights) -> Result<Self, Box<dyn Error>> {
+        let width = weights.compressor_ape.len() / weights.compression_ratio.get();
+        if width == 0
+            || weights.compressor_wkv.len() != width * v4_state::HIDDEN
+            || weights.compressor_wgate.len() != width * v4_state::HIDDEN
+        {
+            return Err("strict device Compressor workspace geometry mismatch".into());
+        }
+        Ok(Self {
+            cublas: cublas_exact::CublasExact::load()?,
+            workspace: DeviceBuffer::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?,
+            input: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            wkv: DeviceBuffer::zeroed(stream, weights.compressor_wkv.len())?,
+            wgate: DeviceBuffer::zeroed(stream, weights.compressor_wgate.len())?,
+            indexer_wkv: weights
+                .indexer
+                .as_ref()
+                .map(|indexer| DeviceBuffer::zeroed(stream, indexer.compressor_wkv.len()))
+                .transpose()?,
+            indexer_wgate: weights
+                .indexer
+                .as_ref()
+                .map(|indexer| DeviceBuffer::zeroed(stream, indexer.compressor_wgate.len()))
+                .transpose()?,
+        })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.workspace.num_bytes()
+            + self.input.num_bytes()
+            + self.wkv.num_bytes()
+            + self.wgate.num_bytes()
+            + self.indexer_wkv.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .indexer_wgate
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+    }
+}
+
+impl DeviceTokenState {
+    fn new(stream: &CudaStream, weights: &LayerDeviceWeights) -> Result<Self, Box<dyn Error>> {
+        let csa = weights.compression_ratio == v4_state::CompressionRatio::Csa4;
+        let compressor_width = if csa { 1_024 } else { v4_state::Q_HEAD_DIM };
+        let compressor_rows = weights.compression_ratio.get() * (1 + usize::from(csa));
+        let mut topk_csa = Vec::with_capacity(V4_SHORT_DEVICE_DECODE_MAX_ROWS - 3);
+        for position in 3..V4_SHORT_DEVICE_DECODE_MAX_ROWS {
+            let (mut window, _) = v4_state::window_topk_cpu(1, position, v4_state::KV_WINDOW)?;
+            window.resize(v4_state::KV_WINDOW + csa_compressed_rows_after(position), 0);
+            topk_csa.push(DeviceBuffer::from_host(stream, &window)?);
+        }
+        let mut topk_raw = Vec::with_capacity(V4_SHORT_DEVICE_DECODE_MAX_ROWS);
+        for position in 0..V4_SHORT_DEVICE_DECODE_MAX_ROWS {
+            let (window, _) = v4_state::window_topk_cpu(1, position, v4_state::KV_WINDOW)?;
+            topk_raw.push(DeviceBuffer::from_host(stream, &window)?);
+        }
+        Ok(Self {
+            layer: weights.layer,
+            committed_rows: 0,
+            compressor_width,
+            hc_hidden: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HIDDEN)?,
+            freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            inverse_freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            compressed_freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            mixes: DeviceBuffer::zeroed(stream, v4_state::MIX)?,
+            pre: DeviceBuffer::zeroed(stream, v4_state::HC)?,
+            post: DeviceBuffer::zeroed(stream, v4_state::HC)?,
+            comb: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HC)?,
+            trace: DeviceBuffer::zeroed(stream, 41 * v4_state::HC * v4_state::HC)?,
+            collapsed: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            attn_input: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            fp8_7168: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            fp8_7168_scales: DeviceBuffer::zeroed(stream, v4_state::HIDDEN / v4_state::FP8_BLOCK)?,
+            fp8_1536: DeviceBuffer::zeroed(stream, weights.wq_a.out_features)?,
+            fp8_1536_scales: DeviceBuffer::zeroed(
+                stream,
+                weights.wq_a.out_features / v4_state::FP8_BLOCK,
+            )?,
+            fp8_16384: DeviceBuffer::zeroed(stream, v4_state::O_GROUPS * v4_state::O_LORA_RANK)?,
+            fp8_16384_scales: DeviceBuffer::zeroed(
+                stream,
+                v4_state::O_GROUPS * v4_state::O_LORA_RANK / v4_state::FP8_BLOCK,
+            )?,
+            empty_u8: DeviceBuffer::zeroed(stream, 0)?,
+            empty_u16: DeviceBuffer::zeroed(stream, 0)?,
+            q_lora_f32: DeviceBuffer::zeroed(stream, weights.wq_a.out_features)?,
+            q_lora_raw: DeviceBuffer::zeroed(stream, weights.wq_a.out_features)?,
+            q_lora: DeviceBuffer::zeroed(stream, weights.wq_a.out_features)?,
+            q_f32: DeviceBuffer::zeroed(stream, weights.wq_b.out_features)?,
+            q_raw: DeviceBuffer::zeroed(stream, weights.wq_b.out_features)?,
+            q_norm: DeviceBuffer::zeroed(stream, weights.wq_b.out_features)?,
+            q_rope: DeviceBuffer::zeroed(stream, weights.wq_b.out_features)?,
+            kv_f32: DeviceBuffer::zeroed(stream, weights.wkv.out_features)?,
+            kv_raw: DeviceBuffer::zeroed(stream, weights.wkv.out_features)?,
+            kv_norm: DeviceBuffer::zeroed(stream, weights.wkv.out_features)?,
+            kv_rope: DeviceBuffer::zeroed(stream, weights.wkv.out_features)?,
+            kv_ready: DeviceBuffer::zeroed(stream, weights.wkv.out_features)?,
+            kv_scales: DeviceBuffer::zeroed(stream, 7)?,
+            kv_cache: DeviceBuffer::zeroed(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?,
+            compressor: DeviceCompressorRows::new(stream, compressor_width, compressor_rows)?,
+            exact_compressor: strict_compressor_enabled()
+                .then(|| DeviceExactCompressorScratch::new(stream, weights))
+                .transpose()?,
+            indexer_compressor: weights
+                .indexer
+                .as_ref()
+                .map(|_| DeviceCompressorRows::new(stream, 256, 8))
+                .transpose()?,
+            compressed_pool: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_bf16: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_norm: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_rope: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_ready: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_scales: DeviceBuffer::zeroed(stream, 7)?,
+            compressed_cache: DeviceBuffer::zeroed(stream, 2 * v4_state::Q_HEAD_DIM)?,
+            indexer_pool: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_bf16: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_norm: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_rope: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_ready: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_cache: DeviceBuffer::zeroed(stream, 2 * 128)?,
+            indexer_query_raw: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_rope: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_fp4: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_f32: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_weights_f32: DeviceBuffer::zeroed(stream, 64)?,
+            indexer_kv_f32: DeviceBuffer::zeroed(stream, 2 * 128)?,
+            indexer_scores: DeviceBuffer::zeroed(stream, 2)?,
+            indexer_valid: DeviceBuffer::from_host(stream, &[1_u32; 2])?,
+            indexer_selected: DeviceBuffer::zeroed(stream, 2)?,
+            topk_csa,
+            attention_cache: DeviceBuffer::zeroed(
+                stream,
+                (v4_state::KV_WINDOW + 2) * v4_state::Q_HEAD_DIM,
+            )?,
+            compressed_rows: 0,
+            topk_raw,
+            sparse: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            sparse_pos0: SparseAttentionScoreReuseScratch::new(stream, 1, 1)?,
+            sparse_pos1: SparseAttentionScoreReuseScratch::new(stream, 1, v4_state::KV_WINDOW)?,
+            sparse_csa: SparseAttentionScoreReuseScratch::new(stream, 1, v4_state::KV_WINDOW + 2)?,
+            sparse_inverse: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            wo_a: DeviceBuffer::zeroed(stream, v4_state::O_GROUPS * v4_state::O_LORA_RANK)?,
+            attention_f32: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            attention: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            after_attention: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HIDDEN)?,
+        })
+    }
+
+    fn reset_for_layer(
+        &mut self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        weights: &LayerDeviceWeights,
+    ) -> Result<usize, Box<dyn Error>> {
+        let csa = weights.compression_ratio == v4_state::CompressionRatio::Csa4;
+        if self.compressor_width != if csa { 1_024 } else { v4_state::Q_HEAD_DIM }
+            || self.indexer_compressor.is_some() != csa
+        {
+            return Err("device token-state layout reuse geometry mismatch".into());
+        }
+        let mut reset_calls = 0;
+        reset_calls += self.compressor.reset_persistent(module, stream)?;
+        if csa {
+            reset_calls += self
+                .indexer_compressor
+                .as_mut()
+                .ok_or("CSA device token-state indexer disappeared")?
+                .reset_persistent(module, stream)?;
+        }
+        // All other device buffers are either fully overwritten before first
+        // use or are immutable tables initialized once with the layout state.
+        self.layer = weights.layer;
+        self.committed_rows = 0;
+        self.compressed_rows = 0;
+        Ok(reset_calls)
+    }
+
+    fn num_bytes(&self) -> usize {
+        [
+            self.hc_hidden.num_bytes(),
+            self.freqs.num_bytes(),
+            self.inverse_freqs.num_bytes(),
+            self.compressed_freqs.num_bytes(),
+            self.mixes.num_bytes(),
+            self.pre.num_bytes(),
+            self.post.num_bytes(),
+            self.comb.num_bytes(),
+            self.trace.num_bytes(),
+            self.collapsed.num_bytes(),
+            self.attn_input.num_bytes(),
+            self.fp8_7168.num_bytes(),
+            self.fp8_7168_scales.num_bytes(),
+            self.fp8_1536.num_bytes(),
+            self.fp8_1536_scales.num_bytes(),
+            self.fp8_16384.num_bytes(),
+            self.fp8_16384_scales.num_bytes(),
+            self.empty_u8.num_bytes(),
+            self.empty_u16.num_bytes(),
+            self.q_lora_f32.num_bytes(),
+            self.q_lora_raw.num_bytes(),
+            self.q_lora.num_bytes(),
+            self.q_f32.num_bytes(),
+            self.q_raw.num_bytes(),
+            self.q_norm.num_bytes(),
+            self.q_rope.num_bytes(),
+            self.kv_f32.num_bytes(),
+            self.kv_raw.num_bytes(),
+            self.kv_norm.num_bytes(),
+            self.kv_rope.num_bytes(),
+            self.kv_ready.num_bytes(),
+            self.kv_scales.num_bytes(),
+            self.kv_cache.num_bytes(),
+            self.compressor.num_bytes(),
+            self.indexer_compressor
+                .as_ref()
+                .map_or(0, DeviceCompressorRows::num_bytes),
+            self.compressed_pool.num_bytes(),
+            self.compressed_bf16.num_bytes(),
+            self.compressed_norm.num_bytes(),
+            self.compressed_rope.num_bytes(),
+            self.compressed_ready.num_bytes(),
+            self.compressed_scales.num_bytes(),
+            self.compressed_cache.num_bytes(),
+            self.indexer_pool.num_bytes(),
+            self.indexer_bf16.num_bytes(),
+            self.indexer_norm.num_bytes(),
+            self.indexer_rope.num_bytes(),
+            self.indexer_ready.num_bytes(),
+            self.indexer_cache.num_bytes(),
+            self.indexer_query_raw.num_bytes(),
+            self.indexer_query_rope.num_bytes(),
+            self.indexer_query_fp4.num_bytes(),
+            self.indexer_query_f32.num_bytes(),
+            self.indexer_weights_f32.num_bytes(),
+            self.indexer_kv_f32.num_bytes(),
+            self.indexer_scores.num_bytes(),
+            self.indexer_valid.num_bytes(),
+            self.indexer_selected.num_bytes(),
+            self.attention_cache.num_bytes(),
+            self.sparse.num_bytes(),
+            self.sparse_pos0.num_bytes(),
+            self.sparse_pos1.num_bytes(),
+            self.sparse_csa.num_bytes(),
+            self.sparse_inverse.num_bytes(),
+            self.wo_a.num_bytes(),
+            self.attention_f32.num_bytes(),
+            self.attention.num_bytes(),
+            self.after_attention.num_bytes(),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            + self
+                .topk_csa
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .topk_raw
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .exact_compressor
+                .as_ref()
+                .map_or(0, DeviceExactCompressorScratch::num_bytes)
+    }
+
+    fn exact_compressor_bytes(&self) -> usize {
+        self.exact_compressor
+            .as_ref()
+            .map_or(0, DeviceExactCompressorScratch::num_bytes)
+    }
+}
+
+#[derive(Debug)]
+struct DeviceAttentionRun {
+    output: Vec<u16>,
+    elapsed_ns: u64,
+    cuda_event_ns: u64,
+    h2d_count: usize,
+    h2d_bytes: usize,
+    rope_lut_d2d_count: usize,
+    rope_lut_d2d_bytes: usize,
+    d2h_count: usize,
+    d2h_bytes: usize,
+    alloc_count: usize,
+}
+
+unsafe fn copy_device_row<T>(
+    stream: &CudaStream,
+    destination: &DeviceBuffer<T>,
+    destination_row: usize,
+    source: &DeviceBuffer<T>,
+) -> Result<(), Box<dyn Error>> {
+    let byte_offset = destination_row
+        .checked_mul(source.num_bytes())
+        .ok_or("device row copy offset overflow")?;
+    if byte_offset + source.num_bytes() > destination.num_bytes() {
+        return Err("device row copy exceeds persistent allocation".into());
+    }
+    // SAFETY: the checked byte range fits the destination and the source owns
+    // exactly one complete row for the duration of the stream operation.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            destination.cu_deviceptr() + u64::try_from(byte_offset)?,
+            source.cu_deviceptr(),
+            source.num_bytes(),
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
+
+unsafe fn copy_device_range<T>(
+    stream: &CudaStream,
+    destination: &DeviceBuffer<T>,
+    destination_offset: usize,
+    source: &DeviceBuffer<T>,
+    source_offset: usize,
+    elements: usize,
+) -> Result<(), Box<dyn Error>> {
+    let element_bytes = std::mem::size_of::<T>();
+    let byte_len = elements
+        .checked_mul(element_bytes)
+        .ok_or("device range copy byte length overflow")?;
+    let destination_byte_offset = destination_offset
+        .checked_mul(element_bytes)
+        .ok_or("device range copy destination offset overflow")?;
+    let source_byte_offset = source_offset
+        .checked_mul(element_bytes)
+        .ok_or("device range copy source offset overflow")?;
+    if destination_offset
+        .checked_add(elements)
+        .is_none_or(|end| end > destination.len())
+        || source_offset
+            .checked_add(elements)
+            .is_none_or(|end| end > source.len())
+    {
+        return Err("device range copy exceeds allocation".into());
+    }
+    // SAFETY: the validated typed element ranges are disjoint device ranges.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            destination.cu_deviceptr() + u64::try_from(destination_byte_offset)?,
+            source.cu_deviceptr() + u64::try_from(source_byte_offset)?,
+            byte_len,
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_compressor_pool_ratio4_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    persistent_kv: &DeviceBuffer<f32>,
+    persistent_score: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+    head_dim: usize,
+) -> Result<(), Box<dyn Error>> {
+    if !matches!(head_dim, 128 | v4_state::Q_HEAD_DIM)
+        || output.len() != head_dim
+        || persistent_kv.len() != 16 * head_dim
+        || persistent_score.len() != 16 * head_dim
+    {
+        return Err("device ratio-4 compressor pool workspace contract mismatch".into());
+    }
+    // SAFETY: one thread owns each output dimension; geometry matches the
+    // overlap layout created by DeviceCompressorRows for CSA decode.
+    unsafe {
+        module.compressor_pool_ratio4_v4_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(head_dim)?),
+            persistent_kv,
+            persistent_score,
+            output,
+            u32::try_from(head_dim)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_f32_to_bf16_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty() || output.len() != input.len() {
+        return Err("device f32-to-BF16 workspace contract mismatch".into());
+    }
+    // SAFETY: the kernel writes one checked output element per input element.
+    unsafe {
+        module.f32_to_bf16_rne_v4(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len())?),
+            input,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_indexer_fp4_sim_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty() || !input.len().is_multiple_of(128) || output.len() != input.len() {
+        return Err("device CSA indexer FP4 simulation workspace contract mismatch".into());
+    }
+    // SAFETY: one thread owns each complete 128-wide indexer vector.
+    unsafe {
+        module.indexer_fp4_sim_v4_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len() / 128)?),
+            input,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_bf16_linear_f32_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    weight: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+    in_features: usize,
+    out_features: usize,
+) -> Result<(), Box<dyn Error>> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(in_features)
+        || weight.len() != in_features * out_features
+        || output.len() != input.len() / in_features * out_features
+    {
+        return Err("device BF16 linear FP32 workspace contract mismatch".into());
+    }
+    // SAFETY: one thread owns one checked row-major output element.
+    unsafe {
+        module.linear_v4_bf16_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(output.len())?),
+            input,
+            weight,
+            output,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_scale_f32_device_in_place(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    values: &mut DeviceBuffer<f32>,
+    scale: f32,
+) -> Result<(), Box<dyn Error>> {
+    if values.is_empty() || !scale.is_finite() {
+        return Err("device FP32 scale workspace contract mismatch".into());
+    }
+    // SAFETY: each thread updates one disjoint checked FP32 value.
+    unsafe {
+        module.scale_f32_in_place_v4(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(values.len())?),
+            values,
+            scale,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_exact_compressor_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    wkv: &DeviceBuffer<u16>,
+    wgate: &DeviceBuffer<u16>,
+    ape: &DeviceBuffer<f32>,
+    compressor: &mut DeviceCompressorRows,
+    cublas: &cublas_exact::CublasExact,
+    workspace: &DeviceBuffer<u8>,
+    input_f32: &mut DeviceBuffer<f32>,
+    wkv_f32: &mut DeviceBuffer<f32>,
+    wgate_f32: &mut DeviceBuffer<f32>,
+    ratio: usize,
+    start_pos: usize,
+) -> Result<(), Box<dyn Error>> {
+    let outputs = compressor.kv.len();
+    if input.len() != v4_state::HIDDEN
+        || wkv.len() != outputs * v4_state::HIDDEN
+        || wgate.len() != wkv.len()
+        || ape.len() != ratio * outputs
+        || compressor.score.len() != outputs
+        || compressor.score_plus_ape.len() != outputs
+        || input_f32.len() != input.len()
+        || wkv_f32.len() != wkv.len()
+        || wgate_f32.len() != wgate.len()
+    {
+        return Err("strict device Compressor launch geometry mismatch".into());
+    }
+    launch_v4_bf16_to_f32(module, stream, input, input_f32)?;
+    if start_pos == 0 {
+        launch_v4_bf16_to_f32(module, stream, wkv, wkv_f32)?;
+        launch_v4_bf16_to_f32(module, stream, wgate, wgate_f32)?;
+    }
+    let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
+    let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
+    cublas.sgemm_mn1(
+        stream.cu_stream().cast::<std::ffi::c_void>(),
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(wkv_f32.cu_deviceptr()),
+        device_const(input_f32.cu_deviceptr()),
+        device_mut(compressor.kv.cu_deviceptr()),
+        outputs,
+        v4_state::HIDDEN,
+    )?;
+    cublas.sgemm_mn1(
+        stream.cu_stream().cast::<std::ffi::c_void>(),
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(wgate_f32.cu_deviceptr()),
+        device_const(input_f32.cu_deviceptr()),
+        device_mut(compressor.score.cu_deviceptr()),
+        outputs,
+        v4_state::HIDDEN,
+    )?;
+    let ape_offset = (start_pos % ratio)
+        .checked_mul(outputs)
+        .ok_or("strict device Compressor APE offset overflow")?;
+    unsafe {
+        copy_device_range(
+            stream,
+            &compressor.score_plus_ape,
+            0,
+            ape,
+            ape_offset,
+            outputs,
+        )?;
+        module.add_in_place(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(outputs)?),
+            &mut compressor.score_plus_ape,
+            &compressor.score,
+        )?;
+    }
+    Ok(())
+}
+
+/// Candidate-only persistent-state update for the first CSA boundary.  This
+/// deliberately stops before sparse attention: exact commit parity is the
+/// gate, while pos3's CSA query/top-k path remains a separate follow-up.
+fn run_device_token_state_commit_row(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    hc_hidden: &[u16],
+    start_pos: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let weights = &runtime.weights;
+    if weights.layer >= v4_state::V4_LAYER_COUNT
+        || state.layer != weights.layer
+        || start_pos != state.committed_rows
+        || start_pos >= V4_SHORT_DEVICE_DECODE_MAX_ROWS
+        || hc_hidden.len() != v4_state::HC * v4_state::HIDDEN
+    {
+        return Err("device token-state commit row contract mismatch".into());
+    }
+    // SAFETY: each fixed host row exactly matches its preallocated destination.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            state.hc_hidden.cu_deviceptr(),
+            hc_hidden.as_ptr(),
+            state.hc_hidden.num_bytes(),
+            stream.cu_stream(),
+        )?;
+    }
+    rope_lut.copy_forward_row(stream, start_pos, &state.freqs)?;
+    run_l0_mhc_pre_device_into(
+        module,
+        stream,
+        &state.hc_hidden,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+        &mut state.mixes,
+        &mut state.pre,
+        &mut state.post,
+        &mut state.comb,
+        &mut state.collapsed,
+        &mut state.trace,
+        None,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.collapsed,
+        &weights.attn_norm,
+        &mut state.attn_input,
+        v4_state::HIDDEN,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.attn_input,
+        &weights.wkv,
+        &mut state.fp8_7168,
+        &mut state.fp8_7168_scales,
+        &mut state.empty_u16,
+        &mut state.kv_f32,
+        &mut state.kv_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.kv_raw,
+        &weights.kv_norm,
+        &mut state.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &state.kv_norm,
+        &state.freqs,
+        &mut state.kv_rope,
+        1,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_kv_quantize_device_into(
+        module,
+        stream,
+        &state.kv_rope,
+        &mut state.empty_u8,
+        &mut state.kv_scales,
+        &mut state.kv_ready,
+    )?;
+    if let Some(scratch) = state.exact_compressor.as_mut() {
+        let DeviceExactCompressorScratch {
+            cublas,
+            workspace,
+            input,
+            wkv,
+            wgate,
+            ..
+        } = scratch;
+        run_exact_compressor_device_into(
+            module,
+            stream,
+            &state.attn_input,
+            &weights.compressor_wkv,
+            &weights.compressor_wgate,
+            &weights.compressor_ape,
+            &mut state.compressor,
+            cublas,
+            workspace,
+            input,
+            wkv,
+            wgate,
+            weights.compression_ratio.get(),
+            start_pos,
+        )?;
+    } else {
+        run_compressor_device_into(
+            module,
+            stream,
+            &state.attn_input,
+            &weights.compressor_wkv,
+            &weights.compressor_wgate,
+            &weights.compressor_ape,
+            &mut state.compressor.kv,
+            &mut state.compressor.score,
+            &mut state.compressor.score_plus_ape,
+            state.compressor_width,
+            weights.compression_ratio.get(),
+            start_pos,
+        )?;
+    }
+    if l0_pos0_compressor_probe_enabled(weights.layer, start_pos) {
+        let kv = state.compressor.kv.to_host_vec(stream)?;
+        let score = state.compressor.score.to_host_vec(stream)?;
+        let score_plus_ape = state.compressor.score_plus_ape.to_host_vec(stream)?;
+        print_l0_pos0_compressor_probe("device_kernel_pre_commit", &kv, &score, &score_plus_ape);
+    }
+    if let (Some(indexer), Some(indexer_state)) =
+        (weights.indexer.as_ref(), state.indexer_compressor.as_mut())
+    {
+        if let Some(scratch) = state.exact_compressor.as_mut() {
+            let DeviceExactCompressorScratch {
+                cublas,
+                workspace,
+                input,
+                indexer_wkv,
+                indexer_wgate,
+                ..
+            } = scratch;
+            run_exact_compressor_device_into(
+                module,
+                stream,
+                &state.attn_input,
+                &indexer.compressor_wkv,
+                &indexer.compressor_wgate,
+                &indexer.compressor_ape,
+                indexer_state,
+                cublas,
+                workspace,
+                input,
+                indexer_wkv
+                    .as_mut()
+                    .ok_or("strict device indexer Compressor workspace disappeared")?,
+                indexer_wgate
+                    .as_mut()
+                    .ok_or("strict device indexer Compressor workspace disappeared")?,
+                4,
+                start_pos,
+            )?;
+        } else {
+            run_compressor_device_into(
+                module,
+                stream,
+                &state.attn_input,
+                &indexer.compressor_wkv,
+                &indexer.compressor_wgate,
+                &indexer.compressor_ape,
+                &mut indexer_state.kv,
+                &mut indexer_state.score,
+                &mut indexer_state.score_plus_ape,
+                256,
+                4,
+                start_pos,
+            )?;
+        }
+    }
+    unsafe {
+        copy_device_row(stream, &state.kv_cache, start_pos, &state.kv_ready)?;
+        let compressor_slot = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+            4 + start_pos % 4
+        } else {
+            start_pos % v4_state::KV_WINDOW
+        };
+        copy_device_row(
+            stream,
+            &state.compressor.persistent_kv,
+            compressor_slot,
+            &state.compressor.kv,
+        )?;
+        copy_device_row(
+            stream,
+            &state.compressor.persistent_score,
+            compressor_slot,
+            &state.compressor.score_plus_ape,
+        )?;
+        if let Some(indexer_state) = state.indexer_compressor.as_ref() {
+            copy_device_row(
+                stream,
+                &indexer_state.persistent_kv,
+                4 + start_pos % 4,
+                &indexer_state.kv,
+            )?;
+            copy_device_row(
+                stream,
+                &indexer_state.persistent_score,
+                4 + start_pos % 4,
+                &indexer_state.score_plus_ape,
+            )?;
+        }
+    }
+    let csa_boundary = weights.compression_ratio == v4_state::CompressionRatio::Csa4
+        && (start_pos + 1).is_multiple_of(4);
+    if csa_boundary {
+        if state.compressed_rows >= 2 {
+            return Err("short CSA decode exceeds its two-compressed-entry ceiling".into());
+        }
+        run_compressor_pool_ratio4_device_into(
+            module,
+            stream,
+            &state.compressor.persistent_kv,
+            &state.compressor.persistent_score,
+            &mut state.compressed_pool,
+            v4_state::Q_HEAD_DIM,
+        )?;
+        run_f32_to_bf16_device_into(
+            module,
+            stream,
+            &state.compressed_pool,
+            &mut state.compressed_bf16,
+        )?;
+        rope_lut.copy_forward_row(
+            stream,
+            start_pos + 1 - weights.compression_ratio.get(),
+            &state.compressed_freqs,
+        )?;
+        run_l0_rmsnorm_device_into(
+            module,
+            stream,
+            &state.compressed_bf16,
+            &weights.compressor_norm,
+            &mut state.compressed_norm,
+            v4_state::Q_HEAD_DIM,
+        )?;
+        run_rope_device_into(
+            module,
+            stream,
+            &state.compressed_norm,
+            &state.compressed_freqs,
+            &mut state.compressed_rope,
+            1,
+            v4_state::Q_HEAD_DIM,
+        )?;
+        run_l0_kv_quantize_device_into(
+            module,
+            stream,
+            &state.compressed_rope,
+            &mut state.empty_u8,
+            &mut state.compressed_scales,
+            &mut state.compressed_ready,
+        )?;
+        let indexer_weights = weights
+            .indexer
+            .as_ref()
+            .ok_or("CSA indexer weights disappeared at pool boundary")?;
+        let indexer_state = state
+            .indexer_compressor
+            .as_ref()
+            .ok_or("CSA indexer candidate state disappeared at pool boundary")?;
+        run_compressor_pool_ratio4_device_into(
+            module,
+            stream,
+            &indexer_state.persistent_kv,
+            &indexer_state.persistent_score,
+            &mut state.indexer_pool,
+            128,
+        )?;
+        run_f32_to_bf16_device_into(module, stream, &state.indexer_pool, &mut state.indexer_bf16)?;
+        run_l0_rmsnorm_device_into(
+            module,
+            stream,
+            &state.indexer_bf16,
+            &indexer_weights.compressor_norm,
+            &mut state.indexer_norm,
+            128,
+        )?;
+        run_rope_device_into(
+            module,
+            stream,
+            &state.indexer_norm,
+            &state.compressed_freqs,
+            &mut state.indexer_rope,
+            1,
+            128,
+        )?;
+        run_indexer_fp4_sim_device_into(
+            module,
+            stream,
+            &state.indexer_rope,
+            &mut state.indexer_ready,
+        )?;
+        unsafe {
+            copy_device_range(
+                stream,
+                &state.compressed_cache,
+                state.compressed_rows * v4_state::Q_HEAD_DIM,
+                &state.compressed_ready,
+                0,
+                v4_state::Q_HEAD_DIM,
+            )?;
+            copy_device_range(
+                stream,
+                &state.indexer_cache,
+                state.compressed_rows * 128,
+                &state.indexer_ready,
+                0,
+                128,
+            )?;
+            copy_device_range(
+                stream,
+                &state.compressor.persistent_kv,
+                0,
+                &state.compressor.persistent_kv,
+                4 * 1_024,
+                4 * 1_024,
+            )?;
+            copy_device_range(
+                stream,
+                &state.compressor.persistent_score,
+                0,
+                &state.compressor.persistent_score,
+                4 * 1_024,
+                4 * 1_024,
+            )?;
+            let indexer_state = state
+                .indexer_compressor
+                .as_ref()
+                .ok_or("CSA indexer candidate state disappeared during overlap copy")?;
+            copy_device_range(
+                stream,
+                &indexer_state.persistent_kv,
+                0,
+                &indexer_state.persistent_kv,
+                4 * 256,
+                4 * 256,
+            )?;
+            copy_device_range(
+                stream,
+                &indexer_state.persistent_score,
+                0,
+                &indexer_state.persistent_score,
+                4 * 256,
+                4 * 256,
+            )?;
+        }
+        state.compressed_rows += 1;
+    }
+    state.committed_rows += 1;
+    Ok(1 + usize::from(csa_boundary))
+}
+
+/// Complete one attention row after its device-authoritative state commit for
+/// both pinned compression layouts in the five-token stationary gate.
+fn run_device_attention_after_commit(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    position: usize,
+    observe_topk: bool,
+) -> Result<(Vec<u16>, Option<Vec<i32>>), Box<dyn Error>> {
+    let weights = &runtime.weights;
+    let csa_compressed_rows = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+        csa_compressed_rows_after(position)
+    } else {
+        0
+    };
+    let csa_boundary = csa_compressed_rows != 0;
+    if weights.layer >= v4_state::V4_LAYER_COUNT
+        || state.layer != weights.layer
+        || state.committed_rows != position + 1
+        || state.compressed_rows != csa_compressed_rows
+        || csa_boundary && state.indexer_compressor.is_none()
+        || position >= V4_SHORT_DEVICE_DECODE_MAX_ROWS
+    {
+        return Err("device attention-after-commit contract mismatch".into());
+    }
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.attn_input,
+        &weights.wq_a,
+        &mut state.fp8_7168,
+        &mut state.fp8_7168_scales,
+        &mut state.empty_u16,
+        &mut state.q_lora_f32,
+        &mut state.q_lora_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.q_lora_raw,
+        &weights.q_norm,
+        &mut state.q_lora,
+        weights.wq_a.out_features,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.q_lora,
+        &weights.wq_b,
+        &mut state.fp8_1536,
+        &mut state.fp8_1536_scales,
+        &mut state.empty_u16,
+        &mut state.q_f32,
+        &mut state.q_raw,
+        true,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.q_raw,
+        &state.empty_u16,
+        &mut state.q_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &state.q_norm,
+        &state.freqs,
+        &mut state.q_rope,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    if csa_boundary {
+        let indexer = weights
+            .indexer
+            .as_ref()
+            .ok_or("device CSA indexer weights disappeared")?;
+        run_l0_fp8_linear_device_into(
+            module,
+            stream,
+            &state.q_lora,
+            &indexer.wq_b,
+            &mut state.fp8_1536,
+            &mut state.fp8_1536_scales,
+            &mut state.empty_u16,
+            &mut state.indexer_query_f32,
+            &mut state.indexer_query_raw,
+            true,
+        )?;
+        run_rope_device_into(
+            module,
+            stream,
+            &state.indexer_query_raw,
+            &state.freqs,
+            &mut state.indexer_query_rope,
+            64,
+            128,
+        )?;
+        run_indexer_fp4_sim_device_into(
+            module,
+            stream,
+            &state.indexer_query_rope,
+            &mut state.indexer_query_fp4,
+        )?;
+        launch_v4_bf16_to_f32(
+            module,
+            stream,
+            &state.indexer_query_fp4,
+            &mut state.indexer_query_f32,
+        )?;
+        run_bf16_linear_f32_device_into(
+            module,
+            stream,
+            &state.attn_input,
+            &indexer.weights_proj,
+            &mut state.indexer_weights_f32,
+            v4_state::HIDDEN,
+            64,
+        )?;
+        run_scale_f32_device_in_place(
+            module,
+            stream,
+            &mut state.indexer_weights_f32,
+            1.0_f32 / (128.0_f32 * 64.0).sqrt(),
+        )?;
+        launch_v4_bf16_to_f32(
+            module,
+            stream,
+            &state.indexer_cache,
+            &mut state.indexer_kv_f32,
+        )?;
+    }
+    // SAFETY: all copies fit their preallocated cache; CSA contributes its
+    // single first-boundary key only after that boundary has committed.
+    unsafe {
+        copy_device_range(
+            stream,
+            &state.attention_cache,
+            0,
+            &state.kv_cache,
+            0,
+            v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+        )?;
+        if csa_boundary {
+            module.indexer_scores_v4_f32(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(csa_compressed_rows)?),
+                &state.indexer_query_f32,
+                &state.indexer_kv_f32,
+                &state.indexer_weights_f32,
+                &mut state.indexer_scores,
+                1,
+                64,
+                128,
+                u32::try_from(csa_compressed_rows)?,
+            )?;
+            module.indexer_topk_v4_f32(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(csa_compressed_rows)?),
+                &state.indexer_scores,
+                &state.indexer_valid,
+                &mut state.indexer_selected,
+                1,
+                u32::try_from(csa_compressed_rows)?,
+                u32::try_from(csa_compressed_rows)?,
+                u32::try_from(v4_state::KV_WINDOW)?,
+            )?;
+            let topk = state
+                .topk_csa
+                .get(
+                    position
+                        .checked_sub(3)
+                        .ok_or("device CSA top-k position underflow")?,
+                )
+                .ok_or("device CSA top-k position is outside short-decode gate")?;
+            let indexer_topk = csa_compressed_rows.min(v4_state::INDEX_TOPK);
+            copy_device_range(
+                stream,
+                topk,
+                v4_state::KV_WINDOW,
+                &state.indexer_selected,
+                0,
+                indexer_topk,
+            )?;
+            copy_device_range(
+                stream,
+                &state.attention_cache,
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                &state.compressed_cache,
+                0,
+                csa_compressed_rows * v4_state::Q_HEAD_DIM,
+            )?;
+        }
+    }
+    let raw_topk = state
+        .topk_raw
+        .get(position)
+        .ok_or("device raw top-k position is outside short-decode gate")?;
+    let topk = if csa_boundary {
+        state
+            .topk_csa
+            .get(position - 3)
+            .ok_or("device CSA sparse position is outside short-decode gate")?
+    } else {
+        raw_topk
+    };
+    match sparse_attention_arm_from_env()? {
+        SparseAttentionArm::Reference => run_sparse_attention_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.attention_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            topk.len(),
+        )?,
+        SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
+            if csa_boundary {
+                run_sparse_attention_score_reuse_device_into(
+                    module,
+                    stream,
+                    &state.q_rope,
+                    &state.attention_cache,
+                    &weights.attn_sink,
+                    topk,
+                    &mut state.sparse,
+                    &mut state.sparse_csa,
+                    topk.len(),
+                )?
+            } else if position == 0 {
+                run_sparse_attention_score_reuse_device_into(
+                    module,
+                    stream,
+                    &state.q_rope,
+                    &state.attention_cache,
+                    &weights.attn_sink,
+                    topk,
+                    &mut state.sparse,
+                    &mut state.sparse_pos0,
+                    topk.len(),
+                )?
+            } else {
+                run_sparse_attention_score_reuse_device_into(
+                    module,
+                    stream,
+                    &state.q_rope,
+                    &state.attention_cache,
+                    &weights.attn_sink,
+                    topk,
+                    &mut state.sparse,
+                    &mut state.sparse_pos1,
+                    topk.len(),
+                )?
+            }
+        }
+    }
+    rope_lut.copy_inverse_row(stream, position, &state.inverse_freqs)?;
+    run_rope_device_into(
+        module,
+        stream,
+        &state.sparse,
+        &state.inverse_freqs,
+        &mut state.sparse_inverse,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_wo_a_device_into(
+        module,
+        stream,
+        &state.sparse_inverse,
+        &weights.wo_a,
+        &mut state.wo_a,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.wo_a,
+        &weights.wo_b,
+        &mut state.fp8_16384,
+        &mut state.fp8_16384_scales,
+        &mut state.empty_u16,
+        &mut state.attention_f32,
+        &mut state.attention,
+        false,
+    )?;
+    run_l0_hc_post_device_into(
+        module,
+        stream,
+        &state.attention,
+        &state.hc_hidden,
+        &state.post,
+        &state.comb,
+        &mut state.after_attention,
+    )?;
+    Ok((
+        state.after_attention.to_host_vec(stream)?,
+        observe_topk.then(|| topk.to_host_vec(stream)).transpose()?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wavefront_l3_l4_attention_row(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    hc_hidden: &[u16],
+    start_pos: usize,
+    sparse_arm: SparseAttentionArm,
+) -> Result<DeviceAttentionRun, Box<dyn Error>> {
+    let weights = &runtime.weights;
+    if !matches!(weights.layer, 3 | 4)
+        || state.layer != weights.layer
+        || start_pos != state.committed_rows
+        || start_pos > 1
+        || hc_hidden.len() != v4_state::HC * v4_state::HIDDEN
+    {
+        return Err("CDQW L3/L4 attention row contract mismatch".into());
+    }
+    let started = std::time::Instant::now();
+    let event_start = state
+        .hc_hidden
+        .context()
+        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let event_end = state
+        .hc_hidden
+        .context()
+        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    event_start.record(stream)?;
+    // SAFETY: the preallocated destination exactly matches this fixed one-row
+    // host input and remains live through the terminal D2H sync.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            state.hc_hidden.cu_deviceptr(),
+            hc_hidden.as_ptr(),
+            state.hc_hidden.num_bytes(),
+            stream.cu_stream(),
+        )?;
+    }
+    rope_lut.copy_forward_row(stream, start_pos, &state.freqs)?;
+    rope_lut.copy_inverse_row(stream, start_pos, &state.inverse_freqs)?;
+    run_l0_mhc_pre_device_into(
+        module,
+        stream,
+        &state.hc_hidden,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+        &mut state.mixes,
+        &mut state.pre,
+        &mut state.post,
+        &mut state.comb,
+        &mut state.collapsed,
+        &mut state.trace,
+        None,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.collapsed,
+        &weights.attn_norm,
+        &mut state.attn_input,
+        v4_state::HIDDEN,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.attn_input,
+        &weights.wq_a,
+        &mut state.fp8_7168,
+        &mut state.fp8_7168_scales,
+        &mut state.empty_u16,
+        &mut state.q_lora_f32,
+        &mut state.q_lora_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.q_lora_raw,
+        &weights.q_norm,
+        &mut state.q_lora,
+        weights.wq_a.out_features,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.q_lora,
+        &weights.wq_b,
+        &mut state.fp8_1536,
+        &mut state.fp8_1536_scales,
+        &mut state.empty_u16,
+        &mut state.q_f32,
+        &mut state.q_raw,
+        true,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.q_raw,
+        &state.empty_u16,
+        &mut state.q_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &state.q_norm,
+        &state.freqs,
+        &mut state.q_rope,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.attn_input,
+        &weights.wkv,
+        &mut state.fp8_7168,
+        &mut state.fp8_7168_scales,
+        &mut state.empty_u16,
+        &mut state.kv_f32,
+        &mut state.kv_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &state.kv_raw,
+        &weights.kv_norm,
+        &mut state.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &state.kv_norm,
+        &state.freqs,
+        &mut state.kv_rope,
+        1,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_kv_quantize_device_into(
+        module,
+        stream,
+        &state.kv_rope,
+        &mut state.empty_u8,
+        &mut state.kv_scales,
+        &mut state.kv_ready,
+    )?;
+    run_compressor_device_into(
+        module,
+        stream,
+        &state.attn_input,
+        &weights.compressor_wkv,
+        &weights.compressor_wgate,
+        &weights.compressor_ape,
+        &mut state.compressor.kv,
+        &mut state.compressor.score,
+        &mut state.compressor.score_plus_ape,
+        state.compressor_width,
+        weights.compression_ratio.get(),
+        start_pos,
+    )?;
+    if let (Some(indexer), Some(indexer_state)) =
+        (weights.indexer.as_ref(), state.indexer_compressor.as_mut())
+    {
+        run_compressor_device_into(
+            module,
+            stream,
+            &state.attn_input,
+            &indexer.compressor_wkv,
+            &indexer.compressor_wgate,
+            &indexer.compressor_ape,
+            &mut indexer_state.kv,
+            &mut indexer_state.score,
+            &mut indexer_state.score_plus_ape,
+            256,
+            4,
+            start_pos,
+        )?;
+        // ponytail: before the 3->4 pool boundary there are no indexer keys,
+        // so its q/weight projections cannot affect state, top-k, or output.
+        unsafe {
+            let indexer_slot = 4 + start_pos;
+            copy_device_row(
+                stream,
+                &indexer_state.persistent_kv,
+                indexer_slot,
+                &indexer_state.kv,
+            )?;
+            copy_device_row(
+                stream,
+                &indexer_state.persistent_score,
+                indexer_slot,
+                &indexer_state.score_plus_ape,
+            )?;
+        }
+    }
+    unsafe {
+        copy_device_row(stream, &state.kv_cache, start_pos, &state.kv_ready)?;
+        let compressor_slot = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+            weights.compression_ratio.get() + start_pos
+        } else {
+            start_pos
+        };
+        copy_device_row(
+            stream,
+            &state.compressor.persistent_kv,
+            compressor_slot,
+            &state.compressor.kv,
+        )?;
+        copy_device_row(
+            stream,
+            &state.compressor.persistent_score,
+            compressor_slot,
+            &state.compressor.score_plus_ape,
+        )?;
+    }
+    let topk = state
+        .topk_raw
+        .get(start_pos)
+        .ok_or("device attention gate top-k position is outside short-decode storage")?;
+    if !sparse_arm.uses_score_reuse(topk.len()) {
+        run_sparse_attention_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.kv_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            topk.len(),
+        )?;
+    } else if start_pos == 0 {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.kv_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            &mut state.sparse_pos0,
+            topk.len(),
+        )?;
+    } else {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.kv_cache,
+            &weights.attn_sink,
+            topk,
+            &mut state.sparse,
+            &mut state.sparse_pos1,
+            topk.len(),
+        )?;
+    }
+    run_rope_device_into(
+        module,
+        stream,
+        &state.sparse,
+        &state.inverse_freqs,
+        &mut state.sparse_inverse,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_wo_a_device_into(
+        module,
+        stream,
+        &state.sparse_inverse,
+        &weights.wo_a,
+        &mut state.wo_a,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &state.wo_a,
+        &weights.wo_b,
+        &mut state.fp8_16384,
+        &mut state.fp8_16384_scales,
+        &mut state.empty_u16,
+        &mut state.attention_f32,
+        &mut state.attention,
+        false,
+    )?;
+    run_l0_hc_post_device_into(
+        module,
+        stream,
+        &state.attention,
+        &state.hc_hidden,
+        &state.post,
+        &state.comb,
+        &mut state.after_attention,
+    )?;
+    event_end.record(stream)?;
+    event_end.synchronize()?;
+    let cuda_event_ns = (event_start.elapsed_ms(&event_end)? as f64 * 1_000_000.0) as u64;
+    let output = state.after_attention.to_host_vec(stream)?;
+    let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if !sparse_arm.uses_score_reuse(topk.len()) {
+        let scratch = if start_pos == 0 {
+            &mut state.sparse_pos0
+        } else {
+            &mut state.sparse_pos1
+        };
+        run_sparse_attention_reference_state_device_into(
+            module,
+            stream,
+            &state.q_rope,
+            &state.kv_cache,
+            &weights.attn_sink,
+            topk,
+            scratch,
+            topk.len(),
+        )?;
+    }
+    state.committed_rows += 1;
+    Ok(DeviceAttentionRun {
+        output,
+        elapsed_ns,
+        cuda_event_ns,
+        h2d_count: 1,
+        h2d_bytes: state.hc_hidden.num_bytes(),
+        rope_lut_d2d_count: 2,
+        rope_lut_d2d_bytes: state.freqs.num_bytes() + state.inverse_freqs.num_bytes(),
+        d2h_count: 1,
+        d2h_bytes: state.after_attention.num_bytes(),
+        alloc_count: 0,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AttentionAudit {
+    outputs: [Vec<u16>; 2],
+    stage_digests: [Vec<(&'static str, u64)>; 2],
+    topk_digests: [u64; 2],
+    kv: Vec<u16>,
+    main_kv: Vec<f32>,
+    main_score: Vec<f32>,
+    indexer_kv: Option<Vec<f32>>,
+    indexer_score: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug)]
+struct PersistentStateAudit {
+    kv: Vec<u16>,
+    compressed_kv: Vec<u16>,
+    indexer_kv: Vec<u16>,
+    main_kv: Vec<f32>,
+    main_score: Vec<f32>,
+    indexer_main_kv: Option<Vec<f32>>,
+    indexer_main_score: Option<Vec<f32>>,
+}
+
+fn host_persistent_state_audit(state: &v4_state::V4LayerPersistentState) -> PersistentStateAudit {
+    let main = state.compressor();
+    let indexer = state.indexer();
+    PersistentStateAudit {
+        kv: state.kv_bf16().to_vec(),
+        compressed_kv: state.compressed_kv_bf16().to_vec(),
+        indexer_kv: state.indexer_kv_bf16().to_vec(),
+        main_kv: main.kv().to_vec(),
+        main_score: main.score().to_vec(),
+        indexer_main_kv: indexer.map(|value| value.kv().to_vec()),
+        indexer_main_score: indexer.map(|value| value.score().to_vec()),
+    }
+}
+
+fn device_persistent_state_audit(
+    stream: &CudaStream,
+    state: &DeviceTokenState,
+) -> Result<PersistentStateAudit, Box<dyn Error>> {
+    let indexer = state.indexer_compressor.as_ref();
+    Ok(PersistentStateAudit {
+        kv: state.kv_cache.to_host_vec(stream)?[..state.committed_rows * v4_state::Q_HEAD_DIM]
+            .to_vec(),
+        compressed_kv: state.compressed_cache.to_host_vec(stream)?
+            [..state.compressed_rows * v4_state::Q_HEAD_DIM]
+            .to_vec(),
+        indexer_kv: state.indexer_cache.to_host_vec(stream)?[..state.compressed_rows * 128]
+            .to_vec(),
+        main_kv: state.compressor.persistent_kv.to_host_vec(stream)?,
+        main_score: state.compressor.persistent_score.to_host_vec(stream)?,
+        indexer_main_kv: indexer
+            .map(|value| value.persistent_kv.to_host_vec(stream))
+            .transpose()?,
+        indexer_main_score: indexer
+            .map(|value| value.persistent_score.to_host_vec(stream))
+            .transpose()?,
+    })
+}
+
+/// The audit reads each listed device allocation in full before trimming the
+/// logical cache prefix, so this is the physical D2H transfer ledger.
+fn device_persistent_state_audit_d2h_transfer(state: &DeviceTokenState) -> (usize, usize) {
+    let mut count = 5;
+    let mut bytes = state.kv_cache.num_bytes()
+        + state.compressed_cache.num_bytes()
+        + state.indexer_cache.num_bytes()
+        + state.compressor.persistent_kv.num_bytes()
+        + state.compressor.persistent_score.num_bytes();
+    if let Some(indexer) = state.indexer_compressor.as_ref() {
+        count += 2;
+        bytes += indexer.persistent_kv.num_bytes() + indexer.persistent_score.num_bytes();
+    }
+    (count, bytes)
+}
+
+fn first_f32_bits_mismatch(left: &[f32], right: &[f32]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left.to_bits() != right.to_bits())
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+fn check_persistent_state_audit(
+    layer: usize,
+    position: usize,
+    expected: &PersistentStateAudit,
+    actual: &PersistentStateAudit,
+) -> Result<(), Box<dyn Error>> {
+    check_persistent_state_audit_with_compressor_state(layer, position, expected, actual, true)
+}
+
+fn check_short_decode_full_layer_audit(
+    layer: usize,
+    position: usize,
+    expected: &RealLayerRun,
+    expected_state: &PersistentStateAudit,
+    actual: &RealLayerRun,
+    actual_state: &PersistentStateAudit,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(index) = first_mismatch(&expected.attention_output, &actual.attention_output) {
+        return Err(format!(
+            "short decode layer {layer} position {position} attention post mismatch at {index}"
+        )
+        .into());
+    }
+    if expected.attention_topk != actual.attention_topk {
+        return Err(format!(
+            "short decode layer {layer} position {position} attention top-k mismatch"
+        )
+        .into());
+    }
+    check_persistent_state_audit(layer, position, expected_state, actual_state)?;
+    if expected.routes.ids != actual.routes.ids
+        || first_f32_bits_mismatch(&expected.routes.weights, &actual.routes.weights).is_some()
+    {
+        return Err(
+            format!("short decode layer {layer} position {position} route mismatch").into(),
+        );
+    }
+    let expected_routed = expected
+        .routed_audit
+        .as_ref()
+        .ok_or("short decode host oracle omitted routed contribution audit")?;
+    let actual_routed = actual
+        .routed_audit
+        .as_ref()
+        .ok_or("short decode device candidate omitted routed contribution audit")?;
+    if expected_routed.after_attention_digest != actual_routed.after_attention_digest
+        || expected_routed.ffn_input_digest != actual_routed.ffn_input_digest
+        || expected_routed.shared_digest != actual_routed.shared_digest
+        || expected_routed.moe_digest != actual_routed.moe_digest
+    {
+        return Err(format!(
+            "short decode layer {layer} position {position} routed stage mismatch"
+        )
+        .into());
+    }
+    if expected_routed.contributions.len() != actual_routed.contributions.len()
+        || expected_routed
+            .contributions
+            .iter()
+            .zip(&actual_routed.contributions)
+            .any(|(left, right)| first_f32_bits_mismatch(left, right).is_some())
+    {
+        return Err(format!(
+            "short decode layer {layer} position {position} expert output mismatch"
+        )
+        .into());
+    }
+    if let Some(index) = first_mismatch(&expected.output, &actual.output) {
+        return Err(format!(
+            "short decode layer {layer} position {position} canonical output mismatch at {index}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// HCA never reads Compressor's rolling FP32 slots after committing them.  On
+/// a reused HCA allocation their unwritten tail is intentionally unspecified;
+/// audit the observable KV/cache state and complete attention instead.  CSA
+/// retains the full FP32 check because its 3->4 boundary reads the overlap.
+fn check_persistent_state_audit_with_compressor_state(
+    layer: usize,
+    position: usize,
+    expected: &PersistentStateAudit,
+    actual: &PersistentStateAudit,
+    require_compressor_state: bool,
+) -> Result<(), Box<dyn Error>> {
+    for (name, mismatch) in [
+        ("kv", first_mismatch(&expected.kv, &actual.kv)),
+        (
+            "compressed_kv",
+            first_mismatch(&expected.compressed_kv, &actual.compressed_kv),
+        ),
+        (
+            "indexer_kv",
+            first_mismatch(&expected.indexer_kv, &actual.indexer_kv),
+        ),
+    ] {
+        if let Some(index) = mismatch {
+            return Err(format!(
+                "device token-state layer {layer} position {position} {name} first mismatch at {index}"
+            )
+            .into());
+        }
+    }
+    if !require_compressor_state {
+        return Ok(());
+    }
+    for (name, mismatch) in [
+        (
+            "main_compressor_kv",
+            first_f32_bits_mismatch(&expected.main_kv, &actual.main_kv),
+        ),
+        (
+            "main_compressor_score",
+            first_f32_bits_mismatch(&expected.main_score, &actual.main_score),
+        ),
+    ] {
+        if let Some(index) = mismatch {
+            return Err(format!(
+                "device token-state layer {layer} position {position} {name} first mismatch at {index}"
+            )
+            .into());
+        }
+    }
+    for (name, expected, actual) in [
+        (
+            "indexer_compressor_kv",
+            &expected.indexer_main_kv,
+            &actual.indexer_main_kv,
+        ),
+        (
+            "indexer_compressor_score",
+            &expected.indexer_main_score,
+            &actual.indexer_main_score,
+        ),
+    ] {
+        match (expected, actual) {
+            (Some(expected), Some(actual)) => {
+                if let Some(index) = first_f32_bits_mismatch(expected, actual) {
+                    return Err(format!(
+                        "device token-state layer {layer} position {position} {name} first mismatch at {index}"
+                    )
+                    .into());
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "device token-state layer {layer} position {position} {name} presence mismatch"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn persistent_state_audit_json(audit: &PersistentStateAudit) -> serde_json::Value {
+    serde_json::json!({
+        "kv_bf16_digest": format!("{:016x}", fnv1a_u16(&audit.kv)),
+        "compressed_kv_bf16_digest": format!("{:016x}", fnv1a_u16(&audit.compressed_kv)),
+        "indexer_kv_bf16_digest": format!("{:016x}", fnv1a_u16(&audit.indexer_kv)),
+        "main_compressor_kv_f32_digest": format!("{:016x}", fnv1a_f32(&audit.main_kv)),
+        "main_compressor_score_f32_digest": format!("{:016x}", fnv1a_f32(&audit.main_score)),
+        "indexer_compressor_kv_f32_digest": audit.indexer_main_kv.as_ref().map(|value| format!("{:016x}", fnv1a_f32(value))),
+        "indexer_compressor_score_f32_digest": audit.indexer_main_score.as_ref().map(|value| format!("{:016x}", fnv1a_f32(value))),
+    })
+}
+
+fn run_attention_arm_a(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    inputs: &[Vec<u16>; 2],
+) -> Result<(AttentionAudit, u64), Box<dyn Error>> {
+    let mut persistent = v4_state::V4SerialPersistentState::new(2)?;
+    let mut outputs = Vec::with_capacity(2);
+    let mut topk_digests = Vec::with_capacity(2);
+    let mut stage_digests = Vec::with_capacity(2);
+    let started = std::time::Instant::now();
+    for position in 0..2 {
+        persistent.transaction(runtime.weights.layer, |state| {
+            let run = run_real_layer_attention_rows(
+                module,
+                stream,
+                runtime,
+                &inputs[position],
+                position,
+                state,
+                None,
+                None,
+            )?;
+            stage_digests.push(run.stage_digests);
+            outputs.push(run.output);
+            topk_digests.push(run.attention_topk_digest);
+            Ok(())
+        })?;
+    }
+    let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let state = persistent
+        .layer(runtime.weights.layer)
+        .ok_or("canonical attention state disappeared")?;
+    let main = state.compressor();
+    let indexer = state.indexer();
+    Ok((
+        AttentionAudit {
+            outputs: outputs
+                .try_into()
+                .map_err(|_| "canonical attention changed output row count")?,
+            stage_digests: stage_digests
+                .try_into()
+                .map_err(|_| "canonical attention changed stage row count")?,
+            topk_digests: topk_digests
+                .try_into()
+                .map_err(|_| "canonical attention changed top-k row count")?,
+            kv: state.kv_bf16().to_vec(),
+            main_kv: main.kv().to_vec(),
+            main_score: main.score().to_vec(),
+            indexer_kv: indexer.map(|value| value.kv().to_vec()),
+            indexer_score: indexer.map(|value| value.score().to_vec()),
+        },
+        elapsed_ns,
+    ))
+}
+
+fn device_attention_stage_digests(
+    stream: &CudaStream,
+    state: &DeviceTokenState,
+) -> Result<Vec<(&'static str, u64)>, Box<dyn Error>> {
+    let sparse_scratch = if state.committed_rows == 1 {
+        &state.sparse_pos0
+    } else {
+        &state.sparse_pos1
+    };
+    Ok(vec![
+        (
+            "mhc_collapsed",
+            fnv1a_u16(&state.collapsed.to_host_vec(stream)?),
+        ),
+        ("mhc_post", fnv1a_f32(&state.post.to_host_vec(stream)?)),
+        ("mhc_comb", fnv1a_f32(&state.comb.to_host_vec(stream)?)),
+        (
+            "attn_input",
+            fnv1a_u16(&state.attn_input.to_host_vec(stream)?),
+        ),
+        (
+            "q_lora_raw",
+            fnv1a_u16(&state.q_lora_raw.to_host_vec(stream)?),
+        ),
+        ("q_lora", fnv1a_u16(&state.q_lora.to_host_vec(stream)?)),
+        ("q_raw", fnv1a_u16(&state.q_raw.to_host_vec(stream)?)),
+        ("q_norm", fnv1a_u16(&state.q_norm.to_host_vec(stream)?)),
+        ("q_rope", fnv1a_u16(&state.q_rope.to_host_vec(stream)?)),
+        ("kv_raw", fnv1a_u16(&state.kv_raw.to_host_vec(stream)?)),
+        ("kv_norm", fnv1a_u16(&state.kv_norm.to_host_vec(stream)?)),
+        ("kv_rope", fnv1a_u16(&state.kv_rope.to_host_vec(stream)?)),
+        ("kv_ready", fnv1a_u16(&state.kv_ready.to_host_vec(stream)?)),
+        (
+            "compressor_kv",
+            fnv1a_f32(&state.compressor.kv.to_host_vec(stream)?),
+        ),
+        (
+            "compressor_score",
+            fnv1a_f32(&state.compressor.score.to_host_vec(stream)?),
+        ),
+        (
+            "compressor_score_plus_ape",
+            fnv1a_f32(&state.compressor.score_plus_ape.to_host_vec(stream)?),
+        ),
+        (
+            "sparse_raw_scores",
+            fnv1a_f32(&sparse_scratch.scores.to_host_vec(stream)?),
+        ),
+        (
+            "sparse_probabilities",
+            fnv1a_f32(&sparse_scratch.probabilities.to_host_vec(stream)?),
+        ),
+        (
+            "sparse_denominators",
+            fnv1a_f32(&sparse_scratch.denominators.to_host_vec(stream)?),
+        ),
+        (
+            "sparse_valid_counts",
+            fnv1a_i32(
+                &sparse_scratch
+                    .valid_counts
+                    .to_host_vec(stream)?
+                    .into_iter()
+                    .map(|value| value as i32)
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        ("sparse", fnv1a_u16(&state.sparse.to_host_vec(stream)?)),
+        (
+            "sparse_inverse",
+            fnv1a_u16(&state.sparse_inverse.to_host_vec(stream)?),
+        ),
+        ("wo_a", fnv1a_u16(&state.wo_a.to_host_vec(stream)?)),
+        (
+            "attention",
+            fnv1a_u16(&state.attention.to_host_vec(stream)?),
+        ),
+        (
+            "attention_post",
+            fnv1a_u16(&state.after_attention.to_host_vec(stream)?),
+        ),
+    ])
+}
+
+fn run_attention_arm_b(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    inputs: &[Vec<u16>; 2],
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    sparse_arm: SparseAttentionArm,
+) -> Result<(AttentionAudit, u64, [DeviceAttentionRun; 2]), Box<dyn Error>> {
+    let run0 = run_wavefront_l3_l4_attention_row(
+        module, stream, runtime, state, rope_lut, &inputs[0], 0, sparse_arm,
+    )?;
+    let stages0 = device_attention_stage_digests(stream, state)?;
+    let run1 = run_wavefront_l3_l4_attention_row(
+        module, stream, runtime, state, rope_lut, &inputs[1], 1, sparse_arm,
+    )?;
+    let stages1 = device_attention_stage_digests(stream, state)?;
+    let elapsed_ns = run0.elapsed_ns.saturating_add(run1.elapsed_ns);
+    // These downloads are a post-timing correctness audit. The measured path
+    // above has only the terminal hidden D2H recorded in each row result.
+    let kv = state.kv_cache.to_host_vec(stream)?;
+    let main_kv = state.compressor.persistent_kv.to_host_vec(stream)?;
+    let main_score = state.compressor.persistent_score.to_host_vec(stream)?;
+    let indexer_kv = state
+        .indexer_compressor
+        .as_ref()
+        .map(|value| value.persistent_kv.to_host_vec(stream))
+        .transpose()?;
+    let indexer_score = state
+        .indexer_compressor
+        .as_ref()
+        .map(|value| value.persistent_score.to_host_vec(stream))
+        .transpose()?;
+    let topk_digests = [
+        fnv1a_i32(&v4_state::window_topk_cpu(1, 0, v4_state::KV_WINDOW)?.0),
+        fnv1a_i32(&v4_state::window_topk_cpu(1, 1, v4_state::KV_WINDOW)?.0),
+    ];
+    Ok((
+        AttentionAudit {
+            outputs: [run0.output.clone(), run1.output.clone()],
+            stage_digests: [stages0, stages1],
+            topk_digests,
+            kv: kv[..state.committed_rows * v4_state::Q_HEAD_DIM].to_vec(),
+            main_kv,
+            main_score,
+            indexer_kv,
+            indexer_score,
+        },
+        elapsed_ns,
+        [run0, run1],
+    ))
+}
+
+fn first_mismatch<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(left, right)| left != right)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+fn check_attention_audit(
+    layer: usize,
+    expected: &AttentionAudit,
+    actual: &AttentionAudit,
+) -> Result<(), Box<dyn Error>> {
+    for position in 0..2 {
+        let comparable = |stages: &[(&'static str, u64)]| {
+            stages
+                .iter()
+                .copied()
+                .filter(|(name, _)| {
+                    !matches!(
+                        *name,
+                        "sparse_raw_scores"
+                            | "sparse_probabilities"
+                            | "sparse_denominators"
+                            | "sparse_valid_counts"
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_stages = comparable(&expected.stage_digests[position]);
+        let actual_stages = comparable(&actual.stage_digests[position]);
+        if expected_stages.len() != actual_stages.len() {
+            return Err(format!(
+                "CDQW layer {layer} position {position} stage audit length mismatch"
+            )
+            .into());
+        }
+        for ((expected_name, expected_digest), (actual_name, actual_digest)) in
+            expected_stages.iter().zip(&actual_stages)
+        {
+            if expected_name != actual_name || expected_digest != actual_digest {
+                return Err(format!(
+                    "CDQW layer {layer} position {position} first stage mismatch: \
+                     A {expected_name}={expected_digest:016x}, \
+                     B {actual_name}={actual_digest:016x}"
+                )
+                .into());
+            }
+        }
+        if let Some(index) = first_mismatch(&expected.outputs[position], &actual.outputs[position])
+        {
+            return Err(format!(
+                "CDQW layer {layer} position {position} attention_post first mismatch at {index}"
+            )
+            .into());
+        }
+        if expected.topk_digests[position] != actual.topk_digests[position] {
+            return Err(format!(
+                "CDQW layer {layer} position {position} sparse top-k digest mismatch"
+            )
+            .into());
+        }
+    }
+    for (stage, mismatch) in [
+        ("kv", first_mismatch(&expected.kv, &actual.kv)),
+        (
+            "main_compressor_kv",
+            first_mismatch(&expected.main_kv, &actual.main_kv),
+        ),
+        (
+            "main_compressor_score",
+            first_mismatch(&expected.main_score, &actual.main_score),
+        ),
+    ] {
+        if let Some(index) = mismatch {
+            return Err(format!("CDQW layer {layer} {stage} first mismatch at {index}").into());
+        }
+    }
+    match (&expected.indexer_kv, &actual.indexer_kv) {
+        (Some(expected), Some(actual)) => {
+            if let Some(index) = first_mismatch(expected, actual) {
+                return Err(format!(
+                    "CDQW layer {layer} indexer_compressor_kv mismatch at {index}"
+                )
+                .into());
+            }
+        }
+        (None, None) => {}
+        _ => return Err(format!("CDQW layer {layer} indexer KV presence mismatch").into()),
+    }
+    match (&expected.indexer_score, &actual.indexer_score) {
+        (Some(expected), Some(actual)) => {
+            if let Some(index) = first_mismatch(expected, actual) {
+                return Err(format!(
+                    "CDQW layer {layer} indexer_compressor_score mismatch at {index}"
+                )
+                .into());
+            }
+        }
+        (None, None) => {}
+        _ => return Err(format!("CDQW layer {layer} indexer score presence mismatch").into()),
+    }
+    Ok(())
+}
+
+fn run_sparse_attention_topk_sweep(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const TOPKS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 129];
+    const PAIRS: usize = 15;
+    let result_path = std::env::var_os("COLIBRI_V4_SPARSE_TOPK_SWEEP_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_SPARSE_TOPK_SWEEP_RESULT_JSONL")?;
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let q_host = (0..v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)
+        .map(|index| v4_router::f32_to_bf16_rne(((index % 29) as f32 - 14.0) * 0.007_812_5))
+        .collect::<Vec<_>>();
+    let kv_host = (0..129 * v4_state::Q_HEAD_DIM)
+        .map(|index| v4_router::f32_to_bf16_rne(((index % 31) as f32 - 15.0) * 0.003_906_25))
+        .collect::<Vec<_>>();
+    let sink_host = (0..v4_state::Q_HEADS)
+        .map(|head| -1.0_f32 - (head % 7) as f32 * 0.03125)
+        .collect::<Vec<_>>();
+    let q = DeviceBuffer::from_host(stream, &q_host)?;
+    let kv = DeviceBuffer::from_host(stream, &kv_host)?;
+    let sink = DeviceBuffer::from_host(stream, &sink_host)?;
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let mut output = std::fs::File::create(&result_path)?;
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-sparse-score-reuse-topk-sweep-v1",
+            "provenance": benchmark_provenance()?,
+            "gpu_timing": "CUDA events; output/raw-state downloads occur after each timed pair",
+            "geometries": ["L3_HCA: q_heads=128,q_head_dim=512", "L4_CSA: q_heads=128,q_head_dim=512"],
+            "topks": TOPKS,
+            "pairs": PAIRS,
+            "arm_order_schedule": "AB/BA alternating; A=scalar sparse_attn_v4_bf16; B=sparse_attn_v4_scores+probabilities+values",
+            "raw_exactness": "BF16 output plus raw f32 scores/probabilities/denominators and u32 valid_counts"
+        })
+    )?;
+
+    for geometry in ["L3_HCA", "L4_CSA"] {
+        for topk_per_row in TOPKS {
+            let topk_host = (0..topk_per_row)
+                .map(i32::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            let topk = DeviceBuffer::from_host(stream, &topk_host)?;
+            let mut reference = DeviceBuffer::<u16>::zeroed(stream, q_host.len())?;
+            let mut candidate = DeviceBuffer::<u16>::zeroed(stream, q_host.len())?;
+            let mut reference_state =
+                SparseAttentionScoreReuseScratch::new(stream, 1, topk_per_row)?;
+            let mut candidate_state =
+                SparseAttentionScoreReuseScratch::new(stream, 1, topk_per_row)?;
+            for _ in 0..2 {
+                run_sparse_attention_device_into(
+                    module,
+                    stream,
+                    &q,
+                    &kv,
+                    &sink,
+                    &topk,
+                    &mut reference,
+                    topk_per_row,
+                )?;
+                run_sparse_attention_score_reuse_device_into(
+                    module,
+                    stream,
+                    &q,
+                    &kv,
+                    &sink,
+                    &topk,
+                    &mut candidate,
+                    &mut candidate_state,
+                    topk_per_row,
+                )?;
+            }
+            end.record(stream)?;
+            end.synchronize()?;
+            let mut reference_samples = Vec::with_capacity(PAIRS);
+            let mut candidate_samples = Vec::with_capacity(PAIRS);
+            for pair in 0..PAIRS {
+                let reference_first = pair.is_multiple_of(2);
+                let mut reference_ns = 0_u64;
+                let mut candidate_ns = 0_u64;
+                for arm in if reference_first {
+                    [
+                        SparseAttentionArm::Reference,
+                        SparseAttentionArm::ScoreReuse,
+                    ]
+                } else {
+                    [
+                        SparseAttentionArm::ScoreReuse,
+                        SparseAttentionArm::Reference,
+                    ]
+                } {
+                    start.record(stream)?;
+                    match arm {
+                        SparseAttentionArm::Reference => run_sparse_attention_device_into(
+                            module,
+                            stream,
+                            &q,
+                            &kv,
+                            &sink,
+                            &topk,
+                            &mut reference,
+                            topk_per_row,
+                        )?,
+                        SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
+                            run_sparse_attention_score_reuse_device_into(
+                                module,
+                                stream,
+                                &q,
+                                &kv,
+                                &sink,
+                                &topk,
+                                &mut candidate,
+                                &mut candidate_state,
+                                topk_per_row,
+                            )?
+                        }
+                    }
+                    end.record(stream)?;
+                    end.synchronize()?;
+                    let elapsed = (start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64;
+                    match arm {
+                        SparseAttentionArm::Reference => reference_ns = elapsed,
+                        SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
+                            candidate_ns = elapsed
+                        }
+                    }
+                }
+                run_sparse_attention_reference_state_device_into(
+                    module,
+                    stream,
+                    &q,
+                    &kv,
+                    &sink,
+                    &topk,
+                    &mut reference_state,
+                    topk_per_row,
+                )?;
+                let reference_output = reference.to_host_vec(stream)?;
+                let candidate_output = candidate.to_host_vec(stream)?;
+                if reference_output != candidate_output {
+                    return Err(format!(
+                        "{geometry} topk={topk_per_row} pair={pair}: BF16 output mismatch"
+                    )
+                    .into());
+                }
+                let reference_scores = reference_state.scores.to_host_vec(stream)?;
+                let candidate_scores = candidate_state.scores.to_host_vec(stream)?;
+                let reference_probabilities = reference_state.probabilities.to_host_vec(stream)?;
+                let candidate_probabilities = candidate_state.probabilities.to_host_vec(stream)?;
+                let reference_denominators = reference_state.denominators.to_host_vec(stream)?;
+                let candidate_denominators = candidate_state.denominators.to_host_vec(stream)?;
+                let reference_valid_counts = reference_state.valid_counts.to_host_vec(stream)?;
+                let candidate_valid_counts = candidate_state.valid_counts.to_host_vec(stream)?;
+                let raw_exact = reference_scores
+                    .iter()
+                    .zip(&candidate_scores)
+                    .chain(reference_probabilities.iter().zip(&candidate_probabilities))
+                    .chain(reference_denominators.iter().zip(&candidate_denominators))
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+                    && reference_valid_counts == candidate_valid_counts;
+                if !raw_exact {
+                    return Err(format!(
+                        "{geometry} topk={topk_per_row} pair={pair}: raw state mismatch"
+                    )
+                    .into());
+                }
+                reference_samples.push(reference_ns);
+                candidate_samples.push(candidate_ns);
+                writeln!(
+                    output,
+                    "{}",
+                    serde_json::json!({
+                        "event": "pair",
+                        "geometry": geometry,
+                        "topk": topk_per_row,
+                        "pair": pair,
+                        "arm_order": if reference_first { "AB" } else { "BA" },
+                        "reference_cuda_event_ns": reference_ns,
+                        "candidate_cuda_event_ns": candidate_ns,
+                        "speedup": reference_ns as f64 / candidate_ns as f64,
+                        "exact": true,
+                        "output_bf16_digest": format!("{:016x}", fnv1a_u16(&candidate_output)),
+                        "scores_f32_digest": format!("{:016x}", fnv1a_f32(&candidate_scores)),
+                        "probabilities_f32_digest": format!("{:016x}", fnv1a_f32(&candidate_probabilities)),
+                        "denominators_f32_digest": format!("{:016x}", fnv1a_f32(&candidate_denominators)),
+                        "valid_counts_digest": format!("{:016x}", fnv1a_i32(&candidate_valid_counts.iter().map(|&value| value as i32).collect::<Vec<_>>())),
+                    })
+                )?;
+            }
+            let (reference_p50_ms, reference_p95_ms) = median_p95_ms(&reference_samples);
+            let (candidate_p50_ms, candidate_p95_ms) = median_p95_ms(&candidate_samples);
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "summary",
+                    "geometry": geometry,
+                    "topk": topk_per_row,
+                    "pairs": PAIRS,
+                    "exact": true,
+                    "reference_cuda_event_p50_ms": reference_p50_ms,
+                    "reference_cuda_event_p95_ms": reference_p95_ms,
+                    "candidate_cuda_event_p50_ms": candidate_p50_ms,
+                    "candidate_cuda_event_p95_ms": candidate_p95_ms,
+                    "speedup_p50": reference_p50_ms / candidate_p50_ms,
+                    "speedup_p95": reference_p95_ms / candidate_p95_ms,
+                    "candidate_p95_wins": candidate_p95_ms < reference_p95_ms,
+                })
+            )?;
+        }
+    }
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-sparse-topk-sweep\",\"result_jsonl\":{}}}",
+        serde_json::to_string(&result_path)?
+    );
+    Ok(())
+}
+
+fn run_attention_arm_a_timed(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    inputs: &[Vec<u16>; 2],
+) -> Result<(AttentionAudit, u64, u64), Box<dyn Error>> {
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    start.record(stream)?;
+    let (audit, wall_ns) = run_attention_arm_a(module, stream, runtime, inputs)?;
+    end.record(stream)?;
+    end.synchronize()?;
+    Ok((
+        audit,
+        wall_ns,
+        (start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64,
+    ))
+}
+
+fn gpu_telemetry_snapshot() -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=temperature.gpu,power.draw,clocks.sm,clocks.mem",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err("nvidia-smi telemetry query failed".into());
+    }
+    let fields = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .next()
+        .ok_or("nvidia-smi telemetry is empty")?
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err("nvidia-smi telemetry format changed".into());
+    }
+    Ok(serde_json::json!({
+        "temperature_c": fields[0],
+        "power_w": fields[1],
+        "sm_clock_mhz": fields[2],
+        "memory_clock_mhz": fields[3],
+    }))
+}
+
+fn run_real_v4_wavefront_attention_bench(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const PAIRS: usize = 30;
+    const REQUIRED_P50_SPEEDUP: f64 = 1.0 / 0.95;
+    let result_path = std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_WAVEFRONT_ATTENTION_RESULT_JSONL")?;
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let model_dir = v4_model_dir()?;
+    let token_ids = [0_i64, 1_i64];
+    let mut lanes = (0..V4_QD4_LANES)
+        .map(|_| {
+            let lane_stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &lane_stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let inputs =
+        prepare_two_token_prefix(context, module, stream, &model_dir, token_ids, &mut lanes)?;
+    let sparse_arm = sparse_attention_arm_from_env()?;
+    let rope_lut = DeviceRequestRopeLut::new(stream, V4_REQUEST_ROPE_LUT_ROWS)?;
+    let telemetry_before = gpu_telemetry_snapshot()?;
+    let mut output = std::fs::File::create(&result_path)?;
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-device-attention-gate-v1",
+            "provenance": benchmark_provenance()?,
+            "model_revision": v4_state::REVISION,
+            "layers": [3, 4],
+            "positions": [0, 1],
+            "pairs": PAIRS,
+            "arm_order_schedule": "AB/BA alternating; A=current host attention runner; B=existing device-resident attention chain",
+            "sparse_attention_arm": format!("{sparse_arm:?}"),
+            "timing": "monotonic host wall is the gate; CUDA events are diagnostics; state downloads are post-timing exactness audit only",
+            "request_rope_lut": {
+                "h2d_count": 1,
+                "h2d_bytes": rope_lut.num_bytes(),
+            },
+            "gate": {
+                "exact": "30/30 pairs per layer; both positions; attention_post BF16, top-k, KV, main/indexer compressor state, and all comparable stage digests",
+                "p50_speedup_at_least": REQUIRED_P50_SPEEDUP,
+                "p95_nonregression": true,
+                "candidate_transfer_contract": "request-global RoPE LUT: 1 H2D / 2,560 B; per two positions: 2 hidden H2D, 4 LUT-row D2D, 2 terminal hidden D2H, zero temporary allocations; no intermediate D2H"
+            },
+            "gpu_before": telemetry_before,
+        })
+    )?;
+    let mut overall_go = true;
+    for layer in [3_usize, 4] {
+        let (runtime, _) = load_layer_runtime(&model_dir, layer, &token_ids, stream)?;
+        let mut host_wall_samples = Vec::with_capacity(PAIRS);
+        let mut device_wall_samples = Vec::with_capacity(PAIRS);
+        let mut host_cuda_event_samples = Vec::with_capacity(PAIRS);
+        let mut device_cuda_event_samples = Vec::with_capacity(PAIRS);
+        let mut exact_pairs = 0_usize;
+        for pair in 0..PAIRS {
+            let host_first = pair.is_multiple_of(2);
+            let ((host, host_wall_ns, host_cuda_event_ns), (device, device_wall_ns, device_runs)) =
+                if host_first {
+                    let host =
+                        run_attention_arm_a_timed(context, module, stream, &runtime, &inputs)?;
+                    let mut state = DeviceTokenState::new(stream, &runtime.weights)?;
+                    let device = run_attention_arm_b(
+                        module, stream, &runtime, &inputs, &mut state, &rope_lut, sparse_arm,
+                    )?;
+                    (host, device)
+                } else {
+                    let mut state = DeviceTokenState::new(stream, &runtime.weights)?;
+                    let device = run_attention_arm_b(
+                        module, stream, &runtime, &inputs, &mut state, &rope_lut, sparse_arm,
+                    )?;
+                    let host =
+                        run_attention_arm_a_timed(context, module, stream, &runtime, &inputs)?;
+                    (host, device)
+                };
+            check_attention_audit(layer, &host, &device)?;
+            exact_pairs += 1;
+            let h2d_count = device_runs.iter().map(|run| run.h2d_count).sum::<usize>();
+            let h2d_bytes = device_runs.iter().map(|run| run.h2d_bytes).sum::<usize>();
+            let rope_lut_d2d_count = device_runs
+                .iter()
+                .map(|run| run.rope_lut_d2d_count)
+                .sum::<usize>();
+            let rope_lut_d2d_bytes = device_runs
+                .iter()
+                .map(|run| run.rope_lut_d2d_bytes)
+                .sum::<usize>();
+            let d2h_count = device_runs.iter().map(|run| run.d2h_count).sum::<usize>();
+            let d2h_bytes = device_runs.iter().map(|run| run.d2h_bytes).sum::<usize>();
+            let alloc_count = device_runs.iter().map(|run| run.alloc_count).sum::<usize>();
+            let device_cuda_event_ns = device_runs
+                .iter()
+                .fold(0_u64, |sum, run| sum.saturating_add(run.cuda_event_ns));
+            if h2d_count != 2
+                || h2d_bytes != 2 * v4_state::HC * v4_state::HIDDEN * 2
+                || rope_lut_d2d_count != 4
+                || rope_lut_d2d_bytes != 4 * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>()
+                || d2h_count != 2
+                || d2h_bytes != 2 * v4_state::HC * v4_state::HIDDEN * 2
+                || alloc_count != 0
+            {
+                return Err(format!(
+                    "device attention layer {layer} transfer/allocation contract failed"
+                )
+                .into());
+            }
+            host_wall_samples.push(host_wall_ns);
+            device_wall_samples.push(device_wall_ns);
+            host_cuda_event_samples.push(host_cuda_event_ns);
+            device_cuda_event_samples.push(device_cuda_event_ns);
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "pair",
+                    "layer": layer,
+                    "pair": pair,
+                    "arm_order": if host_first { "AB" } else { "BA" },
+                    "exact": true,
+                    "host_wall_ns": host_wall_ns,
+                    "device_wall_ns": device_wall_ns,
+                    "wall_speedup": host_wall_ns as f64 / device_wall_ns as f64,
+                    "host_cuda_event_ns": host_cuda_event_ns,
+                    "device_cuda_event_ns": device_cuda_event_ns,
+                    "device_h2d_count": h2d_count,
+                    "device_h2d_bytes": h2d_bytes,
+                    "device_request_rope_lut_d2d_count": rope_lut_d2d_count,
+                    "device_request_rope_lut_d2d_bytes": rope_lut_d2d_bytes,
+                    "device_terminal_d2h_count": d2h_count,
+                    "device_terminal_d2h_bytes": d2h_bytes,
+                    "device_intermediate_d2h_count": 0,
+                    "device_temporary_alloc_count": alloc_count,
+                    "attention_post_digests": device.outputs.iter().map(|row| format!("{:016x}", fnv1a_u16(row))).collect::<Vec<_>>(),
+                    "topk_digests": device.topk_digests.iter().map(|digest| format!("{digest:016x}")).collect::<Vec<_>>(),
+                    "kv_digest": format!("{:016x}", fnv1a_u16(&device.kv)),
+                    "main_compressor_kv_digest": format!("{:016x}", fnv1a_f32(&device.main_kv)),
+                    "main_compressor_score_digest": format!("{:016x}", fnv1a_f32(&device.main_score)),
+                    "indexer_compressor_kv_digest": device.indexer_kv.as_ref().map(|value| format!("{:016x}", fnv1a_f32(value))),
+                    "indexer_compressor_score_digest": device.indexer_score.as_ref().map(|value| format!("{:016x}", fnv1a_f32(value))),
+                })
+            )?;
+        }
+        let host_p50 = median_u64(&host_wall_samples);
+        let device_p50 = median_u64(&device_wall_samples);
+        let (_, host_p95) = median_p95_ms(&host_wall_samples);
+        let (_, device_p95) = median_p95_ms(&device_wall_samples);
+        let p50_go = host_p50 as f64 / device_p50 as f64 >= REQUIRED_P50_SPEEDUP;
+        let p95_go = device_p95 <= host_p95;
+        let layer_status = if exact_pairs == PAIRS && p50_go && p95_go {
+            "GO"
+        } else {
+            "STOP"
+        };
+        overall_go &= layer_status == "GO";
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "layer_summary",
+                "layer": layer,
+                "status": layer_status,
+                "exact_pairs": exact_pairs,
+                "host_wall_p50_ns": host_p50,
+                "device_wall_p50_ns": device_p50,
+                "host_wall_p95_ms": host_p95,
+                "device_wall_p95_ms": device_p95,
+                "wall_speedup_p50": host_p50 as f64 / device_p50 as f64,
+                "host_cuda_event_p50_ns": median_u64(&host_cuda_event_samples),
+                "device_cuda_event_p50_ns": median_u64(&device_cuda_event_samples),
+                "p50_gate": p50_go,
+                "p95_gate": p95_go,
+                "required_p50_speedup": REQUIRED_P50_SPEEDUP,
+                "pairs": PAIRS,
+            })
+        )?;
+    }
+    let telemetry_after = gpu_telemetry_snapshot()?;
+    let status = if overall_go { "GO" } else { "STOP" };
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": status,
+            "full61_promotion": false,
+            "gpu_after": telemetry_after,
+            "result": "local L3/L4 position-0/1 gate only",
+        })
+    )?;
+    output.sync_all()?;
+    println!(
+        "{{\"status\":\"{status}\",\"mode\":\"v4-device-attention-gate\",\"result_jsonl\":{}}}",
+        serde_json::to_string(&result_path)?
+    );
+    Ok(())
+}
+
+fn run_device_attention_preflight_gate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let result_path = std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_RESULT_JSONL")?;
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_PREFILL").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE").is_some()
+    {
+        return Err("device-attention preflight gate is isolated from full61, stationary, and production QD4 modes".into());
+    }
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let model_dir = v4_model_dir()?;
+    let plan = device_attention_capacity_plan(&model_dir, true, false, V4_REQUEST_ROPE_LUT_ROWS)?;
+    let relevant_config_fingerprint = normalized_config_fingerprint(serde_json::json!({
+        "allocation_scope": "qd4_4_lanes+max_csa_fixed+request_rope_lut+max_csa_device_state+hca_device_state+tid2eid_transient+headroom",
+        "headroom_bytes": plan.headroom_bytes,
+        "max_device_token_state_bytes": plan.max_device_token_state_bytes,
+        "hca_device_token_state_bytes": plan.hca_device_token_state_bytes,
+        "max_fixed_device_bytes": plan.max_fixed_device_bytes,
+        "model_revision": v4_state::REVISION,
+        "qd4": true,
+        "request_rope_lut_bytes": plan.rope_lut_bytes,
+        "tid2eid_transient_max_bytes": plan.tid2eid_transient_max_bytes,
+    }))?;
+    let before_bytes = device_available_bytes()?;
+    if before_bytes < plan.required_bytes {
+        return Err(format!(
+            "device-attention preflight requires {} bytes but cuMemGetInfo reports {} free",
+            plan.required_bytes, before_bytes
+        )
+        .into());
+    }
+    let mut samples = vec![serde_json::json!({
+        "stage": "before",
+        "available_bytes": before_bytes,
+    })];
+    let mut min_available_bytes = before_bytes;
+    let mut lane_streams = Vec::with_capacity(V4_QD4_LANES);
+    for _ in 0..V4_QD4_LANES {
+        lane_streams.push(context.new_stream()?);
+    }
+    let lanes = lane_streams
+        .iter()
+        .map(|lane_stream| ExpertSlot::new_empty(context, module, lane_stream))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    for lane_stream in &lane_streams {
+        lane_stream.synchronize()?;
+    }
+    let after_qd4_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_qd4_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_qd4_lanes",
+        "available_bytes": after_qd4_bytes,
+    }));
+    let (hca_runtime, _) = load_layer_runtime(&model_dir, 3, &[0], stream)?;
+    let hca_state = DeviceTokenState::new(stream, &hca_runtime.weights)?;
+    if hca_state.num_bytes() != plan.hca_device_token_state_bytes {
+        return Err(format!(
+            "HCA DeviceTokenState bytes {} != planned HCA maximum {}",
+            hca_state.num_bytes(),
+            plan.hca_device_token_state_bytes
+        )
+        .into());
+    }
+    drop(hca_runtime);
+    stream.synchronize()?;
+    let after_hca_state_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_hca_state_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_hca_device_token_state",
+        "available_bytes": after_hca_state_bytes,
+    }));
+    let (runtime, _) = load_layer_runtime(&model_dir, 4, &[0], stream)?;
+    if runtime.weights.num_bytes() != plan.max_fixed_device_bytes {
+        return Err(format!(
+            "CSA layer 4 fixed bytes {} != metadata maximum {}",
+            runtime.weights.num_bytes(),
+            plan.max_fixed_device_bytes
+        )
+        .into());
+    }
+    stream.synchronize()?;
+    let after_fixed_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_fixed_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_max_csa_fixed_runtime",
+        "available_bytes": after_fixed_bytes,
+    }));
+    let rope_lut = DeviceRequestRopeLut::new(stream, V4_REQUEST_ROPE_LUT_ROWS)?;
+    if rope_lut.num_bytes() != plan.rope_lut_bytes {
+        return Err("request RoPE LUT allocation does not match the capacity ledger".into());
+    }
+    stream.synchronize()?;
+    let after_rope_lut_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_rope_lut_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_request_rope_lut",
+        "available_bytes": after_rope_lut_bytes,
+    }));
+    let state = DeviceTokenState::new(stream, &runtime.weights)?;
+    if state.num_bytes() != plan.max_device_token_state_bytes {
+        return Err(format!(
+            "CSA DeviceTokenState bytes {} != planned maximum {}",
+            state.num_bytes(),
+            plan.max_device_token_state_bytes
+        )
+        .into());
+    }
+    let exact_compressor_scratch_bytes = state.exact_compressor_bytes();
+    stream.synchronize()?;
+    let after_state_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_state_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_max_csa_device_token_state",
+        "available_bytes": after_state_bytes,
+    }));
+    let tid2eid = DeviceBuffer::from_host(stream, &[0_i64; v4_router::V4_TOPK])?;
+    if tid2eid.num_bytes() != plan.tid2eid_transient_max_bytes {
+        return Err("tid2eid transient allocation does not match the capacity ledger".into());
+    }
+    stream.synchronize()?;
+    let after_lut_bytes = device_available_bytes()?;
+    min_available_bytes = min_available_bytes.min(after_lut_bytes);
+    samples.push(serde_json::json!({
+        "stage": "after_tid2eid_transient",
+        "available_bytes": after_lut_bytes,
+    }));
+    drop(tid2eid);
+    drop(state);
+    drop(hca_state);
+    drop(rope_lut);
+    drop(runtime);
+    drop(lanes);
+    for lane_stream in &lane_streams {
+        lane_stream.synchronize()?;
+    }
+    stream.synchronize()?;
+    drop(lane_streams);
+    let after_release_bytes = device_available_bytes()?;
+    if after_release_bytes < before_bytes {
+        return Err(format!(
+            "device-attention preflight left GPU residue: before={} after_release={}",
+            before_bytes, after_release_bytes
+        )
+        .into());
+    }
+    samples.push(serde_json::json!({
+        "stage": "after_release",
+        "available_bytes": after_release_bytes,
+    }));
+    let output = result.file_mut();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-device-attention-capacity-preflight-v1",
+            "provenance": benchmark_provenance()?,
+            "relevant_config_fingerprint": relevant_config_fingerprint,
+            "model_revision": v4_state::REVISION,
+            "allocation_scope": "QD4 four lanes, maximum CSA fixed runtime, one request-global RoPE LUT, maximum CSA DeviceTokenState/strict scratch plus one HCA DeviceTokenState/strict scratch, then one true-peak tid2eid row; no layer execution or full61",
+            "checked_sum_bytes": plan.required_bytes,
+            "qd4_device_bytes": plan.qd4_device_bytes,
+            "max_fixed_layer": plan.fixed_layer,
+            "allocated_csa_layer": 4,
+            "max_fixed_device_bytes": plan.max_fixed_device_bytes,
+            "max_device_token_state_bytes": plan.max_device_token_state_bytes,
+            "hca_device_token_state_bytes": plan.hca_device_token_state_bytes,
+            "actual_exact_compressor_scratch_bytes": exact_compressor_scratch_bytes,
+            "rope_lut_bytes": plan.rope_lut_bytes,
+            "rope_lut_status": "device_request_global",
+            "tid2eid_transient_max_bytes": plan.tid2eid_transient_max_bytes,
+            "headroom_bytes": plan.headroom_bytes,
+            "cuMemGetInfo": {
+                "available_before_bytes": before_bytes,
+                "available_after_release_bytes": after_release_bytes,
+                "available_min_bytes": min_available_bytes,
+                "recovery_contract": "after_release >= before; a larger value is tolerated because unrelated CUDA allocations may have been released",
+                "recovery_exact": after_release_bytes == before_bytes,
+                "samples": samples,
+            },
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-device-attention-capacity-preflight\",\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
+fn run_real_v4_device_token_state_gate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let result_path = std::env::var_os("COLIBRI_V4_DEVICE_TOKEN_STATE_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_DEVICE_TOKEN_STATE_RESULT_JSONL")?;
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_PREFILL").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4_BENCH").is_some()
+    {
+        return Err(
+            "device token-state gate is isolated from full61, stationary, and QD4 modes".into(),
+        );
+    }
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let model_dir = v4_model_dir()?;
+    let raw_wo_a_gate = optional_one_flag("COLIBRI_V4_RAW_WO_A_GATE")?;
+    let hca_reuse_gate = optional_one_flag("COLIBRI_V4_HCA_REUSE_GATE")?;
+    if hca_reuse_gate && !raw_wo_a_gate {
+        return Err("HCA reuse gate requires raw wo_a GPU decode".into());
+    }
+    let layers: &[usize] = if hca_reuse_gate {
+        &[0, 1]
+    } else if raw_wo_a_gate {
+        &[3, 4]
+    } else {
+        &[0, 3, 2, 4]
+    };
+    let capacity = validate_device_attention_capacity(
+        &model_dir,
+        false,
+        false,
+        V4_REQUEST_ROPE_LUT_ROWS,
+        device_available_bytes()?,
+    )?;
+    let token_ids = qd4_gate_prompt_ids(&model_dir)?;
+    let inputs =
+        prepare_qd4_stationary_gate_inputs(context, module, stream, &model_dir, &token_ids, 4)?;
+    let gate_cublas = cublas_exact::CublasExact::load()?;
+    let rope_lut = DeviceRequestRopeLut::new(stream, V4_REQUEST_ROPE_LUT_ROWS)?;
+    let cublas_provenance = gate_cublas.provenance();
+    let sparse_attention_arm = match sparse_attention_arm_from_env()? {
+        SparseAttentionArm::Reference => "reference:sparse_attn_v4_bf16",
+        SparseAttentionArm::ScoreReuse => "score_reuse:sparse_attn_v4_scores+probabilities+values",
+        SparseAttentionArm::Sm89Crossover => "sm89_crossover:K<4=reference,K>=4=score_reuse",
+    };
+    let relevant_config_fingerprint = normalized_config_fingerprint(serde_json::json!({
+        "candidate": "device_authoritative_strict_cublas",
+        "host_control": "independent_official_cublas",
+        "layers": layers,
+        "model_revision": v4_state::REVISION,
+        "positions": [0, 1, 2, 3, 4],
+        "prompt_ids": token_ids,
+        "request_rope_lut_rows": V4_REQUEST_ROPE_LUT_ROWS,
+        "sparse_attention_arm": sparse_attention_arm,
+    }))?;
+    let output = result.file_mut();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-device-token-state-pos4-gate-v3",
+            "provenance": benchmark_provenance()?,
+            "relevant_config_fingerprint": relevant_config_fingerprint,
+            "model_revision": v4_state::REVISION,
+            "prompt": "official single-user chat hi",
+            "prompt_ids": token_ids,
+            "layers": layers,
+            "positions": [0, 1, 2, 3, 4],
+            "candidate": "device-authoritative persistent-state staging with strict cuBLAS main and indexer Compressor projections",
+            "host_control": "strict cuBLAS host attention runner, used as the independent canonical persistent-state oracle for main and indexer Compressor projections",
+            "strict_cublas": {
+                "resolved_path": cublas_provenance.resolved_path,
+                "sha256": cublas_provenance.actual_sha256,
+                "abi": "cublasSgemm_v2",
+                "version": cublas_provenance.version,
+            },
+            "gate": {
+                "exact": if hca_reuse_gate { "every position: BF16 KV, compressed KV/indexer KV, complete attention_post BF16, sparse top-k, and all defined HCA persistent compressor FP32 slots" } else { "every position: BF16 KV, compressed KV/indexer KV, complete attention_post BF16, and sparse top-k; CSA additionally checks all persistent compressor FP32 bits because its boundary reads them, while HCA's unwritten compressor tail is deliberately not observable state" },
+                "transaction": "candidate device state is audited before any production state is exposed; failure returns an error without host-state mutation",
+                "scope": if hca_reuse_gate { "isolated L0 to L1 HCA continuous-reuse five-input pos0..4 gate using raw-FP8 wo_a H2D plus existing GPU decode; passing does not claim full61 production support" } else if raw_wo_a_gate { "isolated L3 HCA and L4 CSA five-input pos0..4 gate using raw-FP8 wo_a H2D plus existing GPU decode; passing does not claim full61 production support" } else { "isolated L0/L3 HCA and L2/L4 CSA five-input pos0..4 gate only; each layout reuses one candidate across layers; passing does not claim full61 production support" },
+                "transfer": "one request-global RoPE LUT H2D plus per-row hidden H2D; forward/inverse RoPE rows are scoped device-to-device copies; all persistent writes and boundary transforms are device-side; strict audits use post-run D2H"
+            }
+        })
+    )?;
+    let mut hca_candidate = None;
+    let mut csa_candidate = None;
+    let mut hca_state_allocations = 0_usize;
+    let mut csa_state_allocations = 0_usize;
+    for &layer in layers {
+        let layer_inputs = inputs
+            .get(&layer)
+            .ok_or("real prefix did not retain device-token-state gate inputs")?;
+        if layer_inputs.len() < 5 {
+            return Err("real prefix produced fewer than five input rows".into());
+        }
+        let (runtime, raw_upload) = if raw_wo_a_gate {
+            let (host, _) = load_layer_host_raw_wo_a(&model_dir, layer, &token_ids)?;
+            let raw_bytes = host
+                .tail
+                .wo_a_raw
+                .as_ref()
+                .ok_or("raw wo_a gate host payload disappeared")?
+                .len();
+            let host_payload_bytes = host.num_bytes();
+            let (runtime, telemetry) =
+                upload_layer_runtime_raw_wo_a(&model_dir, layer, &host, module, stream)?;
+            let decoded_bytes = runtime.weights.wo_a.num_bytes();
+            if telemetry.raw_h2d_bytes != raw_bytes
+                || telemetry.fixed_h2d_bytes.checked_add(raw_bytes)
+                    != Some(runtime.weights.num_bytes())
+                || decoded_bytes
+                    != raw_bytes
+                        .checked_mul(2)
+                        .ok_or("raw wo_a decoded byte overflow")?
+            {
+                return Err(format!(
+                    "raw wo_a physical transfer contract failed for layer {layer}"
+                )
+                .into());
+            }
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "raw_wo_a_transfer",
+                    "layer": layer,
+                    "host_payload_bytes": host_payload_bytes,
+                    "raw_h2d_bytes": telemetry.raw_h2d_bytes,
+                    "decoded_device_bytes": decoded_bytes,
+                    "total_fixed_h2d_bytes": telemetry.fixed_h2d_bytes,
+                    "physical_contract": "raw H2D plus all non-wo_a uploads; decoded wo_a remains resident as BF16",
+                    "exact": true,
+                })
+            )?;
+            (runtime, true)
+        } else {
+            (
+                load_layer_runtime(&model_dir, layer, &token_ids, stream)?.0,
+                false,
+            )
+        };
+        let mut canonical = v4_state::V4SerialPersistentState::new(5)?;
+        let slot = if runtime.weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+            &mut csa_candidate
+        } else {
+            &mut hca_candidate
+        };
+        let reused = slot.is_some();
+        if !reused {
+            *slot = Some(DeviceTokenState::new(stream, &runtime.weights)?);
+            if runtime.weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+                csa_state_allocations += 1;
+            } else {
+                hca_state_allocations += 1;
+            }
+        }
+        let candidate = slot
+            .as_mut()
+            .ok_or("device token-state gate candidate cache slot disappeared")?;
+        let _ = candidate.reset_for_layer(module, stream, &runtime.weights)?;
+        if candidate.indexer_valid.to_host_vec(stream)? != [1] {
+            return Err("device token-state reset did not restore indexer validity".into());
+        }
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "device_memory",
+                "layer": layer,
+                "compression_ratio": runtime.weights.compression_ratio.get(),
+                "reused_layout_state": reused,
+                "device_token_state_bytes": candidate.num_bytes(),
+                "exact_compressor_scratch_bytes": candidate.exact_compressor_bytes(),
+            })
+        )?;
+        for position in 0..5 {
+            let mut host_attention = None;
+            canonical.transaction(layer, |state| {
+                let run = run_real_layer_attention_rows(
+                    module,
+                    stream,
+                    &runtime,
+                    &layer_inputs[position],
+                    position,
+                    state,
+                    Some(&gate_cublas),
+                    None,
+                )?;
+                host_attention = Some((
+                    run.output,
+                    run.topk
+                        .ok_or("strict token-state host oracle omitted sparse top-k")?,
+                ));
+                Ok(())
+            })?;
+            let expected = host_persistent_state_audit(
+                canonical
+                    .layer(layer)
+                    .ok_or("canonical token-state gate layer disappeared")?,
+            );
+            run_device_token_state_commit_row(
+                module,
+                stream,
+                &runtime,
+                candidate,
+                &rope_lut,
+                &layer_inputs[position],
+                position,
+            )?;
+            let actual = device_persistent_state_audit(stream, &candidate)?;
+            let require_compressor_state = hca_reuse_gate
+                || runtime.weights.compression_ratio == v4_state::CompressionRatio::Csa4;
+            check_persistent_state_audit_with_compressor_state(
+                layer,
+                position,
+                &expected,
+                &actual,
+                require_compressor_state,
+            )?;
+            let attention = {
+                let (output, topk) = run_device_attention_after_commit(
+                    module, stream, &runtime, candidate, &rope_lut, position, true,
+                )?;
+                let (expected_output, expected_topk) =
+                    host_attention.ok_or("canonical attention result disappeared")?;
+                if let Some(index) = first_mismatch(&expected_output, &output) {
+                    return Err(format!(
+                        "device L{} pos{position} attention output first mismatch at {index}",
+                        layer,
+                    )
+                    .into());
+                }
+                let topk = topk.ok_or("strict token-state gate omitted top-k D2H")?;
+                if let Some(index) = first_mismatch(&expected_topk, &topk) {
+                    return Err(format!(
+                        "device L{layer} pos{position} sparse top-k first mismatch at {index}"
+                    )
+                    .into());
+                }
+                let expected_topk_digest = fnv1a_i32(&expected_topk);
+                let actual_topk_digest = fnv1a_i32(&topk);
+                debug_assert_eq!(expected_topk_digest, actual_topk_digest);
+                let after_attention_state = device_persistent_state_audit(stream, &candidate)?;
+                check_persistent_state_audit_with_compressor_state(
+                    layer,
+                    position,
+                    &expected,
+                    &after_attention_state,
+                    require_compressor_state,
+                )?;
+                Some(serde_json::json!({
+                    "exact": true,
+                    "attention_post_bf16_digest": format!("{:016x}", fnv1a_u16(&output)),
+                    "sparse_topk_digest": format!("{actual_topk_digest:016x}"),
+                    "sparse_topk": topk,
+                }))
+            };
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "position",
+                    "layer": layer,
+                    "position": position,
+                    "exact": true,
+                    "persistent_state": persistent_state_audit_json(&actual),
+                    "candidate_committed_rows": candidate.committed_rows,
+                    "candidate_compressed_rows": candidate.compressed_rows,
+                    "complete_attention": attention,
+                })
+            )?;
+        }
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "layer_summary",
+                "layer": layer,
+                "status": "GO",
+                "exact_positions": 5,
+                "raw_wo_a_gpu_decode": raw_upload,
+                "complete_attention_claim": true,
+            })
+        )?;
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": "GO",
+            "state_allocations": {"hca": hca_state_allocations, "csa": csa_state_allocations},
+            "strict_cublas_handles": {"hca": hca_state_allocations, "csa": csa_state_allocations},
+            "capacity_guard": {
+                "required_bytes": capacity.required_bytes,
+                "max_csa_state_bytes": capacity.max_device_token_state_bytes,
+                "hca_state_bytes": capacity.hca_device_token_state_bytes,
+                "headroom_bytes": capacity.headroom_bytes,
+            },
+            "result": if hca_reuse_gate { "raw-FP8 wo_a H2D plus GPU decode passed device-authoritative L0 to L1 HCA continuous-reuse persistent state plus complete attention pos0..4 exact output/top-k/state audit" } else if raw_wo_a_gate { "raw-FP8 wo_a H2D plus GPU decode passed device-authoritative L3 HCA and L4 CSA persistent state plus complete attention pos0..4 exact output/top-k/state audit" } else { "device-authoritative L0/L3 HCA and L2/L4 CSA persistent state plus complete attention passed pos0..4 exact output/top-k/state audit" },
+            "complete_attention_claim": true,
+            "full61_production_claim": false,
+        })
+    )?;
+    output.sync_all()?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"GO\",\"mode\":\"v4-device-token-state-pos4-gate\",\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
+struct Qd4StationaryGatePosition {
+    position: usize,
+    route_ids: Vec<i32>,
+    route_weight_bits: Vec<u32>,
+    attention_topk_digest: u64,
+    attention_topk_per_row: usize,
+    after_attention_digest: u64,
+    ffn_input_digest: u64,
+    shared_digest: u64,
+    contribution_digests: Vec<u64>,
+    contributions: Vec<Vec<f32>>,
+    moe_digest: u64,
+    hidden_digest: u64,
+    state: v4_state::V4LayerPersistentState,
+}
+
+struct Qd4StationaryGateArm {
+    positions: Vec<Qd4StationaryGatePosition>,
+    routed_wall_ns: u64,
+    routed_source_bytes: usize,
+    routed_h2d_bytes: usize,
+    startup_setup_ns: u64,
+    steady_slot_allocations: usize,
+    device_used_after_startup_bytes: usize,
+    worker_errors: usize,
+    immutable_cache: Option<Qd4ImmutableExpertCacheTelemetry>,
+}
+
+fn qd4_gate_state_json(state: &v4_state::V4LayerPersistentState) -> serde_json::Value {
+    let main = state.compressor();
+    let indexer = state.indexer();
+    serde_json::json!({
+        "kv_bf16_digest": format!("{:016x}", fnv1a_u16(state.kv_bf16())),
+        "compressed_kv_bf16_digest": format!("{:016x}", fnv1a_u16(state.compressed_kv_bf16())),
+        "indexer_kv_bf16_digest": format!("{:016x}", fnv1a_u16(state.indexer_kv_bf16())),
+        "main_compressor_kv_f32_digest": format!("{:016x}", fnv1a_f32(main.kv())),
+        "main_compressor_score_f32_digest": format!("{:016x}", fnv1a_f32(main.score())),
+        "indexer_compressor_kv_f32_digest": indexer.map(|value| format!("{:016x}", fnv1a_f32(value.kv()))),
+        "indexer_compressor_score_f32_digest": indexer.map(|value| format!("{:016x}", fnv1a_f32(value.score()))),
+        "committed_kv_rows": state.committed_kv_rows(),
+    })
+}
+
+fn qd4_gate_position_json(
+    layer: usize,
+    pair: usize,
+    position: &Qd4StationaryGatePosition,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "position",
+        "layer": layer,
+        "pair": pair,
+        "token_position": position.position,
+        "route_ids": position.route_ids,
+        "route_weight_bits": position.route_weight_bits,
+        "attention_topk_digest": format!("{:016x}", position.attention_topk_digest),
+        "attention_topk_per_row": position.attention_topk_per_row,
+        "after_attention_bf16_digest": format!("{:016x}", position.after_attention_digest),
+        "ffn_input_bf16_digest": format!("{:016x}", position.ffn_input_digest),
+        "shared_f32_digest": format!("{:016x}", position.shared_digest),
+        "route_slot_contribution_f32_digests": position.contribution_digests.iter().map(|value| format!("{value:016x}")).collect::<Vec<_>>(),
+        "canonical_moe_bf16_digest": format!("{:016x}", position.moe_digest),
+        "post_hc_hidden_bf16_digest": format!("{:016x}", position.hidden_digest),
+        "persistent_state": qd4_gate_state_json(&position.state),
+        "route_slot_f32_values_checked_bitwise": true,
+    })
+}
+
+fn qd4_gate_f32_bits_equal(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn qd4_stationary_control_first(pair: usize) -> bool {
+    matches!(pair, 0 | 3)
+}
+
+fn check_qd4_stationary_gate_pair(
+    layer: usize,
+    control: &Qd4StationaryGateArm,
+    qd4: &Qd4StationaryGateArm,
+) -> Result<(), Box<dyn Error>> {
+    if control.positions.len() != 5 || qd4.positions.len() != 5 {
+        return Err(format!("QD4 stationary layer {layer} did not produce five positions").into());
+    }
+    for (position, (control, qd4)) in control.positions.iter().zip(&qd4.positions).enumerate() {
+        if control.position != position
+            || qd4.position != position
+            || control.route_ids != qd4.route_ids
+            || control.route_weight_bits != qd4.route_weight_bits
+            || control.attention_topk_digest != qd4.attention_topk_digest
+            || control.attention_topk_per_row != qd4.attention_topk_per_row
+            || control.after_attention_digest != qd4.after_attention_digest
+            || control.ffn_input_digest != qd4.ffn_input_digest
+            || control.shared_digest != qd4.shared_digest
+            || control.moe_digest != qd4.moe_digest
+            || control.hidden_digest != qd4.hidden_digest
+            || !control.state.bits_equal(&qd4.state)
+            || control.contribution_digests != qd4.contribution_digests
+            || control.contributions.len() != v4_router::V4_TOPK
+            || qd4.contributions.len() != v4_router::V4_TOPK
+            || !control
+                .contributions
+                .iter()
+                .zip(&qd4.contributions)
+                .all(|(control, qd4)| qd4_gate_f32_bits_equal(control, qd4))
+        {
+            return Err(format!(
+                "QD4 stationary layer {layer} position {position} changed canonical routed execution"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn check_qd4_immutable_cache_gate_physical(
+    layer: usize,
+    arm: &Qd4StationaryGateArm,
+) -> Result<(), Box<dyn Error>> {
+    let cache = arm
+        .immutable_cache
+        .as_ref()
+        .ok_or("QD4 immutable cache gate candidate omitted cache telemetry")?;
+    let expected_routes = 5 * v4_router::V4_TOPK;
+    let expert_bytes = v4_expert::V4_ROUTED_EXPERT_BYTES;
+    let source_bytes = cache
+        .source_loads
+        .checked_mul(expert_bytes)
+        .ok_or("QD4 immutable cache gate source byte count overflow")?;
+    let d2d_bytes = expected_routes
+        .checked_mul(expert_bytes)
+        .ok_or("QD4 immutable cache gate D2D byte count overflow")?;
+    if cache.route_executions != expected_routes
+        || cache.source_loads != cache.expert_union_loads
+        || cache.source_bytes != source_bytes
+        || cache.h2d_loads != cache.source_loads
+        || cache.h2d_bytes != cache.source_bytes
+        || cache.hits != expected_routes.saturating_sub(cache.source_loads)
+        || cache.d2d_copies != expected_routes
+        || cache.d2d_bytes != d2d_bytes
+        || cache.max_occupancy > V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        || cache.completed_layers != 1
+        || cache.worker_errors != 0
+        || cache.fallbacks != 0
+        || arm.routed_source_bytes != cache.source_bytes
+        || arm.routed_h2d_bytes != cache.h2d_bytes
+        || arm.worker_errors != 0
+    {
+        return Err(format!(
+            "QD4 immutable cache gate layer {layer} physical telemetry did not close"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn qd4_gate_prompt_ids(model_dir: &std::path::Path) -> Result<Vec<i64>, Box<dyn Error>> {
+    let tokenizer = v4_tokenizer::V4Tokenizer::open(model_dir)?;
+    let prompt = v4_chat::format_single_user("hi", v4_chat::ThinkingMode::Chat);
+    let ids = tokenizer.encode_raw(&prompt)?;
+    if ids.as_slice() != [0, 128_803, 6_366, 128_804, 128_822] {
+        return Err("QD4 stationary gate official hi prompt changed".into());
+    }
+    Ok(ids)
+}
+
+fn qd4_gate_initial_hidden(
+    model_dir: &std::path::Path,
+    token_ids: &[i64],
+) -> Result<Vec<Vec<u16>>, Box<dyn Error>> {
+    token_ids
+        .iter()
+        .map(|&token_id| {
+            let embedding = v4_state::load(model_dir, &[token_id])?.embedding;
+            let mut hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+            for _ in 0..v4_state::HC {
+                hidden.extend_from_slice(&embedding);
+            }
+            Ok(hidden)
+        })
+        .collect()
+}
+
+fn prepare_qd4_stationary_gate_inputs(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    token_ids: &[i64],
+    target_layer: usize,
+) -> Result<BTreeMap<usize, Vec<Vec<u16>>>, Box<dyn Error>> {
+    if !(3..=4).contains(&target_layer) {
+        return Err("QD4 stationary prefix supports only L3 or L4 targets".into());
+    }
+    let mut hidden = qd4_gate_initial_hidden(model_dir, token_ids)?;
+    let mut persistent = v4_state::V4SerialPersistentState::new(token_ids.len())?;
+    let mut inputs = BTreeMap::new();
+    for layer in 0..target_layer {
+        inputs.insert(layer, hidden.clone());
+        let (runtime, _) = load_layer_runtime(model_dir, layer, token_ids, stream)?;
+        let hash_ids = load_layer_hash_ids(model_dir, layer, token_ids)?;
+        // ponytail: this is one cold prefix only; it mirrors current per-layer
+        // union retention rather than adding a second input-cache mechanism.
+        let mut expert_slots = BTreeMap::new();
+        for position in 0..token_ids.len() {
+            let row_hash_ids = if runtime.weights.hash_router {
+                &hash_ids[position * v4_router::V4_TOPK..(position + 1) * v4_router::V4_TOPK]
+            } else {
+                &[]
+            };
+            let mut next = None;
+            persistent.transaction(layer, |state| {
+                next = Some(
+                    run_real_layer_rows(
+                        context,
+                        module,
+                        stream,
+                        &runtime,
+                        None,
+                        None,
+                        Some(&mut expert_slots),
+                        row_hash_ids,
+                        &hidden[position],
+                        &[token_ids[position]],
+                        position,
+                        Some(state),
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                        None,
+                    )?
+                    .output,
+                );
+                Ok(())
+            })?;
+            hidden[position] = next.ok_or("QD4 stationary prefix did not produce hidden")?;
+        }
+    }
+    inputs.insert(target_layer, hidden);
+    Ok(inputs)
+}
+
+fn run_qd4_stationary_gate_arm(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    runtime: &LoadedLayerRuntime,
+    token_ids: &[i64],
+    hash_ids: &[i64],
+    inputs: &[Vec<u16>],
+    use_qd4: bool,
+    use_immutable_cache: bool,
+) -> Result<Qd4StationaryGateArm, Box<dyn Error>> {
+    if token_ids.len() != 5 || inputs.len() != token_ids.len() {
+        return Err("QD4 stationary gate requires five real prompt rows".into());
+    }
+    if use_immutable_cache && !use_qd4 {
+        return Err("QD4 immutable cache gate requires persistent QD4 lanes".into());
+    }
+    let startup_started = std::time::Instant::now();
+    let mut lanes = use_qd4
+        .then(|| {
+            (0..V4_QD4_LANES)
+                .map(|_| {
+                    let lane_stream = context.new_stream()?;
+                    ExpertSlot::new_empty(context, module, &lane_stream)
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()
+        })
+        .transpose()?;
+    let mut immutable_cache = use_immutable_cache
+        .then(|| Qd4ImmutableExpertCache::new(context, module))
+        .transpose()?;
+    let startup_setup_ns = use_qd4
+        .then(|| u64::try_from(startup_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let device_used_after_startup_bytes = device_used_bytes()?;
+    let mut persistent = v4_state::V4SerialPersistentState::new(token_ids.len())?;
+    let mut expert_slots = (!use_qd4).then(BTreeMap::new);
+    let mut positions = Vec::with_capacity(token_ids.len());
+    let mut routed_wall_ns = 0_u64;
+    let mut routed_source_bytes = 0_usize;
+    let mut routed_h2d_bytes = 0_usize;
+    if let Some(cache) = immutable_cache.as_mut() {
+        cache.begin_layer(runtime.weights.layer)?;
+    }
+    for position in 0..token_ids.len() {
+        let row_hash_ids = if runtime.weights.hash_router {
+            &hash_ids[position * v4_router::V4_TOPK..(position + 1) * v4_router::V4_TOPK]
+        } else {
+            &[]
+        };
+        let mut completed = None;
+        persistent.transaction(runtime.weights.layer, |state| {
+            let run = run_real_layer_rows(
+                context,
+                module,
+                stream,
+                runtime,
+                lanes.as_deref_mut(),
+                immutable_cache.as_mut(),
+                expert_slots.as_mut(),
+                row_hash_ids,
+                &inputs[position],
+                &[token_ids[position]],
+                position,
+                Some(state),
+                None,
+                None,
+                false,
+                None,
+                true,
+                None,
+            )?;
+            let audit = run
+                .routed_audit
+                .ok_or("QD4 stationary gate omitted routed contribution audit")?;
+            let position_result = Qd4StationaryGatePosition {
+                position,
+                route_ids: run.routes.ids,
+                route_weight_bits: run
+                    .routes
+                    .weights
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect(),
+                attention_topk_digest: run.attention_topk_digest,
+                attention_topk_per_row: run.attention_topk_per_row,
+                after_attention_digest: audit.after_attention_digest,
+                ffn_input_digest: audit.ffn_input_digest,
+                shared_digest: audit.shared_digest,
+                contribution_digests: audit
+                    .contributions
+                    .iter()
+                    .map(|value| fnv1a_f32(value))
+                    .collect(),
+                contributions: audit.contributions,
+                moe_digest: audit.moe_digest,
+                hidden_digest: fnv1a_u16(&run.output),
+                state: state.clone(),
+            };
+            completed = Some((
+                position_result,
+                run.stage.routed_ns,
+                run.stage.routed_source_bytes,
+                run.stage.routed_h2d_bytes,
+            ));
+            Ok(())
+        })?;
+        let (result, wall_ns, source_bytes, h2d_bytes) =
+            completed.ok_or("QD4 stationary arm did not commit a row")?;
+        routed_wall_ns = routed_wall_ns.saturating_add(wall_ns);
+        routed_source_bytes = routed_source_bytes.saturating_add(source_bytes);
+        routed_h2d_bytes = routed_h2d_bytes.saturating_add(h2d_bytes);
+        positions.push(result);
+    }
+    if let Some(cache) = immutable_cache.as_mut() {
+        cache.finish_layer(runtime.weights.layer)?;
+    }
+    Ok(Qd4StationaryGateArm {
+        positions,
+        routed_wall_ns,
+        routed_source_bytes,
+        routed_h2d_bytes,
+        startup_setup_ns,
+        steady_slot_allocations: expert_slots.as_ref().map_or(0, BTreeMap::len),
+        device_used_after_startup_bytes,
+        worker_errors: 0,
+        immutable_cache: immutable_cache.map(|cache| cache.telemetry),
+    })
+}
+
+fn qd4_stationary_gate_arm_json(arm: &Qd4StationaryGateArm) -> serde_json::Value {
+    serde_json::json!({
+        "routed_wall_ns": arm.routed_wall_ns,
+        "routed_source_bytes": arm.routed_source_bytes,
+        "routed_h2d_bytes": arm.routed_h2d_bytes,
+        "startup_setup_ns": arm.startup_setup_ns,
+        "steady_slot_allocations": arm.steady_slot_allocations,
+        "device_used_after_startup_bytes": arm.device_used_after_startup_bytes,
+        "worker_errors": arm.worker_errors,
+        "immutable_cache": arm.immutable_cache.as_ref().map(|cache| serde_json::json!({
+            "route_executions": cache.route_executions,
+            "expert_union_loads": cache.expert_union_loads,
+            "source_loads": cache.source_loads,
+            "source_bytes": cache.source_bytes,
+            "h2d_loads": cache.h2d_loads,
+            "h2d_bytes": cache.h2d_bytes,
+            "hits": cache.hits,
+            "d2d_copies": cache.d2d_copies,
+            "d2d_bytes": cache.d2d_bytes,
+            "max_occupancy": cache.max_occupancy,
+            "completed_layers": cache.completed_layers,
+            "worker_errors": cache.worker_errors,
+            "fallbacks": cache.fallbacks,
+            "slots": V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS,
+        })),
+    })
+}
+
+fn run_qd4_immutable_cache_targeted_gate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const LAYER: usize = 3;
+    let result_path = std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE_RESULT_JSONL")?;
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_PREFILL").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4_BENCH").is_some()
+        || std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE").is_some()
+        || parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? != 0
+        || parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")? != 0
+    {
+        return Err(
+            "QD4 immutable-cache targeted gate is isolated from full61, stationary, QD4, and fixed-cache modes"
+                .into(),
+        );
+    }
+    let required_host = V4_QD4_PINNED_HOST_BYTES + V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES;
+    let required_device = V4_QD4_DEVICE_BYTES + V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES;
+    let host_available = host_available_bytes()?;
+    let device_available = device_available_bytes()?;
+    if host_available < required_host || device_available < required_device {
+        return Err(
+            "QD4 immutable-cache targeted gate lacks the explicit lane/cache reserve".into(),
+        );
+    }
+
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let model_dir = v4_model_dir()?;
+    let token_ids = qd4_gate_prompt_ids(&model_dir)?;
+    let inputs =
+        prepare_qd4_stationary_gate_inputs(context, module, stream, &model_dir, &token_ids, LAYER)?;
+    let input = inputs
+        .get(&LAYER)
+        .and_then(|rows| rows.first())
+        .ok_or("QD4 targeted prefix omitted L3 position zero input")?;
+    let (runtime, _) = load_layer_runtime(&model_dir, LAYER, &token_ids, stream)?;
+    let hash_ids = load_layer_hash_ids(&model_dir, LAYER, &token_ids)?;
+    let mut persistent = v4_state::V4SerialPersistentState::new(token_ids.len())?;
+    let mut prepared = None;
+    persistent.transaction(LAYER, |state| {
+        let attention =
+            run_real_layer_attention_rows(module, stream, &runtime, input, 0, state, None, None)?;
+        let ffn_hc = run_l0_mhc_pre(
+            module,
+            stream,
+            &attention.output,
+            &runtime.weights.hc_ffn_fn,
+            &runtime.weights.hc_ffn_scale,
+            &runtime.weights.hc_ffn_base,
+        )?;
+        let row_hash_ids = if runtime.weights.hash_router {
+            &hash_ids[..v4_router::V4_TOPK]
+        } else {
+            &[]
+        };
+        let router = run_layer_router(
+            module,
+            stream,
+            &ffn_hc.collapsed,
+            &runtime.weights,
+            row_hash_ids,
+        )?;
+        let shared = run_layer_shared_expert(module, stream, &router.input, &runtime.weights)?;
+        prepared = Some((router.input, router.routes, shared));
+        Ok(())
+    })?;
+    let (ffn_input, routes, shared) =
+        prepared.ok_or("QD4 targeted router preparation disappeared")?;
+    if routes.ids.len() != v4_router::V4_TOPK
+        || routes.weights.len() != v4_router::V4_TOPK
+        || routes.ids.iter().collect::<BTreeSet<_>>().len() != v4_router::V4_TOPK
+    {
+        return Err("QD4 targeted L3 route batch must contain six unique experts".into());
+    }
+    let state_before_routed = persistent
+        .layer(LAYER)
+        .ok_or("QD4 targeted L3 persistent state disappeared")?
+        .clone();
+    let plans: [v4_expert::RoutedExpertRangePlan; v4_router::V4_TOPK] = routes
+        .ids
+        .iter()
+        .map(|&expert| {
+            v4_expert::RoutedExpertRangePlan::new(
+                &runtime.expert_shard,
+                LAYER,
+                u16::try_from(expert)?,
+            )
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+        .try_into()
+        .map_err(|_| "QD4 targeted route plan count changed")?;
+    let mut lanes = (0..V4_QD4_LANES)
+        .map(|_| {
+            let lane_stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &lane_stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut cache = Qd4ImmutableExpertCache::new(context, module)?;
+    cache.begin_layer(LAYER)?;
+    let first = run_qd4_routed_once(
+        &mut lanes,
+        Some(&mut cache),
+        &runtime.expert_shard,
+        LAYER,
+        &ffn_input,
+        &routes,
+        &shared,
+        &plans,
+        None,
+        true,
+    )?;
+    let second = run_qd4_routed_once(
+        &mut lanes,
+        Some(&mut cache),
+        &runtime.expert_shard,
+        LAYER,
+        &ffn_input,
+        &routes,
+        &shared,
+        &plans,
+        None,
+        true,
+    )?;
+    let first_contributions = first
+        .contributions
+        .as_ref()
+        .ok_or("QD4 targeted first batch omitted F32 route contributions")?;
+    let second_contributions = second
+        .contributions
+        .as_ref()
+        .ok_or("QD4 targeted second batch omitted F32 route contributions")?;
+    if first.cache_miss_count != v4_router::V4_TOPK
+        || second.cache_miss_count != 0
+        || first.output != second.output
+        || first_contributions.len() != v4_router::V4_TOPK
+        || second_contributions.len() != v4_router::V4_TOPK
+        || !first_contributions
+            .iter()
+            .zip(second_contributions)
+            .all(|(first, second)| qd4_gate_f32_bits_equal(first, second))
+        || !state_before_routed.bits_equal(
+            persistent
+                .layer(LAYER)
+                .ok_or("QD4 targeted L3 persistent state disappeared after routing")?,
+        )
+    {
+        return Err(
+            "QD4 targeted L3 cache batches changed exact routed or persistent state".into(),
+        );
+    }
+    cache.finish_layer(LAYER)?;
+    let telemetry = cache.telemetry;
+    let expert_bytes = v4_expert::V4_ROUTED_EXPERT_BYTES;
+    let expected_source_bytes = v4_router::V4_TOPK
+        .checked_mul(expert_bytes)
+        .ok_or("QD4 targeted source byte count overflow")?;
+    let expected_d2d_bytes = 2_usize
+        .checked_mul(v4_router::V4_TOPK)
+        .and_then(|count| count.checked_mul(expert_bytes))
+        .ok_or("QD4 targeted D2D byte count overflow")?;
+    if telemetry.route_executions != 2 * v4_router::V4_TOPK
+        || telemetry.expert_union_loads != v4_router::V4_TOPK
+        || telemetry.source_loads != v4_router::V4_TOPK
+        || telemetry.source_bytes != expected_source_bytes
+        || telemetry.h2d_loads != v4_router::V4_TOPK
+        || telemetry.h2d_bytes != expected_source_bytes
+        || telemetry.hits != v4_router::V4_TOPK
+        || telemetry.d2d_copies != 2 * v4_router::V4_TOPK
+        || telemetry.d2d_bytes != expected_d2d_bytes
+        || telemetry.max_occupancy != v4_router::V4_TOPK
+        || telemetry.completed_layers != 1
+        || telemetry.worker_errors != 0
+        || telemetry.fallbacks != 0
+        || cache.free.len() != V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        || !cache.resident.is_empty()
+    {
+        return Err("QD4 targeted L3 immutable-cache physical accounting did not close".into());
+    }
+    writeln!(
+        result.file_mut(),
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-qd4-immutable-cache-targeted-l3-v1",
+            "provenance": benchmark_provenance()?,
+            "model_revision": v4_state::REVISION,
+            "prompt": "official single-user chat hi",
+            "prompt_ids": token_ids,
+            "target": "one real L3 position-zero six-route batch twice: compulsory misses then immutable-cache hits",
+            "route_ids": routes.ids,
+            "route_weight_bits": routes.weights.iter().map(|weight| weight.to_bits()).collect::<Vec<_>>(),
+            "exact": {
+                "route_slot_f32_bitwise": true,
+                "canonical_moe_bf16": true,
+                "persistent_state_unchanged_across_routed_replay": true,
+                "first_miss_count": first.cache_miss_count,
+                "second_miss_count": second.cache_miss_count,
+                "canonical_moe_bf16_digest": format!("{:016x}", fnv1a_u16(&first.output)),
+                "route_slot_f32_digests": first_contributions.iter().map(|values| format!("{:016x}", fnv1a_f32(values))).collect::<Vec<_>>(),
+                "persistent_state": qd4_gate_state_json(&state_before_routed),
+            },
+            "physical": {
+                "lanes": V4_QD4_LANES,
+                "slots": V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS,
+                "route_executions": telemetry.route_executions,
+                "expert_union_loads": telemetry.expert_union_loads,
+                "source_loads": telemetry.source_loads,
+                "source_bytes": telemetry.source_bytes,
+                "h2d_loads": telemetry.h2d_loads,
+                "h2d_bytes": telemetry.h2d_bytes,
+                "hits": telemetry.hits,
+                "d2d_copies": telemetry.d2d_copies,
+                "d2d_bytes": telemetry.d2d_bytes,
+                "max_occupancy": telemetry.max_occupancy,
+                "completed_layers": telemetry.completed_layers,
+                "free_slots_after_finish": cache.free.len(),
+                "resident_slots_after_finish": cache.resident.len(),
+                "host_available_before_bytes": host_available,
+                "device_available_before_bytes": device_available,
+            },
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"GO\",\"mode\":\"v4-qd4-immutable-cache-targeted-l3\",\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
+fn run_qd4_stationary_gate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const PAIRS: usize = 4;
+    const REQUIRED_SPEEDUP: f64 = 1.10;
+    let immutable_cache_gate = optional_one_flag("COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE")?;
+    let result_path = std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_QD4_STATIONARY_GATE_RESULT_JSONL")?;
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_PREFILL").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4").is_some()
+        || std::env::var_os("COLIBRI_V4_ROUTED_QD4_BENCH").is_some()
+        || parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? != 0
+        || parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")? != 0
+    {
+        return Err(
+            "QD4 stationary gate is isolated: clear full61, stationary, QD4, and fixed-cache modes"
+                .into(),
+        );
+    }
+    let required_host = V4_QD4_PINNED_HOST_BYTES
+        + usize::from(immutable_cache_gate) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES;
+    let required_device = V4_QD4_DEVICE_BYTES
+        + usize::from(immutable_cache_gate) * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES;
+    if host_available_bytes()? < required_host || device_available_bytes()? < required_device {
+        return Err("QD4 stationary gate lacks the explicit pinned/device lane reserve".into());
+    }
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let model_dir = v4_model_dir()?;
+    let token_ids = qd4_gate_prompt_ids(&model_dir)?;
+    let inputs =
+        prepare_qd4_stationary_gate_inputs(context, module, stream, &model_dir, &token_ids, 4)?;
+    let telemetry_before = gpu_telemetry_snapshot()?;
+    let mut output = std::fs::File::create(&result_path)?;
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-qd4-stationary-gate-v2",
+            "provenance": benchmark_provenance()?,
+            "model_revision": v4_state::REVISION,
+            "prompt": "official single-user chat hi",
+            "prompt_ids": token_ids,
+            "layers": [3, 4],
+            "positions": [0, 1, 2, 3, 4],
+            "pairs_per_layer": PAIRS,
+            "arm_order_schedule": if immutable_cache_gate { "ABBA/BAAB; A=four persistent QD4 lanes cache off, B=same four persistent QD4 lanes with request-scoped 32-slot immutable cache" } else { "ABBABAAB; A=current per-layer 32-slot union reuse, B=four persistent QD4 lanes" },
+            "timing": "sum of five routed inclusive host-wall scopes; fixed runtimes and prefix preparation are outside timing",
+            "fixed_prefetch": "not exercised or claimed",
+            "reserve": {
+                "qd4_pinned_host_bytes": V4_QD4_PINNED_HOST_BYTES,
+                "qd4_device_bytes": V4_QD4_DEVICE_BYTES,
+                "immutable_cache_enabled": immutable_cache_gate,
+                "immutable_cache_pinned_host_bytes": usize::from(immutable_cache_gate) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+                "immutable_cache_device_bytes": usize::from(immutable_cache_gate) * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                "host_available_before_bytes": host_available_bytes()?,
+                "device_available_before_bytes": device_available_bytes()?,
+            },
+            "gate": {
+                "exact": "all five positions: routes/weight bits, attention/FFN/shared digests, six route-slot F32 contribution values bitwise, canonical expert-ID-order MoE BF16, post-HC hidden, and KV/compressor/indexer state",
+                "timing": if immutable_cache_gate { "development-only; no speed threshold" } else { "speed gate retained for legacy QD4 comparison" },
+                "ratio_of_medians_at_least": (!immutable_cache_gate).then_some(REQUIRED_SPEEDUP),
+                "paired_positive_required": (!immutable_cache_gate).then_some(PAIRS),
+                "p95_nonregression": !immutable_cache_gate,
+                "immutable_cache_physical": immutable_cache_gate.then_some("route_exec=30/layer; source/H2D=union; occupancy<=32; D2D=30*expert_bytes; worker/fallback/capacity errors=0"),
+                "zero_oom_or_worker_errors": true,
+            },
+            "gpu_before": telemetry_before,
+        })
+    )?;
+    let mut all_go = true;
+    for layer in [3_usize, 4] {
+        let (runtime, _) = load_layer_runtime(&model_dir, layer, &token_ids, stream)?;
+        let hash_ids = load_layer_hash_ids(&model_dir, layer, &token_ids)?;
+        let layer_inputs = inputs
+            .get(&layer)
+            .ok_or("QD4 stationary prefix omitted target inputs")?;
+        let mut control_samples = Vec::with_capacity(PAIRS);
+        let mut qd4_samples = Vec::with_capacity(PAIRS);
+        let mut positive_pairs = 0_usize;
+        let mut exact_pairs = 0_usize;
+        let mut worker_errors = 0_usize;
+        for pair in 0..PAIRS {
+            let control_first = qd4_stationary_control_first(pair);
+            let (control, qd4) = if control_first {
+                let control = run_qd4_stationary_gate_arm(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    &token_ids,
+                    &hash_ids,
+                    layer_inputs,
+                    immutable_cache_gate,
+                    false,
+                )?;
+                let qd4 = run_qd4_stationary_gate_arm(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    &token_ids,
+                    &hash_ids,
+                    layer_inputs,
+                    true,
+                    immutable_cache_gate,
+                )?;
+                (control, qd4)
+            } else {
+                let qd4 = run_qd4_stationary_gate_arm(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    &token_ids,
+                    &hash_ids,
+                    layer_inputs,
+                    true,
+                    immutable_cache_gate,
+                )?;
+                let control = run_qd4_stationary_gate_arm(
+                    context,
+                    module,
+                    stream,
+                    &runtime,
+                    &token_ids,
+                    &hash_ids,
+                    layer_inputs,
+                    immutable_cache_gate,
+                    false,
+                )?;
+                (control, qd4)
+            };
+            check_qd4_stationary_gate_pair(layer, &control, &qd4)?;
+            if immutable_cache_gate {
+                check_qd4_immutable_cache_gate_physical(layer, &qd4)?;
+            }
+            exact_pairs += 1;
+            worker_errors = worker_errors
+                .saturating_add(control.worker_errors)
+                .saturating_add(qd4.worker_errors);
+            positive_pairs += usize::from(control.routed_wall_ns > qd4.routed_wall_ns);
+            control_samples.push(control.routed_wall_ns);
+            qd4_samples.push(qd4.routed_wall_ns);
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "pair",
+                    "layer": layer,
+                    "pair": pair,
+                    "arm_order": if control_first { "AB" } else { "BA" },
+                    "exact": true,
+                    "control": qd4_stationary_gate_arm_json(&control),
+                    "qd4": qd4_stationary_gate_arm_json(&qd4),
+                    "routed_wall_speedup": control.routed_wall_ns as f64 / qd4.routed_wall_ns as f64,
+                    "positive": control.routed_wall_ns > qd4.routed_wall_ns,
+                })
+            )?;
+            for position in &qd4.positions {
+                writeln!(output, "{}", qd4_gate_position_json(layer, pair, position))?;
+            }
+        }
+        let control_p50 = median_u64(&control_samples);
+        let qd4_p50 = median_u64(&qd4_samples);
+        let (_, control_p95_ms) = median_p95_ms(&control_samples);
+        let (_, qd4_p95_ms) = median_p95_ms(&qd4_samples);
+        let ratio_of_medians = control_p50 as f64 / qd4_p50 as f64;
+        let exact = exact_pairs == PAIRS;
+        let speed_go = immutable_cache_gate || ratio_of_medians >= REQUIRED_SPEEDUP;
+        let positive_go = immutable_cache_gate || positive_pairs == PAIRS;
+        let p95_go = immutable_cache_gate || qd4_p95_ms <= control_p95_ms;
+        let error_go = worker_errors == 0;
+        let status = if exact && speed_go && positive_go && p95_go && error_go {
+            "GO"
+        } else {
+            "KILL"
+        };
+        all_go &= status == "GO";
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "event": "layer_summary",
+                "layer": layer,
+                "status": status,
+                "exact_pairs": exact_pairs,
+                "control_routed_wall_p50_ns": control_p50,
+                "qd4_routed_wall_p50_ns": qd4_p50,
+                "control_routed_wall_p95_ms": control_p95_ms,
+                "qd4_routed_wall_p95_ms": qd4_p95_ms,
+                "ratio_of_medians": ratio_of_medians,
+                "positive_pairs": positive_pairs,
+                "worker_errors": worker_errors,
+                "speed_gate": speed_go,
+                "positive_gate": positive_go,
+                "p95_gate": p95_go,
+                "error_gate": error_go,
+                "required_ratio_of_medians": (!immutable_cache_gate).then_some(REQUIRED_SPEEDUP),
+                "immutable_cache_gate": immutable_cache_gate,
+            })
+        )?;
+    }
+    let status = if all_go { "GO" } else { "KILL" };
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": status,
+            "full61_promotion": false,
+            "production_guard_change": false,
+            "gpu_after": gpu_telemetry_snapshot()?,
+        })
+    )?;
+    output.sync_all()?;
+    println!(
+        "{{\"status\":\"{status}\",\"mode\":\"v4-qd4-stationary-gate\",\"result_jsonl\":{}}}",
+        serde_json::to_string(&result_path)?
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct LinuxMemorySnapshot {
+    available_bytes: u64,
+    cached_bytes: u64,
+}
+
+fn linux_memory_snapshot() -> Result<LinuxMemorySnapshot, Box<dyn Error>> {
+    let contents = std::fs::read_to_string("/proc/meminfo")?;
+    let value = |name: &str| -> Result<u64, Box<dyn Error>> {
+        let kib = contents
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|tail| tail.split_whitespace().next())
+            .ok_or_else(|| format!("{name} missing from /proc/meminfo"))?
+            .parse::<u64>()?;
+        kib.checked_mul(1_024)
+            .ok_or_else(|| format!("{name} byte count overflow").into())
+    };
+    Ok(LinuxMemorySnapshot {
+        available_bytes: value("MemAvailable:")?,
+        cached_bytes: value("Cached:")?,
+    })
+}
+
+fn model_mount_provenance(
+    model_dir: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let canonical = model_dir.canonicalize()?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let (_, source, fstype) = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (mount, filesystem) = line.split_once(" - ")?;
+            let target = mount.split_whitespace().nth(4)?;
+            let mut filesystem = filesystem.split_whitespace();
+            let fstype = filesystem.next()?;
+            let source = filesystem.next()?;
+            canonical
+                .starts_with(target)
+                .then_some((target.len(), source, fstype))
+        })
+        .max_by_key(|(length, _, _)| *length)
+        .ok_or("model mount provenance is unavailable")?;
+    let source_canonical = std::fs::canonicalize(source)?;
+    let uuid = std::fs::read_dir("/dev/disk/by-uuid")?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            std::fs::canonicalize(entry.path())
+                .ok()
+                .filter(|candidate| candidate == &source_canonical)
+                .and_then(|_| entry.file_name().into_string().ok())
+        })
+        .ok_or("model block device UUID is unavailable")?;
+    Ok(serde_json::json!({
+        "source": source,
+        "fstype": fstype,
+        "uuid": uuid,
+    }))
+}
+
+struct CacheOffSource {
+    layer: usize,
+    shard: safetensors::ShardFile,
+    raw_name: String,
+    raw: Vec<u8>,
+    plan: v4_expert::RoutedExpertRangePlan,
+    routed: [Vec<u8>; 6],
+}
+
+impl CacheOffSource {
+    fn new(model_dir: &std::path::Path, layer: usize) -> Result<Self, Box<dyn Error>> {
+        let shard = safetensors::ShardFile::open(
+            model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+        )?;
+        let raw_name = format!("layers.{layer}.attn.wo_a.weight");
+        let raw = vec![0_u8; usize::try_from(shard.tensor(&raw_name)?.byte_len)?];
+        let plan = v4_expert::RoutedExpertRangePlan::new(&shard, layer, 0)?;
+        let routed = [
+            vec![0_u8; v4_expert::V4_W1_BYTES],
+            vec![0_u8; v4_expert::V4_W1_SCALE_BYTES],
+            vec![0_u8; v4_expert::V4_W2_BYTES],
+            vec![0_u8; v4_expert::V4_W2_SCALE_BYTES],
+            vec![0_u8; v4_expert::V4_W1_BYTES],
+            vec![0_u8; v4_expert::V4_W1_SCALE_BYTES],
+        ];
+        Ok(Self {
+            layer,
+            shard,
+            raw_name,
+            raw,
+            plan,
+            routed,
+        })
+    }
+
+    fn evict(&self) -> Result<(), Box<dyn Error>> {
+        self.shard
+            .advise_range_dontneed(&self.raw_name, 0, self.raw.len())?;
+        self.plan.advise_dontneed(&self.shard)
+    }
+
+    fn read(
+        &mut self,
+        mode: safetensors::RangeReadMode,
+    ) -> Result<safetensors::RangeReadTelemetry, Box<dyn Error>> {
+        let raw = self
+            .shard
+            .read_at_mode(&self.raw_name, 0, &mut self.raw, mode)?;
+        let [w1, w1_scale, w2, w2_scale, w3, w3_scale] = &mut self.routed;
+        let routed = self.plan.read_into_mode(
+            &self.shard,
+            [
+                w1.as_mut_slice(),
+                w1_scale.as_mut_slice(),
+                w2.as_mut_slice(),
+                w2_scale.as_mut_slice(),
+                w3.as_mut_slice(),
+                w3_scale.as_mut_slice(),
+            ],
+            mode,
+        )?;
+        Ok(safetensors::RangeReadTelemetry {
+            logical_bytes: raw
+                .logical_bytes
+                .checked_add(routed.logical_bytes)
+                .ok_or("cache-off logical byte count overflow")?,
+            physical_bytes: raw
+                .physical_bytes
+                .checked_add(routed.physical_bytes)
+                .ok_or("cache-off physical byte count overflow")?,
+        })
+    }
+
+    fn update_digest(&self, mut hash: u64) -> u64 {
+        for byte in self.raw.iter().chain(self.routed.iter().flatten()) {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CacheOffSample {
+    read_wall_ns: u64,
+    logical_bytes: usize,
+    physical_bytes: usize,
+    digest: u64,
+    available_delta_bytes: i64,
+    cached_delta_bytes: i64,
+}
+
+fn run_cache_off_arm(
+    sources: &mut [CacheOffSource],
+    mode: safetensors::RangeReadMode,
+) -> Result<CacheOffSample, Box<dyn Error>> {
+    for source in sources.iter() {
+        source.evict()?;
+    }
+    let before = linux_memory_snapshot()?;
+    let started = std::time::Instant::now();
+    let mut logical_bytes = 0_usize;
+    let mut physical_bytes = 0_usize;
+    for source in sources.iter_mut() {
+        let read = source.read(mode)?;
+        logical_bytes = logical_bytes
+            .checked_add(read.logical_bytes)
+            .ok_or("cache-off logical byte total overflow")?;
+        physical_bytes = physical_bytes
+            .checked_add(read.physical_bytes)
+            .ok_or("cache-off physical byte total overflow")?;
+    }
+    let read_wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let after = linux_memory_snapshot()?;
+    let digest = sources
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, source| {
+            source.update_digest(hash)
+        });
+    Ok(CacheOffSample {
+        read_wall_ns,
+        logical_bytes,
+        physical_bytes,
+        digest,
+        available_delta_bytes: i64::try_from(after.available_bytes)?
+            - i64::try_from(before.available_bytes)?,
+        cached_delta_bytes: i64::try_from(after.cached_bytes)?
+            - i64::try_from(before.cached_bytes)?,
+    })
+}
+
+fn median_i64(samples: &[i64]) -> i64 {
+    let mut samples = samples.to_vec();
+    samples.sort_unstable();
+    let middle = samples.len() / 2;
+    if samples.len().is_multiple_of(2) {
+        (samples[middle - 1] as i128 + samples[middle] as i128) as i64 / 2
+    } else {
+        samples[middle]
+    }
+}
+
+fn run_real_v4_cache_off_bench() -> Result<(), Box<dyn Error>> {
+    let repeats = std::env::var("COLIBRI_V4_CACHE_OFF_REPEATS")
+        .unwrap_or_else(|_| "30".into())
+        .parse::<usize>()?;
+    if repeats != 3 && repeats < 30 {
+        return Err("COLIBRI_V4_CACHE_OFF_REPEATS must be 3 for smoke or at least 30".into());
+    }
+    let result_path = std::env::var_os("COLIBRI_V4_CACHE_OFF_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_CACHE_OFF_RESULT_JSONL")?;
+    if let Some(parent) = result_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let model_dir = v4_model_dir()?;
+    let mut sources = [
+        CacheOffSource::new(&model_dir, 3)?,
+        CacheOffSource::new(&model_dir, 4)?,
+    ];
+    let mut output = std::fs::File::create(&result_path)?;
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-cache-off-stage0-v1",
+            "provenance": benchmark_provenance()?,
+            "model_mount": model_mount_provenance(&model_dir)?,
+            "model_revision": v4_state::REVISION,
+            "layers": sources.iter().map(|source| source.layer).collect::<Vec<_>>(),
+            "expert_id": 0,
+            "repeats": repeats,
+            "arm_order_schedule": "BF/FB; every arm is range-evicted before timing",
+            "gate": "exact digest; cache-off median wall <= buffered*1.10; lower Cached delta and no worse MemAvailable delta",
+        })
+    )?;
+    let modes = [
+        safetensors::RangeReadMode::Buffered,
+        safetensors::RangeReadMode::Fadvise,
+    ];
+    let name = |mode| match mode {
+        safetensors::RangeReadMode::Buffered => "buffered",
+        safetensors::RangeReadMode::Fadvise => "fadvise",
+        safetensors::RangeReadMode::Direct => "direct",
+    };
+    let mut samples = [Vec::with_capacity(repeats), Vec::with_capacity(repeats)];
+    let mut oracle = None;
+    for repeat in 0..repeats {
+        let order = if b2_serial_first(repeat) {
+            [0_usize, 1]
+        } else {
+            [1_usize, 0]
+        };
+        for &mode_index in &order {
+            let sample = run_cache_off_arm(&mut sources, modes[mode_index])?;
+            if oracle.is_some_and(|digest| digest != sample.digest) {
+                return Err(format!(
+                    "cache-off repeat {repeat} {} changed canonical bytes",
+                    name(modes[mode_index])
+                )
+                .into());
+            }
+            oracle.get_or_insert(sample.digest);
+            writeln!(
+                output,
+                "{}",
+                serde_json::json!({
+                    "event": "sample",
+                    "repeat": repeat,
+                    "arm_order": if order[0] == 0 { "BF" } else { "FB" },
+                    "mode": name(modes[mode_index]),
+                    "read_wall_ns": sample.read_wall_ns,
+                    "logical_bytes": sample.logical_bytes,
+                    "physical_bytes": sample.physical_bytes,
+                    "physical_overread_bytes": sample.physical_bytes - sample.logical_bytes,
+                    "digest": format!("{:016x}", sample.digest),
+                    "mem_available_delta_bytes": sample.available_delta_bytes,
+                    "cached_delta_bytes": sample.cached_delta_bytes,
+                })
+            )?;
+            samples[mode_index].push(sample);
+        }
+    }
+    let wall = samples.each_ref().map(|values| {
+        median_u64(
+            &values
+                .iter()
+                .map(|sample| sample.read_wall_ns)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let cached = samples.each_ref().map(|values| {
+        median_i64(
+            &values
+                .iter()
+                .map(|sample| sample.cached_delta_bytes)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let available = samples.each_ref().map(|values| {
+        median_i64(
+            &values
+                .iter()
+                .map(|sample| sample.available_delta_bytes)
+                .collect::<Vec<_>>(),
+        )
+    });
+    let fadvise_pass = wall[1] <= wall[0].saturating_mul(110) / 100
+        && cached[1] < cached[0]
+        && available[1] >= available[0];
+    let status = if fadvise_pass { "PASS" } else { "KILL" };
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "event": "summary",
+            "status": status,
+            "canonical_exact": true,
+            "buffered": {"wall_p50_ns": wall[0], "cached_delta_p50_bytes": cached[0], "mem_available_delta_p50_bytes": available[0]},
+            "fadvise": {"wall_p50_ns": wall[1], "wall_ratio": wall[1] as f64 / wall[0] as f64, "cached_delta_p50_bytes": cached[1], "mem_available_delta_p50_bytes": available[1], "gate_pass": fadvise_pass},
+            "direct": serde_json::Value::Null,
+            "logical_bytes_per_arm": samples[0][0].logical_bytes,
+            "direct_physical_bytes_per_arm": serde_json::Value::Null,
+            "direct_overread_bytes_per_arm": serde_json::Value::Null,
+            "repeats": repeats,
+        })
+    )?;
+    println!(
+        "{{\"status\":\"{status}\",\"mode\":\"v4-cache-off-stage0\",\"result_jsonl\":{}}}",
+        serde_json::to_string(&result_path)?
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_real_layer_attention_rows(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    hc_hidden: &[u16],
+    start_pos: usize,
+    state: &mut v4_state::V4LayerPersistentState,
+    cublas: Option<&cublas_exact::CublasExact>,
+    mut strict_scratch: Option<&mut StrictCompressorScratch>,
+) -> Result<RealAttentionRun, Box<dyn Error>> {
+    let weights = &runtime.weights;
+    let row_width = v4_state::HC * v4_state::HIDDEN;
+    let rows = hc_hidden.len() / row_width;
+    if rows == 0
+        || rows > 2
+        || hc_hidden.len() != rows * row_width
+        || state.layer() != weights.layer
+        || state.committed_kv_rows() != start_pos
+    {
+        return Err(format!(
+            "layer {} real attention input/state contract mismatch",
+            weights.layer
+        )
+        .into());
+    }
+    let attention_started = std::time::Instant::now();
+    let capture_stages = std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").is_some();
+    let mut stage_digests = Vec::new();
+    let freqs = (0..rows)
+        .flat_map(|row| v4_state::compressed_rope_freqs(start_pos + row))
+        .collect::<Vec<_>>();
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        hc_hidden,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+    )?;
+    maybe_write_v4_audit_f32(weights.layer, "attn_hc_post", &attn_hc.post)?;
+    maybe_write_v4_audit_f32(weights.layer, "attn_hc_comb", &attn_hc.comb)?;
+    if capture_stages {
+        stage_digests.extend([
+            ("mhc_collapsed", fnv1a_u16(&attn_hc.collapsed)),
+            ("mhc_post", fnv1a_f32(&attn_hc.post)),
+            ("mhc_comb", fnv1a_f32(&attn_hc.comb)),
+        ]);
+    }
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &weights.attn_norm,
+        v4_state::HIDDEN,
+    )?;
+    if capture_stages {
+        stage_digests.push(("attn_input", fnv1a_u16(&attn_input)));
+    }
+    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    if capture_stages {
+        stage_digests.push(("q_lora_raw", fnv1a_u16(&q_lora_raw)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "q_lora_raw", &q_lora_raw)?;
+    let q_lora = run_l0_rmsnorm(
+        module,
+        stream,
+        &q_lora_raw,
+        &weights.q_norm,
+        weights.wq_a.out_features,
+    )?;
+    if capture_stages {
+        stage_digests.push(("q_lora", fnv1a_u16(&q_lora)));
+    }
+    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    if capture_stages {
+        stage_digests.push(("q_raw", fnv1a_u16(&q_raw)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "q_raw", &q_raw)?;
+    let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let q = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    if capture_stages {
+        stage_digests.push(("q_norm", fnv1a_u16(&q)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "q_norm", &q)?;
+    let q = run_l0_rope(module, stream, &q, &freqs, v4_state::Q_HEADS, false)?;
+    if capture_stages {
+        stage_digests.push(("q_rope", fnv1a_u16(&q)));
+    }
+    let (_, kv) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    if capture_stages {
+        stage_digests.push(("kv_raw", fnv1a_u16(&kv)));
+    }
+    let kv = run_l0_rmsnorm(module, stream, &kv, &weights.kv_norm, v4_state::Q_HEAD_DIM)?;
+    if capture_stages {
+        stage_digests.push(("kv_norm", fnv1a_u16(&kv)));
+    }
+    let kv = run_l0_rope(module, stream, &kv, &freqs, 1, false)?;
+    if capture_stages {
+        stage_digests.push(("kv_rope", fnv1a_u16(&kv)));
+    }
+    let kv = run_l0_kv_quantize(module, stream, &kv)?;
+    if capture_stages {
+        stage_digests.push(("kv_ready", fnv1a_u16(&kv)));
+    }
+    let compressor = run_layer_compressor(
+        module,
+        stream,
+        &attn_input,
+        weights,
+        start_pos,
+        cublas,
+        strict_scratch.as_deref_mut(),
+    )?;
+    if l0_pos0_compressor_probe_enabled(weights.layer, start_pos) {
+        print_l0_pos0_compressor_probe(
+            "host_pre_commit",
+            &compressor.kv_f32,
+            &compressor.score_f32,
+            &compressor.score_plus_ape_f32,
+        );
+    }
+    if capture_stages {
+        stage_digests.extend([
+            ("compressor_kv", fnv1a_f32(&compressor.kv_f32)),
+            ("compressor_score", fnv1a_f32(&compressor.score_f32)),
+            (
+                "compressor_score_plus_ape",
+                fnv1a_f32(&compressor.score_plus_ape_f32),
+            ),
+        ]);
+    }
+    let indexer = weights
+        .indexer
+        .as_ref()
+        .map(|indexer| {
+            run_csa_indexer_projections(
+                module,
+                stream,
+                &attn_input,
+                &q_lora,
+                &freqs,
+                indexer,
+                start_pos,
+                cublas,
+                strict_scratch.as_deref_mut(),
+            )
+        })
+        .transpose()?;
+    let commit_started = std::time::Instant::now();
+    let (topk, indexer_topk_gpu_ns) = commit_layer_attention_state(
+        module,
+        stream,
+        weights,
+        state,
+        &kv,
+        &compressor,
+        indexer.as_ref(),
+        start_pos,
+    )?;
+    let commit_ns = u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    maybe_write_v4_audit_f32(
+        weights.layer,
+        "main_compressor_kv_state",
+        state.compressor().kv(),
+    )?;
+    maybe_write_v4_audit_f32(
+        weights.layer,
+        "main_compressor_score_state",
+        state.compressor().score(),
+    )?;
+    let attention_topk_digest = fnv1a_i32(&topk.indices);
+    let cache = state.attention_cache_bf16();
+    let sparse = match sparse_attention_arm_from_env()? {
+        SparseAttentionArm::Reference => {
+            run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+        }
+        SparseAttentionArm::ScoreReuse => {
+            run_sparse_attention_score_reuse(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+        }
+        SparseAttentionArm::Sm89Crossover if topk.per_row >= SM89_SCORE_REUSE_MIN_TOPK => {
+            run_sparse_attention_score_reuse(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+        }
+        SparseAttentionArm::Sm89Crossover => {
+            run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+        }
+    };
+    if capture_stages {
+        stage_digests.push(("sparse", fnv1a_u16(&sparse)));
+    }
+    let sparse = run_l0_rope(module, stream, &sparse, &freqs, v4_state::Q_HEADS, true)?;
+    if capture_stages {
+        stage_digests.push(("sparse_inverse", fnv1a_u16(&sparse)));
+    }
+    let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
+    if capture_stages {
+        stage_digests.push(("wo_a", fnv1a_u16(&wo_a)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "wo_a", &wo_a)?;
+    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    if capture_stages {
+        stage_digests.push(("attention", fnv1a_u16(&attention)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "attention", &attention)?;
+    let output = run_l0_hc_post(
+        module,
+        stream,
+        &attention,
+        hc_hidden,
+        &attn_hc.post,
+        &attn_hc.comb,
+    )?;
+    if capture_stages {
+        stage_digests.push(("attention_post", fnv1a_u16(&output)));
+    }
+    maybe_write_v4_audit_u16(weights.layer, "attention_post", &output)?;
+    Ok(RealAttentionRun {
+        output,
+        topk: Some(topk.indices.clone()),
+        stage_digests,
+        attention_topk_digest,
+        attention_topk_per_row: topk.per_row,
+        indexer_topk_gpu_ns,
+        attention_ns: u64::try_from(attention_started.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(commit_ns),
+        commit_ns,
+        device_transfer: None,
+    })
+}
+
+fn run_device_attention_row(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    hc_hidden: &[u16],
+    start_pos: usize,
+    observe_topk: bool,
+) -> Result<RealAttentionRun, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let rope_lut_d2d_count = run_device_token_state_commit_row(
+        module, stream, runtime, state, rope_lut, hc_hidden, start_pos,
+    )?;
+    let commit_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let (output, topk) = run_device_attention_after_commit(
+        module,
+        stream,
+        runtime,
+        state,
+        rope_lut,
+        start_pos,
+        observe_topk,
+    )?;
+    let attention_topk_digest = topk.as_deref().map_or(0, fnv1a_i32);
+    let attention_topk_per_row = topk.as_ref().map_or(0, Vec::len);
+    let audit_topk_bytes = topk.as_ref().map_or(0, Vec::len) * std::mem::size_of::<i32>();
+    let attention_ns = u64::try_from(started.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(commit_ns);
+    Ok(RealAttentionRun {
+        output,
+        topk,
+        stage_digests: Vec::new(),
+        attention_topk_digest,
+        attention_topk_per_row,
+        indexer_topk_gpu_ns: 0,
+        attention_ns,
+        commit_ns,
+        device_transfer: Some(DeviceAttentionTransfer {
+            h2d_count: 1,
+            h2d_bytes: state.hc_hidden.num_bytes(),
+            rope_lut_d2d_count: rope_lut_d2d_count + 1,
+            rope_lut_d2d_bytes: (rope_lut_d2d_count + 1) * state.freqs.num_bytes(),
+            terminal_d2h_count: 1,
+            terminal_d2h_bytes: state.after_attention.num_bytes(),
+            intermediate_or_audit_d2h_count: usize::from(observe_topk),
+            intermediate_or_audit_d2h_bytes: audit_topk_bytes,
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_real_layer_rows<'module, 'slots, 'lane>(
+    context: &std::sync::Arc<CudaContext>,
+    module: &'module kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    runtime: &LoadedLayerRuntime,
+    qd4_lanes: Option<&mut [ExpertSlot<'lane>]>,
+    qd4_immutable_cache: Option<&mut Qd4ImmutableExpertCache<'lane>>,
+    mut expert_slots: Option<&'slots mut BTreeMap<u16, ExpertSlot<'module>>>,
+    hash_ids: &[i64],
+    hc_hidden: &[u16],
+    token_ids: &[i64],
+    start_pos: usize,
+    state: Option<&mut v4_state::V4LayerPersistentState>,
+    device_state: Option<&mut DeviceTokenState>,
+    device_rope_lut: Option<&DeviceRequestRopeLut>,
+    device_observe_topk: bool,
+    critical_path_origin: Option<std::time::Instant>,
+    capture_routed_contributions: bool,
+    strict_scratch: Option<&mut StrictCompressorScratch>,
+) -> Result<RealLayerRun, Box<dyn Error>> {
+    let weights = &runtime.weights;
+    let row_width = v4_state::HC * v4_state::HIDDEN;
+    let rows = hc_hidden.len() / row_width;
+    if rows == 0
+        || rows > 2
+        || hc_hidden.len() != rows * row_width
+        || token_ids.len() != rows
+        || device_state.is_none()
+            && state.as_ref().is_none_or(|state| {
+                state.layer() != weights.layer || state.committed_kv_rows() != start_pos
+            })
+    {
+        return Err(format!(
+            "layer {} real runner input/state contract mismatch",
+            weights.layer
+        )
+        .into());
+    }
+    if capture_routed_contributions && rows != 1 {
+        return Err("routed contribution audit requires exactly one row".into());
+    }
+    let mut stage = LayerStageTelemetry::default();
+    let mut critical_path_timeline = critical_path_origin.map(CriticalPathTimeline::new);
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.attention_start_ns = timeline.now();
+    }
+    let attention = if let Some(device_state) = device_state {
+        run_device_attention_row(
+            module,
+            stream,
+            runtime,
+            device_state,
+            device_rope_lut.ok_or("device attention row is missing request RoPE LUT")?,
+            hc_hidden,
+            start_pos,
+            device_observe_topk,
+        )?
+    } else {
+        run_real_layer_attention_rows(
+            module,
+            stream,
+            runtime,
+            hc_hidden,
+            start_pos,
+            state.ok_or("host layer runner is missing persistent state")?,
+            None,
+            strict_scratch,
+        )?
+    };
+    let after_attention = attention.output;
+    let attention_output = after_attention.clone();
+    let attention_topk = attention.topk;
+    let device_transfer = attention.device_transfer;
+    let attention_topk_digest = attention.attention_topk_digest;
+    let attention_topk_per_row = attention.attention_topk_per_row;
+    let indexer_topk_gpu_ns = attention.indexer_topk_gpu_ns;
+    stage.attention_ns = attention.attention_ns;
+    stage.commit_ns = attention.commit_ns;
+    if let Some(transfer) = device_transfer.as_ref() {
+        stage.attention_hidden_h2d_count = transfer.h2d_count;
+        stage.attention_hidden_h2d_bytes = transfer.h2d_bytes;
+        stage.attention_rope_lut_d2d_count = transfer.rope_lut_d2d_count;
+        stage.attention_rope_lut_d2d_bytes = transfer.rope_lut_d2d_bytes;
+        stage.attention_terminal_d2h_count = transfer.terminal_d2h_count;
+        stage.attention_terminal_d2h_bytes = transfer.terminal_d2h_bytes;
+        stage.attention_intermediate_or_audit_d2h_count = transfer.intermediate_or_audit_d2h_count;
+        stage.attention_intermediate_or_audit_d2h_bytes = transfer.intermediate_or_audit_d2h_bytes;
+    }
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.attention_end_ns = timeline.now();
+        timeline.attention_commit_ns = attention.commit_ns;
+        timeline.router_start_ns = timeline.now();
+    }
+    let router_started = std::time::Instant::now();
+    let ffn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &after_attention,
+        &weights.hc_ffn_fn,
+        &weights.hc_ffn_scale,
+        &weights.hc_ffn_base,
+    )?;
+    stage.router_mhc_ns = ffn_hc.telemetry.wall_ns;
+    stage.router_mhc_input_alloc_h2d_sync_ns = ffn_hc.telemetry.input_alloc_h2d_sync_ns;
+    stage.router_mhc_workspace_alloc_sync_ns = ffn_hc.telemetry.workspace_alloc_sync_ns;
+    stage.router_mhc_workspace_init_gpu_ns = ffn_hc.telemetry.workspace_init_gpu_ns;
+    stage.router_mhc_mixing_linear_sync_ns = ffn_hc.telemetry.mixing_linear_sync_ns;
+    stage.router_mhc_mixing_linear_gpu_ns = ffn_hc.telemetry.mixing_linear_gpu_ns;
+    stage.router_mhc_sinkhorn_normalize_collapse_sync_ns =
+        ffn_hc.telemetry.sinkhorn_normalize_collapse_sync_ns;
+    stage.router_mhc_sinkhorn_normalize_collapse_gpu_ns =
+        ffn_hc.telemetry.sinkhorn_normalize_collapse_gpu_ns;
+    stage.router_mhc_output_d2h_sync_ns = ffn_hc.telemetry.output_d2h_sync_ns;
+    stage.router_mhc_other_ns = ffn_hc.telemetry.other_ns;
+    let router_host_prep_started = std::time::Instant::now();
+    let hash_ids = if weights.hash_router {
+        if hash_ids.len() != rows * v4_router::V4_TOPK {
+            return Err(format!("layer {} hash router rows disappeared", weights.layer).into());
+        }
+        hash_ids.to_vec()
+    } else {
+        Vec::new()
+    };
+    stage.router_host_prep_ns =
+        u64::try_from(router_host_prep_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let router = run_layer_router(module, stream, &ffn_hc.collapsed, weights, &hash_ids)?;
+    let ffn_input = router.input;
+    let routes = router.routes;
+    stage.router_alloc_h2d_sync_ns = router.telemetry.alloc_h2d_sync_ns;
+    stage.router_workspace_alloc_ns = router.telemetry.workspace_alloc_ns;
+    stage.router_kernel_select_sync_ns = router.telemetry.kernel_select_sync_ns;
+    stage.router_kernel_select_gpu_ns = router.telemetry.kernel_select_gpu_ns;
+    stage.router_d2h_sync_ns = router.telemetry.d2h_sync_ns;
+    maybe_write_v4_audit_u16(weights.layer, "ffn_input", &ffn_input)?;
+    stage.router_ns = u64::try_from(router_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    stage.router_other_ns = stage.router_ns.saturating_sub(stage.router_accounted_ns());
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.router_end_ns = timeline.now();
+        timeline.shared_start_ns = timeline.now();
+    }
+    let shared_started = std::time::Instant::now();
+    let shared = run_layer_shared_expert(module, stream, &ffn_input, weights)?;
+    stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.shared_end_ns = timeline.now();
+    }
+    maybe_run_routed_qd4_benchmark(
+        context,
+        module,
+        stream,
+        &runtime.expert_shard,
+        weights.layer,
+        &ffn_input,
+        &routes,
+        &shared,
+    )?;
+    let routed_started = std::time::Instant::now();
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.routed_start_ns = timeline.now();
+    }
+    let (moe, routed_contributions) = if let Some(lanes) = qd4_lanes {
+        if rows != 1 {
+            return Err("QD4 full inference currently requires B=1/S=1".into());
+        }
+        let immutable_cache_enabled = qd4_immutable_cache.is_some();
+        let plans: [v4_expert::RoutedExpertRangePlan; v4_router::V4_TOPK] = routes
+            .ids
+            .iter()
+            .map(|&expert| {
+                v4_expert::RoutedExpertRangePlan::new(
+                    &runtime.expert_shard,
+                    weights.layer,
+                    u16::try_from(expert)?,
+                )
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+            .try_into()
+            .map_err(|_| "QD4 route plan count changed")?;
+        let qd4 = run_qd4_routed_once(
+            lanes,
+            qd4_immutable_cache,
+            &runtime.expert_shard,
+            weights.layer,
+            &ffn_input,
+            &routes,
+            &shared,
+            &plans,
+            critical_path_origin,
+            capture_routed_contributions,
+        )?;
+        // QD4 lanes overlap: the phase-profile child is their elapsed wall
+        // scope, not the six lane-duration sum.
+        stage.routed_read_ns = qd4.sample.read_wall_ns;
+        stage.routed_setup_ns = 0;
+        stage.routed_h2d_ns = qd4.sample.h2d_ns;
+        stage.routed_kernel_ns = qd4.sample.kernel_ns;
+        stage.routed_source_bytes = qd4
+            .cache_miss_count
+            .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+            .ok_or("QD4 immutable cache routed source byte count overflow")?;
+        if qd4.cache_miss_count == 0 && !immutable_cache_enabled {
+            stage.routed_source_bytes = v4_expert::V4_ROUTED_EXPERT_BYTES * v4_router::V4_TOPK;
+        }
+        stage.routed_h2d_bytes = stage.routed_source_bytes;
+        stage.routed_expert_loads = stage.routed_source_bytes / v4_expert::V4_ROUTED_EXPERT_BYTES;
+        stage.routed_parallel_batch_wall_ns = Some(qd4.sample.inclusive_ns);
+        stage.routed_parallel_read_horizon_ns = Some(qd4.sample.read_wall_ns);
+        if let Some(timeline) = critical_path_timeline.as_mut() {
+            timeline.routed = qd4.sample.timeline.clone();
+        }
+        (qd4.output, qd4.contributions)
+    } else {
+        let mut contributions: Vec<Vec<Option<Vec<f32>>>> = (0..rows)
+            .map(|_| (0..v4_router::V4_TOPK).map(|_| None).collect())
+            .collect();
+        let mut expert_union = routes
+            .ids
+            .iter()
+            .map(|&id| u16::try_from(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        expert_union.sort_unstable();
+        expert_union.dedup();
+        for expert_id in expert_union {
+            let mut temporary_slot = None;
+            let mut load_slot = || -> Result<ExpertSlot<'module>, Box<dyn Error>> {
+                let expert = v4_expert::RoutedExpert::load_layer(
+                    &runtime.expert_shard,
+                    weights.layer,
+                    expert_id,
+                )?;
+                stage.routed_read_ns = stage
+                    .routed_read_ns
+                    .saturating_add((expert.read_ms * 1_000_000.0) as u64);
+                stage.routed_alloc_ns = stage
+                    .routed_alloc_ns
+                    .saturating_add((expert.alloc_ms * 1_000_000.0) as u64);
+                stage.routed_source_bytes =
+                    stage.routed_source_bytes.saturating_add(expert.h2d_bytes());
+                stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
+                let setup_started = std::time::Instant::now();
+                let slot = ExpertSlot::new(context, module, stream, &expert)?;
+                stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(
+                    u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                stage.routed_h2d_ns = stage
+                    .routed_h2d_ns
+                    .saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
+                stage.routed_h2d_bytes = stage.routed_h2d_bytes.saturating_add(expert.h2d_bytes());
+                Ok(slot)
+            };
+            let slot = if let Some(expert_slots) = expert_slots.as_deref_mut() {
+                if expert_slots.contains_key(&expert_id) {
+                    expert_slots
+                        .get_mut(&expert_id)
+                        .ok_or("retained expert slot disappeared")?
+                } else if should_retain_layer_expert(expert_slots.len()) {
+                    expert_slots.insert(expert_id, load_slot()?);
+                    expert_slots
+                        .get_mut(&expert_id)
+                        .ok_or("expert slot disappeared after insertion")?
+                } else {
+                    temporary_slot.insert(load_slot()?)
+                }
+            } else {
+                temporary_slot.insert(load_slot()?)
+            };
+            drop(load_slot);
+            for row in 0..rows {
+                for route_slot in 0..v4_router::V4_TOPK {
+                    let route = row * v4_router::V4_TOPK + route_slot;
+                    if routes.ids[route] == i32::from(expert_id) {
+                        let input =
+                            &ffn_input[row * v4_state::HIDDEN..(row + 1) * v4_state::HIDDEN];
+                        contributions[row][route_slot] = Some({
+                            let (output, kernel_ns) = slot.execute(input, routes.weights[route])?;
+                            stage.routed_kernel_ns =
+                                stage.routed_kernel_ns.saturating_add(kernel_ns);
+                            output
+                        });
+                    }
+                }
+            }
+        }
+        let mut moe = Vec::with_capacity(rows * v4_state::HIDDEN);
+        for row in 0..rows {
+            let routed = (0..v4_router::V4_TOPK)
+                .map(|slot| {
+                    Ok((
+                        u16::try_from(routes.ids[row * v4_router::V4_TOPK + slot])?,
+                        contributions[row][slot]
+                            .as_deref()
+                            .ok_or("missing routed expert contribution")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            moe.extend(v4_expert::reduce_moe_canonical(
+                &routed,
+                &shared[row * v4_state::HIDDEN..(row + 1) * v4_state::HIDDEN],
+            )?);
+        }
+        let audit = if capture_routed_contributions {
+            Some(
+                (0..v4_router::V4_TOPK)
+                    .map(|slot| {
+                        contributions[0][slot]
+                            .take()
+                            .ok_or("routed contribution disappeared before audit")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
+        (moe, audit)
+    };
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.routed_end_ns = timeline.now();
+        timeline.hc_post_start_ns = timeline.now();
+    }
+    let output = run_l0_hc_post(
+        module,
+        stream,
+        &moe,
+        &after_attention,
+        &ffn_hc.post,
+        &ffn_hc.comb,
+    )?;
+    maybe_write_v4_audit_u16(weights.layer, "hidden", &output)?;
+    stage.routed_ns = u64::try_from(routed_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if let Some(timeline) = critical_path_timeline.as_mut() {
+        timeline.hc_post_end_ns = timeline.now();
+        timeline.output_ready_ns = timeline.now();
+    }
+    let routed_audit = routed_contributions.map(|contributions| RoutedExecutionAudit {
+        after_attention_digest: fnv1a_u16(&after_attention),
+        ffn_input_digest: fnv1a_u16(&ffn_input),
+        shared_digest: fnv1a_f32(&shared),
+        moe_digest: fnv1a_u16(&moe),
+        contributions,
+    });
+    Ok(RealLayerRun {
+        output,
+        attention_output,
+        routes,
+        attention_topk,
+        attention_topk_digest,
+        attention_topk_per_row,
+        device_transfer,
+        indexer_topk_gpu_ns,
+        stage,
+        critical_path_timeline,
+        routed_audit,
+    })
+}
+
+#[derive(Clone)]
+struct L0Persistent {
+    kv: v4_state::V4KvCache,
+    compressor: v4_state::V4CompressorState,
+}
+
+impl L0Persistent {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            kv: v4_state::V4KvCache::new(),
+            compressor: v4_state::V4CompressorState::new_decode(
+                v4_state::COMPRESS_RATIO,
+                v4_state::Q_HEAD_DIM,
+            )?,
+        })
+    }
+
+    fn bits_equal(&self, other: &Self) -> bool {
+        self.kv.bits_equal(&other.kv) && self.compressor.bits_equal(&other.compressor)
+    }
+}
+
+struct L0Run {
+    output: Vec<u16>,
+    routes: v4_router::RouterSelection,
+    prefixes: Vec<L0Persistent>,
+    persistent: L0Persistent,
+    stage_hashes: Vec<(&'static str, u64)>,
+    expert_union: Vec<u16>,
+    expert_bytes: usize,
+    expert_alloc_ms: f64,
+    expert_read_ms: f64,
+    expert_setup_ms: f64,
+    expert_setup_samples_ms: Vec<f64>,
+    expert_h2d_samples_ms: Vec<f64>,
+    expert_kernel_ms: f64,
+    dynamic_bytes: usize,
+    elapsed_ms: f64,
+}
+
+fn fnv1a_u16(values: &[u16]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn fnv1a_bytes(values: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in values {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn normalized_config_fingerprint(
+    config: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if !config.is_object() {
+        return Err("normalized relevant configuration must be a JSON object".into());
+    }
+    let canonical_json = serde_json::to_string(&config)?;
+    Ok(serde_json::json!({
+        "algorithm": "fnv1a64",
+        "digest": format!("{:016x}", fnv1a_bytes(canonical_json.as_bytes())),
+        "canonical_json": canonical_json,
+        "normalized": config,
+    }))
+}
+
+fn fnv1a_i32(values: &[i32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn fnv1a_f32(values: &[f32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn p95_f64(values: &[f64]) -> f64 {
+    let mut values = values.to_vec();
+    values.sort_by(f64::total_cmp);
+    values[(values.len() * 95).div_ceil(100) - 1]
+}
+
+fn l0_persistent_digest(state: &L0Persistent) -> u64 {
+    let mut hash = fnv1a_u16(state.kv.as_slice());
+    for value in state.compressor.kv().iter().chain(state.compressor.score()) {
+        for byte in value.to_bits().to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// Actual host-to-device bytes issued by one host-boundary L0 P0 run.
+/// CUDA memset/allocations and device-to-host trace copies are not H2D.
+fn l0_dynamic_h2d_bytes(rows: usize) -> usize {
+    let bf16 = std::mem::size_of::<u16>();
+    let f32_bytes = std::mem::size_of::<f32>();
+    let i32_bytes = std::mem::size_of::<i32>();
+    let i64_bytes = std::mem::size_of::<i64>();
+    let h = v4_state::HIDDEN;
+    let hc_state = rows * v4_state::HC * h;
+    let q = rows * v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let kv = rows * v4_state::Q_HEAD_DIM;
+    let q_lora = rows * 1_536;
+    let o_lora = rows * v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    let expert_intermediate = rows * v4_expert::V4_EXPERT_INTERMEDIATE;
+    let post = rows * v4_state::HC;
+    let comb = rows * v4_state::HC * v4_state::HC;
+    let freqs = rows * v4_state::Q_ROPE_DIM;
+    let cache = v4_state::KV_CACHE_POSITIONS * v4_state::Q_HEAD_DIM;
+    let topk = rows * 128;
+
+    hc_state * bf16 // attention mHC
+        + rows * h * bf16 // attention RMSNorm
+        + rows * h * bf16 // wq_a
+        + q_lora * bf16 // q_norm
+        + q_lora * bf16 // wq_b
+        + q * bf16 // per-head RMSNorm
+        + q * bf16 + freqs * f32_bytes // forward q RoPE
+        + rows * h * bf16 // wkv
+        + kv * bf16 // kv_norm
+        + kv * bf16 + freqs * f32_bytes // forward kv RoPE
+        + kv * bf16 * 2 // fake-quant source and initialized destination
+        + rows * h * bf16 // Compressor input
+        + q * bf16 + cache * bf16 + topk * i32_bytes // sparse attention
+        + q * bf16 + freqs * f32_bytes // inverse RoPE
+        + q * bf16 // wo_a
+        + o_lora * bf16 // wo_b
+        + rows * h * bf16 + hc_state * bf16 + post * f32_bytes + comb * f32_bytes // attention HC post
+        + hc_state * bf16 // FFN mHC
+        + rows * h * bf16 // FFN RMSNorm
+        + rows * h * bf16 + v4_router::V4_ROUTED_EXPERTS * f32_bytes
+        + rows * v4_router::V4_TOPK * i64_bytes // gate projection/select
+        + rows * h * bf16 * 2 // shared w1/w3
+        + expert_intermediate * bf16 * 3 // shared gate/up uploads and w2 input
+        + rows * v4_router::V4_TOPK * h * bf16 // routed expert inputs
+        + rows * h * bf16 + hc_state * bf16 + post * f32_bytes + comb * f32_bytes
+    // final HC post
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_real_l0_rows(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    weights: &LayerDeviceWeights,
+    expert_shard: &safetensors::ShardFile,
+    embedding: &[u16],
+    freqs: &[f32],
+    hash_ids: &[i64],
+    start_pos: usize,
+    base: &L0Persistent,
+) -> Result<L0Run, Box<dyn Error>> {
+    let rows = embedding.len() / v4_state::HIDDEN;
+    if rows == 0
+        || rows > 2
+        || embedding.len() != rows * v4_state::HIDDEN
+        || freqs.len() != rows * v4_state::Q_ROPE_DIM
+        || (weights.hash_router && hash_ids.len() != rows * v4_router::V4_TOPK)
+        || (!weights.hash_router && !hash_ids.is_empty())
+    {
+        return Err(format!(
+            "layer {} runner accepts only complete K<=2 rows with router-mode-matched ids",
+            weights.layer
+        )
+        .into());
+    }
+    if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+        return Err(format!(
+            "layer {} CSA semantic gate: indexer q/weight projection, indexer compressor commit, and learned compressed-KV selection are not yet joined to the common runner",
+            weights.layer
+        )
+        .into());
+    }
+    if start_pos / weights.compression_ratio.get()
+        != (start_pos + rows) / weights.compression_ratio.get()
+    {
+        return Err(format!(
+            "layer {} HCA semantic gate: compression-boundary pooled KV finalize/norm/RoPE/quantized cache commit is not yet joined to the common runner",
+            weights.layer
+        )
+        .into());
+    }
+    let started = std::time::Instant::now();
+    let mut residual = Vec::with_capacity(rows * v4_state::HC * v4_state::HIDDEN);
+    for row in embedding.chunks_exact(v4_state::HIDDEN) {
+        for _ in 0..v4_state::HC {
+            residual.extend_from_slice(row);
+        }
+    }
+
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &residual,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+    )?;
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &weights.attn_norm,
+        v4_state::HIDDEN,
+    )?;
+
+    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    maybe_write_v4_audit_u16(weights.layer, "q_lora_raw", &q_lora_raw)?;
+    let q_lora = run_l0_rmsnorm(
+        module,
+        stream,
+        &q_lora_raw,
+        &weights.q_norm,
+        weights.wq_a.out_features,
+    )?;
+    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    maybe_write_v4_audit_u16(weights.layer, "q_raw", &q_raw)?;
+    let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    maybe_write_v4_audit_u16(weights.layer, "q_norm", &q_norm)?;
+    let q = run_l0_rope(module, stream, &q_norm, freqs, v4_state::Q_HEADS, false)?;
+
+    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = run_l0_rmsnorm(
+        module,
+        stream,
+        &kv_raw,
+        &weights.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    let kv_rope = run_l0_rope(module, stream, &kv_norm, freqs, 1, false)?;
+    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let compressor =
+        run_layer_compressor(module, stream, &attn_input, weights, start_pos, None, None)?;
+
+    let mut persistent = base.clone();
+    let mut prefixes = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let kv_row = &kv[row * v4_state::Q_HEAD_DIM..][..v4_state::Q_HEAD_DIM];
+        persistent.kv = persistent.kv.prepare_decode_row(kv_row, start_pos + row)?;
+        let range = row * v4_state::Q_HEAD_DIM..(row + 1) * v4_state::Q_HEAD_DIM;
+        persistent.compressor = persistent.compressor.prepare_decode_row(
+            &v4_state::CompressorPrepared {
+                kv_f32: compressor.kv_f32[range.clone()].to_vec(),
+                score_f32: compressor.score_f32[range.clone()].to_vec(),
+                score_plus_ape_f32: compressor.score_plus_ape_f32[range].to_vec(),
+            },
+            start_pos + row,
+        )?;
+        prefixes.push(persistent.clone());
+    }
+
+    let sparse = run_l0_sparse_attention(
+        module,
+        stream,
+        &q,
+        persistent.kv.as_slice(),
+        &weights.attn_sink,
+        start_pos,
+    )?;
+    let sparse = run_l0_rope(module, stream, &sparse, freqs, v4_state::Q_HEADS, true)?;
+    let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
+    maybe_write_v4_audit_u16(weights.layer, "wo_a", &wo_a)?;
+    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    maybe_write_v4_audit_u16(weights.layer, "attention", &attention)?;
+    let after_attention = run_l0_hc_post(
+        module,
+        stream,
+        &attention,
+        &residual,
+        &attn_hc.post,
+        &attn_hc.comb,
+    )?;
+    maybe_write_v4_audit_u16(weights.layer, "attention_post", &after_attention)?;
+
+    let ffn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &after_attention,
+        &weights.hc_ffn_fn,
+        &weights.hc_ffn_scale,
+        &weights.hc_ffn_base,
+    )?;
+    let router = run_layer_router(module, stream, &ffn_hc.collapsed, weights, hash_ids)?;
+    let ffn_input = router.input;
+    let routes = router.routes;
+    maybe_write_v4_audit_u16(weights.layer, "ffn_input", &ffn_input)?;
+    let shared = run_layer_shared_expert(module, stream, &ffn_input, weights)?;
+
+    let mut expert_union = routes
+        .ids
+        .iter()
+        .map(|&id| u16::try_from(id))
+        .collect::<Result<Vec<_>, _>>()?;
+    expert_union.sort_unstable();
+    expert_union.dedup();
+    let mut contributions: Vec<Vec<Option<Vec<f32>>>> = (0..rows)
+        .map(|_| (0..v4_router::V4_TOPK).map(|_| None).collect())
+        .collect();
+    let mut expert_bytes = 0;
+    let mut expert_alloc_ms = 0.0;
+    let mut expert_read_ms = 0.0;
+    let mut expert_setup_ms = 0.0;
+    let mut expert_setup_samples_ms = Vec::with_capacity(expert_union.len());
+    let mut expert_h2d_samples_ms = Vec::with_capacity(expert_union.len());
+    let mut expert_kernel_ms = 0.0;
+    for &expert_id in &expert_union {
+        let expert = v4_expert::RoutedExpert::load_layer(expert_shard, weights.layer, expert_id)?;
+        expert_alloc_ms += expert.alloc_ms;
+        expert_read_ms += expert.read_ms;
+        expert_bytes += expert.h2d_bytes();
+        let expert_setup_started = std::time::Instant::now();
+        let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
+        let setup_ms = expert_setup_started.elapsed().as_secs_f64() * 1_000.0;
+        expert_setup_ms += setup_ms;
+        expert_setup_samples_ms.push(setup_ms);
+        expert_h2d_samples_ms.push(slot.weight_h2d_ms);
+        for row in 0..rows {
+            for route_slot in 0..v4_router::V4_TOPK {
+                let route = row * v4_router::V4_TOPK + route_slot;
+                if routes.ids[route] == i32::from(expert_id) {
+                    let input = &ffn_input[row * v4_state::HIDDEN..][..v4_state::HIDDEN];
+                    let (output, kernel_ns) = slot.execute(input, routes.weights[route])?;
+                    expert_kernel_ms += kernel_ns as f64 / 1_000_000.0;
+                    contributions[row][route_slot] = Some(output);
+                }
+            }
+        }
+    }
+
+    let mut moe = Vec::with_capacity(rows * v4_state::HIDDEN);
+    for row in 0..rows {
+        let routed = (0..v4_router::V4_TOPK)
+            .map(|slot| {
+                Ok((
+                    u16::try_from(routes.ids[row * v4_router::V4_TOPK + slot])?,
+                    contributions[row][slot]
+                        .as_deref()
+                        .ok_or("missing routed expert contribution")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        moe.extend(v4_expert::reduce_moe_canonical(
+            &routed,
+            &shared[row * v4_state::HIDDEN..][..v4_state::HIDDEN],
+        )?);
+    }
+    let output = run_l0_hc_post(
+        module,
+        stream,
+        &moe,
+        &after_attention,
+        &ffn_hc.post,
+        &ffn_hc.comb,
+    )?;
+    maybe_write_v4_audit_u16(weights.layer, "hidden", &output)?;
+    let mut route_hash = fnv1a_i32(&routes.ids);
+    for byte in fnv1a_f32(&routes.weights).to_le_bytes() {
+        route_hash = (route_hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let stage_hashes = vec![
+        ("attn_hc", fnv1a_u16(&attn_hc.collapsed)),
+        ("attn_norm", fnv1a_u16(&attn_input)),
+        ("q_lora_raw", fnv1a_u16(&q_lora_raw)),
+        ("q_lora_norm", fnv1a_u16(&q_lora)),
+        ("q_raw", fnv1a_u16(&q_raw)),
+        ("q_norm", fnv1a_u16(&q_norm)),
+        ("q", fnv1a_u16(&q)),
+        ("kv_raw", fnv1a_u16(&kv_raw)),
+        ("kv_norm", fnv1a_u16(&kv_norm)),
+        ("kv_rope", fnv1a_u16(&kv_rope)),
+        ("kv", fnv1a_u16(&kv)),
+        ("compressor", fnv1a_f32(&compressor.score_plus_ape_f32)),
+        ("sparse_attn", fnv1a_u16(&sparse)),
+        ("attn_out", fnv1a_u16(&attention)),
+        ("attn_post", fnv1a_u16(&after_attention)),
+        ("ffn_hc", fnv1a_u16(&ffn_hc.collapsed)),
+        ("routes", route_hash),
+        ("moe", fnv1a_u16(&moe)),
+        ("l0_out", fnv1a_u16(&output)),
+        ("state", l0_persistent_digest(&persistent)),
+    ];
+    let dynamic_bytes = l0_dynamic_h2d_bytes(rows);
+    Ok(L0Run {
+        output,
+        routes,
+        prefixes,
+        persistent,
+        stage_hashes,
+        expert_union,
+        expert_bytes,
+        expert_alloc_ms,
+        expert_read_ms,
+        expert_setup_ms,
+        expert_setup_samples_ms,
+        expert_h2d_samples_ms,
+        expert_kernel_ms,
+        dynamic_bytes,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1_000.0,
+    })
+}
+
+fn run_real_l0_k2_if_available(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let root = v4_model_dir()?;
+    let test_started = std::time::Instant::now();
+    let token_ids = [0_i64, 1];
+    let state_load_started = std::time::Instant::now();
+    let state = v4_state::load(&root, &token_ids)?;
+    let state_load_ms = state_load_started.elapsed().as_secs_f64() * 1_000.0;
+    let projection_load_started = std::time::Instant::now();
+    let projections = v4_state::load_fp8_projections(&root)?;
+    let projection_load_ms = projection_load_started.elapsed().as_secs_f64() * 1_000.0;
+    let compressor_load_started = std::time::Instant::now();
+    let compressor = v4_state::load_compressor_weights(&root)?;
+    let compressor_load_ms = compressor_load_started.elapsed().as_secs_f64() * 1_000.0;
+    let tail = v4_state::load_l0_tail(&root)?;
+    let fixture = v4_state::fp8_projection_fixture()?;
+    let freqs = &fixture.freqs_cis_f32_pairs[..2 * v4_state::Q_ROPE_DIM];
+    let expert_shard = safetensors::ShardFile::open(root.join("model-00002-of-00064.safetensors"))?;
+    let hash_load_started = std::time::Instant::now();
+    let hash_ids = read_v4_hash_rows(&expert_shard, "layers.0.ffn.gate.tid2eid", &token_ids)?;
+    let hash_load_ms = hash_load_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let upload_started = std::time::Instant::now();
+    let weights = LayerDeviceWeights::new_l0(stream, &state, &projections, &compressor, &tail)?;
+    stream.synchronize()?;
+    let upload_ms = upload_started.elapsed().as_secs_f64() * 1_000.0;
+    let dense_h2d = weights.dense_num_bytes();
+    let shared_h2d = weights.shared_num_bytes();
+    let resident_bytes = dense_h2d + shared_h2d;
+    let embedding_source_bytes = state.embedding.len() * std::mem::size_of::<u16>();
+    let fixed_source_bytes = state
+        .range_bytes
+        .checked_sub(embedding_source_bytes)
+        .ok_or("L0 fixed source byte underflow")?
+        + projections.range_bytes
+        + compressor.range_bytes
+        + tail.source_range_bytes;
+    let base = L0Persistent::new()?;
+    let k2 = run_real_l0_rows(
+        context,
+        module,
+        stream,
+        &weights,
+        &expert_shard,
+        &state.embedding,
+        freqs,
+        &hash_ids,
+        0,
+        &base,
+    )?;
+    let row_freqs = v4_state::Q_ROPE_DIM;
+    let row_routes = v4_router::V4_TOPK;
+    let s10 = run_real_l0_rows(
+        context,
+        module,
+        stream,
+        &weights,
+        &expert_shard,
+        &state.embedding[..v4_state::HIDDEN],
+        &freqs[..row_freqs],
+        &hash_ids[..row_routes],
+        0,
+        &base,
+    )?;
+    let s11 = run_real_l0_rows(
+        context,
+        module,
+        stream,
+        &weights,
+        &expert_shard,
+        &state.embedding[v4_state::HIDDEN..],
+        &freqs[row_freqs..],
+        &hash_ids[row_routes..],
+        1,
+        &s10.persistent,
+    )?;
+
+    let output_row = v4_state::HC * v4_state::HIDDEN;
+    if k2.output[..output_row] != s10.output
+        || k2.output[output_row..] != s11.output
+        || k2.routes.ids[..row_routes] != s10.routes.ids
+        || k2.routes.ids[row_routes..] != s11.routes.ids
+        || !k2.routes.weights[..row_routes]
+            .iter()
+            .zip(&s10.routes.weights)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        || !k2.routes.weights[row_routes..]
+            .iter()
+            .zip(&s11.routes.weights)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+        || k2.prefixes.len() != 2
+        || !k2.prefixes[0].bits_equal(&s10.persistent)
+        || !k2.prefixes[1].bits_equal(&s11.persistent)
+        || !k2.persistent.bits_equal(&s11.persistent)
+    {
+        return Err("real full-L0 K2 differs from two sequential S=1 rows".into());
+    }
+
+    let exact = |left: &L0Persistent, right: &L0Persistent| left.bits_equal(right);
+    let prepared = || {
+        v4_state::K2Prepared::prepare(
+            &base,
+            |state| {
+                state.clone_from(&k2.prefixes[0]);
+                Ok(())
+            },
+            |state| {
+                state.clone_from(&k2.prefixes[1]);
+                Ok(())
+            },
+        )
+    };
+    let sequential = [&s10.persistent, &s11.persistent];
+    let full = prepared()?.validate(sequential, [0, 1], [0, 1], exact)?;
+    if full.accepted_rows() != 2 {
+        return Err("real full-L0 K2 full acceptance changed".into());
+    }
+    let mut r0 = base.clone();
+    prepared()?
+        .validate(sequential, [0, 1], [0, 1], exact)?
+        .commit_prefix(&mut r0, 0, exact)?;
+    let mut r1 = base.clone();
+    prepared()?
+        .validate(sequential, [0, 1], [0, 1], exact)?
+        .commit_prefix(&mut r1, 1, exact)?;
+    let mut r2 = base.clone();
+    full.commit_prefix(&mut r2, 2, exact)?;
+    if !r0.bits_equal(&base) || !r1.bits_equal(&s10.persistent) || !r2.bits_equal(&s11.persistent) {
+        return Err("real full-L0 K2 r0/r1/r2 commit mismatch".into());
+    }
+    let rejected = prepared()?.validate(sequential, [0, 1], [0, 2], exact)?;
+    let mut rejected_state = base.clone();
+    if !matches!(
+        rejected.commit_prefix(&mut rejected_state, 2, exact),
+        Err(v4_state::K2ContractError::RejectedSuffix)
+    ) {
+        return Err("real full-L0 K2 accepted a rejected suffix".into());
+    }
+    rejected.commit_prefix(&mut rejected_state, 1, exact)?;
+    let mut dirty = s10.persistent.clone();
+    if !matches!(
+        prepared()?
+            .validate(sequential, [0, 1], [0, 1], exact)?
+            .commit_prefix(&mut dirty, 1, exact),
+        Err(v4_state::K2ContractError::DirtyAuthoritativeState)
+    ) {
+        return Err("real full-L0 K2 accepted dirty authoritative state".into());
+    }
+
+    for (run_name, run) in [("K2", &k2), ("S1_r0", &s10), ("S1_r1", &s11)] {
+        let hashes = run
+            .stage_hashes
+            .iter()
+            .map(|(stage, hash)| format!("{stage}={hash:016x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "V4_L0_TRACE run={run_name} routes={:?} union={:?} hashes=[{hashes}]",
+            run.routes.ids, run.expert_union
+        );
+    }
+    let s1_time = s10.elapsed_ms + s11.elapsed_ms;
+    let s1_dynamic = s10.dynamic_bytes + s11.dynamic_bytes;
+    let s1_expert = s10.expert_bytes + s11.expert_bytes;
+    let gate = v4_state::evaluate_k2_renewal_gate(v4_state::K2GateInput {
+        draft_matches: 1,
+        trials: 1,
+        t1_lower: (s1_time / 2.0).max(f64::EPSILON),
+        t2_upper: k2.elapsed_ms.max(f64::EPSILON),
+        b1_lower: ((resident_bytes + s1_expert) as f64 / 2.0).max(1.0),
+        b2_upper: (resident_bytes + k2.expert_bytes) as f64,
+    });
+    println!(
+        "V4_L0_K2_TELEMETRY rows=2 token_ids={token_ids:?} q_sample=1/1 t1_s1x2_wall_total={s1_time:.3}ms t1_per_row_mean={:.3}ms t2_k2_wall={:.3}ms D_actual_h2d_k2={} D_actual_h2d_s1x2={} P_actual_h2d_k2={} P_actual_h2d_s1x2={} P_dense_fixed={} P_shared_fixed={} P_routed_k2_union={} P_routed_s1x2_actual={} loader_source_k2={} loader_source_s1x2={} loader_fixed_source={} loader_embedding_source={} actual_test_weight_h2d={} expert_union_k2={:?} state_digest={:016x} fixed_weight_upload={upload_ms:.3}ms gate={}",
+        s1_time / 2.0,
+        k2.elapsed_ms,
+        k2.dynamic_bytes,
+        s1_dynamic,
+        resident_bytes + k2.expert_bytes,
+        resident_bytes + s1_expert,
+        dense_h2d,
+        shared_h2d,
+        k2.expert_bytes,
+        s1_expert,
+        fixed_source_bytes + embedding_source_bytes + k2.expert_bytes,
+        fixed_source_bytes + embedding_source_bytes + s1_expert,
+        fixed_source_bytes,
+        embedding_source_bytes,
+        resident_bytes + k2.expert_bytes + s1_expert,
+        k2.expert_union,
+        l0_persistent_digest(&k2.persistent),
+        gate.reason,
+    );
+    println!(
+        "V4_L0_BYTE_DEFINITION D=actual dynamic host-to-device payloads issued by the host-boundary runner; P=dense fixed H2D + shared fixed H2D + routed expert H2D. S1x2 routed bytes are the two observed S1 loads summed without cross-run dedup; K2 routed bytes are its sorted expert union loaded once. loader_source counts pinned shard bytes before wo_a FP8-to-BF16 expansion."
+    );
+    let fixed_read_alloc_ms = state_load_ms
+        + projection_load_ms
+        + compressor_load_ms
+        + (tail.load_elapsed_ms - tail.wo_a_decode_ms)
+        + hash_load_ms;
+    let mut s1_h2d_samples = s10.expert_h2d_samples_ms.clone();
+    s1_h2d_samples.extend_from_slice(&s11.expert_h2d_samples_ms);
+    let mut s1_setup_samples = s10.expert_setup_samples_ms.clone();
+    s1_setup_samples.extend_from_slice(&s11.expert_setup_samples_ms);
+    let k2_read_gbps = k2.expert_bytes as f64 / (k2.expert_read_ms * 1_000_000.0);
+    let s1_read_gbps = s1_expert as f64 / ((s10.expert_read_ms + s11.expert_read_ms) * 1_000_000.0);
+    println!(
+        "V4_L0_IO_BREAKDOWN fixed_read_alloc={fixed_read_alloc_ms:.3}ms wo_a_decode={:.3}ms routed_host_alloc_k2={:.3}ms routed_host_alloc_s1x2={:.3}ms pinned_device_alloc_h2d_k2={:.3}ms pinned_device_alloc_h2d_s1x2={:.3}ms setup_p95_k2={:.3}ms setup_p95_s1x2={:.3}ms allocation_free_h2d_p95_k2={:.3}ms allocation_free_h2d_p95_s1x2={:.3}ms routed_read_k2={:.3}ms routed_read_s1x2={:.3}ms routed_read_k2_gbps={k2_read_gbps:.3} routed_read_s1x2_gbps={s1_read_gbps:.3} routed_decode_k2=0.000ms routed_decode_s1x2=0.000ms routed_kernel_k2={:.3}ms routed_kernel_s1x2={:.3}ms runner_e2e_k2={:.3}ms runner_e2e_s1x2={s1_time:.3}ms full_test_e2e={:.3}ms",
+        tail.wo_a_decode_ms,
+        k2.expert_alloc_ms,
+        s10.expert_alloc_ms + s11.expert_alloc_ms,
+        k2.expert_setup_ms,
+        s10.expert_setup_ms + s11.expert_setup_ms,
+        p95_f64(&k2.expert_setup_samples_ms),
+        p95_f64(&s1_setup_samples),
+        p95_f64(&k2.expert_h2d_samples_ms),
+        p95_f64(&s1_h2d_samples),
+        k2.expert_read_ms,
+        s10.expert_read_ms + s11.expert_read_ms,
+        k2.expert_kernel_ms,
+        s10.expert_kernel_ms + s11.expert_kernel_ms,
+        k2.elapsed_ms,
+        test_started.elapsed().as_secs_f64() * 1_000.0,
+    );
+    println!(
+        "PASS: real V4 full L0 K2 equals two S=1 rows exactly; output={:016x}, routes/weights=exact, persistent=exact, r0/r1/r2/reject/dirty=exact; one sample is telemetry only",
+        fnv1a_u16(&k2.output),
+    );
+    Ok(())
+}
+
+fn run_k2_p0_host_contract() -> Result<u64, Box<dyn Error>> {
+    type HostState = (
+        v4_state::V4KvCache,
+        [u32; v4_state::HC],
+        v4_state::V4CompressorState,
+        Option<v4_state::V4CompressorState>,
+    );
+
+    fn exact(left: &HostState, right: &HostState) -> bool {
+        left.0.bits_equal(&right.0)
+            && left.1 == right.1
+            && left.2.bits_equal(&right.2)
+            && match (&left.3, &right.3) {
+                (Some(left), Some(right)) => left.bits_equal(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    fn projected(width: usize, marker: f32) -> v4_state::CompressorPrepared {
+        v4_state::CompressorPrepared {
+            kv_f32: vec![marker; width],
+            score_f32: vec![marker + 8.0; width],
+            score_plus_ape_f32: vec![marker + 16.0; width],
+        }
+    }
+
+    fn apply(
+        state: &mut HostState,
+        ratio: usize,
+        start_pos: usize,
+        marker: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        let row = vec![v4_router::f32_to_bf16_rne(marker as f32); v4_state::Q_HEAD_DIM];
+        state.0 = state.0.prepare_decode_row(&row, start_pos)?;
+        if start_pos
+            .checked_add(1)
+            .ok_or("K2 host position overflow")?
+            .is_multiple_of(ratio)
+        {
+            let compressed =
+                vec![v4_router::f32_to_bf16_rne((marker + 32) as f32); v4_state::Q_HEAD_DIM];
+            state.0 = state
+                .0
+                .prepare_compressed_row(&compressed, start_pos / ratio)?;
+        }
+        state.1[0] = state.1[0].wrapping_mul(17).wrapping_add(marker as u32);
+        let width = if ratio == 4 { 4 } else { 2 };
+        state.2 = state
+            .2
+            .prepare_decode_row(&projected(width, marker as f32), start_pos)?;
+        if let Some(indexer) = &state.3 {
+            state.3 =
+                Some(indexer.prepare_decode_row(&projected(2, marker as f32 + 64.0), start_pos)?);
+        }
+        Ok(())
+    }
+
+    fn boundary(ratio: usize, start_pos: usize) -> Result<HostState, Box<dyn Error>> {
+        let base = (
+            v4_state::V4KvCache::new(),
+            [0; v4_state::HC],
+            v4_state::V4CompressorState::new_decode(ratio, 2)?,
+            if ratio == 4 {
+                Some(v4_state::V4CompressorState::new_decode(4, 1)?)
+            } else {
+                None
+            },
+        );
+        let mut sequential0 = base.clone();
+        apply(&mut sequential0, ratio, start_pos, 3)?;
+        let mut sequential1 = sequential0.clone();
+        apply(&mut sequential1, ratio, start_pos + 1, 5)?;
+        // ponytail: full state snapshots are the P0 correctness ceiling; move
+        // to delta pages only after this exact contract passes the byte gate.
+        let validated = v4_state::K2Prepared::prepare(
+            &base,
+            |state| apply(state, ratio, start_pos, 3),
+            |state| apply(state, ratio, start_pos + 1, 5),
+        )?
+        .validate([&sequential0, &sequential1], [7, 11], [7, 11], exact)?;
+        if validated.accepted_rows() != 2 {
+            return Err("K2 host full-accept prefix changed".into());
+        }
+        let mut authoritative = base;
+        validated.commit_prefix(&mut authoritative, 2, exact)?;
+        if !exact(&authoritative, &sequential1) {
+            return Err("K2 host commit differs from sequential S=1".into());
+        }
+        Ok(authoritative)
+    }
+
+    fn hash_state(state: &HostState, mut hash: u64) -> u64 {
+        for &bits in state.0.as_slice() {
+            for byte in bits.to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        for &value in &state.1 {
+            for byte in value.to_le_bytes() {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        for compressor in std::iter::once(&state.2).chain(state.3.iter()) {
+            for &value in compressor.kv().iter().chain(compressor.score()) {
+                for byte in value.to_bits().to_le_bytes() {
+                    hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        hash
+    }
+
+    let ratio4 = boundary(4, 3)?;
+    let ratio128 = boundary(128, 127)?;
+    let mut hash = hash_state(&ratio4, 0xcbf2_9ce4_8422_2325);
+    hash = hash_state(&ratio128, hash);
+
+    let execution_order = [6_u16, 3, 1, 5, 2, 4];
+    let contributions: Vec<_> = execution_order
+        .iter()
+        .map(|&expert| (expert, vec![expert as f32 / 8.0; v4_expert::V4_HIDDEN]))
+        .collect();
+    let routed: Vec<_> = contributions
+        .iter()
+        .map(|(expert, values)| (*expert, values.as_slice()))
+        .collect();
+    let shared = vec![2.0_f32; v4_expert::V4_HIDDEN];
+    let canonical = v4_expert::reduce_moe_canonical(&routed, &shared)?;
+    for bits in canonical {
+        for byte in bits.to_le_bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    Ok(hash)
+}
+
+fn run_real_l0_compressor_cublas_exact_if_available(
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const OFFICIAL_RAW_KV: u64 = 0x7f8a_ba0e_84d6_9c22;
+    const OFFICIAL_RAW_SCORE_APE: u64 = 0x2b84_6a05_10d4_4fbc;
+    const OFFICIAL_STATE_KV: u64 = 0x9af7_3870_9362_5c22;
+    const OFFICIAL_STATE_SCORE: u64 = 0x2589_1515_a4d6_ffbc;
+    const REFERENCE_RAW_KV: u64 = 0xad53_d3f6_c10b_98cd;
+    const REFERENCE_RAW_SCORE_APE: u64 = 0x0052_3bf6_da39_b612;
+    const REFERENCE_STATE_KV: u64 = 0x607f_82ef_92d9_f8cd;
+    const REFERENCE_STATE_SCORE: u64 = 0x2380_0c9d_021c_6612;
+
+    let cublas = cublas_exact::CublasExact::load()?;
+    let root = v4_model_dir()?;
+    let state = v4_state::load(&root, &[0])?;
+    let compressor_weights = v4_state::load_compressor_weights(&root)?;
+    let mut residual = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+    for _ in 0..v4_state::HC {
+        residual.extend_from_slice(&state.embedding);
+    }
+    let hc_fn = DeviceBuffer::from_host(stream, &state.hc_fn)?;
+    let hc_scale = DeviceBuffer::from_host(stream, &state.hc_scale)?;
+    let hc_base = DeviceBuffer::from_host(stream, &state.hc_base)?;
+    let norm = DeviceBuffer::from_host(stream, &state.attn_norm)?;
+    let hc = run_l0_mhc_pre(module, stream, &residual, &hc_fn, &hc_scale, &hc_base)?;
+    let input = run_l0_rmsnorm(module, stream, &hc.collapsed, &norm, v4_state::HIDDEN)?;
+
+    let wkv = DeviceBuffer::from_host(stream, &compressor_weights.wkv_bf16)?;
+    let wgate = DeviceBuffer::from_host(stream, &compressor_weights.wgate_bf16)?;
+    let ape = DeviceBuffer::from_host(stream, &compressor_weights.ape_f32)?;
+    let reference = run_compressor(
+        module,
+        stream,
+        &input,
+        &wkv,
+        &wgate,
+        &ape,
+        v4_state::Q_HEAD_DIM,
+        v4_state::COMPRESS_RATIO,
+        0,
+    )?;
+    let official = run_l0_compressor_official_cublas(&cublas, stream, &input, &compressor_weights)?;
+    let official_repeat =
+        run_l0_compressor_official_cublas(&cublas, stream, &input, &compressor_weights)?;
+    let prepared_equal = |left: &v4_state::CompressorPrepared,
+                          right: &v4_state::CompressorPrepared| {
+        left.kv_f32
+            .iter()
+            .chain(&left.score_f32)
+            .chain(&left.score_plus_ape_f32)
+            .zip(
+                right
+                    .kv_f32
+                    .iter()
+                    .chain(&right.score_f32)
+                    .chain(&right.score_plus_ape_f32),
+            )
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+    };
+    if !prepared_equal(&official, &official_repeat) {
+        return Err("official cuBLAS L0 Compressor repeat changed raw bits".into());
+    }
+    let state_digests = |prepared: &v4_state::CompressorPrepared| {
+        let state = v4_state::V4CompressorState::new_decode(
+            v4_state::COMPRESS_RATIO,
+            v4_state::Q_HEAD_DIM,
+        )?
+        .prepare_decode_row(prepared, 0)?;
+        Ok::<_, Box<dyn Error>>((fnv1a_f32(state.kv()), fnv1a_f32(state.score())))
+    };
+    let reference_raw = (
+        fnv1a_f32(&reference.kv_f32),
+        fnv1a_f32(&reference.score_plus_ape_f32),
+    );
+    let official_raw = (
+        fnv1a_f32(&official.kv_f32),
+        fnv1a_f32(&official.score_plus_ape_f32),
+    );
+    let reference_state = state_digests(&reference)?;
+    let official_state = state_digests(&official)?;
+    if reference_raw != (REFERENCE_RAW_KV, REFERENCE_RAW_SCORE_APE)
+        || reference_state != (REFERENCE_STATE_KV, REFERENCE_STATE_SCORE)
+    {
+        return Err(format!(
+            "reference Compressor arm drifted: raw={reference_raw:016x?}, state={reference_state:016x?}"
+        )
+        .into());
+    }
+    if official_raw != (OFFICIAL_RAW_KV, OFFICIAL_RAW_SCORE_APE)
+        || official_state != (OFFICIAL_STATE_KV, OFFICIAL_STATE_SCORE)
+    {
+        return Err(format!(
+            "official cuBLAS Compressor arm mismatch: raw={official_raw:016x?}, state={official_state:016x?}"
+        )
+        .into());
+    }
+    if prepared_equal(&reference, &official) {
+        return Err("Compressor A/B fixture no longer distinguishes reference and cuBLAS".into());
+    }
+    let provenance = cublas.provenance();
+    println!(
+        "CUBLAS_EXACT_PROVENANCE resolved={} version={} dladdr={} proc_maps={} sha256={} workspace_bytes={}",
+        provenance.resolved_path.display(),
+        provenance.version,
+        provenance.dladdr_path.display(),
+        provenance.maps_path.display(),
+        provenance.actual_sha256,
+        cublas_exact::WORKSPACE_BYTES,
+    );
+    println!(
+        "CUBLAS_COMPRESSOR_AB reference_raw={reference_raw:016x?} reference_state={reference_state:016x?} official_raw={official_raw:016x?} official_state={official_state:016x?}"
+    );
+    println!(
+        "PASS: official cuBLAS L0 Compressor raw/state digests match the pinned official oracle exactly; reference arm remains pinned and distinct"
+    );
+    Ok(())
+}
+
+fn run_real_v4_compressor_slice_if_available(
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let root = v4_model_dir()?;
+    let fixture = v4_state::fp8_projection_fixture()?;
+    let weights = v4_state::load_compressor_weights(&root)?;
+    if weights.range_bytes != 14_942_208 {
+        return Err("V4 Compressor pinned source range changed".into());
+    }
+    let prepared = v4_state::prepare_compressor_cpu(&fixture.input_bf16, &weights)?;
+    let exact = |left: &[f32], right: &[f32]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+    };
+    let prepared_exact = |kv: &[f32], score: &[f32], score_plus_ape: &[f32]| {
+        kv.iter()
+            .chain(score)
+            .chain(score_plus_ape)
+            .all(|value| value.is_finite())
+            && exact(kv, &fixture.compressor_kv_f32)
+            && exact(score, &fixture.compressor_score_f32)
+            && exact(score_plus_ape, &fixture.compressor_score_plus_ape_f32)
+    };
+    if !prepared_exact(
+        &prepared.kv_f32,
+        &prepared.score_f32,
+        &prepared.score_plus_ape_f32,
+    ) {
+        return Err("V4 Compressor CPU prepare exact gate failed".into());
+    }
+
+    let input = DeviceBuffer::from_host(stream, &fixture.input_bf16)?;
+    let wkv = DeviceBuffer::from_host(stream, &weights.wkv_bf16)?;
+    let wgate = DeviceBuffer::from_host(stream, &weights.wgate_bf16)?;
+    let ape = DeviceBuffer::from_host(stream, &weights.ape_f32)?;
+    let mut kv = DeviceBuffer::<f32>::zeroed(stream, prepared.kv_f32.len())?;
+    let mut score = DeviceBuffer::<f32>::zeroed(stream, prepared.score_f32.len())?;
+    let mut score_plus_ape =
+        DeviceBuffer::<f32>::zeroed(stream, prepared.score_plus_ape_f32.len())?;
+    // SAFETY: the fixed launch and all seven buffers satisfy the kernel's
+    // complete L0 start_pos=0 shapes; every thread owns one output element.
+    unsafe {
+        module.compressor_v4_bf16_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(kv.len())?),
+            &input,
+            &wkv,
+            &wgate,
+            &ape,
+            &mut kv,
+            &mut score,
+            &mut score_plus_ape,
+            0,
+            u32::try_from(v4_state::HIDDEN)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+            u32::try_from(v4_state::COMPRESS_RATIO)?,
+        )?;
+    }
+    let kv_host = kv.to_host_vec(stream)?;
+    let score_host = score.to_host_vec(stream)?;
+    let score_plus_ape_host = score_plus_ape.to_host_vec(stream)?;
+    let (kv_mismatches, _) = report_v4_state_f32(
+        "Compressor kv GPU/fixture",
+        &kv_host,
+        &fixture.compressor_kv_f32,
+    );
+    let (score_mismatches, _) = report_v4_state_f32(
+        "Compressor score GPU/fixture",
+        &score_host,
+        &fixture.compressor_score_f32,
+    );
+    let (score_ape_mismatches, _) = report_v4_state_f32(
+        "Compressor score+ape GPU/fixture",
+        &score_plus_ape_host,
+        &fixture.compressor_score_plus_ape_f32,
+    );
+    if kv_mismatches != 0
+        || score_mismatches != 0
+        || score_ape_mismatches != 0
+        || !prepared_exact(&kv_host, &score_host, &score_plus_ape_host)
+    {
+        return Err("V4 Compressor GPU prepare exact gate failed before state write".into());
+    }
+
+    let write_elements = v4_state::preflight_compressor_commit(
+        fixture.compressor_kv_state_initial_f32.len(),
+        fixture.compressor_score_state_initial_f32.len(),
+        kv.len(),
+        score_plus_ape.len(),
+        1,
+        0,
+        v4_state::IDS.len(),
+        v4_state::COMPRESS_RATIO,
+        false,
+    )?;
+    let write_bytes = write_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("V4 Compressor commit byte overflow")?;
+    let mut state_kv = DeviceBuffer::from_host(stream, &fixture.compressor_kv_state_initial_f32)?;
+    let mut state_score =
+        DeviceBuffer::from_host(stream, &fixture.compressor_score_state_initial_f32)?;
+    let initial_kv = state_kv.to_host_vec(stream)?;
+    let initial_score = state_score.to_host_vec(stream)?;
+    if !exact(&initial_kv, &fixture.compressor_kv_state_initial_f32)
+        || !exact(&initial_score, &fixture.compressor_score_state_initial_f32)
+    {
+        return Err("V4 Compressor GPU initial state exact gate failed".into());
+    }
+
+    let mut scratch_kv =
+        unsafe { DeviceBuffer::<f32>::uninitialized_async(stream, state_kv.len())? };
+    let mut scratch_score =
+        unsafe { DeviceBuffer::<f32>::uninitialized_async(stream, state_score.len())? };
+    scratch_kv.copy_from_device_async(&state_kv, stream)?;
+    scratch_score.copy_from_device_async(&state_score, stream)?;
+    // SAFETY: preflight proves both prefix copies have the same 8,192-byte
+    // range and fit the paired scratch states. Authoritative buffers are untouched.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            scratch_kv.cu_deviceptr(),
+            kv.cu_deviceptr(),
+            write_bytes,
+            stream.cu_stream(),
+        )?;
+        cuda_core::memory::memcpy_dtod_async(
+            scratch_score.cu_deviceptr(),
+            score_plus_ape.cu_deviceptr(),
+            write_bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    let scratch_kv_host = scratch_kv.to_host_vec(stream)?;
+    let scratch_score_host = scratch_score.to_host_vec(stream)?;
+    let (state_kv_mismatches, _) = report_v4_state_f32(
+        "Compressor KV scratch GPU/fixture",
+        &scratch_kv_host,
+        &fixture.compressor_kv_state_after_f32,
+    );
+    let (state_score_mismatches, _) = report_v4_state_f32(
+        "Compressor score scratch GPU/fixture",
+        &scratch_score_host,
+        &fixture.compressor_score_state_after_f32,
+    );
+    if state_kv_mismatches != 0 || state_score_mismatches != 0 {
+        return Err("V4 Compressor paired GPU scratch gate failed".into());
+    }
+    std::mem::swap(&mut state_kv, &mut scratch_kv);
+    std::mem::swap(&mut state_score, &mut scratch_score);
+    let authoritative_kv = state_kv.to_host_vec(stream)?;
+    let authoritative_score = state_score.to_host_vec(stream)?;
+
+    scratch_kv.copy_from_device_async(&state_kv, stream)?;
+    scratch_score.copy_from_device_async(&state_score, stream)?;
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            scratch_kv.cu_deviceptr(),
+            kv.cu_deviceptr(),
+            write_bytes,
+            stream.cu_stream(),
+        )?;
+        cuda_core::memory::memcpy_dtod_async(
+            scratch_score.cu_deviceptr(),
+            score_plus_ape.cu_deviceptr(),
+            write_bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    let repeat_kv = scratch_kv.to_host_vec(stream)?;
+    let repeat_score = scratch_score.to_host_vec(stream)?;
+    let repeat_idempotent =
+        exact(&repeat_kv, &authoritative_kv) && exact(&repeat_score, &authoritative_score);
+    if !repeat_idempotent {
+        return Err("V4 Compressor repeated GPU commit was not byte-idempotent".into());
+    }
+    std::mem::swap(&mut state_kv, &mut scratch_kv);
+    std::mem::swap(&mut state_score, &mut scratch_score);
+
+    let before_reject_kv = state_kv.to_host_vec(stream)?;
+    let before_reject_score = state_score.to_host_vec(stream)?;
+    let invalid_rejected = v4_state::preflight_compressor_commit(
+        state_kv.len(),
+        state_score.len(),
+        kv.len(),
+        score_plus_ape.len(),
+        1,
+        usize::MAX,
+        v4_state::IDS.len(),
+        v4_state::COMPRESS_RATIO,
+        false,
+    )
+    .is_err();
+    let mut conflict = score_plus_ape_host.clone();
+    conflict[0] = f32::from_bits(conflict[0].to_bits() ^ 1);
+    let conflict_rejected = !prepared_exact(&kv_host, &score_host, &conflict);
+    let mut non_finite = kv_host.clone();
+    non_finite[0] = f32::NAN;
+    let non_finite_rejected = !prepared_exact(&non_finite, &score_host, &score_plus_ape_host);
+    let after_reject_kv = state_kv.to_host_vec(stream)?;
+    let after_reject_score = state_score.to_host_vec(stream)?;
+    let reject_unchanged = exact(&before_reject_kv, &after_reject_kv)
+        && exact(&before_reject_score, &after_reject_score);
+    let cache_before = fixture.cache_after_bf16.clone();
+    let cache_unchanged = fixture.cache_after_bf16 == cache_before;
+    println!(
+        "Compressor commit invariants: bytes={write_bytes}, repeat_idempotent={repeat_idempotent}, invalid_rejected={invalid_rejected}, conflict_rejected={conflict_rejected}, non_finite_rejected={non_finite_rejected}, reject_unchanged={reject_unchanged}, AB_cache_unchanged={cache_unchanged}"
+    );
+    if !invalid_rejected
+        || !conflict_rejected
+        || !non_finite_rejected
+        || !reject_unchanged
+        || !cache_unchanged
+    {
+        return Err("V4 Compressor GPU fail-closed gate failed".into());
+    }
+    println!(
+        "PASS: V4 L0 Compressor C exact prepare -> paired scratch validate -> authoritative commit; stop before attention"
+    );
+    let k2_contract_hash = run_k2_p0_host_contract()?;
+    println!(
+        "K2_HOST_CONTRACT ratio4_start_pos=3 ratio128_start_pos=127 row_equivalence=true partial_commit=0 canonical_expert_order=true shared_last=true fnv1a={k2_contract_hash:016x}"
+    );
+    // This harness has no real K2 timing/byte samples yet. Exact parity above
+    // is the hard prerequisite; the robust minimax gate must therefore choose AR.
+    let renewal = v4_state::evaluate_k2_renewal_gate(v4_state::K2GateInput {
+        draft_matches: 0,
+        trials: 0,
+        t1_lower: f64::NAN,
+        t2_upper: f64::NAN,
+        b1_lower: f64::NAN,
+        b2_upper: f64::NAN,
+    });
+    println!(
+        "K2_SAFE_MINIMAX exact_prerequisite=true samples=0 q_lower={:?} committed_rows_lower={:?} time_ratio_upper={:?} bytes_per_row_upper={:?} decision={} reason={}",
+        renewal.q_lower,
+        renewal.committed_rows_lower,
+        renewal.time_ratio_upper,
+        renewal.bytes_per_row_upper,
+        if renewal.admit { "K2" } else { "AR" },
+        renewal.reason,
+    );
+    if renewal.admit {
+        return Err("unmeasured K2 robust gate admitted production execution".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_v4_fp8_matvec(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<u8>,
+    weight: &DeviceBuffer<u8>,
+    weight_scales: &DeviceBuffer<u8>,
+    output_f32: &mut DeviceBuffer<f32>,
+    output_bf16: &mut DeviceBuffer<u16>,
+    in_features: usize,
+    out_features: usize,
+    strict_k_order: bool,
+    requests: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    for _ in 0..5 {
+        // SAFETY: this helper preserves the fixed validated buffers.
+        unsafe {
+            launch_v4_fp8_matvec(
+                module,
+                stream,
+                input,
+                input_scales,
+                weight,
+                weight_scales,
+                output_f32,
+                output_bf16,
+                in_features,
+                out_features,
+                strict_k_order,
+            )
+        }?;
+    }
+    end.record(stream)?;
+    end.synchronize()?;
+    let mut samples = Vec::with_capacity(requests);
+    for _ in 0..requests {
+        start.record(stream)?;
+        // SAFETY: this helper preserves the fixed validated buffers.
+        unsafe {
+            launch_v4_fp8_matvec(
+                module,
+                stream,
+                input,
+                input_scales,
+                weight,
+                weight_scales,
+                output_f32,
+                output_bf16,
+                in_features,
+                out_features,
+                strict_k_order,
+            )
+        }?;
+        end.record(stream)?;
+        end.synchronize()?;
+        samples.push((start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64);
+    }
+    Ok(samples)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_v4_kv_ready(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    freqs: &DeviceBuffer<f32>,
+    rope: &mut DeviceBuffer<u16>,
+    ready: &mut DeviceBuffer<u16>,
+    empty_fp8: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+    topk: &mut DeviceBuffer<i32>,
+    requests: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    for _ in 0..5 {
+        // SAFETY: benchmark reuses only the validated resident Phase A buffers.
+        unsafe {
+            launch_v4_kv_ready(
+                module, stream, input, freqs, rope, ready, empty_fp8, scales, topk,
+            )
+        }?;
+    }
+    end.record(stream)?;
+    end.synchronize()?;
+    let mut samples = Vec::with_capacity(requests);
+    for _ in 0..requests {
+        start.record(stream)?;
+        // SAFETY: benchmark reuses only the validated resident Phase A buffers.
+        unsafe {
+            launch_v4_kv_ready(
+                module, stream, input, freqs, rope, ready, empty_fp8, scales, topk,
+            )
+        }?;
+        end.record(stream)?;
+        end.synchronize()?;
+        samples.push((start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64);
+    }
+    Ok(samples)
+}
+
+fn benchmark_v4_kv_commit(
+    context: &std::sync::Arc<CudaContext>,
+    stream: &CudaStream,
+    ready: &DeviceBuffer<u16>,
+    cache: &DeviceBuffer<u16>,
+    bytes: usize,
+    requests: usize,
+) -> Result<Vec<u64>, Box<dyn Error>> {
+    let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+    for _ in 0..5 {
+        // SAFETY: Phase B preflight already proved this fixed contiguous copy.
+        unsafe {
+            cuda_core::memory::memcpy_dtod_async(
+                cache.cu_deviceptr(),
+                ready.cu_deviceptr(),
+                bytes,
+                stream.cu_stream(),
+            )?;
+        }
+    }
+    end.record(stream)?;
+    end.synchronize()?;
+    let mut samples = Vec::with_capacity(requests);
+    for _ in 0..requests {
+        start.record(stream)?;
+        // SAFETY: Phase B preflight already proved this fixed contiguous copy.
+        unsafe {
+            cuda_core::memory::memcpy_dtod_async(
+                cache.cu_deviceptr(),
+                ready.cu_deviceptr(),
+                bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        end.record(stream)?;
+        end.synchronize()?;
+        samples.push((start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64);
+    }
+    Ok(samples)
+}
+
+fn report_v4_state_u8(name: &str, actual: &[u8], expected: &[u8]) -> usize {
+    assert_eq!(actual.len(), expected.len(), "{name}: length");
+    let mismatches = actual
+        .iter()
+        .zip(expected)
+        .filter(|(actual, expected)| actual != expected)
+        .count();
+    println!("{name}: bit_mismatches={mismatches}");
+    mismatches
+}
+
+fn report_v4_state_i32(name: &str, actual: &[i32], expected: &[i32]) -> usize {
+    assert_eq!(actual.len(), expected.len(), "{name}: length");
+    let mismatches = actual
+        .iter()
+        .zip(expected)
+        .filter(|(actual, expected)| actual != expected)
+        .count();
+    println!("{name}: mismatches={mismatches}");
+    mismatches
+}
+
+fn run_real_v4_router_slice_if_available(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    let root = v4_model_dir()?;
+    let hash_path = root.join("model-00002-of-00064.safetensors");
+    let learned_path = root.join("model-00005-of-00064.safetensors");
+    if !hash_path.is_file() || !learned_path.is_file() {
+        return Err(format!(
+            "V4 L0/L3 router shards are unavailable under {}",
+            root.display()
+        )
+        .into());
+    }
+
+    let rows = 4; // B=2, S=2 in the fixture's flattened reference order.
+    let hash_input_ids = [0_i64, 1, 2, 129_279];
+    let hash = safetensors::ShardFile::open(hash_path)?;
+    let hash_input = deterministic_v4_bf16(rows, 7);
+    let hash_norm = read_v4_bf16(&hash, "layers.0.ffn_norm.weight", &[7_168])?;
+    let hash_gate = read_v4_bf16(&hash, "layers.0.ffn.gate.weight", &[384, 7_168])?;
+    let hash_ids = read_v4_hash_rows(&hash, "layers.0.ffn.gate.tid2eid", &hash_input_ids)?;
+    let hash_normalized = v4_router::rmsnorm_bf16(&hash_input, &hash_norm)?;
+    let hash_logits = v4_router::project_gate_logits(&hash_normalized, &hash_gate)?;
+    let hash_expected = v4_router::select_hash(&hash_logits, &hash_ids)?;
+    let (hash_actual_normalized, hash_actual) = run_v4_router_gpu_oracle(
+        module,
+        stream,
+        &hash_input,
+        &hash_norm,
+        &hash_logits,
+        &vec![0.0; v4_router::V4_ROUTED_EXPERTS],
+        &hash_ids,
+        true,
+    )?;
+    assert_eq!(hash_actual_normalized, hash_normalized, "L0 BF16 RMSNorm");
+    assert_router_selection_close("L0 V4 hash router", &hash_actual, &hash_expected);
+
+    let learned = safetensors::ShardFile::open(learned_path)?;
+    let learned_input = deterministic_v4_bf16(rows, 31);
+    let learned_norm = read_v4_bf16(&learned, "layers.3.ffn_norm.weight", &[7_168])?;
+    let learned_gate = read_v4_bf16(&learned, "layers.3.ffn.gate.weight", &[384, 7_168])?;
+    let learned_bias = read_v4_f32(&learned, "layers.3.ffn.gate.bias", &[384])?;
+    let learned_normalized = v4_router::rmsnorm_bf16(&learned_input, &learned_norm)?;
+    let learned_logits = v4_router::project_gate_logits(&learned_normalized, &learned_gate)?;
+    let learned_expected = v4_router::select_learned(&learned_logits, &learned_bias)?;
+    let (learned_actual_normalized, learned_actual) = run_v4_router_gpu_oracle(
+        module,
+        stream,
+        &learned_input,
+        &learned_norm,
+        &learned_logits,
+        &learned_bias,
+        &[],
+        false,
+    )?;
+    assert_eq!(
+        learned_actual_normalized, learned_normalized,
+        "L3 BF16 RMSNorm"
+    );
+    assert_router_selection_close("L3 V4 learned router", &learned_actual, &learned_expected);
+    println!(
+        "PASS: real V4 L0 hash and L3 learned router ranges, B=2/S=2, match CPU and GPU selection"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qd4_stationary_gate_schedule_and_f32_audit_are_strict() {
+        let schedule = (0..4)
+            .flat_map(|pair| {
+                if qd4_stationary_control_first(pair) {
+                    ['A', 'B']
+                } else {
+                    ['B', 'A']
+                }
+            })
+            .collect::<String>();
+        assert_eq!(schedule, "ABBABAAB");
+        assert!(qd4_gate_f32_bits_equal(&[0.0, f32::NAN], &[0.0, f32::NAN]));
+        assert!(!qd4_gate_f32_bits_equal(&[0.0], &[-0.0]));
+    }
+
+    #[test]
+    fn greedy_id_schedule_stops_on_eos_or_max_new_tokens() {
+        assert_eq!(greedy_forward_tokens(1, 0).unwrap(), 1);
+        assert_eq!(greedy_forward_tokens(1, 1).unwrap(), 1);
+        assert_eq!(greedy_forward_tokens(1, 2).unwrap(), 2);
+        assert_eq!(greedy_forward_tokens(2, 2).unwrap(), 3);
+        assert!(greedy_forward_tokens(0, 1).is_err());
+
+        assert_eq!(
+            greedy_argmax_decision(1, 0, 0, 2, V4_EOS_TOKEN_ID),
+            GreedyDecision::EmitAndStop(GreedyStopReason::Eos),
+            "an EOS after a one-token prompt consumes one forward and is not fed back"
+        );
+        assert_eq!(
+            greedy_argmax_decision(1, 0, 0, 2, 42),
+            GreedyDecision::EmitAndContinue,
+            "a non-EOS first argmax is fed into the second forward"
+        );
+        assert_eq!(
+            greedy_argmax_decision(1, 1, 1, 2, V4_EOS_TOKEN_ID),
+            GreedyDecision::EmitAndStop(GreedyStopReason::Eos),
+            "the second argmax EOS is emitted after exactly two forwards"
+        );
+        assert_eq!(
+            greedy_argmax_decision(1, 1, 1, 2, 42),
+            GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens),
+            "a non-EOS sequence stops only after the requested new-token count"
+        );
+
+        assert_eq!(greedy_forward_tokens(5, 1).unwrap(), 5);
+        assert!(
+            (0..4).all(|position| !b1_needs_final_head(5, position)),
+            "intermediate chat prompt positions do not invoke the final head"
+        );
+        assert!(b1_needs_final_head(5, 4));
+        assert!(b1_needs_final_head(5, 5));
+        assert_eq!(
+            greedy_argmax_decision(5, 4, 0, 1, 42),
+            GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens),
+            "five prompt positions plus one new token requires five forwards"
+        );
+        assert!(chat_input_conflict(true, true, false));
+        assert!(chat_input_conflict(true, false, true));
+        assert!(!chat_input_conflict(true, false, false));
+    }
+
+    #[test]
+    fn layer_stationary_prefill_rejects_noncausal_or_noncomparable_modes() {
+        assert!(validate_layer_stationary_prefill(5, 1, 61, true, false, false).is_ok());
+        assert!(validate_layer_stationary_prefill(5, 2, 61, true, false, true).is_ok());
+        assert!(validate_layer_stationary_prefill(5, 5, 61, true, false, true).is_ok());
+        assert!(validate_layer_stationary_prefill(5, 1, 61, true, true, false).is_err());
+        assert!(validate_layer_stationary_prefill(0, 1, 61, true, false, false).is_err());
+        assert!(validate_layer_stationary_prefill(5, 2, 61, true, false, false).is_err());
+        assert!(validate_layer_stationary_prefill(5, 6, 61, true, false, true).is_err());
+        assert!(validate_layer_stationary_prefill(5, 1, 60, true, false, false).is_err());
+        assert!(validate_layer_stationary_prefill(5, 1, 61, false, false, false).is_err());
+    }
+
+    #[test]
+    fn short_device_decode_ledger_uses_full61_state_and_nine_rope_rows() {
+        assert_eq!(V4_SHORT_DEVICE_DECODE_MAX_ROWS, 9);
+        assert_eq!(
+            31 * V4_DEVICE_TOKEN_STATE_HCA_BYTES + 30 * V4_DEVICE_TOKEN_STATE_MAX_BYTES,
+            3_763_637_590
+        );
+        assert_eq!(
+            2 * V4_SHORT_DEVICE_DECODE_MAX_ROWS * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>(),
+            4_608
+        );
+        assert_eq!(
+            140_845_056
+                + 1_126_760_448
+                + 494_348_312
+                + 3_763_637_590
+                + 4_608
+                + 48
+                + V4_DEVICE_CAPACITY_HEADROOM_BYTES,
+            7_673_079_710
+        );
+        assert_eq!(csa_compressed_rows_after(3), 1);
+        assert_eq!(csa_compressed_rows_after(6), 1);
+        assert_eq!(csa_compressed_rows_after(7), 2);
+        assert_eq!(csa_compressed_rows_after(8), 2);
+        assert_eq!(short_device_decode_rows(5, 2, true).unwrap(), 6);
+        assert_eq!(short_device_decode_rows(5, 5, true).unwrap(), 9);
+        assert!(short_device_decode_rows(5, 6, true).is_err());
+    }
+
+    #[test]
+    fn device_attention_h2d_accounting_uses_constructed_rope_lut_bytes() {
+        let dispatches = V4_REQUEST_ROPE_LUT_ROWS * v4_state::V4_LAYER_COUNT;
+        let hidden_bytes =
+            dispatches * v4_state::HC * v4_state::HIDDEN * std::mem::size_of::<u16>();
+        assert_eq!(
+            device_attention_expected_h2d_bytes(V4_REQUEST_ROPE_LUT_BYTES, dispatches).unwrap(),
+            V4_REQUEST_ROPE_LUT_BYTES + hidden_bytes
+        );
+        let nine_row_bytes =
+            2 * V4_SHORT_DEVICE_DECODE_MAX_ROWS * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
+        assert_eq!(
+            device_attention_expected_h2d_bytes(nine_row_bytes, dispatches).unwrap(),
+            nine_row_bytes + hidden_bytes
+        );
+    }
+
+    #[test]
+    fn stationary_qd4_is_exclusive_and_has_a_fixed_lane_reserve() {
+        assert_eq!(qd4_lane_count(false), 0);
+        assert_eq!(qd4_lane_count(true), V4_QD4_LANES);
+        assert!(validate_qd4_lane_reserve(V4_QD4_PINNED_HOST_BYTES, V4_QD4_DEVICE_BYTES).is_ok());
+        assert!(
+            validate_qd4_lane_reserve(V4_QD4_PINNED_HOST_BYTES - 1, V4_QD4_DEVICE_BYTES).is_err()
+        );
+        assert!(
+            validate_qd4_lane_reserve(V4_QD4_PINNED_HOST_BYTES, V4_QD4_DEVICE_BYTES - 1).is_err()
+        );
+        assert_eq!(qd4_expected_routed_loads(61, 5).unwrap(), 1_830);
+    }
+
+    #[test]
+    fn qd4_immutable_cache_reserve_is_exact_and_bounded() {
+        assert_eq!(V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS, 32);
+        assert_eq!(
+            V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+            V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+                * (v4_expert::V4_ROUTED_EXPERT_BYTES
+                    + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+                    + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>())
+        );
+        assert!(
+            V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES > V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES
+        );
+    }
+
+    #[test]
+    fn phase_profile_env_and_mode_are_strict() {
+        assert!(!parse_optional_one_flag("X", None).unwrap());
+        assert!(parse_optional_one_flag("X", Some(std::ffi::OsStr::new("1"))).unwrap());
+        assert!(parse_optional_one_flag("X", Some(std::ffi::OsStr::new("0"))).is_err());
+        assert!(parse_default_true_zero_one_flag("X", None).unwrap());
+        assert!(parse_default_true_zero_one_flag("X", Some(std::ffi::OsStr::new("1"))).unwrap());
+        assert!(!parse_default_true_zero_one_flag("X", Some(std::ffi::OsStr::new("0"))).unwrap());
+        assert!(parse_default_true_zero_one_flag("X", Some(std::ffi::OsStr::new("yes"))).is_err());
+        assert_eq!(
+            fixed_prefetch_wo_a_decode_arm(true, true, true),
+            "raw_fp8_gpu_decode"
+        );
+        assert_eq!(
+            fixed_prefetch_wo_a_decode_arm(true, true, false),
+            "host_bf16_decode"
+        );
+        assert_eq!(
+            fixed_prefetch_wo_a_decode_arm(false, true, true),
+            "inactive"
+        );
+        assert!(validate_phase_profile_mode(true, true).is_ok());
+        assert!(validate_phase_profile_mode(false, true).is_err());
+        assert!(validate_phase_profile_mode(true, false).is_err());
+        assert!(
+            parse_optional_one_flag(
+                "COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH",
+                Some(std::ffi::OsStr::new("yes"))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_fixed_prefetch_requirements(true, true, true, 4 * 1024 * 1024 * 1024).is_ok()
+        );
+        assert!(validate_fixed_prefetch_requirements(false, true, true, usize::MAX).is_err());
+        assert!(validate_fixed_prefetch_requirements(true, false, true, usize::MAX).is_err());
+        assert!(validate_fixed_prefetch_requirements(true, true, false, usize::MAX).is_err());
+        assert!(validate_fixed_prefetch_requirements(true, true, true, 1).is_err());
+    }
+
+    #[test]
+    fn fixed_prefetch_schedule_is_one_ahead_and_accounts_for_wait() {
+        let telemetry = FixedLoadTelemetry {
+            fixed_read_alloc_ns: 20,
+            fixed_decode_ns: 30,
+            ..FixedLoadTelemetry::default()
+        };
+        let transition =
+            fixed_prefetch_transition_json(4, 5, &telemetry, 10, 90, 20, 20, 100, 80, 2).unwrap();
+        assert_eq!(transition["overlap_ns"], 70);
+        assert!(!transition["ready_before_consume"].as_bool().unwrap());
+        assert_eq!(transition["consume_wait_ns"], 10);
+        assert_eq!(transition["host_prefetched_bytes"], 20);
+        assert!(
+            fixed_prefetch_transition_json(4, 6, &telemetry, 10, 90, 20, 20, 100, 80, 2).is_err()
+        );
+        assert!(
+            fixed_prefetch_transition_json(4, 5, &telemetry, 90, 10, 20, 20, 100, 80, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn stationary_phase_profile_keeps_nested_diagnostics_out_of_top_level_sum() {
+        let fixed = FixedLoadTelemetry {
+            fixed_read_alloc_ns: 10,
+            fixed_decode_ns: 20,
+            fixed_h2d_ns: 30,
+            fixed_source_bytes: 7,
+            fixed_h2d_bytes: 8,
+            raw_h2d_ns: 9,
+            raw_h2d_bytes: 10,
+            cache_status: "miss",
+            ..FixedLoadTelemetry::default()
+        };
+        let stage = LayerStageTelemetry {
+            layer_prepare_ns: 70,
+            layer_prepare_count: 1,
+            attention_ns: 40,
+            device_state_setup_ns: 7,
+            device_state_setup_count: 1,
+            attention_hidden_h2d_count: 1,
+            attention_hidden_h2d_bytes: v4_state::HC * v4_state::HIDDEN * 2,
+            attention_rope_lut_d2d_count: 2,
+            attention_rope_lut_d2d_bytes: 2 * v4_state::Q_ROPE_DIM * 4,
+            attention_terminal_d2h_count: 1,
+            attention_terminal_d2h_bytes: v4_state::HC * v4_state::HIDDEN * 2,
+            commit_ns: 5,
+            router_ns: 50,
+            router_mhc_ns: 20,
+            router_kernel_select_sync_ns: 10,
+            router_kernel_select_gpu_ns: 8,
+            shared_ns: 20,
+            routed_ns: 100,
+            routed_read_ns: 10,
+            routed_alloc_ns: 9,
+            routed_setup_ns: 40,
+            routed_h2d_ns: 30,
+            routed_kernel_ns: 20,
+            routed_source_bytes: 11,
+            routed_h2d_bytes: 12,
+            ..LayerStageTelemetry::default()
+        };
+        let (profile, attributed, outer) =
+            stationary_layer_phase_profile_json(100, 400, Some(&fixed), &stage, 4, false).unwrap();
+        assert_eq!(outer, 300);
+        assert_eq!(attributed, 292);
+        assert_eq!(profile["unattributed_gap_ns"], 8);
+        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v4");
+        assert_eq!(profile["top_level"]["layer_prepare"]["wall_ns"], 70);
+        assert_eq!(
+            profile["top_level"]["layer_prepare"]["fixed_load"]["wall_ns"],
+            60
+        );
+        assert_eq!(
+            profile["top_level"]["layer_prepare"]["fixed_load"]["raw_h2d_ns"],
+            9
+        );
+        assert_eq!(
+            profile["top_level"]["attention"]["device_state_setup"]["wall_ns"],
+            7
+        );
+        assert_eq!(
+            profile["top_level"]["attention"]["transfers"]["request_rope_lut_d2d"]["count"],
+            2
+        );
+        assert_eq!(
+            profile["top_level"]["attention"]["temporary"]["steady_device_alloc_count"],
+            0
+        );
+        assert!(profile["closure"]["exact"].as_bool().unwrap());
+        assert_eq!(profile["top_level"]["routed"]["wall_ns"], 100);
+        assert_eq!(
+            profile["top_level"]["routed"]["diagnostics"]["setup_ns"],
+            40
+        );
+        assert!(
+            stationary_layer_phase_profile_json(401, 400, Some(&fixed), &stage, 4, false).is_err()
+        );
+        let (final_profile, final_attributed) =
+            stationary_final_phase_profile_json(400, 500, 10, 80, 40, false).unwrap();
+        assert_eq!(final_attributed, 90);
+        assert_eq!(final_profile["unattributed_gap_ns"], 10);
+        assert_eq!(
+            final_profile["top_level"]["cpu_final"]["diagnostics"]["streamed_weight_read_ns"],
+            40
+        );
+        assert_eq!(
+            stationary_phase_profile_outer_accounting(300, 100, 450).unwrap(),
+            (400, 50),
+            "layer outer is deliberately distinct from final outer"
+        );
+        assert!(stationary_phase_profile_outer_accounting(300, 151, 450).is_err());
+    }
+
+    #[test]
+    fn one_token_phase_profile_closure_uses_only_exclusive_outer_scopes() {
+        let (prefill_outer, decode_outer, profiled_outer, request_gap) =
+            stationary_one_token_phase_profile_outer_accounting(300, 100, 220, 80, 800).unwrap();
+        assert_eq!(
+            (prefill_outer, decode_outer, profiled_outer, request_gap),
+            (400, 300, 700, 100)
+        );
+        assert_eq!(prefill_outer + decode_outer + request_gap, 800);
+        assert!(
+            stationary_one_token_phase_profile_outer_accounting(300, 100, 220, 81, 700).is_err()
+        );
+    }
+
+    #[test]
+    fn stationary_parallel_profile_keeps_lane_work_out_of_wall_bounds() {
+        let parallel = LayerStageTelemetry {
+            attention_ns: 40,
+            commit_ns: 5,
+            router_ns: 50,
+            router_mhc_ns: 20,
+            router_kernel_select_sync_ns: 10,
+            router_kernel_select_gpu_ns: 8,
+            shared_ns: 20,
+            routed_ns: 100,
+            routed_read_ns: 80,
+            routed_alloc_ns: 9,
+            routed_setup_ns: 40,
+            routed_h2d_ns: 160,
+            routed_kernel_ns: 140,
+            routed_parallel_batch_wall_ns: Some(90),
+            routed_parallel_read_horizon_ns: Some(80),
+            routed_source_bytes: 11,
+            routed_h2d_bytes: 12,
+            ..LayerStageTelemetry::default()
+        };
+        let (profile, attributed, outer) =
+            stationary_layer_phase_profile_json(100, 400, None, &parallel, 4, true).unwrap();
+        assert_eq!(outer, 300);
+        assert_eq!(attributed, 215);
+        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v4");
+        let lanes = &profile["top_level"]["routed"]["parallel_lanes"];
+        assert_eq!(lanes["lane_count"], V4_QD4_LANES);
+        assert_eq!(lanes["route_job_count"], v4_router::V4_TOPK);
+        assert_eq!(lanes["batch_wall_ns"], 90);
+        assert_eq!(lanes["read_completion_horizon_ns"], 80);
+        assert_eq!(lanes["h2d_event_work_sum_ns"], 160);
+        assert_eq!(lanes["kernel_event_work_sum_ns"], 140);
+        assert!(
+            profile["top_level"]["routed"]["diagnostics"]
+                .get("h2d_ns")
+                .is_none()
+        );
+
+        let serial_with_parallel_work = LayerStageTelemetry {
+            routed_h2d_ns: 101,
+            ..parallel
+        };
+        assert!(
+            stationary_layer_phase_profile_json(
+                100,
+                400,
+                None,
+                &serial_with_parallel_work,
+                4,
+                false,
+            )
+            .is_err()
+        );
+        let bad_outer = LayerStageTelemetry {
+            routed_ns: 101,
+            ..parallel
+        };
+        assert!(stationary_layer_phase_profile_json(100, 300, None, &bad_outer, 4, true).is_err());
+    }
+
+    #[test]
+    fn normalized_config_fingerprint_is_order_independent_and_self_describing() {
+        let first = normalized_config_fingerprint(serde_json::json!({"z": true, "a": 1})).unwrap();
+        let second = normalized_config_fingerprint(serde_json::json!({"a": 1, "z": true})).unwrap();
+        assert_eq!(first["algorithm"], "fnv1a64");
+        assert_eq!(first["digest"], second["digest"]);
+        assert_eq!(first["canonical_json"], second["canonical_json"]);
+        assert_eq!(first["normalized"]["a"], 1);
+        assert!(normalized_config_fingerprint(serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn five_token_device_attention_transfer_contract_has_frozen_geometry() {
+        let manifests = v4_state::serial_layer_manifests(0).unwrap();
+        let dispatches = 5 * manifests.len();
+        let csa_boundaries = manifests
+            .iter()
+            .filter(|manifest| manifest.compression_ratio == v4_state::CompressionRatio::Csa4)
+            .count();
+        let hidden_row_bytes = v4_state::HC * v4_state::HIDDEN * std::mem::size_of::<u16>();
+        let rope_row_bytes = v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
+        assert_eq!(dispatches, 305);
+        assert_eq!(dispatches * hidden_row_bytes, 17_489_920);
+        assert_eq!(V4_REQUEST_ROPE_LUT_BYTES, 2_560);
+        assert_eq!(csa_boundaries, 30);
+        assert_eq!(2 * dispatches + csa_boundaries, 640);
+        assert_eq!((2 * dispatches + csa_boundaries) * rope_row_bytes, 163_840);
+    }
+
+    #[test]
+    fn layer_expert_retention_stops_at_the_laptop_cap() {
+        assert!(should_retain_layer_expert(31));
+        assert!(!should_retain_layer_expert(32));
+    }
+
+    #[test]
+    fn pending_result_file_is_exclusive_and_transactional() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = |case: &str| {
+            std::env::temp_dir().join(format!(
+                "colibri-result-{case}-{}-{unique}.jsonl",
+                std::process::id()
+            ))
+        };
+
+        let existing = path("existing");
+        std::fs::write(&existing, b"keep").unwrap();
+        assert!(PendingResultFile::reserve(existing.clone()).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        std::fs::remove_file(existing).unwrap();
+
+        let aborted = path("aborted");
+        {
+            let mut result = PendingResultFile::reserve(aborted.clone()).unwrap();
+            writeln!(result.file_mut(), "partial").unwrap();
+        }
+        assert!(!aborted.exists());
+
+        let committed = path("committed");
+        {
+            let mut result = PendingResultFile::reserve(committed.clone()).unwrap();
+            writeln!(result.file_mut(), "complete").unwrap();
+            result.commit().unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&committed).unwrap(), "complete\n");
+        std::fs::remove_file(committed).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires pinned DeepSeek-V4-Pro snapshot"]
+    fn official_single_user_chat_hi_encodes_to_pinned_ids() {
+        let root = v4_model_dir().expect("pinned model directory");
+        let tokenizer = v4_tokenizer::V4Tokenizer::open(&root).expect("pinned V4 tokenizer");
+        let prompt = v4_chat::format_single_user("hi", v4_chat::ThinkingMode::Chat);
+        assert_eq!(
+            tokenizer
+                .encode_raw(&prompt)
+                .expect("encode official chat prompt"),
+            [0, 128_803, 6_366, 128_804, 128_822]
+        );
+    }
+
+    #[test]
+    fn router_telemetry_schema_closes_exclusive_wall_time() {
+        let stage = LayerStageTelemetry {
+            router_ns: 100,
+            router_mhc_ns: 40,
+            router_host_prep_ns: 3,
+            router_alloc_h2d_sync_ns: 12,
+            router_workspace_alloc_ns: 5,
+            router_kernel_select_sync_ns: 30,
+            router_d2h_sync_ns: 8,
+            router_other_ns: 2,
+            router_kernel_select_gpu_ns: 17,
+            ..LayerStageTelemetry::default()
+        };
+        assert_eq!(stage.router_accounted_ns(), stage.router_ns);
+        assert!(stage.router_kernel_select_gpu_ns <= stage.router_kernel_select_sync_ns);
+    }
+
+    #[test]
+    fn mhc_telemetry_schema_closes_exclusive_wall_time() {
+        let telemetry = MhcTelemetry {
+            wall_ns: 100,
+            input_alloc_h2d_sync_ns: 12,
+            workspace_alloc_sync_ns: 8,
+            workspace_init_gpu_ns: 6,
+            mixing_linear_sync_ns: 25,
+            mixing_linear_gpu_ns: 23,
+            sinkhorn_normalize_collapse_sync_ns: 40,
+            sinkhorn_normalize_collapse_gpu_ns: 38,
+            output_d2h_sync_ns: 10,
+            other_ns: 5,
+        };
+        assert_eq!(telemetry.accounted_wall_ns(), telemetry.wall_ns);
+        assert_ne!(telemetry.mixing_linear_gpu_ns, 0);
+        assert_ne!(telemetry.sinkhorn_normalize_collapse_gpu_ns, 0);
+    }
+
+    #[test]
+    fn source_identity_rechecks_manifest_and_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "colibri-source-identity-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.rs");
+        let binary = root.join("binary");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        std::fs::write(&binary, "binary\n").unwrap();
+        let manifest = root.join("manifest");
+        std::fs::write(
+            &manifest,
+            format!("{}  source.rs\n", sha256_file(&source).unwrap()),
+        )
+        .unwrap();
+        let identity = sha256_file(&manifest).unwrap();
+        let provenance = validate_source_identity(&identity, &manifest, &binary).unwrap();
+        assert_eq!(provenance["source_identity_sha256"], identity);
+
+        std::fs::write(&source, "changed\n").unwrap();
+        assert!(validate_source_identity(&identity, &manifest, &binary).is_err());
+        assert!(validate_source_identity("missing", &manifest, &binary).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixed_cache_budget_keeps_whole_best_value_layers() {
+        let plan = [(0, 100, 100), (1, 60, 120), (2, 50, 40)]
+            .into_iter()
+            .map(|(layer, bytes, saved)| FixedLayerPlan {
+                layer,
+                tensors: Vec::new(),
+                device_bytes: bytes,
+                raw_device_bytes: bytes,
+                host_bytes: bytes,
+                raw_host_bytes: bytes,
+                device_saved_ns: saved,
+                host_saved_ns: saved,
+            })
+            .collect::<Vec<_>>();
+        let selected = select_fixed_cache_layers(&plan, 110, &[false; 3], true, false);
+        assert_eq!(selected, [false, true, true]);
+        assert!(
+            plan.iter()
+                .zip(selected)
+                .filter(|(_, selected)| *selected)
+                .map(|(plan, _)| plan.device_bytes)
+                .sum::<usize>()
+                <= 110
+        );
+    }
+
+    #[test]
+    fn routed_qd4_lane_budget_is_exact() {
+        assert_eq!(
+            v4_expert::V4_ROUTED_EXPERT_BYTES,
+            3 * 11_010_048 + 3 * 688_128
+        );
+        assert_eq!(4 * v4_expert::V4_ROUTED_EXPERT_BYTES, 140_378_112);
+    }
+
+    #[test]
+    fn qd4_supervisor_reaps_six_jobs_and_propagates_error_and_panic() {
+        let completed = run_supervised_qd4_batches(
+            vec![(); 4],
+            1,
+            std::time::Duration::from_millis(100),
+            None,
+            |_, _, job| Ok(job.route_slot),
+            |_, batch| {
+                let mut slots = batch.completions;
+                slots.sort_unstable();
+                Ok(slots)
+            },
+        )
+        .unwrap();
+        assert_eq!(completed, [vec![0, 1, 2, 3, 4, 5]]);
+
+        let error = run_supervised_qd4_batches(
+            vec![(); 4],
+            1,
+            std::time::Duration::from_millis(100),
+            None,
+            |_, _, job| {
+                if job.route_slot == 2 {
+                    Err("injected lane error".into())
+                } else {
+                    Ok(job.route_slot)
+                }
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected lane error"));
+
+        let panic = run_supervised_qd4_batches(
+            vec![(); 4],
+            1,
+            std::time::Duration::from_millis(20),
+            None,
+            |_, _, job| {
+                assert_ne!(job.route_slot, 2, "injected lane panic");
+                Ok(job.route_slot)
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(panic.contains("panicked"));
+    }
+
+    #[test]
+    fn b2_layer_stationary_plan_loads_each_fixed_layer_once() {
+        let steps = [(3, [0, 1]), (4, [0, 1])];
+        assert_eq!(
+            (0..8).map(b2_serial_first).collect::<Vec<_>>(),
+            [true, false, false, true, true, false, false, true]
+        );
+        assert_eq!((0..12).filter(|&repeat| b2_serial_first(repeat)).count(), 6);
+        assert_eq!(
+            steps
+                .iter()
+                .map(|(layer, _)| *layer)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn e4m3fn_gpu_decode_matches_all_codepoints() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input = (0_u16..=255).map(|bits| bits as u8).collect::<Vec<_>>();
+        let expected = input
+            .iter()
+            .map(|&bits| v4_router::f32_to_bf16_rne(v4_state::E4M3Fn(bits).decode()))
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&stream, &input).expect("upload E4M3FN codepoints");
+        let mut output = DeviceBuffer::<u16>::zeroed(&stream, 256).expect("allocate BF16 output");
+        launch_e4m3fn_to_bf16(&module, &stream, &input, &mut output).expect("launch E4M3FN decode");
+        assert_eq!(
+            output.to_host_vec(&stream).expect("download BF16 output"),
+            expected
+        );
+    }
+
+    #[test]
+    fn streamed_bf16_head_warp_matches_small_cpu_slice() {
+        const INPUTS: usize = 64;
+        const OUTPUTS: usize = 17;
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input = (0..INPUTS)
+            .map(|index| v4_router::f32_to_bf16_rne(((index % 13) as f32 - 6.0) * 0.03125))
+            .collect::<Vec<_>>();
+        let weight = (0..OUTPUTS * INPUTS)
+            .map(|index| v4_router::f32_to_bf16_rne(((index % 29) as f32 - 14.0) * 0.015625))
+            .collect::<Vec<_>>();
+        let expected = weight
+            .chunks_exact(INPUTS)
+            .map(|row| {
+                input
+                    .iter()
+                    .zip(row)
+                    .fold(0.0_f32, |sum, (&input, &weight)| {
+                        sum + v4_router::bf16_to_f32(input) * v4_router::bf16_to_f32(weight)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::from_host(&stream, &input).unwrap();
+        let weight = DeviceBuffer::from_host(&stream, &weight).unwrap();
+        let mut output = DeviceBuffer::<f32>::zeroed(&stream, OUTPUTS).unwrap();
+        // SAFETY: one complete warp owns each fully initialized output row.
+        unsafe {
+            module
+                .matvec_bf16_streamed(
+                    &stream,
+                    LaunchConfig::for_num_elems((OUTPUTS * 32) as u32),
+                    &input,
+                    &weight,
+                    &mut output,
+                    INPUTS as u32,
+                    OUTPUTS as u32,
+                )
+                .unwrap();
+        }
+        let actual = output.to_host_vec(&stream).unwrap();
+        assert_close("streamed BF16 head slice", &actual, &expected);
+        let argmax = |values: &[f32]| {
+            (0..values.len())
+                .max_by(|&left, &right| values[left].total_cmp(&values[right]))
+                .unwrap()
+        };
+        assert_eq!(argmax(&actual), argmax(&expected));
+    }
+
+    #[test]
+    fn compressor_gpu_matches_cpu_for_hca_csa_and_indexer_geometries() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input_host = [
+            v4_router::f32_to_bf16_rne(1.0),
+            v4_router::f32_to_bf16_rne(2.0),
+            v4_router::f32_to_bf16_rne(3.0),
+            v4_router::f32_to_bf16_rne(4.0),
+        ];
+
+        for (outputs, ratio, start_pos) in [
+            (512_usize, 128_usize, 127_usize),
+            (1_024, 4, 3),
+            (256, 4, 3),
+        ] {
+            let mut ape_host = vec![0.0_f32; ratio * outputs];
+            for phase in 0..ratio {
+                ape_host[phase * outputs..(phase + 1) * outputs].fill(phase as f32);
+            }
+            let weights = v4_state::CompressorWeights {
+                wkv_bf16: [
+                    v4_router::f32_to_bf16_rne(1.0),
+                    v4_router::f32_to_bf16_rne(2.0),
+                ]
+                .repeat(outputs),
+                wgate_bf16: [
+                    v4_router::f32_to_bf16_rne(2.0),
+                    v4_router::f32_to_bf16_rne(-1.0),
+                ]
+                .repeat(outputs),
+                ape_f32: ape_host,
+                range_bytes: 0,
+            };
+            let expected = v4_state::prepare_compressor_cpu_with_geometry(
+                &input_host,
+                &weights,
+                2,
+                outputs,
+                ratio,
+                start_pos,
+            )
+            .expect("prepare generic compressor CPU oracle");
+            let input = DeviceBuffer::from_host(&stream, &input_host).expect("upload input");
+            let wkv =
+                DeviceBuffer::from_host(&stream, &weights.wkv_bf16).expect("upload wkv weights");
+            let wgate =
+                DeviceBuffer::from_host(&stream, &weights.wgate_bf16).expect("upload gate weights");
+            let ape = DeviceBuffer::from_host(&stream, &weights.ape_f32).expect("upload APE");
+            let mut kv =
+                DeviceBuffer::<f32>::zeroed(&stream, 2 * outputs).expect("allocate compressor KV");
+            let mut score = DeviceBuffer::<f32>::zeroed(&stream, 2 * outputs)
+                .expect("allocate compressor score");
+            let mut score_plus_ape = DeviceBuffer::<f32>::zeroed(&stream, 2 * outputs)
+                .expect("allocate compressor score+APE");
+            unsafe {
+                module
+                    .compressor_v4_bf16_f32(
+                        &stream,
+                        LaunchConfig::for_num_elems(u32::try_from(2 * outputs).unwrap()),
+                        &input,
+                        &wkv,
+                        &wgate,
+                        &ape,
+                        &mut kv,
+                        &mut score,
+                        &mut score_plus_ape,
+                        start_pos as u32,
+                        2,
+                        outputs as u32,
+                        ratio as u32,
+                    )
+                    .expect("launch generic compressor");
+            }
+            assert_eq!(
+                kv.to_host_vec(&stream).unwrap(),
+                expected.kv_f32,
+                "KV projection outputs={outputs} ratio={ratio}"
+            );
+            assert_eq!(
+                score.to_host_vec(&stream).unwrap(),
+                expected.score_f32,
+                "score projection outputs={outputs} ratio={ratio}"
+            );
+            assert_eq!(
+                score_plus_ape.to_host_vec(&stream).unwrap(),
+                expected.score_plus_ape_f32,
+                "score+APE outputs={outputs} ratio={ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_attention_consumes_concatenated_local_and_compressed_indices() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let q_host = vec![v4_router::f32_to_bf16_rne(0.0); 128 * 512];
+        let mut kv_host = vec![v4_router::f32_to_bf16_rne(0.0); 2 * 512];
+        kv_host[512..].fill(v4_router::f32_to_bf16_rne(2.0));
+        let q = DeviceBuffer::from_host(&stream, &q_host).unwrap();
+        let kv = DeviceBuffer::from_host(&stream, &kv_host).unwrap();
+        let sink = DeviceBuffer::from_host(&stream, &vec![-100.0_f32; 128]).unwrap();
+        let topk = DeviceBuffer::from_host(&stream, &[0_i32, 1_i32]).unwrap();
+        let mut output = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+        unsafe {
+            module
+                .sparse_attn_v4_bf16(
+                    &stream,
+                    LaunchConfig::for_num_elems(u32::try_from(output.len()).unwrap()),
+                    &q,
+                    &kv,
+                    &sink,
+                    &topk,
+                    &mut output,
+                    2,
+                )
+                .expect("launch sparse attention with compressed KV");
+        }
+        assert_eq!(
+            output.to_host_vec(&stream).unwrap(),
+            vec![v4_router::f32_to_bf16_rne(1.0); q_host.len()]
+        );
+    }
+
+    #[test]
+    fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_locally() {
+        const HEADS: usize = v4_state::Q_HEADS;
+        const DIM: usize = v4_state::Q_HEAD_DIM;
+
+        fn assert_f32_bits(label: &str, actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len(), "{label}: length");
+            if let Some((index, (actual, expected))) = actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits())
+            {
+                panic!(
+                    "{label}: f32 bit mismatch at {index}: {:08x} != {:08x}",
+                    actual.to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
+
+        let pos0 = v4_state::SparseTopk {
+            indices: vec![0],
+            rows: 1,
+            per_row: 1,
+            window_per_row: 1,
+            compressed_per_row: 0,
+        };
+        let pos1_indices = v4_state::window_topk_cpu(1, 1, v4_state::KV_WINDOW)
+            .unwrap()
+            .0;
+        assert_eq!(&pos1_indices[..2], &[0, 1]);
+        let pos1 = v4_state::SparseTopk {
+            indices: pos1_indices,
+            rows: 1,
+            per_row: v4_state::KV_WINDOW,
+            window_per_row: v4_state::KV_WINDOW,
+            compressed_per_row: 0,
+        };
+        let csa_scores = vec![1.0_f32];
+        let l4_3 = v4_state::build_csa_sparse_topk(
+            &csa_scores,
+            1,
+            1,
+            &[1],
+            3,
+            v4_state::KV_WINDOW,
+            v4_state::INDEX_TOPK,
+        )
+        .unwrap();
+        let l4_4 = v4_state::build_csa_sparse_topk(
+            &csa_scores,
+            1,
+            1,
+            &[1],
+            4,
+            v4_state::KV_WINDOW,
+            v4_state::INDEX_TOPK,
+        )
+        .unwrap();
+        let l3_127 = v4_state::build_hca_sparse_topk(1, 127, v4_state::KV_WINDOW, 128).unwrap();
+        let l3_128 = v4_state::build_hca_sparse_topk(1, 128, v4_state::KV_WINDOW, 128).unwrap();
+        for topk in [&l4_3, &l4_4, &l3_127, &l3_128] {
+            assert_eq!(topk.per_row, v4_state::KV_WINDOW + 1);
+            assert_eq!(topk.indices[v4_state::KV_WINDOW], 128);
+        }
+
+        let q_host = (0..HEADS * DIM)
+            .map(|index| v4_router::f32_to_bf16_rne(((index % 29) as f32 - 14.0) * 0.007_812_5))
+            .collect::<Vec<_>>();
+        let kv_host = (0..(v4_state::KV_WINDOW + 1) * DIM)
+            .map(|index| v4_router::f32_to_bf16_rne(((index % 31) as f32 - 15.0) * 0.003_906_25))
+            .collect::<Vec<_>>();
+        let sink_host = (0..HEADS)
+            .map(|head| -1.0_f32 - (head % 7) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let q = DeviceBuffer::from_host(&stream, &q_host).expect("upload q");
+        let kv = DeviceBuffer::from_host(&stream, &kv_host).expect("upload kv");
+        let sink = DeviceBuffer::from_host(&stream, &sink_host).expect("upload sink");
+
+        for (name, topk) in [
+            ("pos0", &pos0),
+            ("pos1", &pos1),
+            ("l4_3_to_4_before", &l4_3),
+            ("l4_3_to_4_after", &l4_4),
+            ("l3_127_to_128_before", &l3_127),
+            ("l3_127_to_128_after", &l3_128),
+        ] {
+            let topk_device = DeviceBuffer::from_host(&stream, &topk.indices).expect("upload topk");
+            let mut reference = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+            let mut candidate = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+            let mut reference_state =
+                SparseAttentionScoreReuseScratch::new(&stream, 1, topk.per_row).unwrap();
+            let mut candidate_state =
+                SparseAttentionScoreReuseScratch::new(&stream, 1, topk.per_row).unwrap();
+            run_sparse_attention_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk_device,
+                &mut reference,
+                topk.per_row,
+            )
+            .unwrap();
+            run_sparse_attention_reference_state_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk_device,
+                &mut reference_state,
+                topk.per_row,
+            )
+            .unwrap();
+            run_sparse_attention_score_reuse_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk_device,
+                &mut candidate,
+                &mut candidate_state,
+                topk.per_row,
+            )
+            .unwrap();
+            let reference_bits = reference.to_host_vec(&stream).unwrap();
+            assert_eq!(
+                candidate.to_host_vec(&stream).unwrap(),
+                reference_bits,
+                "{name}: score-reuse BF16 bits against scalar reference"
+            );
+            assert_f32_bits(
+                &format!("{name}: scores"),
+                &candidate_state.scores.to_host_vec(&stream).unwrap(),
+                &reference_state.scores.to_host_vec(&stream).unwrap(),
+            );
+            assert_f32_bits(
+                &format!("{name}: probabilities"),
+                &candidate_state.probabilities.to_host_vec(&stream).unwrap(),
+                &reference_state.probabilities.to_host_vec(&stream).unwrap(),
+            );
+            assert_f32_bits(
+                &format!("{name}: denominators"),
+                &candidate_state.denominators.to_host_vec(&stream).unwrap(),
+                &reference_state.denominators.to_host_vec(&stream).unwrap(),
+            );
+            assert_eq!(
+                candidate_state.valid_counts.to_host_vec(&stream).unwrap(),
+                reference_state.valid_counts.to_host_vec(&stream).unwrap(),
+                "{name}: valid counts"
+            );
+        }
+
+        let topk = DeviceBuffer::from_host(&stream, &l3_128.indices).unwrap();
+        let mut reference = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+        let mut candidate = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
+        let mut scratch =
+            SparseAttentionScoreReuseScratch::new(&stream, 1, l3_128.per_row).unwrap();
+        let start = context
+            .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+            .unwrap();
+        let end = context
+            .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+            .unwrap();
+        for _ in 0..2 {
+            run_sparse_attention_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk,
+                &mut reference,
+                l3_128.per_row,
+            )
+            .unwrap();
+            run_sparse_attention_score_reuse_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk,
+                &mut candidate,
+                &mut scratch,
+                l3_128.per_row,
+            )
+            .unwrap();
+        }
+        end.record(&stream).unwrap();
+        end.synchronize().unwrap();
+        let mut reference_ns = Vec::new();
+        let mut candidate_ns = Vec::new();
+        for _ in 0..7 {
+            start.record(&stream).unwrap();
+            run_sparse_attention_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk,
+                &mut reference,
+                l3_128.per_row,
+            )
+            .unwrap();
+            end.record(&stream).unwrap();
+            end.synchronize().unwrap();
+            reference_ns.push((start.elapsed_ms(&end).unwrap() as f64 * 1_000_000.0) as u64);
+            start.record(&stream).unwrap();
+            run_sparse_attention_score_reuse_device_into(
+                &module,
+                &stream,
+                &q,
+                &kv,
+                &sink,
+                &topk,
+                &mut candidate,
+                &mut scratch,
+                l3_128.per_row,
+            )
+            .unwrap();
+            end.record(&stream).unwrap();
+            end.synchronize().unwrap();
+            candidate_ns.push((start.elapsed_ms(&end).unwrap() as f64 * 1_000_000.0) as u64);
+        }
+        let reference_p50 = median_u64(&reference_ns);
+        let candidate_p50 = median_u64(&candidate_ns);
+        println!(
+            "SPARSE_SCORE_REUSE exact=1 shape=B1x128x512 topk={} l3_127_to_128 reference_p50_ms={:.3} candidate_p50_ms={:.3}",
+            l3_128.per_row,
+            reference_p50 as f64 / 1_000_000.0,
+            candidate_p50 as f64 / 1_000_000.0,
+        );
+        assert!(
+            candidate_p50 < reference_p50,
+            "score reuse did not accelerate the isolated L3 127->128 fixture"
+        );
+    }
+
+    #[test]
+    fn csa_indexer_scores_match_cpu_oracle_and_select_causal_topk() {
+        let (rows, heads, head_dim, keys) = (2_usize, 3_usize, 4_usize, 5_usize);
+        let q = (0..rows * heads * head_dim)
+            .map(|index| (index as f32 - 7.0) / 8.0)
+            .collect::<Vec<_>>();
+        let kv = (0..keys * head_dim)
+            .map(|index| ((index * 3 % 17) as f32 - 8.0) / 7.0)
+            .collect::<Vec<_>>();
+        let weights = vec![0.5, -0.25, 1.0, -0.75, 0.625, 0.375];
+        let expected = v4_state::indexer_scores_cpu(&q, &kv, &weights, rows, heads, head_dim, keys)
+            .expect("CPU CSA indexer score oracle");
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let q_device = DeviceBuffer::from_host(&stream, &q).expect("upload q");
+        let kv_device = DeviceBuffer::from_host(&stream, &kv).expect("upload kv");
+        let weights_device = DeviceBuffer::from_host(&stream, &weights).expect("upload weights");
+        let mut scores =
+            DeviceBuffer::from_host(&stream, &vec![0.0_f32; rows * keys]).expect("allocate scores");
+        unsafe {
+            module
+                .indexer_scores_v4_f32(
+                    &stream,
+                    LaunchConfig::for_num_elems(u32::try_from(rows * keys).unwrap()),
+                    &q_device,
+                    &kv_device,
+                    &weights_device,
+                    &mut scores,
+                    rows as u32,
+                    heads as u32,
+                    head_dim as u32,
+                    keys as u32,
+                )
+                .expect("launch CSA indexer scores");
+        }
+        let actual = scores.to_host_vec(&stream).expect("download scores");
+        assert_close("CSA indexer scores", &actual, &expected);
+        let expected_topk =
+            v4_state::indexer_topk_cpu(&expected, rows, keys, 2, &[3, 5], 128).unwrap();
+        let actual_topk = v4_state::indexer_topk_cpu(&actual, rows, keys, 2, &[3, 5], 128).unwrap();
+        assert_eq!(actual_topk, expected_topk);
+        let valid = DeviceBuffer::from_host(&stream, &[3_u32, 5_u32]).unwrap();
+        let mut gpu_topk = DeviceBuffer::<i32>::zeroed(&stream, rows * 2).unwrap();
+        unsafe {
+            module
+                .indexer_topk_v4_f32(
+                    &stream,
+                    LaunchConfig::for_num_elems(u32::try_from(rows * 2).unwrap()),
+                    &scores,
+                    &valid,
+                    &mut gpu_topk,
+                    rows as u32,
+                    keys as u32,
+                    2,
+                    128,
+                )
+                .expect("launch deterministic CSA top-k");
+        }
+        assert_eq!(gpu_topk.to_host_vec(&stream).unwrap(), expected_topk);
+    }
+
+    #[test]
+    fn csa_indexer_bf16_weight_projection_matches_cpu_exactly() {
+        let input_f32 = [1.0_f32, -2.0, 0.5, 3.0, -1.0, 0.25, 2.0, -0.5];
+        let weight_f32 = [
+            0.5_f32, 1.0, -1.0, 0.25, -0.5, 0.75, 1.5, -2.0, 2.0, -1.0, 0.5, 1.0,
+        ];
+        let input = input_f32
+            .into_iter()
+            .map(v4_router::f32_to_bf16_rne)
+            .collect::<Vec<_>>();
+        let weight = weight_f32
+            .into_iter()
+            .map(v4_router::f32_to_bf16_rne)
+            .collect::<Vec<_>>();
+        let expected = input
+            .chunks_exact(4)
+            .flat_map(|row| {
+                weight.chunks_exact(4).map(move |column| {
+                    row.iter()
+                        .zip(column)
+                        .map(|(&left, &right)| {
+                            v4_router::bf16_to_f32(left) * v4_router::bf16_to_f32(right)
+                        })
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let weight = DeviceBuffer::from_host(&stream, &weight).unwrap();
+        let actual = run_bf16_linear_f32(&module, &stream, &input, &weight, 4, 3).unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires COLIBRI_DSV4_MODEL_DIR pinned snapshot and CUDA device"]
+    fn real_full_l0_k2_matches_two_s1_rows() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        run_real_l0_k2_if_available(&context, &module, &stream)
+            .expect("real V4 full-L0 K2 contract");
+    }
+
+    #[test]
+    #[ignore = "requires COLIBRI_DSV4_MODEL_DIR pinned snapshot and CUDA device"]
+    fn real_common_runtime_loads_nonzero_hca_then_csa_with_layer_experts() {
+        let root = v4_model_dir().expect("pinned model directory");
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let manifests = v4_state::serial_layer_manifests(0).unwrap();
+        let mut visited = Vec::new();
+        let (hidden, telemetry) = v4_state::run_serial_layer_slice(
+            vec![v4_router::f32_to_bf16_rne(1.0)],
+            &manifests[3..=4],
+            |manifest, input| {
+                let (runtime, _) = load_layer_runtime(&root, manifest.layer, &[0], &stream)?;
+                assert_eq!(runtime.weights.layer, manifest.layer);
+                assert_eq!(
+                    runtime.weights.compression_ratio,
+                    manifest.compression_ratio
+                );
+                assert!(!runtime.weights.hash_router);
+                assert_eq!(
+                    runtime.weights.indexer.is_some(),
+                    manifest.compression_ratio == v4_state::CompressionRatio::Csa4
+                );
+                let expert =
+                    v4_expert::RoutedExpert::load_layer(&runtime.expert_shard, manifest.layer, 0)?;
+                assert!(expert.h2d_bytes() > 0);
+                visited.push(manifest.layer);
+                Ok((
+                    vec![v4_router::f32_to_bf16_rne(
+                        v4_router::bf16_to_f32(input[0]) + manifest.layer as f32 + 1.0,
+                    )],
+                    manifest.contract_range_bytes,
+                    u64::from(manifest.compression_ratio == v4_state::CompressionRatio::Csa4),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, vec![3, 4]);
+        assert_eq!(telemetry.len(), 2);
+        assert_ne!(hidden, vec![v4_router::f32_to_bf16_rne(1.0)]);
+    }
+
+    #[test]
+    #[ignore = "requires COLIBRI_DSV4_MODEL_DIR pinned snapshot and CUDA device"]
+    fn real_l0_compressor_official_cublas_exact_arm_matches_oracle() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        run_real_l0_compressor_cublas_exact_if_available(&module, &stream)
+            .expect("official cuBLAS L0 Compressor exact arm");
+    }
+
+    #[test]
+    #[ignore = "requires COLIBRI_DSV4_MODEL_DIR pinned snapshot and CUDA device"]
+    fn real_compressor_cuda_prepare_and_paired_commit_match_fixture() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        run_real_v4_compressor_slice_if_available(&module, &stream)
+            .expect("real V4 Compressor CUDA contract");
+    }
+
+    #[test]
+    #[ignore = "requires COLIBRI_DSV4_MODEL_DIR pinned snapshot and CUDA device"]
+    fn real_mhc_cuda_matches_canonical_fixture() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        run_real_v4_state_slice_if_available(&module, &stream).expect("real V4 mHC CUDA contract");
+    }
+
+    #[test]
+    fn rows_add_contract_rejects_bad_rows_and_accepts_empty_work() {
+        assert_eq!(validate_rows_add(8, 0, 0, &[], 2), Ok(None));
+        assert_eq!(
+            validate_rows_add(8, 0, 0, &[], 0),
+            Err(RowsAddError::ZeroWidth)
+        );
+        assert_eq!(
+            validate_rows_add(8, 2, 1, &[-1], 2),
+            Err(RowsAddError::NegativeRow(-1))
+        );
+        assert_eq!(
+            validate_rows_add(8, 4, 2, &[1, 1], 2),
+            Err(RowsAddError::DuplicateRow(1))
+        );
+        assert_eq!(
+            validate_rows_add(8, 2, 1, &[4], 2),
+            Err(RowsAddError::RowOutOfRange {
+                row: 4,
+                row_count: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn k2_fp4_microtile_router_and_contribution_match_active_rows1() {
+        fn fnv1a_u16(values: &[u16]) -> u64 {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for value in values {
+                for byte in value.to_le_bytes() {
+                    hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            hash
+        }
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+
+        let router_row = deterministic_v4_bf16(1, 41);
+        let router_batch = [router_row.clone(), deterministic_v4_bf16(1, 73)].concat();
+        let norm = vec![v4_router::f32_to_bf16_rne(1.0); v4_router::V4_HIDDEN];
+        let logits_row: Vec<f32> = (0..v4_router::V4_ROUTED_EXPERTS)
+            .map(|expert| (expert as f32 - 192.0) / 64.0)
+            .collect();
+        let logits_batch = [logits_row.clone(), logits_row.clone()].concat();
+        let hash_row = [1_i64, 3, 5, 7, 9, 11];
+        let hash_batch = [hash_row, hash_row].concat();
+        let bias = vec![0.0_f32; v4_router::V4_ROUTED_EXPERTS];
+        let (normalized_s1, routes_s1) = run_v4_router_gpu_oracle(
+            &module,
+            &stream,
+            &router_row,
+            &norm,
+            &logits_row,
+            &bias,
+            &hash_row,
+            true,
+        )
+        .expect("S=1 router");
+        let (normalized_k2, routes_k2) = run_v4_router_gpu_oracle(
+            &module,
+            &stream,
+            &router_batch,
+            &norm,
+            &logits_batch,
+            &bias,
+            &hash_batch,
+            true,
+        )
+        .expect("K2 router");
+        assert_eq!(
+            &normalized_k2[..v4_router::V4_HIDDEN],
+            normalized_s1.as_slice(),
+            "active_rows=2 changed row0 normalized BF16 bits"
+        );
+        assert_eq!(
+            &routes_k2.ids[..v4_router::V4_TOPK],
+            routes_s1.ids.as_slice(),
+            "active_rows=2 changed row0 routes"
+        );
+        assert!(
+            routes_k2.weights[..v4_router::V4_TOPK]
+                .iter()
+                .zip(&routes_s1.weights)
+                .all(|(k2, s1)| k2.to_bits() == s1.to_bits()),
+            "active_rows=2 changed row0 route weight bits"
+        );
+        assert!(
+            routes_k2.weights[v4_router::V4_TOPK..]
+                .iter()
+                .zip(&routes_s1.weights)
+                .all(|(k2, s1)| k2.to_bits() == s1.to_bits()),
+            "test requires the second row to share the selected route weights"
+        );
+        let route_weight = routes_s1.weights[0];
+
+        const INPUT: usize = 32;
+        const INTERMEDIATE: usize = 32;
+        const OUTPUT: usize = 2;
+        let row0: Vec<f32> = (0..INPUT).map(|index| index as f32 / 16.0 - 1.0).collect();
+        let row1: Vec<f32> = (0..INPUT)
+            .map(|index| (31 - index) as f32 / 20.0 - 0.75)
+            .collect();
+        let input_k2 = [row0.clone(), row1].concat();
+        let w1: Vec<u8> = (0..INTERMEDIATE * INPUT / 2)
+            .map(|index| [0x10, 0x32, 0x54, 0x76, 0x89, 0xab, 0xcd, 0xef][index % 8])
+            .collect();
+        let w3: Vec<u8> = (0..INTERMEDIATE * INPUT / 2)
+            .map(|index| [0x21, 0x43, 0x65, 0x87, 0x9a, 0xbc, 0xde, 0xf0][index % 8])
+            .collect();
+        let w2: Vec<u8> = (0..OUTPUT * INTERMEDIATE / 2)
+            .map(|index| [0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef][index % 8])
+            .collect();
+        let w1_scale = vec![127_u8; INTERMEDIATE * INPUT / 32];
+        let w3_scale = vec![127_u8; INTERMEDIATE * INPUT / 32];
+        let w2_scale = vec![127_u8; OUTPUT * INTERMEDIATE / 32];
+
+        let run = |input: &[f32], rows: usize| {
+            let input = DeviceBuffer::from_host(&stream, input).expect("upload synthetic rows");
+            let w1_device = DeviceBuffer::from_host(&stream, &w1).expect("upload w1");
+            let w3_device = DeviceBuffer::from_host(&stream, &w3).expect("upload w3");
+            let w2_device = DeviceBuffer::from_host(&stream, &w2).expect("upload w2");
+            let w1_scale_device =
+                DeviceBuffer::from_host(&stream, &w1_scale).expect("upload w1 scales");
+            let w3_scale_device =
+                DeviceBuffer::from_host(&stream, &w3_scale).expect("upload w3 scales");
+            let w2_scale_device =
+                DeviceBuffer::from_host(&stream, &w2_scale).expect("upload w2 scales");
+            let mut gate = DeviceBuffer::<u16>::zeroed(&stream, rows * INTERMEDIATE).expect("gate");
+            let mut up = DeviceBuffer::<u16>::zeroed(&stream, rows * INTERMEDIATE).expect("up");
+            let mut activated =
+                DeviceBuffer::<u16>::zeroed(&stream, rows * INTERMEDIATE).expect("activated");
+            let mut activated_f32 =
+                DeviceBuffer::<f32>::zeroed(&stream, rows * INTERMEDIATE).expect("activated f32");
+            let mut output = DeviceBuffer::<u16>::zeroed(&stream, rows * OUTPUT).expect("output");
+            launch_v4_fp4_matvec(
+                &module,
+                &stream,
+                &input,
+                &w1_device,
+                &w1_scale_device,
+                &mut gate,
+                rows,
+                INTERMEDIATE,
+                INPUT,
+            )
+            .expect("w1 fixed-microtile");
+            launch_v4_fp4_matvec(
+                &module,
+                &stream,
+                &input,
+                &w3_device,
+                &w3_scale_device,
+                &mut up,
+                rows,
+                INTERMEDIATE,
+                INPUT,
+            )
+            .expect("w3 fixed-microtile");
+            launch_v4_swiglu_route(&module, &stream, &gate, &up, &mut activated, route_weight)
+                .expect("weighted SwiGLU");
+            launch_v4_bf16_to_f32(&module, &stream, &activated, &mut activated_f32)
+                .expect("BF16 activation to FP32");
+            launch_v4_fp4_matvec(
+                &module,
+                &stream,
+                &activated_f32,
+                &w2_device,
+                &w2_scale_device,
+                &mut output,
+                rows,
+                OUTPUT,
+                INTERMEDIATE,
+            )
+            .expect("w2 fixed-microtile");
+            (
+                gate.to_host_vec(&stream).expect("download gate"),
+                up.to_host_vec(&stream).expect("download up"),
+                activated
+                    .to_host_vec(&stream)
+                    .expect("download weighted activation"),
+                output.to_host_vec(&stream).expect("download contribution"),
+            )
+        };
+
+        let s1 = run(&row0, 1);
+        let k2 = run(&input_k2, 2);
+        assert_eq!(&k2.0[..INTERMEDIATE], s1.0.as_slice(), "w1 raw BF16");
+        assert_eq!(&k2.1[..INTERMEDIATE], s1.1.as_slice(), "w3 raw BF16");
+        assert_eq!(
+            &k2.2[..INTERMEDIATE],
+            s1.2.as_slice(),
+            "weighted SwiGLU BF16"
+        );
+        assert_eq!(&k2.3[..OUTPUT], s1.3.as_slice(), "final contribution BF16");
+        println!(
+            "K2_ROW_INVARIANCE raw_bit_mismatch=0 route_id_mismatch=0 route_weight_bit_mismatch=0 contribution_bit_mismatch=0 contribution_fnv1a={:016x}",
+            fnv1a_u16(&s1.3)
+        );
+    }
+}

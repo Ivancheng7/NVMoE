@@ -1,0 +1,428 @@
+{
+  "binary": {
+    "activation_fp8": {
+      "bytes": 28672,
+      "dtype": "e4m3fn",
+      "offset": 57352,
+      "shape": [
+        4,
+        7168
+      ]
+    },
+    "activation_scale": {
+      "bytes": 224,
+      "dtype": "e8m0fnu",
+      "offset": 86024,
+      "shape": [
+        4,
+        56
+      ]
+    },
+    "cache_after_bf16": {
+      "bytes": 163840,
+      "dtype": "bf16-le",
+      "offset": 2952564,
+      "shape": [
+        1,
+        160,
+        512
+      ]
+    },
+    "cache_initial_bf16": {
+      "bytes": 163840,
+      "dtype": "bf16-le",
+      "offset": 2788724,
+      "shape": [
+        1,
+        160,
+        512
+      ]
+    },
+    "causal_topk_i32": {
+      "bytes": 64,
+      "dtype": "i32-le",
+      "offset": 2788660,
+      "shape": [
+        1,
+        4,
+        4
+      ]
+    },
+    "compressor_kv_f32": {
+      "bytes": 8192,
+      "dtype": "f32-le",
+      "offset": 3116404,
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    "compressor_kv_state_after_f32": {
+      "bytes": 262144,
+      "dtype": "f32-le",
+      "offset": 3665268,
+      "shape": [
+        1,
+        128,
+        512
+      ]
+    },
+    "compressor_kv_state_initial_f32": {
+      "bytes": 262144,
+      "dtype": "f32-le",
+      "offset": 3140980,
+      "shape": [
+        1,
+        128,
+        512
+      ]
+    },
+    "compressor_score_f32": {
+      "bytes": 8192,
+      "dtype": "f32-le",
+      "offset": 3124596,
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    "compressor_score_plus_ape_f32": {
+      "bytes": 8192,
+      "dtype": "f32-le",
+      "offset": 3132788,
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    "compressor_score_state_after_f32": {
+      "bytes": 262144,
+      "dtype": "f32-le",
+      "offset": 3927412,
+      "shape": [
+        1,
+        128,
+        512
+      ]
+    },
+    "compressor_score_state_initial_f32": {
+      "bytes": 262144,
+      "dtype": "f32-le",
+      "offset": 3403124,
+      "shape": [
+        1,
+        128,
+        512
+      ]
+    },
+    "freqs_cis_f32_pairs": {
+      "bytes": 1024,
+      "dtype": "f32-le",
+      "offset": 2255128,
+      "shape": [
+        4,
+        32,
+        2
+      ]
+    },
+    "input_bf16": {
+      "bytes": 57344,
+      "dtype": "bf16-le",
+      "offset": 8,
+      "shape": [
+        4,
+        7168
+      ]
+    },
+    "kv_norm_bf16": {
+      "bytes": 4096,
+      "dtype": "bf16-le",
+      "offset": 147688,
+      "shape": [
+        4,
+        512
+      ]
+    },
+    "kv_ready_bf16": {
+      "bytes": 4096,
+      "dtype": "bf16-le",
+      "offset": 2784564,
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    "kv_rope_bf16": {
+      "bytes": 4096,
+      "dtype": "bf16-le",
+      "offset": 2780440,
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    "kv_scale_e8m0": {
+      "bytes": 28,
+      "dtype": "e8m0fnu",
+      "offset": 2784536,
+      "shape": [
+        1,
+        4,
+        7
+      ]
+    },
+    "magic": "CV4P8001",
+    "q_head_rms_bf16": {
+      "bytes": 524288,
+      "dtype": "bf16-le",
+      "offset": 1730840,
+      "shape": [
+        1,
+        4,
+        128,
+        512
+      ]
+    },
+    "q_norm_bf16": {
+      "bytes": 12288,
+      "dtype": "bf16-le",
+      "offset": 123112,
+      "shape": [
+        4,
+        1536
+      ]
+    },
+    "q_rope_bf16": {
+      "bytes": 524288,
+      "dtype": "bf16-le",
+      "offset": 2256152,
+      "shape": [
+        1,
+        4,
+        128,
+        512
+      ]
+    },
+    "sha256": "b70ad7a4cb47c290eaa4f810566078c65cc0fb99bde06c27ac6f304500a790ee",
+    "wkv_bf16": {
+      "bytes": 4096,
+      "dtype": "bf16-le",
+      "offset": 143592,
+      "shape": [
+        4,
+        512
+      ]
+    },
+    "wkv_f32": {
+      "bytes": 8192,
+      "dtype": "f32-le",
+      "offset": 135400,
+      "shape": [
+        4,
+        512
+      ]
+    },
+    "wq_b_activation": {
+      "bytes": 6144,
+      "dtype": "e4m3fn",
+      "offset": 151784,
+      "shape": [
+        4,
+        1536
+      ]
+    },
+    "wq_b_activation_scale": {
+      "bytes": 48,
+      "dtype": "e8m0fnu",
+      "offset": 157928,
+      "shape": [
+        4,
+        12
+      ]
+    },
+    "wq_b_bf16": {
+      "bytes": 524288,
+      "dtype": "bf16-le",
+      "offset": 1206552,
+      "shape": [
+        4,
+        65536
+      ]
+    },
+    "wq_b_f32": {
+      "bytes": 1048576,
+      "dtype": "f32-le",
+      "offset": 157976,
+      "shape": [
+        4,
+        65536
+      ]
+    },
+    "wq_bf16": {
+      "bytes": 12288,
+      "dtype": "bf16-le",
+      "offset": 110824,
+      "shape": [
+        4,
+        1536
+      ]
+    },
+    "wq_f32": {
+      "bytes": 24576,
+      "dtype": "f32-le",
+      "offset": 86248,
+      "shape": [
+        4,
+        1536
+      ]
+    }
+  },
+  "cache_contract": {
+    "capacity_1_compressed_view_sha256": "c35020473aed1b4642cd726cad727b63fff2824ad68cedd7ffb73c7cbd890479",
+    "capacity_1_untouched_tail_sha256": "30d4da31db85877f0102e0d56b9559e9d4400fde83c253a19c7c1988b4ed0c64",
+    "capacity_4_after_sha256": "525ba206025f57ccb2459086e2abd6d571551d61c37be9ca45067f784717b45c",
+    "capacity_4_initial_sha256": "ff6335069b6e140eb47149d847aea80bf7e2b06bd80ae9708aa382efb3ae21ee"
+  },
+  "compressor_contract": {
+    "batch_size": 1,
+    "compress_ratio": 128,
+    "kv_state_tail_sha256": "5132a24b01320fb085912c4da9e4c7cebe6c0f2a5dd43f277b4138e8d6d4e9b3",
+    "overlap": false,
+    "score_state_tail_sha256": "0fe4793aa3e282837a93e5d34698915b3ab667ccbabd7fc21cfb01dda8252c37",
+    "sequence_len": 4,
+    "should_compress": false,
+    "start_pos": 0,
+    "written_byte_range": [
+      0,
+      8192
+    ]
+  },
+  "environment": {
+    "device": "cpu",
+    "safetensors": "0.8.0",
+    "threads": 1,
+    "torch": "2.13.0+cpu"
+  },
+  "hashes": {
+    "activation_fp8": "c7dcb5b1f75fc67053a6659ee8e6df59d7347e9f26198d8aba6b996c97727358",
+    "activation_scale": "f77fc18aea43e17694cdacdfe676ce7f18b68ce15f31cdd751201d0fc543a09a",
+    "cache_after_bf16": "ebe6644642b05f6d23efa9f573d5483c498c7aba210c0a41f0611aca073edba6",
+    "cache_initial_bf16": "6cdd259c8ecbe61fbc369f3293c1961541386954a223b17a37899d7fd9ad42da",
+    "causal_topk_i32": "ebcca8a99005905d352d187e38023107b7bfc6611dd69499ad2b88288c594f00",
+    "compressor_kv_f32": "e3c9aac77d93f70cb1b0dc2242cfa8a67fe712d67142bc669eac7c0a224d9f3f",
+    "compressor_kv_state_after_f32": "e95703723cea6e25b27c510cd92d652491a11d0b0ede02330ef0566aa00073dd",
+    "compressor_kv_state_initial_f32": "8a39d2abd3999ab73c34db2476849cddf303ce389b35826850f9a700589b4a90",
+    "compressor_score_f32": "824861a6cd77a8eaf3997d2f4da5d00396507cfdff6ea97d390f08ff059fbbe7",
+    "compressor_score_plus_ape_f32": "941e5c6962754b0863ebe8ccb5ff97e69f41d03dd220836de1671ec0eb5df34a",
+    "compressor_score_state_after_f32": "e056758653a459bc66f6d2da2a764b56aa8f06da528ed30c8cae3b48c21249a4",
+    "compressor_score_state_initial_f32": "6470bc26e7cc29bf2cc0672d57eb7062150933581c52927d2a4f7be0f5ed0778",
+    "freqs_cis_f32_pairs": "d8d903ccf3dff66933fe32d3dc01f48088011b7697124229bd54cde47e0a05c1",
+    "input_bf16": "7627d8b18a5eb98d14a8985094e01cd178fbad8bbc3103cfef8e7dd38bd8185f",
+    "kv_norm_bf16": "8e3eb47d233e2be25fb53b8453ca969c0400939444dc8271c5bfb85ad9d28b3b",
+    "kv_ready_bf16": "20dfb59da6da5b9a29463c3ce731de48f1c8ff4dca7df3105b11e9760df0b5a1",
+    "kv_rope_bf16": "57e405931f753518bcb4292931a1e77f725b69b0b833071b95467c3240d278e8",
+    "kv_scale_e8m0": "884a47bc34eb98a71f783a70457f2126cec940333470386395edd90383a55579",
+    "q_head_rms_bf16": "eff8c5282170c26212abc8199df18f61a5513375590a73e64c6da0a33173da2a",
+    "q_norm_bf16": "abe4e938487183728742c2adb5370839fbf63309397ecf8ae8f6f436b19a2397",
+    "q_rope_bf16": "185eae6ca4339d4d66d532f7e88647b31a793d7db6f6d5e444465f87fb4e2621",
+    "wkv_bf16": "bf8b3fedbb3b23fece8f9cef75ba3faedfb6e84acd51e101f548f3a9dc2c2da7",
+    "wkv_f32": "dd89a3a25e6c3705d4e45c268b7557e42de3ff0a3ba3abfe0453a4f5dad4756e",
+    "wq_b_activation": "f1cd00c6cbf276f79383b367409c1bab002cee33c0b04dc5080d346f3bb9a0c7",
+    "wq_b_activation_scale": "6dab1934d3c41a145599c3de00c609bdc5da40ad44c0834bb677290dac346c72",
+    "wq_b_bf16": "53af957538b5a9cb9f52eac2466b8bc236b270b27e94768bad1ecb56a511e179",
+    "wq_b_f32": "b1f75f61eb5a679528dc37a64bf45eba9eac09d06394da4e6dd313dad7792716",
+    "wq_bf16": "b076e4cd4ed9b711d73693d62595804630c212f4d824beb146860d97c43df024",
+    "wq_f32": "e1d3c01a491346ddb36c93f83b939d4b8036fc212de70c238b47f435048be2a9"
+  },
+  "ids": [
+    0,
+    1,
+    2,
+    129279
+  ],
+  "model_revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+  "schema": "colibri-v4-fp8-projection-pytorch-oracle-v4",
+  "semantics": {
+    "activation": "BF16 groups of 128; max(abs) clamped to 1e-4; ceil-power-of-two E8M0 scale; E4M3FN RNE",
+    "compressor_boundary": "start_pos=0, bsz=1, seqlen=4, ratio=128, overlap=false; FP32 F.linear wkv/wgate; only remainder rows commit to paired FP32 states; should_compress=false; stop before norm/RoPE/quant/cache/attention",
+    "kv_boundary": "fixed kv_norm BF16; RoPE only last 64 adjacent pairs; first 448 fake-quantized in 64-wide E4M3FN/E8M0 blocks; causal topk; one contiguous capacity-1 cache write then stop",
+    "norm": "FP32 mean-square and rsqrt with eps=1e-6; multiply BF16 checkpoint weight in FP32; cast BF16",
+    "projection": "FP32 dot per K=128 block; multiply activation and 128x128 weight E8M0 scales; accumulate blocks in K order; cast BF16",
+    "wq_b_boundary": "q_norm BF16 is independently requantized before wq_b; wq_b output boundary is raw FP32 then BF16 with no following op in this fixture"
+  },
+  "source": {
+    "compressor": {
+      "ape": "layers.0.attn.compressor.ape",
+      "ape_sha256": "9b28a13ba864996147d41ec3f14f684ab18574ad0e6f7781a7a125b1e9a91af1",
+      "ape_shape": [
+        128,
+        512
+      ],
+      "wgate": "layers.0.attn.compressor.wgate.weight",
+      "wgate_sha256": "827ebd72c1cdf7b81ec6ba76725fe46e7b01f383466067e92111054e07f4c9f6",
+      "wgate_shape": [
+        512,
+        7168
+      ],
+      "wkv": "layers.0.attn.compressor.wkv.weight",
+      "wkv_sha256": "caa6aca271c241ba79879ab6a310bd962003909fcd3399e5ebe56da7b3f7393c",
+      "wkv_shape": [
+        512,
+        7168
+      ]
+    },
+    "input_state_norm_sha256": "7627d8b18a5eb98d14a8985094e01cd178fbad8bbc3103cfef8e7dd38bd8185f",
+    "shard": "model-00002-of-00064.safetensors",
+    "wkv": {
+      "norm": "layers.0.attn.kv_norm.weight",
+      "norm_sha256": "ce678d0a21406ca1e7ec57e0a4aada2efb8c3f584f6836bd7631f380e2d4bb10",
+      "scale": "layers.0.attn.wkv.scale",
+      "scale_sha256": "b5fffc2f9c839be42fff94a01aedce011aee1d5615c04448424eda17254da7f5",
+      "scale_shape": [
+        4,
+        56
+      ],
+      "weight": "layers.0.attn.wkv.weight",
+      "weight_sha256": "dc3715393b77cd9fec370dbfd27c8f24e0ae8b4cb10fd1ae317a0277aa84ef32",
+      "weight_shape": [
+        512,
+        7168
+      ]
+    },
+    "wq_a": {
+      "norm": "layers.0.attn.q_norm.weight",
+      "norm_sha256": "a0c59ac1e4485921f87da97089f8cb22f12c9d8516f0523d956391103a6c8a23",
+      "scale": "layers.0.attn.wq_a.scale",
+      "scale_sha256": "8596a7b6b956ee51acee01f85cf8809a15ea4698fc41b5f87a0942bc5c1bc6d7",
+      "scale_shape": [
+        12,
+        56
+      ],
+      "weight": "layers.0.attn.wq_a.weight",
+      "weight_sha256": "3dd3d8d478e4c973edb23877d40b8e444c93807bc727ed06f57ed833df3e085b",
+      "weight_shape": [
+        1536,
+        7168
+      ]
+    },
+    "wq_b": {
+      "scale": "layers.0.attn.wq_b.scale",
+      "scale_sha256": "ff34ea897240620cbec27a801a034c55c93a260f240bb375ec38a9bf957c499c",
+      "scale_shape": [
+        512,
+        12
+      ],
+      "weight": "layers.0.attn.wq_b.weight",
+      "weight_sha256": "1d7a1b01c1c1e39059a4cb5ce4d373f4906d6be8eb82bed7d277d7ab5fe75c9e",
+      "weight_shape": [
+        65536,
+        1536
+      ]
+    }
+  }
+}

@@ -1,0 +1,37 @@
+name: Rust preflight
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  rust-preflight:
+    # Hosted runners have no NVIDIA device. This checks the pinned Rust source
+    # path and cuda-oxide CLI provenance, not CUDA artifact finalization or GPU
+    # correctness; those remain hardware gates.
+    name: Rust source preflight (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-03
+          components: rust-src,rustc-dev,rustfmt,llvm-tools
+      - name: Install pinned cuda-oxide CLI
+        run: >-
+          cargo install --git https://github.com/NVlabs/cuda-oxide.git
+          --rev 8d02eac17e56d5ed5ad3713fc498a2591d810919
+          cargo-oxide --locked
+      - name: Check Rust source and CUDA entrypoint
+        working-directory: rust
+        run: |
+          cargo fmt --check
+          cargo check --locked -p colibri-cuda
+          ./run-identified.sh --version
+      - name: Check README evidence files
+        run: |
+          python3 -m json.tool docs/assets/readme/data/qd4-full61/confirmatory/summary.json >/dev/null
+          python3 -m json.tool docs/assets/readme/data/qd4-stationary-gate/review-boundary.json >/dev/null
+          python3 -c 'import xml.etree.ElementTree as E, pathlib; [E.parse(p) for p in pathlib.Path("docs/assets/readme").glob("[0-9][0-9]-*.svg")]'

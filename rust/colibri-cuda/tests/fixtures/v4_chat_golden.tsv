@@ -1,0 +1,9 @@
+case	mode	content	prompt
+chat_hi	chat	hi	<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>
+thinking_hi	thinking	hi	<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜><think>
+chat_empty	chat		<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>
+thinking_empty	thinking		<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜><think>
+chat_ascii	chat	Hello, world!	<｜begin▁of▁sentence｜><｜User｜>Hello, world!<｜Assistant｜></think>
+thinking_ascii	thinking	Hello, world!	<｜begin▁of▁sentence｜><｜User｜>Hello, world!<｜Assistant｜><think>
+chat_unicode	chat	你好，世界！	<｜begin▁of▁sentence｜><｜User｜>你好，世界！<｜Assistant｜></think>
+thinking_unicode	thinking	你好，世界！	<｜begin▁of▁sentence｜><｜User｜>你好，世界！<｜Assistant｜><think>
