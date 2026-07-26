@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">P6 full61 next-token timing</title>
+  <desc id="desc">Three horizontal bars start at zero seconds per token. Pre-pipeline is 17.162779092 seconds per token, pinned pipeline is 15.852466305, and combined path is 14.789027100. Each condition has one development trace and no confidence interval.</desc>
+  <style>
+    .title { font-family: Arial, Helvetica, sans-serif; font-size: 36px; font-weight: 700; fill: #17202a; }
+    .subtitle { font-family: Arial, Helvetica, sans-serif; font-size: 20px; fill: #4d5b66; }
+    .label { font-family: Arial, Helvetica, sans-serif; font-size: 24px; font-weight: 700; fill: #17202a; }
+    .value { font-family: Arial, Helvetica, sans-serif; font-size: 26px; font-weight: 700; fill: #17202a; }
+    .note { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #4d5b66; }
+    .tick { font-family: Arial, Helvetica, sans-serif; font-size: 18px; fill: #4d5b66; }
+  </style>
+  <rect width="1200" height="720" fill="#ffffff"/>
+  <text class="title" x="72" y="72">P6 full61 next-token wall time</text>
+  <text class="subtitle" x="72" y="106">Same timing estimand in each condition. Lower is faster.</text>
+  <text class="subtitle" x="72" y="136">Development traces only: n = 1 per condition, no confidence interval.</text>
+
+  <line x1="300" y1="190" x2="300" y2="570" stroke="#17202a" stroke-width="3"/>
+  <line x1="300" y1="570" x2="1080" y2="570" stroke="#17202a" stroke-width="3"/>
+  <g stroke="#d9e1e8" stroke-width="2">
+    <line x1="495" y1="190" x2="495" y2="570"/>
+    <line x1="690" y1="190" x2="690" y2="570"/>
+    <line x1="885" y1="190" x2="885" y2="570"/>
+    <line x1="1080" y1="190" x2="1080" y2="570"/>
+  </g>
+  <g class="tick" text-anchor="middle">
+    <text x="300" y="606">0</text>
+    <text x="495" y="606">5</text>
+    <text x="690" y="606">10</text>
+    <text x="885" y="606">15</text>
+    <text x="1080" y="606">20</text>
+  </g>
+  <text class="note" x="690" y="652" text-anchor="middle">seconds per token</text>
+
+  <text class="label" x="72" y="256">Pre-pipeline</text>
+  <rect x="300" y="210" width="669.35" height="70" rx="6" fill="#0072b2"/>
+  <text class="value" x="985" y="256">17.162779092 s</text>
+
+  <text class="label" x="72" y="386">Pinned pipeline</text>
+  <rect x="300" y="340" width="618.25" height="70" rx="6" fill="#009e73"/>
+  <text class="value" x="934" y="386">15.852466305 s</text>
+
+  <text class="label" x="72" y="516">Combined path</text>
+  <rect x="300" y="470" width="576.77" height="70" rx="6" fill="#d55e00"/>
+  <text class="value" x="892" y="516">14.789027100 s</text>
+
+  <rect x="72" y="662" width="1056" height="1" fill="#d9e1e8"/>
+  <text class="note" x="72" y="696">Combined path: 0.0676177 token/s. Descriptive 1.1605x comparison with pre-pipeline.</text>
+</svg>

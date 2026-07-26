@@ -22,6 +22,21 @@ use std::io::Write;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer, sys};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
 
+const CERTIFIED_HEAD_NONFINITE: u32 = 1;
+const CERTIFIED_HEAD_SUBNORMAL: u32 = 2;
+const CERTIFIED_HEAD_OVERFLOW: u32 = 4;
+const CERTIFIED_HEAD_INTERVAL_INVALID: u32 = 8;
+const CERTIFIED_HEAD_ALL_CANDIDATES: u32 = 16;
+const CERTIFIED_HEAD_RUNTIME_ERROR: u32 = 32;
+
+const CERTIFIED_ARGMAX_CHUNK_ROWS: usize = 1_024;
+const CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES: usize = v4_state::HIDDEN * 2
+    + CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN * 2
+    + CERTIFIED_ARGMAX_CHUNK_ROWS * (std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u32>());
+const CERTIFIED_ARGMAX_HOST_TEMP_BYTES: usize = CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN * 4
+    + v4_state::VOCAB * (std::mem::size_of::<f32>() * 3)
+    + v4_state::HIDDEN * (std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u16>() * 2);
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -407,6 +422,8 @@ mod kernels {
         input: &[u16],
         weight: &[u16],
         mut output: DisjointSlice<f32>,
+        mut sumabs: DisjointSlice<f32>,
+        mut status: DisjointSlice<u32>,
         in_features: u32,
         out_features: u32,
     ) {
@@ -417,15 +434,43 @@ mod kernels {
         if input.len() != in_features
             || weight.len() < out_features * in_features
             || output.len() < out_features
+            || sumabs.len() < out_features
+            || status.len() < out_features
             || output_row >= out_features
         {
             return;
         }
         let mut sum = 0.0_f32;
+        let mut absolute_sum = 0.0_f32;
+        let mut row_status = 0_i32;
         let mut column = lane;
         while column < in_features {
-            sum +=
-                bf16_to_f32(input[column]) * bf16_to_f32(weight[output_row * in_features + column]);
+            let input_bits = input[column];
+            let weight_bits = weight[output_row * in_features + column];
+            let input_exponent = (input_bits >> 7) & 0xff;
+            let weight_exponent = (weight_bits >> 7) & 0xff;
+            if input_exponent == 0xff || weight_exponent == 0xff {
+                row_status |= CERTIFIED_HEAD_NONFINITE as i32;
+            }
+            if (input_exponent == 0 && input_bits & 0x7f != 0)
+                || (weight_exponent == 0 && weight_bits & 0x7f != 0)
+            {
+                row_status |= CERTIFIED_HEAD_SUBNORMAL as i32;
+            }
+            let product = bf16_to_f32(input_bits) * bf16_to_f32(weight_bits);
+            sum += product;
+            absolute_sum += product.abs();
+            let product_bits = product.to_bits();
+            let sum_bits = sum.to_bits();
+            if product_bits & 0x7f80_0000 == 0x7f80_0000 || sum_bits & 0x7f80_0000 == 0x7f80_0000 {
+                row_status |= CERTIFIED_HEAD_NONFINITE as i32;
+                row_status |= CERTIFIED_HEAD_OVERFLOW as i32;
+            }
+            if (product_bits & 0x7f80_0000 == 0 && product_bits & 0x007f_ffff != 0)
+                || (sum_bits & 0x7f80_0000 == 0 && sum_bits & 0x007f_ffff != 0)
+            {
+                row_status |= CERTIFIED_HEAD_SUBNORMAL as i32;
+            }
             column += 32;
         }
         sum += warp::shuffle_xor_f32(sum, 16);
@@ -433,10 +478,33 @@ mod kernels {
         sum += warp::shuffle_xor_f32(sum, 4);
         sum += warp::shuffle_xor_f32(sum, 2);
         sum += warp::shuffle_xor_f32(sum, 1);
+        absolute_sum += warp::shuffle_xor_f32(absolute_sum, 16);
+        absolute_sum += warp::shuffle_xor_f32(absolute_sum, 8);
+        absolute_sum += warp::shuffle_xor_f32(absolute_sum, 4);
+        absolute_sum += warp::shuffle_xor_f32(absolute_sum, 2);
+        absolute_sum += warp::shuffle_xor_f32(absolute_sum, 1);
+        row_status |= warp::shuffle_xor(row_status as u32, 16) as i32;
+        row_status |= warp::shuffle_xor(row_status as u32, 8) as i32;
+        row_status |= warp::shuffle_xor(row_status as u32, 4) as i32;
+        row_status |= warp::shuffle_xor(row_status as u32, 2) as i32;
+        row_status |= warp::shuffle_xor(row_status as u32, 1) as i32;
         if lane == 0 {
+            let sum_bits = sum.to_bits();
+            let sumabs_bits = absolute_sum.to_bits();
+            if sum_bits & 0x7f80_0000 == 0x7f80_0000 || sumabs_bits & 0x7f80_0000 == 0x7f80_0000 {
+                row_status |= CERTIFIED_HEAD_NONFINITE as i32;
+                row_status |= CERTIFIED_HEAD_OVERFLOW as i32;
+            }
+            if (sum_bits & 0x7f80_0000 == 0 && sum_bits & 0x007f_ffff != 0)
+                || (sumabs_bits & 0x7f80_0000 == 0 && sumabs_bits & 0x007f_ffff != 0)
+            {
+                row_status |= CERTIFIED_HEAD_SUBNORMAL as i32;
+            }
             // SAFETY: lane zero uniquely owns this checked output row.
             unsafe {
                 *output.as_mut_ptr().add(output_row) = sum;
+                *sumabs.as_mut_ptr().add(output_row) = absolute_sum;
+                *status.as_mut_ptr().add(output_row) = row_status as u32;
             }
         }
     }
@@ -2460,6 +2528,19 @@ fn raw_wo_a_gpu_decode_enabled() -> Result<bool, Box<dyn Error>> {
     parse_default_true_zero_one_flag("COLIBRI_V4_RAW_WO_A_GPU_DECODE", value.as_deref())
 }
 
+fn certified_argmax_production_enabled(
+    device_attention: bool,
+    greedy_steps: usize,
+) -> Result<bool, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_CERTIFIED_ARGMAX_PRODUCTION");
+    Ok(device_attention
+        && greedy_steps != 0
+        && parse_default_true_zero_one_flag(
+            "COLIBRI_V4_CERTIFIED_ARGMAX_PRODUCTION",
+            value.as_deref(),
+        )?)
+}
+
 fn fixed_prefetch_wo_a_decode_arm(
     fixed_prefetch: bool,
     device_attention: bool,
@@ -2595,6 +2676,7 @@ struct Full61Preflight {
     qd4_enabled: bool,
     qd4_immutable_expert_cache: bool,
     qd4_bench: bool,
+    certified_argmax_audit: bool,
     result: Option<PendingResultFile>,
 }
 
@@ -2616,6 +2698,7 @@ impl Full61Preflight {
         let qd4_immutable_expert_cache =
             optional_one_flag("COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE")?;
         let qd4_bench = optional_one_flag("COLIBRI_V4_ROUTED_QD4_BENCH")?;
+        let certified_argmax_audit = optional_one_flag("COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT")?;
         let raw_cache = optional_one_flag("COLIBRI_V4_RAW_FIXED_CACHE")?;
         let cache_is_off = parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? == 0
             && parse_gib_budget("COLIBRI_V4_HOST_FIXED_CACHE_GIB")? == 0
@@ -2650,6 +2733,11 @@ impl Full61Preflight {
         if fixed_prefetch {
             validate_fixed_prefetch_mode(full61_requested, layer_stationary_prefill, cache_is_off)?;
         }
+        if certified_argmax_audit && !layer_stationary_prefill {
+            return Err(
+                "COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT requires full61 layer-stationary prefill".into(),
+            );
+        }
         let result_path = std::env::var_os("COLIBRI_V4_RESULT_JSONL").map(std::path::PathBuf::from);
         if layer_stationary_prefill && result_path.is_none() {
             return Err("layer-stationary prefill requires COLIBRI_V4_RESULT_JSONL".into());
@@ -2662,6 +2750,7 @@ impl Full61Preflight {
             qd4_enabled,
             qd4_immutable_expert_cache,
             qd4_bench,
+            certified_argmax_audit,
             result: result_path.map(PendingResultFile::reserve).transpose()?,
         })
     }
@@ -2684,10 +2773,14 @@ fn main() {
         || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").is_some()
         || std::env::var_os("COLIBRI_V4_SPARSE_K128_MICROGATE").is_some()
         || std::env::var_os("COLIBRI_V4_TARGETED_ATTENTION_AUDIT").is_some()
+        || std::env::var_os("COLIBRI_V4_PINNED_H2D_SERVICE_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_GATE").is_some()
+        || std::env::var_os("COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT").is_some()
         || std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some();
     let mut full61_preflight = (std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
         || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
-        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some())
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some()
+        || std::env::var_os("COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT").is_some())
     .then(Full61Preflight::from_env)
     .transpose()
     .expect("validate V4 full61 configuration");
@@ -2709,8 +2802,22 @@ fn main() {
     // ponytail: this smoke uses synchronous safe copies for a terminal parity
     // check; switch to event-owned async buffers when production dispatch lands.
     let context = CudaContext::new(0).expect("create CUDA context");
+    if optional_one_flag("COLIBRI_V4_PINNED_H2D_SERVICE_GATE")
+        .expect("validate pinned H2D service-gate flag")
+    {
+        pinned_h2d_service_gate(&context).expect("run pinned H2D service gate");
+        return;
+    }
     let stream = context.default_stream();
     let module = kernels::load(&context).expect("load embedded Rust PTX");
+
+    if optional_one_flag("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_GATE")
+        .expect("validate pinned fixed worker boundary-gate flag")
+    {
+        run_pinned_fixed_worker_boundary_gate(&context, &module, &stream)
+            .expect("run pinned fixed worker boundary gate");
+        return;
+    }
 
     if std::env::var_os("COLIBRI_V4_FINAL_HEAD_BENCH").as_deref() == Some(std::ffi::OsStr::new("1"))
     {
@@ -2965,6 +3072,8 @@ fn main() {
 
 struct StreamedFinalHeadRun {
     output: v4_state::FinalHeadOutput,
+    sumabs_f32: Vec<f32>,
+    status: Vec<u32>,
     read_ns: u64,
     h2d_ns: u64,
     kernel_ns: u64,
@@ -3092,7 +3201,7 @@ fn run_real_v4_final_head_bench(
                     "h2d_bytes": source_bytes + v4_state::HIDDEN * 2,
                     "kernel_ns": gpu.kernel_ns,
                     "d2h_ns": gpu.d2h_ns,
-                    "d2h_bytes": v4_state::VOCAB * 4,
+                    "d2h_bytes": v4_state::VOCAB * (std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u32>()),
                     "cpu_preprocess_ns": gpu.cpu_preprocess_ns,
                 },
                 "canonical": {
@@ -3148,7 +3257,6 @@ fn run_streamed_final_head_gpu(
     weights: &v4_state::FinalHeadWeights,
     hc_hidden_bf16: &[u16],
 ) -> Result<StreamedFinalHeadRun, Box<dyn Error>> {
-    const CHUNK_ROWS: usize = 1_024;
     let wall_started = std::time::Instant::now();
     let cpu_started = std::time::Instant::now();
     let pre = v4_state::final_hc_gate_cpu(
@@ -3181,17 +3289,22 @@ fn run_streamed_final_head_gpu(
     let input_upload_started = std::time::Instant::now();
     let device_input = DeviceBuffer::from_host(stream, &output.normalized_bf16)?;
     let mut h2d_ns = u64::try_from(input_upload_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let device_weight = DeviceBuffer::<u16>::zeroed(stream, CHUNK_ROWS * v4_state::HIDDEN)?;
-    let mut device_output = DeviceBuffer::<f32>::zeroed(stream, CHUNK_ROWS)?;
+    let device_weight =
+        DeviceBuffer::<u16>::zeroed(stream, CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN)?;
+    let mut device_output = DeviceBuffer::<f32>::zeroed(stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
+    let mut device_sumabs = DeviceBuffer::<f32>::zeroed(stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
+    let mut device_status = DeviceBuffer::<u32>::zeroed(stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
     let start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
     let end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
-    let mut bytes = vec![0_u8; CHUNK_ROWS * v4_state::HIDDEN * 2];
-    let mut words = vec![0_u16; CHUNK_ROWS * v4_state::HIDDEN];
+    let mut bytes = vec![0_u8; CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN * 2];
+    let mut words = vec![0_u16; CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN];
     let mut read_ns = 0_u64;
     let mut kernel_ns = 0_u64;
     let mut d2h_ns = 0_u64;
-    for token_start in (0..v4_state::VOCAB).step_by(CHUNK_ROWS) {
-        let chunk_rows = (v4_state::VOCAB - token_start).min(CHUNK_ROWS);
+    let mut sumabs_f32 = vec![0.0_f32; v4_state::VOCAB];
+    let mut status = vec![0_u32; v4_state::VOCAB];
+    for token_start in (0..v4_state::VOCAB).step_by(CERTIFIED_ARGMAX_CHUNK_ROWS) {
+        let chunk_rows = (v4_state::VOCAB - token_start).min(CERTIFIED_ARGMAX_CHUNK_ROWS);
         let chunk_elements = chunk_rows * v4_state::HIDDEN;
         let chunk_bytes = chunk_elements * 2;
         let read_started = std::time::Instant::now();
@@ -3231,6 +3344,8 @@ fn run_streamed_final_head_gpu(
                 &device_input,
                 &device_weight,
                 &mut device_output,
+                &mut device_sumabs,
+                &mut device_status,
                 u32::try_from(v4_state::HIDDEN)?,
                 u32::try_from(chunk_rows)?,
             )?;
@@ -3240,11 +3355,16 @@ fn run_streamed_final_head_gpu(
         kernel_ns = kernel_ns.saturating_add((start.elapsed_ms(&end)? as f64 * 1_000_000.0) as u64);
         let download_started = std::time::Instant::now();
         let chunk = device_output.to_host_vec(stream)?;
+        let chunk_sumabs = device_sumabs.to_host_vec(stream)?;
+        let chunk_status = device_status.to_host_vec(stream)?;
         d2h_ns = d2h_ns.saturating_add(
             u64::try_from(download_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
         output.logits_f32[token_start..token_start + chunk_rows]
             .copy_from_slice(&chunk[..chunk_rows]);
+        sumabs_f32[token_start..token_start + chunk_rows]
+            .copy_from_slice(&chunk_sumabs[..chunk_rows]);
+        status[token_start..token_start + chunk_rows].copy_from_slice(&chunk_status[..chunk_rows]);
     }
     for token in 1..v4_state::VOCAB {
         if output.logits_f32[token] > output.logits_f32[output.argmax[0]] {
@@ -3253,6 +3373,8 @@ fn run_streamed_final_head_gpu(
     }
     Ok(StreamedFinalHeadRun {
         output,
+        sumabs_f32,
+        status,
         read_ns,
         h2d_ns,
         kernel_ns,
@@ -3260,6 +3382,368 @@ fn run_streamed_final_head_gpu(
         cpu_preprocess_ns,
         wall_ns: u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
     })
+}
+
+struct CertifiedArgmaxRun {
+    token: usize,
+    candidate_count: usize,
+    status: u32,
+    fallback: bool,
+    certified: bool,
+    coeff: f64,
+    margin: Option<f64>,
+    normalized_bf16_digest: u64,
+    mechanism_ns: u64,
+    read_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    d2h_ns: u64,
+    cpu_preprocess_ns: u64,
+    repair_ns: u64,
+    cpu_fallback: Option<v4_state::FinalHeadCpuRun>,
+}
+
+struct IdOnlyFinalHeadDecision {
+    token: usize,
+    certificate: Option<CertifiedArgmaxRun>,
+    cpu: Option<v4_state::FinalHeadCpuRun>,
+    certificate_error: Option<String>,
+}
+
+fn certified_argmax_coeff() -> f64 {
+    let unit_roundoff = 1.0_f64 / (1_u64 << 24) as f64;
+    let gamma = |operations: u32| {
+        let error = operations as f64 * unit_roundoff;
+        error / (1.0 - error)
+    };
+    let gamma_c = gamma(7_167);
+    let gamma_lane = gamma(223);
+    let gamma_tree = gamma(5);
+    let beta = (1.0 + gamma_lane) * (1.0 + gamma_tree) - 1.0;
+    let coeff = (gamma_c + beta) / (1.0 - beta);
+    debug_assert!(coeff.is_finite() && coeff > 0.0);
+    coeff
+}
+
+fn run_certified_argmax_p0(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    weights: &v4_state::FinalHeadWeights,
+    hidden_bf16: &[u16],
+) -> Result<CertifiedArgmaxRun, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let streamed = run_streamed_final_head_gpu(context, module, stream, weights, hidden_bf16)?;
+    let coeff = certified_argmax_coeff();
+    let mut status = streamed
+        .status
+        .iter()
+        .copied()
+        .fold(0_u32, |all, row| all | row);
+    let mut lower = Vec::with_capacity(v4_state::VOCAB);
+    let mut upper = Vec::with_capacity(v4_state::VOCAB);
+    if streamed.output.logits_f32.len() != v4_state::VOCAB
+        || streamed.sumabs_f32.len() != v4_state::VOCAB
+        || streamed.status.len() != v4_state::VOCAB
+    {
+        status |= CERTIFIED_HEAD_INTERVAL_INVALID;
+    } else {
+        for (&logit, &sumabs) in streamed.output.logits_f32.iter().zip(&streamed.sumabs_f32) {
+            if !logit.is_finite() || !sumabs.is_finite() || sumabs < 0.0 {
+                status |= CERTIFIED_HEAD_INTERVAL_INVALID;
+                break;
+            }
+            let radius = (coeff * sumabs as f64).next_up();
+            let lo = (logit as f64 - radius).next_down();
+            let hi = (logit as f64 + radius).next_up();
+            if !radius.is_finite() || !lo.is_finite() || !hi.is_finite() || lo > hi {
+                status |= CERTIFIED_HEAD_INTERVAL_INVALID;
+                break;
+            }
+            lower.push(lo);
+            upper.push(hi);
+        }
+    }
+    let mut candidates = Vec::new();
+    if status == 0 {
+        let max_lower = lower.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        candidates.extend(
+            upper
+                .iter()
+                .enumerate()
+                .filter_map(|(token, &hi)| (hi >= max_lower).then_some(token)),
+        );
+        if candidates.is_empty() {
+            status |= CERTIFIED_HEAD_INTERVAL_INVALID;
+        } else if candidates.len() == v4_state::VOCAB {
+            status |= CERTIFIED_HEAD_ALL_CANDIDATES;
+        }
+    }
+    let fallback = status != 0;
+    let repair_started = std::time::Instant::now();
+    let mut cpu_fallback = if fallback {
+        Some(v4_state::final_checkpoint_head_cpu_timed(
+            weights,
+            hidden_bf16,
+            1,
+        )?)
+    } else {
+        None
+    };
+    let token = if let Some(cpu) = cpu_fallback.as_ref() {
+        cpu.output.argmax[0]
+    } else {
+        let mut bytes = vec![0_u8; v4_state::HIDDEN * 2];
+        let mut row_bf16 = vec![0_u16; v4_state::HIDDEN];
+        let mut best = candidates[0];
+        let mut best_logit = f32::NEG_INFINITY;
+        for token in candidates.iter().copied() {
+            weights.read_head_weight_bytes(token, 1, &mut bytes)?;
+            for (weight, pair) in row_bf16.iter_mut().zip(bytes.chunks_exact(2)) {
+                *weight = u16::from_le_bytes([pair[0], pair[1]]);
+            }
+            let logit =
+                v4_state::canonical_final_head_row_dot(&streamed.output.normalized_bf16, &row_bf16);
+            if token == candidates[0] || logit > best_logit {
+                best = token;
+                best_logit = logit;
+            }
+        }
+        best
+    };
+    let repair_ns = u64::try_from(repair_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let margin = (!fallback).then(|| {
+        let best_other = upper
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != token)
+            .map(|(_, &value)| value)
+            .fold(f64::NEG_INFINITY, f64::max);
+        (lower[token] - best_other).next_down()
+    });
+    Ok(CertifiedArgmaxRun {
+        token,
+        candidate_count: candidates.len(),
+        status,
+        fallback,
+        certified: !fallback,
+        coeff,
+        margin,
+        normalized_bf16_digest: fnv1a_u16(&streamed.output.normalized_bf16),
+        mechanism_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        read_ns: streamed.read_ns,
+        h2d_ns: streamed.h2d_ns,
+        kernel_ns: streamed.kernel_ns,
+        d2h_ns: streamed.d2h_ns,
+        cpu_preprocess_ns: streamed.cpu_preprocess_ns,
+        repair_ns,
+        cpu_fallback: cpu_fallback.take(),
+    })
+}
+
+fn run_id_only_final_head(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    weights: &v4_state::FinalHeadWeights,
+    hidden_bf16: &[u16],
+    certified_production: bool,
+    audit_cpu: bool,
+) -> Result<IdOnlyFinalHeadDecision, Box<dyn Error>> {
+    if !certified_production {
+        let cpu = v4_state::final_checkpoint_head_cpu_timed(weights, hidden_bf16, 1)?;
+        return Ok(IdOnlyFinalHeadDecision {
+            token: cpu.output.argmax[0],
+            certificate: None,
+            cpu: Some(cpu),
+            certificate_error: None,
+        });
+    }
+    let started = std::time::Instant::now();
+    let mut certificate =
+        match run_certified_argmax_p0(context, module, stream, weights, hidden_bf16) {
+            Ok(certificate) => certificate,
+            Err(error) => {
+                let repair_started = std::time::Instant::now();
+                let cpu = v4_state::final_checkpoint_head_cpu_timed(weights, hidden_bf16, 1)?;
+                let repair_ns =
+                    u64::try_from(repair_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                return Ok(IdOnlyFinalHeadDecision {
+                    token: cpu.output.argmax[0],
+                    certificate: Some(CertifiedArgmaxRun {
+                        token: cpu.output.argmax[0],
+                        candidate_count: v4_state::VOCAB,
+                        status: CERTIFIED_HEAD_RUNTIME_ERROR,
+                        fallback: true,
+                        certified: false,
+                        coeff: certified_argmax_coeff(),
+                        margin: None,
+                        normalized_bf16_digest: fnv1a_u16(&cpu.output.normalized_bf16),
+                        mechanism_ns: u64::try_from(started.elapsed().as_nanos())
+                            .unwrap_or(u64::MAX),
+                        read_ns: 0,
+                        h2d_ns: 0,
+                        kernel_ns: 0,
+                        d2h_ns: 0,
+                        cpu_preprocess_ns: 0,
+                        repair_ns,
+                        cpu_fallback: None,
+                    }),
+                    cpu: Some(cpu),
+                    certificate_error: Some(error.to_string()),
+                });
+            }
+        };
+    let token = certificate.token;
+    let cpu = if certificate.fallback {
+        certificate.cpu_fallback.take()
+    } else if audit_cpu {
+        Some(v4_state::final_checkpoint_head_cpu_timed(
+            weights,
+            hidden_bf16,
+            1,
+        )?)
+    } else {
+        None
+    };
+    Ok(IdOnlyFinalHeadDecision {
+        token,
+        certificate: Some(certificate),
+        cpu,
+        certificate_error: None,
+    })
+}
+
+fn final_head_profile_metrics(decision: &IdOnlyFinalHeadDecision) -> (u64, u64) {
+    if let Some(cpu) = decision.cpu.as_ref() {
+        (cpu.wall_ns, cpu.read_ns)
+    } else if let Some(certificate) = decision.certificate.as_ref() {
+        (certificate.mechanism_ns, certificate.read_ns)
+    } else {
+        (0, 0)
+    }
+}
+
+fn certified_argmax_record(
+    position: usize,
+    decision: &IdOnlyFinalHeadDecision,
+) -> Option<serde_json::Value> {
+    let certificate = decision.certificate.as_ref()?;
+    let cpu = decision.cpu.as_ref();
+    Some(serde_json::json!({
+        "event": "certified_argmax",
+        "position": position,
+        "head": "bf16_streamed_gpu_certificate",
+        "cert_token": certificate.token,
+        "candidate_count": certificate.candidate_count,
+        "status_flags": certificate.status,
+        "fallback": certificate.fallback,
+        "certified": certificate.certified,
+        "coeff": certificate.coeff,
+        "margin": certificate.margin,
+        "certificate_mechanism_ns": certificate.mechanism_ns,
+        "repair_ns": certificate.repair_ns,
+        "certificate_error": decision.certificate_error,
+        "gpu": {
+            "read_ns": certificate.read_ns,
+            "h2d_ns": certificate.h2d_ns,
+            "kernel_ns": certificate.kernel_ns,
+            "d2h_ns": certificate.d2h_ns,
+            "cpu_preprocess_ns": certificate.cpu_preprocess_ns,
+        },
+        "cpu_audit": cpu.map(|cpu| serde_json::json!({
+            "argmax": cpu.output.argmax[0],
+            "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+            "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+            "wall_ns": cpu.wall_ns,
+            "read_ns": cpu.read_ns,
+        })),
+        "argmax_exact": cpu.map(|cpu| certificate.token == cpu.output.argmax[0]),
+        "normalized_digest_exact": cpu.map(|cpu| {
+            certificate.normalized_bf16_digest == fnv1a_u16(&cpu.output.normalized_bf16)
+        }),
+    }))
+}
+
+fn validate_certified_argmax_audit(
+    position: usize,
+    decision: &IdOnlyFinalHeadDecision,
+) -> Result<(), Box<dyn Error>> {
+    let certificate = decision
+        .certificate
+        .as_ref()
+        .ok_or("certified argmax audit did not run the certificate")?;
+    let cpu = decision
+        .cpu
+        .as_ref()
+        .ok_or("certified argmax audit did not retain its CPU final")?;
+    if certificate.token != cpu.output.argmax[0]
+        || certificate.normalized_bf16_digest != fnv1a_u16(&cpu.output.normalized_bf16)
+    {
+        return Err(format!(
+            "certified argmax or normalized digest diverged from canonical CPU audit at position {position}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn id_only_final_record(
+    position: usize,
+    input_id: i64,
+    input_kind: &str,
+    state: &str,
+    decision: &IdOnlyFinalHeadDecision,
+    input_hidden_bf16: Option<&[u16]>,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut record = serde_json::json!({
+        "event": "final",
+        "position": position,
+        "input_id": input_id,
+        "input_kind": input_kind,
+        "state": state,
+        "head": if decision.certificate.is_some() { "bf16_streamed_gpu_certificate" } else { "canonical_cpu_streamed_bf16" },
+        "argmax": decision.token,
+        "status": "PASS",
+    });
+    let object = record
+        .as_object_mut()
+        .ok_or("id-only final record is not an object")?;
+    if let Some(cpu) = decision.cpu.as_ref() {
+        object.insert(
+            "collapsed_bf16_digest".into(),
+            serde_json::json!(format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16))),
+        );
+        object.insert(
+            "normalized_bf16_digest".into(),
+            serde_json::json!(format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16))),
+        );
+        object.insert(
+            "logits_f32_digest".into(),
+            serde_json::json!(format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32))),
+        );
+    } else if let Some(certificate) = decision.certificate.as_ref() {
+        object.insert(
+            "normalized_bf16_digest".into(),
+            serde_json::json!(format!("{:016x}", certificate.normalized_bf16_digest)),
+        );
+        object.insert(
+            "certificate".into(),
+            serde_json::json!({
+                "candidate_count": certificate.candidate_count,
+                "status_flags": certificate.status,
+                "fallback": certificate.fallback,
+                "certified": certificate.certified,
+            }),
+        );
+    }
+    if let Some(hidden) = input_hidden_bf16 {
+        object.insert(
+            "input_hidden_bf16_digest".into(),
+            serde_json::json!(format!("{:016x}", fnv1a_u16(hidden))),
+        );
+    }
+    Ok(record)
 }
 
 const V4_EOS_TOKEN_ID: i64 = 1;
@@ -3415,9 +3899,9 @@ fn short_device_decode_static_check() -> Result<(), Box<dyn Error>> {
         || csa_compressed_rows_after(6) != 1
         || csa_compressed_rows_after(7) != 2
         || csa_compressed_rows_after(8) != 2
-        || state_bytes != 3_763_637_590
+        || state_bytes != 3_763_828_054
         || rope_bytes != 4_608
-        || total_bytes != 7_673_079_710
+        || total_bytes != 7_673_270_174
     {
         return Err("short device decode static contract mismatch".into());
     }
@@ -3769,6 +4253,7 @@ fn run_real_v4_full61_b1(
             preflight.qd4_immutable_expert_cache,
             phase_profile,
             preflight.fixed_prefetch,
+            preflight.certified_argmax_audit,
             device_short_decode,
             greedy_steps,
             result,
@@ -4391,6 +4876,7 @@ fn run_real_v4_layer_stationary_prefill(
     qd4_immutable_expert_cache: bool,
     phase_profile: bool,
     fixed_prefetch: bool,
+    certified_argmax_audit: bool,
     device_short_decode: bool,
     greedy_steps: usize,
     mut result: PendingResultFile,
@@ -4429,8 +4915,34 @@ fn run_real_v4_layer_stationary_prefill(
     let fixed_prefetch_wo_a_arm =
         fixed_prefetch_wo_a_decode_arm(fixed_prefetch, device_attention, raw_wo_a_gpu_decode);
     let fixed_prefetch_raw_wo_a = fixed_prefetch_wo_a_arm == "raw_fp8_gpu_decode";
+    let pinned_fixed_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
+    let bounded_readahead = pinned_fixed_pipeline
+        && cfg!(target_os = "linux")
+        && parse_default_true_zero_one_flag(
+            "COLIBRI_V4_BOUNDED_READAHEAD",
+            std::env::var_os("COLIBRI_V4_BOUNDED_READAHEAD").as_deref(),
+        )?;
     if device_short_decode && !fixed_prefetch_raw_wo_a {
         return Err("short device decode requires raw wo_a fixed prefetch".into());
+    }
+    if pinned_fixed_pipeline && (!device_short_decode || !fixed_prefetch_raw_wo_a) {
+        return Err(
+            "pinned fixed pipeline requires short device decode and raw wo_a fixed prefetch".into(),
+        );
+    }
+    if certified_argmax_audit
+        && (targeted_attention_audit
+            || !device_attention
+            || !device_attention_audit
+            || !device_short_decode
+            || !pinned_fixed_pipeline
+            || prompt_len != 5
+            || greedy_steps != 3)
+    {
+        return Err(
+            "certified argmax audit requires the D-exact path: full61 device-attention production plus independent audit, pinned fixed pipeline, prompt positions 0..6, and greedy_steps=3"
+                .into(),
+        );
     }
     if device_short_decode && phase_profile && device_attention_audit {
         return Err("short device phase profile requires production non-audit attention".into());
@@ -4481,6 +4993,8 @@ fn run_real_v4_layer_stationary_prefill(
             "device attention semantic pilot requires exactly five prompt positions".into(),
         );
     }
+    let certified_argmax_production =
+        certified_argmax_production_enabled(device_attention, greedy_steps)?;
     let short_decode_rows =
         short_device_decode_rows(prompt_len, greedy_steps, device_short_decode)?;
     let strict_audit_scratch_required =
@@ -4496,6 +5010,7 @@ fn run_real_v4_layer_stationary_prefill(
                 qd4_enabled,
                 qd4_immutable_expert_cache,
                 short_decode_rows,
+                certified_argmax_production,
                 device_available_bytes()?,
             )
         })
@@ -4522,6 +5037,13 @@ fn run_real_v4_layer_stationary_prefill(
             )
         })
         .and_then(|bytes| bytes.checked_add(strict_audit_arena_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                device_attention_capacity
+                    .as_ref()
+                    .map_or(0, |plan| plan.certified_argmax_host_temp_bytes),
+            )
+        })
         .ok_or("stationary raw host reserve overflow")?;
     let stationary_layers = manifests
         .iter()
@@ -5360,13 +5882,38 @@ fn run_real_v4_layer_stationary_prefill(
         }
     }
 
+    if certified_argmax_production
+        && device_short_decode
+        && parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?
+            == 7 * 512 * 1024 * 1024
+        && stationary_raw_retention.as_ref().map(|cache| {
+            cache
+                .raw_device
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count()
+        }) != Some(8)
+    {
+        return Err(
+            "certified final-head ledger reduced the required eight device retention entries"
+                .into(),
+        );
+    }
     let final_scope_started_ns = phase_profile.then(|| timeline_elapsed_ns(request_started));
     let final_load_started = phase_profile.then(std::time::Instant::now);
     let final_weights = v4_state::load_final_head(root)?;
     let final_fixed_read_ns = final_load_started
         .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    let cpu =
-        v4_state::final_checkpoint_head_cpu_timed(&final_weights, &hidden[prompt_len - 1], 1)?;
+    let final_decision = run_id_only_final_head(
+        context,
+        module,
+        stream,
+        &final_weights,
+        &hidden[prompt_len - 1],
+        certified_argmax_production,
+        certified_argmax_audit,
+    )?;
+    let (final_head_wall_ns, final_head_read_ns) = final_head_profile_metrics(&final_decision);
     let mut final_phase_profile = None;
     if let Some(request_start_ns) = final_scope_started_ns {
         let request_end_ns = timeline_elapsed_ns(request_started);
@@ -5374,15 +5921,15 @@ fn run_real_v4_layer_stationary_prefill(
             request_start_ns,
             request_end_ns,
             final_fixed_read_ns.expect("profiled final load must have a duration"),
-            cpu.wall_ns,
-            cpu.read_ns,
+            final_head_wall_ns,
+            final_head_read_ns,
             qd4_enabled,
         )?;
         final_phase_profile = Some(profile);
         phase_profile_top_level_ns = phase_profile_top_level_ns.saturating_add(attributed_ns);
         phase_profile_final_outer_ns = request_end_ns - request_start_ns;
     }
-    let argmax = cpu.output.argmax[0];
+    let argmax = final_decision.token;
     let generated_id = i64::try_from(argmax)?;
     let stop_reason = if generated_id == V4_EOS_TOKEN_ID {
         "eos"
@@ -5406,219 +5953,460 @@ fn run_real_v4_layer_stationary_prefill(
         let rope_lut = device_rope_lut
             .as_ref()
             .ok_or("short device decode lost its request RoPE LUT")?;
-        let mut decode_input_id = generated_id;
-        for token_position in prompt_len..short_decode_rows {
-            let embedding = v4_state::load(root, &[decode_input_id])?.embedding;
-            let mut decode_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
-            for _ in 0..v4_state::HC {
-                decode_hidden.extend_from_slice(&embedding);
-            }
-            for manifest in manifests {
-                let layer_scope_started_ns =
-                    phase_profile.then(|| timeline_elapsed_ns(request_started));
-                let layer_prepare_started = phase_profile.then(std::time::Instant::now);
-                let (runtime_lease, fixed) = stationary_raw_retention
-                    .as_mut()
-                    .ok_or("short device decode lost its request-local fixed retention")?
-                    .access_stationary_raw(
-                        root,
-                        manifest.layer,
-                        &[decode_input_id],
+        let mut pipeline_cache = pinned_fixed_pipeline
+            .then(|| {
+                stationary_raw_retention
+                    .take()
+                    .ok_or("pinned fixed pipeline lost its request-local cache")
+            })
+            .transpose()?;
+        let pipeline_transfer = pinned_fixed_pipeline
+            .then(|| context.new_stream())
+            .transpose()?;
+        let mut pipeline_slots = Vec::new();
+        if pinned_fixed_pipeline {
+            let first_scratch = pipeline_cache
+                .as_mut()
+                .and_then(|cache| cache.raw_scratch.take())
+                .ok_or("pinned fixed pipeline lost its retained decode scratch")?;
+            let second_scratch = DeviceBuffer::<u16>::zeroed(
+                stream,
+                RAW_FIXED_SCRATCH_BYTES / std::mem::size_of::<u16>(),
+            )?;
+            pipeline_slots.push(PinnedFixedSlot::new(context, first_scratch)?);
+            pipeline_slots.push(PinnedFixedSlot::new(context, second_scratch)?);
+        }
+        let restored_pipeline_cache = std::thread::scope(
+            |scope| -> Result<Option<FixedLayerCache>, Box<dyn Error>> {
+                let mut request_tx = None;
+                let mut response_rx = None;
+                let mut worker = if pinned_fixed_pipeline {
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<PinnedFixedRequest>(2);
+                    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<
+                        Result<Option<PinnedFixedPrepared>, String>,
+                    >(2);
+                    request_tx = Some(tx);
+                    response_rx = Some(reply_rx);
+                    let cache = pipeline_cache
+                        .take()
+                        .ok_or("pinned fixed worker lost its cache")?;
+                    let transfer = pipeline_transfer
+                        .as_ref()
+                        .ok_or("pinned fixed worker lost its transfer stream")?;
+                    let main = std::sync::Arc::clone(stream);
+                    Some(scope.spawn(move || {
+                        run_pinned_fixed_request_worker(
+                            cache,
+                            pipeline_slots,
+                            root,
+                            module,
+                            &main,
+                            transfer,
+                            rx,
+                            reply_tx,
+                            bounded_readahead,
+                        )
+                    }))
+                } else {
+                    None
+                };
+                let mut decode_input_id = generated_id;
+                for token_position in prompt_len..short_decode_rows {
+                    if let Some(tx) = request_tx.as_ref() {
+                        let first = manifests
+                            .first()
+                            .ok_or("short device decode has no layers")?;
+                        let second = manifests
+                            .get(1)
+                            .ok_or("short device decode has one layer")?;
+                        tx.send((None, Some((first.layer, decode_input_id, None))))?;
+                        tx.send((
+                            None,
+                            Some((
+                                second.layer,
+                                decode_input_id,
+                                manifests.get(2).map(|next| next.layer),
+                            )),
+                        ))?;
+                    }
+                    let embedding = v4_state::load(root, &[decode_input_id])?.embedding;
+                    let mut decode_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+                    for _ in 0..v4_state::HC {
+                        decode_hidden.extend_from_slice(&embedding);
+                    }
+                    for (layer_position, manifest) in manifests.iter().enumerate() {
+                        let layer_scope_started_ns =
+                            phase_profile.then(|| timeline_elapsed_ns(request_started));
+                        let layer_prepare_started = phase_profile.then(std::time::Instant::now);
+                        let mut pipeline_prepared = None;
+                        let mut runtime_lease = None;
+                        let fixed = if let Some(rx) = response_rx.as_ref() {
+                            let reply = match rx.recv() {
+                                Ok(reply) => reply,
+                                Err(_) => {
+                                    drop(request_tx.take());
+                                    return match worker
+                                            .take()
+                                            .ok_or("pinned fixed worker handle disappeared")?
+                                            .join()
+                                        {
+                                            Ok(Err(message)) => Err(format!(
+                                                "pinned fixed worker failed before layer {} preparation: {message}",
+                                                manifest.layer
+                                            )
+                                            .into()),
+                                            Ok(Ok(_)) => Err(format!(
+                                                "pinned fixed worker response channel closed before layer {} preparation after a successful worker exit",
+                                                manifest.layer
+                                            )
+                                            .into()),
+                                            Err(_) => Err(format!(
+                                                "pinned fixed worker panicked before layer {} preparation",
+                                                manifest.layer
+                                            )
+                                            .into()),
+                                        };
+                                }
+                            };
+                            let mut prepared = reply
+                                .map_err(|message| -> Box<dyn Error> { message.into() })?
+                                .ok_or(
+                                    "pinned fixed worker returned an early drain acknowledgement",
+                                )?;
+                            if prepared.lease.layer != manifest.layer {
+                                return Err(format!(
+                                    "pinned fixed worker returned layer {}, expected {}",
+                                    prepared.lease.layer, manifest.layer
+                                )
+                                .into());
+                            }
+                            prepared.wait_ready(stream)?;
+                            let fixed = std::mem::take(&mut prepared.telemetry);
+                            pipeline_prepared = Some(prepared);
+                            fixed
+                        } else {
+                            let (lease, fixed) = stationary_raw_retention
+                                .as_mut()
+                                .ok_or(
+                                    "short device decode lost its request-local fixed retention",
+                                )?
+                                .access_stationary_raw(
+                                    root,
+                                    manifest.layer,
+                                    &[decode_input_id],
+                                    module,
+                                    stream,
+                                )?;
+                            runtime_lease = Some(lease);
+                            fixed
+                        };
+                        let runtime = if let Some(prepared) = pipeline_prepared.as_ref() {
+                            prepared.runtime()
+                        } else {
+                            runtime_lease
+                                .as_ref()
+                                .ok_or("short device decode lost its fixed runtime lease")?
+                        };
+                        let hash_ids =
+                            load_layer_hash_ids(root, manifest.layer, &[decode_input_id])?;
+                        let layer_prepare_ns = layer_prepare_started
+                            .map(|started| {
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            })
+                            .unwrap_or(0);
+                        let mut oracle = None;
+                        if device_attention_audit {
+                            persistent
+                                .as_mut()
+                                .ok_or("short device decode audit lost its host persistent state")?
+                                .transaction(manifest.layer, |host_state| {
+                                    let run = run_real_layer_rows(
+                                        context,
+                                        module,
+                                        stream,
+                                        &runtime,
+                                        qd4_lanes.as_deref_mut(),
+                                        None,
+                                        None,
+                                        if runtime.weights.hash_router {
+                                            &hash_ids
+                                        } else {
+                                            &[]
+                                        },
+                                        &decode_hidden,
+                                        &[decode_input_id],
+                                        token_position,
+                                        Some(host_state),
+                                        None,
+                                        None,
+                                        false,
+                                        None,
+                                        true,
+                                        strict_scratch.as_mut(),
+                                    )?;
+                                    oracle = Some((run, host_persistent_state_audit(host_state)));
+                                    Ok(())
+                                })?;
+                        }
+                        let state = states
+                            .get_mut(manifest.layer)
+                            .and_then(Option::as_mut)
+                            .ok_or(
+                                "short device decode layer state was not retained during prefill",
+                            )?;
+                        if state.layer != manifest.layer || state.committed_rows != token_position {
+                            return Err(
+                                "short device decode persistent-state continuity mismatch".into()
+                            );
+                        }
+                        let kv_rows_before = state.committed_rows;
+                        let mut run = run_real_layer_rows(
+                            context,
+                            module,
+                            stream,
+                            &runtime,
+                            qd4_lanes.as_deref_mut(),
+                            None,
+                            None,
+                            if runtime.weights.hash_router {
+                                &hash_ids
+                            } else {
+                                &[]
+                            },
+                            &decode_hidden,
+                            &[decode_input_id],
+                            token_position,
+                            None,
+                            Some(state),
+                            Some(rope_lut),
+                            device_attention_audit,
+                            None,
+                            device_attention_audit,
+                            None,
+                        )?;
+                        if phase_profile {
+                            run.stage.layer_prepare_ns = layer_prepare_ns;
+                            run.stage.layer_prepare_count = 1;
+                        }
+                        let observed_state = device_attention_audit
+                            .then(|| device_persistent_state_audit(stream, state))
+                            .transpose()?;
+                        let kv_rows_after = state.committed_rows;
+                        if kv_rows_after != kv_rows_before + 1 {
+                            return Err(
+                                "short device decode committed a noncontiguous KV row".into()
+                            );
+                        }
+                        if run.routes.ids.len() != v4_router::V4_TOPK {
+                            return Err("short device decode produced incomplete routes".into());
+                        }
+                        if let Some((expected_run, expected_state)) = oracle.as_ref() {
+                            let actual_state = observed_state.as_ref().ok_or(
+                                "short device decode audit omitted device persistent state",
+                            )?;
+                            check_short_decode_full_layer_audit(
+                                manifest.layer,
+                                token_position,
+                                expected_run,
+                                expected_state,
+                                &run,
+                                actual_state,
+                            )?;
+                        }
+                        short_decode_fixed_source_bytes = short_decode_fixed_source_bytes
+                            .checked_add(fixed.fixed_source_bytes)
+                            .ok_or("short device decode fixed source byte overflow")?;
+                        short_decode_fixed_h2d_bytes = short_decode_fixed_h2d_bytes
+                            .checked_add(fixed.fixed_h2d_bytes)
+                            .ok_or("short device decode fixed H2D byte overflow")?;
+                        short_decode_routed_source_bytes = short_decode_routed_source_bytes
+                            .checked_add(run.stage.routed_source_bytes)
+                            .ok_or("short device decode routed source byte overflow")?;
+                        short_decode_routed_h2d_bytes = short_decode_routed_h2d_bytes
+                            .checked_add(run.stage.routed_h2d_bytes)
+                            .ok_or("short device decode routed H2D byte overflow")?;
+                        let topk_observed = run.attention_topk.is_some();
+                        let mut record = serde_json::json!({
+                            "event": "layer",
+                            "token_position": token_position,
+                            "token_id": decode_input_id,
+                            "layer": manifest.layer,
+                            "compression_ratio": manifest.compression_ratio.get(),
+                            "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
+                            "kv_cache_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.kv))),
+                            "main_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.compressed_kv))),
+                            "main_compressor_kv_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_kv))),
+                            "main_compressor_score_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_score))),
+                            "indexer_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.indexer_kv))),
+                            "indexer_compressor_kv_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_kv.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
+                            "indexer_compressor_score_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_score.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
+                            "route_ids": run.routes.ids,
+                            "route_weights_f32": run.routes.weights,
+                            "topk_observed": topk_observed,
+                            "attention_topk_digest": topk_observed.then(|| format!("{:016x}", run.attention_topk_digest)),
+                            "attention_topk_per_row": topk_observed.then_some(run.attention_topk_per_row),
+                            "kv_rows_before": kv_rows_before,
+                            "kv_rows_after": kv_rows_after,
+                            "fixed_source_bytes": fixed.fixed_source_bytes,
+                            "fixed_h2d_bytes": fixed.fixed_h2d_bytes,
+                            "fixed_cache_status": fixed.cache_status,
+                            "bounded_readahead": bounded_readahead_json(
+                                fixed.bounded_readahead.as_ref(),
+                                fixed.fixed_read_alloc_ns,
+                            ),
+                            "routed_source_bytes": run.stage.routed_source_bytes,
+                            "routed_h2d_bytes": run.stage.routed_h2d_bytes,
+                            "qd4_immutable_cache": false,
+                        });
+                        if let Some(request_start_ns) = layer_scope_started_ns {
+                            let request_end_ns = timeline_elapsed_ns(request_started);
+                            let (profile, attributed_ns, outer_ns) =
+                                stationary_layer_phase_profile_json(
+                                    request_start_ns,
+                                    request_end_ns,
+                                    Some(&fixed),
+                                    &run.stage,
+                                    run.indexer_topk_gpu_ns,
+                                    qd4_enabled,
+                                )?;
+                            record
+                                .as_object_mut()
+                                .ok_or("short decode layer record is not an object")?
+                                .insert("phase_profile".into(), profile);
+                            phase_profile_top_level_ns =
+                                phase_profile_top_level_ns.saturating_add(attributed_ns);
+                            one_token_decode_phase_profile_layer_outer_ns =
+                                one_token_decode_phase_profile_layer_outer_ns
+                                    .saturating_add(outer_ns);
+                        }
+                        short_decode_records.push(record);
+                        if let Some(tx) = request_tx.as_ref() {
+                            let next = manifests.get(layer_position + 2).map(|next| {
+                                (
+                                    next.layer,
+                                    decode_input_id,
+                                    manifests.get(layer_position + 3).map(|next| next.layer),
+                                )
+                            });
+                            tx.send((
+                                Some(
+                                    pipeline_prepared
+                                        .take()
+                                        .ok_or("pinned fixed layer lost its prepared slot")?,
+                                ),
+                                next,
+                            ))?;
+                        } else {
+                            stationary_raw_retention
+                                .as_mut()
+                                .ok_or(
+                                    "short device decode lost its request-local fixed retention",
+                                )?
+                                .restore_stationary_raw(
+                                    runtime_lease
+                                        .take()
+                                        .ok_or("short device decode lost its runtime lease")?,
+                                )?;
+                        }
+                        decode_hidden = run.output;
+                    }
+                    if let Some(rx) = response_rx.as_ref() {
+                        let reply = match rx.recv() {
+                            Ok(reply) => reply,
+                            Err(_) => {
+                                drop(request_tx.take());
+                                return match worker
+                                    .take()
+                                    .ok_or("pinned fixed worker handle disappeared")?
+                                    .join()
+                                {
+                                    Ok(Err(message)) => Err(format!(
+                                        "pinned fixed worker failed before token position {token_position} drain: {message}"
+                                    )
+                                    .into()),
+                                    Ok(Ok(_)) => Err(format!(
+                                        "pinned fixed worker response channel closed before token position {token_position} drain after a successful worker exit"
+                                    )
+                                    .into()),
+                                    Err(_) => Err(format!(
+                                        "pinned fixed worker panicked before token position {token_position} drain"
+                                    )
+                                    .into()),
+                                };
+                            }
+                        };
+                        if reply
+                            .map_err(|message| -> Box<dyn Error> { message.into() })?
+                            .is_some()
+                        {
+                            return Err(
+                                "pinned fixed worker returned a layer instead of drain".into()
+                            );
+                        }
+                    }
+                    let decode_final_scope_started_ns =
+                        phase_profile.then(|| timeline_elapsed_ns(request_started));
+                    let decode_decision = run_id_only_final_head(
+                        context,
                         module,
                         stream,
+                        &final_weights,
+                        &decode_hidden,
+                        certified_argmax_production,
+                        certified_argmax_audit,
                     )?;
-                let runtime = &*runtime_lease;
-                let hash_ids = load_layer_hash_ids(root, manifest.layer, &[decode_input_id])?;
-                let layer_prepare_ns = layer_prepare_started
-                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-                let mut oracle = None;
-                if device_attention_audit {
-                    persistent
-                        .as_mut()
-                        .ok_or("short device decode audit lost its host persistent state")?
-                        .transaction(manifest.layer, |host_state| {
-                            let run = run_real_layer_rows(
-                                context,
-                                module,
-                                stream,
-                                &runtime,
-                                qd4_lanes.as_deref_mut(),
-                                None,
-                                None,
-                                if runtime.weights.hash_router {
-                                    &hash_ids
-                                } else {
-                                    &[]
-                                },
-                                &decode_hidden,
-                                &[decode_input_id],
-                                token_position,
-                                Some(host_state),
-                                None,
-                                None,
-                                false,
-                                None,
-                                true,
-                                strict_scratch.as_mut(),
-                            )?;
-                            oracle = Some((run, host_persistent_state_audit(host_state)));
-                            Ok(())
-                        })?;
-                }
-                let state = states
-                    .get_mut(manifest.layer)
-                    .and_then(Option::as_mut)
-                    .ok_or("short device decode layer state was not retained during prefill")?;
-                if state.layer != manifest.layer || state.committed_rows != token_position {
-                    return Err("short device decode persistent-state continuity mismatch".into());
-                }
-                let kv_rows_before = state.committed_rows;
-                let mut run = run_real_layer_rows(
-                    context,
-                    module,
-                    stream,
-                    &runtime,
-                    qd4_lanes.as_deref_mut(),
-                    None,
-                    None,
-                    if runtime.weights.hash_router {
-                        &hash_ids
-                    } else {
-                        &[]
-                    },
-                    &decode_hidden,
-                    &[decode_input_id],
-                    token_position,
-                    None,
-                    Some(state),
-                    Some(rope_lut),
-                    device_attention_audit,
-                    None,
-                    device_attention_audit,
-                    None,
-                )?;
-                if phase_profile {
-                    run.stage.layer_prepare_ns = layer_prepare_ns;
-                    run.stage.layer_prepare_count = 1;
-                }
-                let observed_state = device_attention_audit
-                    .then(|| device_persistent_state_audit(stream, state))
-                    .transpose()?;
-                let kv_rows_after = state.committed_rows;
-                if kv_rows_after != kv_rows_before + 1 {
-                    return Err("short device decode committed a noncontiguous KV row".into());
-                }
-                if run.routes.ids.len() != v4_router::V4_TOPK {
-                    return Err("short device decode produced incomplete routes".into());
-                }
-                if let Some((expected_run, expected_state)) = oracle.as_ref() {
-                    let actual_state = observed_state
-                        .as_ref()
-                        .ok_or("short device decode audit omitted device persistent state")?;
-                    check_short_decode_full_layer_audit(
-                        manifest.layer,
+                    let (decode_final_wall_ns, decode_final_read_ns) =
+                        final_head_profile_metrics(&decode_decision);
+                    let mut decode_profile = None;
+                    if let Some(request_start_ns) = decode_final_scope_started_ns {
+                        let request_end_ns = timeline_elapsed_ns(request_started);
+                        let (profile, attributed_ns) = stationary_final_phase_profile_json(
+                            request_start_ns,
+                            request_end_ns,
+                            0,
+                            decode_final_wall_ns,
+                            decode_final_read_ns,
+                            qd4_enabled,
+                        )?;
+                        decode_profile = Some(profile);
+                        phase_profile_top_level_ns =
+                            phase_profile_top_level_ns.saturating_add(attributed_ns);
+                        one_token_decode_phase_profile_final_outer_ns =
+                            one_token_decode_phase_profile_final_outer_ns
+                                .saturating_add(request_end_ns - request_start_ns);
+                    }
+                    let next_id = i64::try_from(decode_decision.token)?;
+                    generated_ids.push(next_id);
+                    short_decode_finals.push((
                         token_position,
-                        expected_run,
-                        expected_state,
-                        &run,
-                        actual_state,
-                    )?;
+                        decode_input_id,
+                        decode_decision,
+                        decode_hidden,
+                        decode_profile,
+                    ));
+                    decode_input_id = next_id;
                 }
-                short_decode_fixed_source_bytes = short_decode_fixed_source_bytes
-                    .checked_add(fixed.fixed_source_bytes)
-                    .ok_or("short device decode fixed source byte overflow")?;
-                short_decode_fixed_h2d_bytes = short_decode_fixed_h2d_bytes
-                    .checked_add(fixed.fixed_h2d_bytes)
-                    .ok_or("short device decode fixed H2D byte overflow")?;
-                short_decode_routed_source_bytes = short_decode_routed_source_bytes
-                    .checked_add(run.stage.routed_source_bytes)
-                    .ok_or("short device decode routed source byte overflow")?;
-                short_decode_routed_h2d_bytes = short_decode_routed_h2d_bytes
-                    .checked_add(run.stage.routed_h2d_bytes)
-                    .ok_or("short device decode routed H2D byte overflow")?;
-                let topk_observed = run.attention_topk.is_some();
-                let mut record = serde_json::json!({
-                    "event": "layer",
-                    "token_position": token_position,
-                    "token_id": decode_input_id,
-                    "layer": manifest.layer,
-                    "compression_ratio": manifest.compression_ratio.get(),
-                    "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
-                    "kv_cache_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.kv))),
-                    "main_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.compressed_kv))),
-                    "main_compressor_kv_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_kv))),
-                    "main_compressor_score_state_f32_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_f32(&value.main_score))),
-                    "indexer_compressed_kv_bf16_digest": observed_state.as_ref().map(|value| format!("{:016x}", fnv1a_u16(&value.indexer_kv))),
-                    "indexer_compressor_kv_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_kv.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
-                    "indexer_compressor_score_state_f32_digest": observed_state.as_ref().and_then(|value| value.indexer_main_score.as_ref().map(|digest| format!("{:016x}", fnv1a_f32(digest)))),
-                    "route_ids": run.routes.ids,
-                    "route_weights_f32": run.routes.weights,
-                    "attention_topk_digest": topk_observed.then(|| format!("{:016x}", run.attention_topk_digest)),
-                    "attention_topk_per_row": topk_observed.then_some(run.attention_topk_per_row),
-                    "kv_rows_before": kv_rows_before,
-                    "kv_rows_after": kv_rows_after,
-                    "fixed_source_bytes": fixed.fixed_source_bytes,
-                    "fixed_h2d_bytes": fixed.fixed_h2d_bytes,
-                    "fixed_cache_status": fixed.cache_status,
-                    "routed_source_bytes": run.stage.routed_source_bytes,
-                    "routed_h2d_bytes": run.stage.routed_h2d_bytes,
-                    "qd4_immutable_cache": false,
-                });
-                if let Some(request_start_ns) = layer_scope_started_ns {
-                    let request_end_ns = timeline_elapsed_ns(request_started);
-                    let (profile, attributed_ns, outer_ns) = stationary_layer_phase_profile_json(
-                        request_start_ns,
-                        request_end_ns,
-                        Some(&fixed),
-                        &run.stage,
-                        run.indexer_topk_gpu_ns,
-                        qd4_enabled,
-                    )?;
-                    record
-                        .as_object_mut()
-                        .ok_or("short decode layer record is not an object")?
-                        .insert("phase_profile".into(), profile);
-                    phase_profile_top_level_ns =
-                        phase_profile_top_level_ns.saturating_add(attributed_ns);
-                    one_token_decode_phase_profile_layer_outer_ns =
-                        one_token_decode_phase_profile_layer_outer_ns.saturating_add(outer_ns);
-                }
-                short_decode_records.push(record);
-                decode_hidden = run.output;
-            }
-            let decode_final_scope_started_ns =
-                phase_profile.then(|| timeline_elapsed_ns(request_started));
-            let decode_cpu =
-                v4_state::final_checkpoint_head_cpu_timed(&final_weights, &decode_hidden, 1)?;
-            let mut decode_profile = None;
-            if let Some(request_start_ns) = decode_final_scope_started_ns {
-                let request_end_ns = timeline_elapsed_ns(request_started);
-                let (profile, attributed_ns) = stationary_final_phase_profile_json(
-                    request_start_ns,
-                    request_end_ns,
-                    0,
-                    decode_cpu.wall_ns,
-                    decode_cpu.read_ns,
-                    qd4_enabled,
-                )?;
-                decode_profile = Some(profile);
-                phase_profile_top_level_ns =
-                    phase_profile_top_level_ns.saturating_add(attributed_ns);
-                one_token_decode_phase_profile_final_outer_ns =
-                    one_token_decode_phase_profile_final_outer_ns
-                        .saturating_add(request_end_ns - request_start_ns);
-            }
-            let next_id = i64::try_from(decode_cpu.output.argmax[0])?;
-            generated_ids.push(next_id);
-            short_decode_finals.push((
-                token_position,
-                decode_input_id,
-                decode_cpu,
-                decode_hidden,
-                decode_profile,
-            ));
-            decode_input_id = next_id;
+                drop(request_tx.take());
+                let cache = if let Some(worker) = worker {
+                    Some(
+                        worker
+                            .join()
+                            .map_err(|_| "pinned fixed worker panicked during request shutdown")?
+                            .map_err(|message| -> Box<dyn Error> {
+                                format!(
+                                    "pinned fixed worker failed during request shutdown: {message}"
+                                )
+                                .into()
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                Ok(cache)
+            },
+        )?;
+        if let Some(cache) = restored_pipeline_cache {
+            stationary_raw_retention = Some(cache);
         }
     }
     let request_e2e_ns = timeline_elapsed_ns(request_started);
@@ -5652,6 +6440,34 @@ fn run_real_v4_layer_stationary_prefill(
         };
     if phase_profile && phase_profile_top_level_ns > request_e2e_ns {
         return Err("stationary phase profile top-level scopes exceed request E2E".into());
+    }
+    let mut certified_argmax_records = Vec::new();
+    let mut certificate_rows = Vec::with_capacity(1 + short_decode_finals.len());
+    certificate_rows.push((prompt_len - 1, &final_decision));
+    certificate_rows.extend(
+        short_decode_finals
+            .iter()
+            .map(|(position, _, decision, _, _)| (*position, decision)),
+    );
+    if certified_argmax_audit
+        && certificate_rows
+            .iter()
+            .map(|(position, _)| *position)
+            .collect::<Vec<_>>()
+            != [4, 5, 6]
+    {
+        return Err(
+            "certified argmax audit did not retain original D-exact p4/p5/p6 final decisions"
+                .into(),
+        );
+    }
+    for (position, decision) in certificate_rows {
+        if certified_argmax_audit {
+            validate_certified_argmax_audit(position, decision)?;
+        }
+        if let Some(record) = certified_argmax_record(position, decision) {
+            certified_argmax_records.push(record);
+        }
     }
     let cublas_provenance = if let Some(scratch) = strict_scratch.as_ref() {
         scratch.hca_cublas.provenance().clone()
@@ -5703,6 +6519,8 @@ fn run_real_v4_layer_stationary_prefill(
         "layer_count": manifests.len(),
         "model_revision": v4_state::REVISION,
         "phase_profile": phase_profile,
+        "certified_argmax_audit": certified_argmax_audit,
+        "certified_argmax_production": certified_argmax_production,
         "prompt_ids": token_ids,
         "prompt_len": prompt_len,
         "routed": {
@@ -5746,6 +6564,8 @@ fn run_real_v4_layer_stationary_prefill(
             "rope_lut_bytes": plan.rope_lut_bytes,
             "rope_lut_status": "device_request_global",
             "tid2eid_transient_max_bytes": plan.tid2eid_transient_max_bytes,
+            "certified_argmax_device_temp_bytes": plan.certified_argmax_device_temp_bytes,
+            "certified_argmax_host_temp_bytes": plan.certified_argmax_host_temp_bytes,
             "headroom_bytes": plan.headroom_bytes,
         })),
         "routed_expert_slot_reuse": expert_slot_reuse,
@@ -5763,8 +6583,8 @@ fn run_real_v4_layer_stationary_prefill(
         "executed_layers": v4_state::V4_LAYER_COUNT,
         "model_dir": root,
         "request_e2e_ns": request_e2e_ns,
-        "request_e2e_definition": if device_short_decode { "prompt input through layer-stationary causal prefill, then full61 short device decode rows and canonical CPU-streamed final logits/argmax after every row" } else { "prompt input through layer-stationary causal prefill and canonical CPU-streamed final logits/argmax" },
-        "final_head": {"mode": "canonical_cpu_streamed_bf16", "invocation": if device_short_decode { "after_last_prompt_position_and_each_short_device_decode_row" } else { "after_last_prompt_position" }, "weight_shard": "model-00063-of-00064.safetensors"},
+        "request_e2e_definition": if certified_argmax_production { "prompt input through layer-stationary causal execution and certified GPU final-head argmax; CPU full final is audit/fallback only" } else if device_short_decode { "prompt input through layer-stationary causal prefill, then full61 short device decode rows and canonical CPU-streamed final logits/argmax after every row" } else { "prompt input through layer-stationary causal prefill and canonical CPU-streamed final logits/argmax" },
+        "final_head": {"mode": if certified_argmax_production { "bf16_streamed_gpu_certificate" } else { "canonical_cpu_streamed_bf16" }, "production_enabled": certified_argmax_production, "audit_cpu": certified_argmax_audit, "invocation": if device_short_decode { "after_last_prompt_position_and_each_short_device_decode_row" } else { "after_last_prompt_position" }, "weight_shard": "model-00063-of-00064.safetensors"},
         "physical": {
             "fixed_runtime_loads": manifests.len(),
             "fixed_runtime_loads_per_layer": 1,
@@ -6037,22 +6857,24 @@ fn run_real_v4_layer_stationary_prefill(
             writeln!(result.file_mut(), "{record}")?;
         }
     }
+    for record in &certified_argmax_records {
+        writeln!(result.file_mut(), "{record}")?;
+    }
     for record in &short_decode_records {
         writeln!(result.file_mut(), "{record}")?;
     }
-    let mut final_record = serde_json::json!({
-        "event": "final",
-        "position": prompt_len - 1,
-        "input_id": token_ids[prompt_len - 1],
-        "input_kind": "prompt",
-        "state": if device_attention { "DeviceTokenState" } else { "V4SerialPersistentState" },
-        "head": "canonical_cpu_streamed_bf16",
-        "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
-        "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
-        "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
-        "argmax": argmax,
-        "status": "PASS",
-    });
+    let mut final_record = id_only_final_record(
+        prompt_len - 1,
+        token_ids[prompt_len - 1],
+        "prompt",
+        if device_attention {
+            "DeviceTokenState"
+        } else {
+            "V4SerialPersistentState"
+        },
+        &final_decision,
+        None,
+    )?;
     if let Some(profile) = final_phase_profile {
         final_record
             .as_object_mut()
@@ -6060,21 +6882,16 @@ fn run_real_v4_layer_stationary_prefill(
             .insert("phase_profile".into(), profile);
     }
     writeln!(result.file_mut(), "{final_record}")?;
-    for (position, input_id, decode_cpu, decode_hidden, decode_profile) in &short_decode_finals {
-        let mut decode_final_record = serde_json::json!({
-            "event": "final",
-            "position": position,
-            "input_id": input_id,
-            "input_kind": "generated",
-            "state": "DeviceTokenState",
-            "head": "canonical_cpu_streamed_bf16",
-            "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&decode_cpu.output.collapsed_bf16)),
-            "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&decode_cpu.output.normalized_bf16)),
-            "logits_f32_digest": format!("{:016x}", fnv1a_f32(&decode_cpu.output.logits_f32)),
-            "input_hidden_bf16_digest": format!("{:016x}", fnv1a_u16(decode_hidden)),
-            "argmax": decode_cpu.output.argmax[0],
-            "status": "PASS",
-        });
+    for (position, input_id, decode_decision, decode_hidden, decode_profile) in &short_decode_finals
+    {
+        let mut decode_final_record = id_only_final_record(
+            *position,
+            *input_id,
+            "generated",
+            "DeviceTokenState",
+            decode_decision,
+            Some(decode_hidden),
+        )?;
         if let Some(profile) = decode_profile {
             decode_final_record
                 .as_object_mut()
@@ -8482,8 +9299,21 @@ fn median_f64(samples: &[f64]) -> f64 {
 
 const V4_QD4_LANES: usize = 4;
 const V4_DEVICE_CAPACITY_HEADROOM_BYTES: usize = 2 * 1024 * 1024 * 1024;
-const V4_DEVICE_TOKEN_STATE_MAX_BYTES: usize = 83_863_054;
-const V4_DEVICE_TOKEN_STATE_HCA_BYTES: usize = 40_249_870;
+const V4_Q_LORA_RANK: usize = 1_536;
+const V4_DEVICE_TOKEN_STATE_CSA_WITHOUT_Q_LORA_F32_BYTES: usize =
+    83_863_054 - V4_Q_LORA_RANK * std::mem::size_of::<f32>();
+const V4_DEVICE_TOKEN_STATE_HCA_WITHOUT_Q_LORA_F32_BYTES: usize = 40_249_870;
+const fn device_token_state_ledger_bytes(csa: bool, q_lora_rank: usize) -> usize {
+    (if csa {
+        V4_DEVICE_TOKEN_STATE_CSA_WITHOUT_Q_LORA_F32_BYTES
+    } else {
+        V4_DEVICE_TOKEN_STATE_HCA_WITHOUT_Q_LORA_F32_BYTES
+    }) + q_lora_rank * std::mem::size_of::<f32>()
+}
+const V4_DEVICE_TOKEN_STATE_MAX_BYTES: usize =
+    device_token_state_ledger_bytes(true, V4_Q_LORA_RANK);
+const V4_DEVICE_TOKEN_STATE_HCA_BYTES: usize =
+    device_token_state_ledger_bytes(false, V4_Q_LORA_RANK);
 const V4_REQUEST_ROPE_LUT_ROWS: usize = 5;
 const V4_SHORT_DEVICE_DECODE_MAX_NEW_TOKENS: usize = 5;
 // ponytail: this is a short exact gate, not paged serving; lift only when a
@@ -11619,6 +12449,16 @@ struct FixedLoadTelemetry {
     raw_h2d_ns: u64,
     raw_h2d_bytes: usize,
     cache_status: &'static str,
+    bounded_readahead: Option<BoundedReadaheadTelemetry>,
+}
+
+struct BoundedReadaheadTelemetry {
+    layer: usize,
+    issued: bool,
+    skipped_reason: Option<&'static str>,
+    bytes: u64,
+    ranges: Vec<safetensors::FileRange>,
+    advice_us: u64,
 }
 
 struct FixedLayerCache {
@@ -11629,6 +12469,9 @@ struct FixedLayerCache {
     raw_device: Vec<Option<RawLoadedLayerRuntime>>,
     raw_host: Vec<Option<RawDecodedLayerHost>>,
     raw_scratch: Option<DeviceBuffer<u16>>,
+    raw_device_generation: Vec<u64>,
+    raw_host_generation: Vec<u64>,
+    raw_scratch_generation: u64,
     raw_mode: bool,
     host: Vec<Option<DecodedLayerHost>>,
     device_budget_bytes: usize,
@@ -11657,11 +12500,12 @@ fn restore_leased_slot<T>(slot: &mut Option<T>, value: T) {
     *slot = Some(value);
 }
 
-struct StationaryRawLease<'a> {
+struct StationaryRawLease {
+    layer: usize,
+    device_generation: Option<u64>,
+    host_generation: Option<u64>,
+    scratch_generation: Option<u64>,
     runtime: Option<LoadedLayerRuntime>,
-    device_slot: Option<&'a mut Option<RawLoadedLayerRuntime>>,
-    host_slot: Option<&'a mut Option<RawDecodedLayerHost>>,
-    scratch_slot: Option<&'a mut Option<DeviceBuffer<u16>>>,
     raw_device: Option<DeviceBuffer<u8>>,
     raw_host: Option<RawDecodedLayerHost>,
     scratch: Option<DeviceBuffer<u16>>,
@@ -11669,7 +12513,193 @@ struct StationaryRawLease<'a> {
     decoded_wo_a_in_scratch: bool,
 }
 
-impl std::ops::Deref for StationaryRawLease<'_> {
+struct PinnedFixedSlot {
+    generation: u64,
+    host: PinnedHostBuffer<u8>,
+    scratch: Option<DeviceBuffer<u16>>,
+    h2d_start: cuda_core::CudaEvent,
+    h2d_end: cuda_core::CudaEvent,
+    ready: cuda_core::CudaEvent,
+    runtime_done: cuda_core::CudaEvent,
+}
+
+struct PinnedFixedPrepared {
+    slot: PinnedFixedSlot,
+    generation: u64,
+    runtime_done_recorded: bool,
+    lease: StationaryRawLease,
+    telemetry: FixedLoadTelemetry,
+}
+
+impl PinnedFixedSlot {
+    fn new(
+        context: &std::sync::Arc<CudaContext>,
+        scratch: DeviceBuffer<u16>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let event = || context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
+        Ok(Self {
+            generation: 0,
+            host: PinnedHostBuffer::zeroed(context, PHASE1_CSA_PAYLOAD_BYTES)?,
+            scratch: Some(scratch),
+            h2d_start: event()?,
+            h2d_end: event()?,
+            ready: event()?,
+            runtime_done: event()?,
+        })
+    }
+}
+
+impl PinnedFixedPrepared {
+    fn wait_ready(&mut self, main: &CudaStream) -> Result<(), Box<dyn Error>> {
+        self.slot.ready.synchronize()?;
+        main.wait(&self.slot.ready)?;
+        self.telemetry.fixed_h2d_ns =
+            (self.slot.h2d_start.elapsed_ms(&self.slot.h2d_end)? * 1_000_000.0) as u64;
+        self.telemetry.fixed_decode_ns =
+            (self.slot.h2d_end.elapsed_ms(&self.slot.ready)? * 1_000_000.0) as u64;
+        Ok(())
+    }
+
+    fn runtime(&self) -> &LoadedLayerRuntime {
+        &self.lease
+    }
+
+    fn record_runtime_done(&mut self, main: &CudaStream) -> Result<(), Box<dyn Error>> {
+        self.slot.runtime_done.record(main)?;
+        self.runtime_done_recorded = true;
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        cache: &mut FixedLayerCache,
+        main: &CudaStream,
+        transfer: &CudaStream,
+    ) -> Result<PinnedFixedSlot, Box<dyn Error>> {
+        if self.generation != self.slot.generation {
+            return Err("pinned fixed slot rejected an ABA generation".into());
+        }
+        if !self.runtime_done_recorded {
+            self.slot.runtime_done.record(main)?;
+        }
+        transfer.wait(&self.slot.runtime_done)?;
+        std::mem::swap(
+            &mut self
+                .lease
+                .runtime
+                .as_mut()
+                .ok_or("pinned fixed prepared lost its runtime")?
+                .weights
+                .wo_a,
+            self.slot
+                .scratch
+                .as_mut()
+                .ok_or("pinned fixed prepared lost its slot scratch")?,
+        );
+        cache.restore_stationary_raw(self.lease)?;
+        Ok(self.slot)
+    }
+}
+
+type PinnedFixedRequest = (
+    Option<PinnedFixedPrepared>,
+    Option<(usize, i64, Option<usize>)>,
+);
+type PinnedFixedReply = Result<Option<PinnedFixedPrepared>, String>;
+
+fn run_pinned_fixed_request_worker(
+    mut cache: FixedLayerCache,
+    mut slots: Vec<PinnedFixedSlot>,
+    root: &std::path::Path,
+    module: &kernels::LoadedModule,
+    main: &std::sync::Arc<CudaStream>,
+    transfer: &std::sync::Arc<CudaStream>,
+    rx: std::sync::mpsc::Receiver<PinnedFixedRequest>,
+    reply_tx: std::sync::mpsc::SyncSender<PinnedFixedReply>,
+    bounded_readahead: bool,
+) -> Result<FixedLayerCache, String> {
+    let readahead_page_cap = bounded_readahead
+        .then(|| bounded_readahead_metadata_page_cap(root))
+        .and_then(Result::ok);
+    let mut pending_readahead = None;
+    while let Ok((completed, next)) = rx.recv() {
+        if let Some(completed) = completed {
+            let layer = completed.lease.layer;
+            match completed.finish(&mut cache, main, transfer) {
+                Ok(slot) => slots.push(slot),
+                Err(error) => {
+                    let message = format!("layer {layer} phase runtime_done_restore: {error}");
+                    let _ = reply_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            }
+        }
+        if let Some((layer, token_id, readahead_layer)) = next {
+            let slot = match slots.pop() {
+                Some(slot) => slot,
+                None => {
+                    let message = format!(
+                        "layer {layer} phase acquire_slot: pinned fixed worker exhausted its two slots"
+                    );
+                    let _ = reply_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let mut prepared = match cache
+                .prepare_stationary_raw_pinned(root, layer, token_id, module, transfer, slot)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let message = format!("layer {layer} phase prepare: {error}");
+                    let _ = reply_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if pending_readahead
+                .as_ref()
+                .is_some_and(|telemetry: &BoundedReadaheadTelemetry| telemetry.layer == layer)
+            {
+                let mut telemetry = pending_readahead
+                    .take()
+                    .expect("matching bounded readahead telemetry disappeared");
+                telemetry.layer = layer;
+                prepared.telemetry.bounded_readahead = Some(telemetry);
+            }
+            reply_tx.send(Ok(Some(prepared))).map_err(|_| {
+                format!("layer {layer} phase reply_prepared: pinned fixed response receiver closed")
+            })?;
+            if bounded_readahead {
+                if let Some(readahead_layer) = readahead_layer {
+                    pending_readahead = Some(production_bounded_readahead(
+                        root,
+                        readahead_layer,
+                        readahead_page_cap,
+                    ));
+                }
+            }
+        } else if slots.len() == 2 {
+            reply_tx.send(Ok(None)).map_err(|_| {
+                "request phase reply_drained: pinned fixed response receiver closed".to_string()
+            })?;
+        }
+    }
+    if slots.len() != 2 {
+        return Err(format!(
+            "request phase shutdown: pinned fixed worker stopped with {} of 2 slots",
+            slots.len()
+        ));
+    }
+    let mut retained = slots
+        .pop()
+        .ok_or("request phase retain_scratch: pinned fixed worker lost its retained scratch")?;
+    cache.raw_scratch = retained.scratch.take();
+    transfer
+        .synchronize()
+        .map_err(|error| format!("request phase transfer_sync: {error}"))?;
+    Ok(cache)
+}
+
+impl std::ops::Deref for StationaryRawLease {
     type Target = LoadedLayerRuntime;
 
     fn deref(&self) -> &Self::Target {
@@ -11679,53 +12709,66 @@ impl std::ops::Deref for StationaryRawLease<'_> {
     }
 }
 
-impl Drop for StationaryRawLease<'_> {
-    fn drop(&mut self) {
-        if self.decoded_wo_a_in_scratch {
+impl FixedLayerCache {
+    fn restore_stationary_raw(
+        &mut self,
+        mut lease: StationaryRawLease,
+    ) -> Result<(), Box<dyn Error>> {
+        if lease.device_generation.is_some_and(|generation| {
+            self.raw_device[lease.layer].is_some()
+                || self.raw_device_generation[lease.layer] != generation
+        }) || lease.host_generation.is_some_and(|generation| {
+            self.raw_host[lease.layer].is_some()
+                || self.raw_host_generation[lease.layer] != generation
+        }) || lease.scratch_generation.is_some_and(|generation| {
+            self.raw_scratch.is_some() || self.raw_scratch_generation != generation
+        }) {
+            return Err("stationary raw lease rejected an ABA replacement".into());
+        }
+        if lease.decoded_wo_a_in_scratch {
             std::mem::swap(
-                &mut self
+                &mut lease
                     .runtime
                     .as_mut()
                     .expect("stationary raw lease lost its runtime")
                     .weights
                     .wo_a,
-                self.scratch
+                lease
+                    .scratch
                     .as_mut()
                     .expect("stationary raw lease lost its decode scratch"),
             );
         }
-        if let Some(slot) = self.scratch_slot.take() {
-            restore_leased_slot(
-                slot,
-                self.scratch
+        if lease.scratch_generation.is_some() {
+            let _ = self.raw_scratch.insert(
+                lease
+                    .scratch
                     .take()
                     .expect("stationary raw lease lost its return scratch"),
             );
         }
-        if let Some(slot) = self.device_slot.take() {
-            restore_leased_slot(
-                slot,
-                RawLoadedLayerRuntime {
-                    runtime: self
-                        .runtime
-                        .take()
-                        .expect("stationary raw device lease lost its runtime"),
-                    wo_a_raw: self
-                        .raw_device
-                        .take()
-                        .expect("stationary raw device lease lost its raw payload"),
-                    resident_bytes: self.resident_bytes,
-                },
-            );
-        } else if let Some(slot) = self.host_slot.take() {
-            drop(self.runtime.take());
-            restore_leased_slot(
-                slot,
-                self.raw_host
+        if lease.device_generation.is_some() {
+            let _ = self.raw_device[lease.layer].insert(RawLoadedLayerRuntime {
+                runtime: lease
+                    .runtime
+                    .take()
+                    .expect("stationary raw device lease lost its runtime"),
+                wo_a_raw: lease
+                    .raw_device
+                    .take()
+                    .expect("stationary raw device lease lost its raw payload"),
+                resident_bytes: lease.resident_bytes,
+            });
+        } else if lease.host_generation.is_some() {
+            drop(lease.runtime.take());
+            let _ = self.raw_host[lease.layer].insert(
+                lease
+                    .raw_host
                     .take()
                     .expect("stationary raw host lease lost its raw payload"),
             );
         }
+        Ok(())
     }
 }
 
@@ -11852,6 +12895,243 @@ fn device_available_bytes() -> Result<usize, Box<dyn Error>> {
     Ok(free)
 }
 
+const PHASE1_HCA_PAYLOAD_BYTES: usize = 391_959_576;
+const PHASE1_CSA_PAYLOAD_BYTES: usize = 427_239_448;
+const PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES: usize =
+    PHASE1_CSA_PAYLOAD_BYTES + RAW_FIXED_SCRATCH_BYTES;
+const PHASE1_P6_HCA_TRANSFERS: u64 = 23;
+const PHASE1_P6_CSA_TRANSFERS: u64 = 29;
+const PHASE1_P6_FIXED_PREPARE_NS: u64 = 11_466_446_202;
+const PHASE1_P6_WITH_FINAL_NS: u64 = 17_162_779_092;
+
+#[derive(Clone, Copy)]
+struct ProcessFaults {
+    minor: u64,
+    major: u64,
+}
+
+fn process_faults() -> Result<ProcessFaults, Box<dyn Error>> {
+    let stat = std::fs::read_to_string("/proc/self/stat")?;
+    let fields = stat
+        .rsplit_once(')')
+        .ok_or("/proc/self/stat has no closing command delimiter")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Ok(ProcessFaults {
+        minor: fields
+            .get(7)
+            .ok_or("/proc/self/stat is missing minflt")?
+            .parse()?,
+        major: fields
+            .get(9)
+            .ok_or("/proc/self/stat is missing majflt")?
+            .parse()?,
+    })
+}
+
+fn fault_delta(before: ProcessFaults, after: ProcessFaults) -> serde_json::Value {
+    serde_json::json!({
+        "minor": after.minor.saturating_sub(before.minor),
+        "major": after.major.saturating_sub(before.major),
+    })
+}
+
+fn phase1_predicted_p6_ns(
+    hca_pack_ns: u64,
+    hca_h2d_ns: u64,
+    csa_pack_ns: u64,
+    csa_h2d_ns: u64,
+) -> u64 {
+    let flow_shop_ns = PHASE1_P6_HCA_TRANSFERS
+        .saturating_mul(hca_pack_ns.max(hca_h2d_ns))
+        .saturating_add(PHASE1_P6_CSA_TRANSFERS.saturating_mul(csa_pack_ns.max(csa_h2d_ns)));
+    PHASE1_P6_WITH_FINAL_NS
+        .saturating_sub(PHASE1_P6_FIXED_PREPARE_NS)
+        .saturating_add(flow_shop_ns)
+}
+
+fn pinned_h2d_service_gate(context: &std::sync::Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+    let pinned_capacity_bytes = PHASE1_CSA_PAYLOAD_BYTES
+        .checked_mul(2)
+        .ok_or("Phase1 pinned capacity overflow")?;
+    let host_required_bytes = FIXED_PREFETCH_HOST_HEADROOM_BYTES
+        .checked_add(pinned_capacity_bytes)
+        .and_then(|bytes| bytes.checked_add(2 * PHASE1_CSA_PAYLOAD_BYTES))
+        .ok_or("Phase1 host requirement overflow")?;
+    let host_available = host_available_bytes()?;
+    let device_available = device_available_bytes()?;
+    let device_required = V4_DEVICE_CAPACITY_HEADROOM_BYTES
+        .checked_add(PHASE1_CSA_PAYLOAD_BYTES)
+        .ok_or("Phase1 device requirement overflow")?;
+    if host_available < host_required_bytes || device_available < device_required {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "KILL",
+                "mode": "v4-pinned-h2d-service-gate-phase1",
+                "reason": "WSL preflight/headroom",
+                "host_available_bytes": host_available,
+                "host_required_bytes": host_required_bytes,
+                "device_available_bytes": device_available,
+                "device_required_bytes": device_required,
+            })
+        );
+        return Ok(());
+    }
+
+    let mut hca_slot = PinnedHostBuffer::<u8>::zeroed(context, PHASE1_CSA_PAYLOAD_BYTES)?;
+    let mut csa_slot = PinnedHostBuffer::<u8>::zeroed(context, PHASE1_CSA_PAYLOAD_BYTES)?;
+    let transfer_stream = context.new_stream()?;
+    let mut measurements = Vec::with_capacity(2);
+
+    for (name, bytes, pinned) in [
+        ("hca", PHASE1_HCA_PAYLOAD_BYTES, &mut hca_slot),
+        ("csa", PHASE1_CSA_PAYLOAD_BYTES, &mut csa_slot),
+    ] {
+        let mut payload = vec![0_u8; bytes];
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte = (index as u64)
+                .wrapping_mul(131)
+                .wrapping_add(bytes as u64)
+                .to_le_bytes()[0];
+        }
+        let expected_hash = fnv1a_bytes(&payload);
+
+        let pageable_faults_before = process_faults()?;
+        let pageable_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let pageable_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        pageable_start.record(&transfer_stream)?;
+        let pageable_wall_started = std::time::Instant::now();
+        let pageable_device = DeviceBuffer::from_host(&transfer_stream, &payload)?;
+        let pageable_submission_ns =
+            u64::try_from(pageable_wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        pageable_end.record(&transfer_stream)?;
+        pageable_end.synchronize()?;
+        let pageable_wall_ns =
+            u64::try_from(pageable_wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pageable_event_ns =
+            (pageable_start.elapsed_ms(&pageable_end)? as f64 * 1_000_000.0) as u64;
+        let pageable_faults_after = process_faults()?;
+        let pageable_download = pageable_device.to_host_vec(&transfer_stream)?;
+        let pageable_hash = fnv1a_bytes(&pageable_download);
+        drop(pageable_download);
+        drop(pageable_device);
+
+        let pack_faults_before = process_faults()?;
+        let pack_started = std::time::Instant::now();
+        pinned.as_mut_slice()[..bytes].copy_from_slice(&payload);
+        let pack_ns = u64::try_from(pack_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pack_faults_after = process_faults()?;
+
+        let pinned_faults_before = process_faults()?;
+        let pinned_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let pinned_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
+        let pinned_wall_started = std::time::Instant::now();
+        let pinned_device =
+            unsafe { DeviceBuffer::<u8>::uninitialized_async(&transfer_stream, bytes)? };
+        pinned_start.record(&transfer_stream)?;
+        let copy_result = unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                pinned_device.cu_deviceptr(),
+                pinned.as_ptr().cast(),
+                bytes,
+                transfer_stream.cu_stream(),
+            )
+        };
+        if copy_result != 0 {
+            return Err(format!("Phase1 pinned H2D enqueue failed with {copy_result:?}").into());
+        }
+        pinned_end.record(&transfer_stream)?;
+        let pinned_submission_ns =
+            u64::try_from(pinned_wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        pinned_end.synchronize()?;
+        let pinned_wall_ns =
+            u64::try_from(pinned_wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pinned_event_ns = (pinned_start.elapsed_ms(&pinned_end)? as f64 * 1_000_000.0) as u64;
+        let pinned_faults_after = process_faults()?;
+        let pinned_download = pinned_device.to_host_vec(&transfer_stream)?;
+        let pinned_hash = fnv1a_bytes(&pinned_download);
+        drop(pinned_download);
+        drop(pinned_device);
+        transfer_stream.synchronize()?;
+
+        measurements.push(serde_json::json!({
+            "payload": name,
+            "bytes": bytes,
+            "expected_hash": format!("{expected_hash:016x}"),
+            "pageable": {
+                "allocation_success": true,
+                "cuda_event_service_ns": pageable_event_ns,
+                "submission_ns": pageable_submission_ns,
+                "wall_ns": pageable_wall_ns,
+                "faults": fault_delta(pageable_faults_before, pageable_faults_after),
+                "d2h_hash": format!("{pageable_hash:016x}"),
+                "hash_equal": pageable_hash == expected_hash,
+            },
+            "pinned": {
+                "allocation_success": true,
+                "pack_wall_ns": pack_ns,
+                "pack_faults": fault_delta(pack_faults_before, pack_faults_after),
+                "cuda_event_h2d_service_ns": pinned_event_ns,
+                "submission_ns": pinned_submission_ns,
+                "wall_ns": pinned_wall_ns,
+                "transfer_faults": fault_delta(pinned_faults_before, pinned_faults_after),
+                "d2h_hash": format!("{pinned_hash:016x}"),
+                "hash_equal": pinned_hash == expected_hash,
+            },
+        }));
+    }
+
+    let value = |payload: usize, arm: &str, field: &str| -> Result<u64, Box<dyn Error>> {
+        measurements[payload][arm][field]
+            .as_u64()
+            .ok_or_else(|| format!("Phase1 measurement {payload}.{arm}.{field} is missing").into())
+    };
+    let predicted_p6_ns = phase1_predicted_p6_ns(
+        value(0, "pinned", "pack_wall_ns")?,
+        value(0, "pinned", "cuda_event_h2d_service_ns")?,
+        value(1, "pinned", "pack_wall_ns")?,
+        value(1, "pinned", "cuda_event_h2d_service_ns")?,
+    );
+    let hashes_pass = measurements.iter().all(|measurement| {
+        measurement["pageable"]["hash_equal"] == true && measurement["pinned"]["hash_equal"] == true
+    });
+    let threshold_ns = PHASE1_P6_WITH_FINAL_NS.saturating_mul(80) / 100;
+    let status = if hashes_pass && predicted_p6_ns <= threshold_ns {
+        "PASS"
+    } else {
+        "KILL"
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": status,
+            "mode": "v4-pinned-h2d-service-gate-phase1",
+            "payload_measurements": measurements,
+            "allocation": {
+                "pinned_slot_count": 2,
+                "pinned_capacity_bytes": pinned_capacity_bytes,
+                "host_available_bytes": host_available,
+                "host_required_bytes": host_required_bytes,
+                "device_available_bytes": device_available,
+                "device_required_bytes": device_required,
+            },
+            "flow_shop": {
+                "model": "p6_nonfixed + 23*max(hca_pack,hca_h2d) + 29*max(csa_pack,csa_h2d)",
+                "p6_with_final_baseline_ns": PHASE1_P6_WITH_FINAL_NS,
+                "p6_fixed_prepare_baseline_ns": PHASE1_P6_FIXED_PREPARE_NS,
+                "predicted_p6_with_final_ns": predicted_p6_ns,
+                "required_max_ns": threshold_ns,
+                "required_reduction_percent": 20,
+            },
+            "hashes_pass": hashes_pass,
+            "phase2_authorized": false,
+        })
+    );
+    Ok(())
+}
+
 fn fixed_layer_tensor_plan(
     model_dir: &std::path::Path,
     layer: usize,
@@ -11913,6 +13193,178 @@ fn fixed_layer_tensor_plan(
     Ok((tensors, device_bytes, wo_a_source_bytes))
 }
 
+const BOUNDED_READAHEAD_MIN_AVAILABLE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+struct BoundedReadaheadSourceSpan {
+    range: safetensors::FileRange,
+}
+
+struct BoundedReadaheadLayer {
+    shard: safetensors::ShardFile,
+    spans: Vec<BoundedReadaheadSourceSpan>,
+    source_bytes: u64,
+}
+
+fn fixed_layer_bounded_readahead_source(
+    model_dir: &std::path::Path,
+    layer: usize,
+) -> Result<BoundedReadaheadLayer, Box<dyn Error>> {
+    let (fixed, _, _) = fixed_layer_tensor_plan(model_dir, layer)?;
+    let shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    let mut spans = fixed
+        .into_iter()
+        .filter(|tensor| tensor.source_bytes != 0)
+        .map(|tensor| {
+            let len = u64::try_from(tensor.source_bytes)?;
+            Ok::<_, Box<dyn Error>>(BoundedReadaheadSourceSpan {
+                range: shard.tensor_file_range(&tensor.name, 0, len)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prefix = format!("layers.{layer}");
+    // fixed_layer_tensor_plan deliberately omits these because they are not
+    // retained device payloads. They are nevertheless real loader reads.
+    let wo_a_scale = format!("{prefix}.attn.wo_a.scale");
+    let wo_a_scale_len = shard.tensor(&wo_a_scale)?.byte_len;
+    spans.push(BoundedReadaheadSourceSpan {
+        range: shard.tensor_file_range(&wo_a_scale, 0, wo_a_scale_len)?,
+    });
+    if layer < 3 {
+        let tid2eid = format!("{prefix}.ffn.gate.tid2eid");
+        let len = u64::try_from(v4_router::V4_TOPK * std::mem::size_of::<i64>())?;
+        spans.push(BoundedReadaheadSourceSpan {
+            range: shard.tensor_file_range(&tid2eid, 0, len)?,
+        });
+    }
+    let source_bytes = spans.iter().try_fold(0_u64, |total, span| {
+        total
+            .checked_add(span.range.len)
+            .ok_or("bounded readahead source byte count overflow")
+    })?;
+    Ok(BoundedReadaheadLayer {
+        shard,
+        spans,
+        source_bytes,
+    })
+}
+
+fn bounded_readahead_window_bytes(
+    ranges: &[safetensors::FileRange],
+) -> Result<u64, Box<dyn Error>> {
+    ranges.iter().try_fold(0_u64, |total, range| {
+        total
+            .checked_add(range.len)
+            .ok_or_else(|| "bounded readahead issued byte count overflow".into())
+    })
+}
+
+fn bounded_readahead_page_cap(source_bytes: u64, page_bytes: u64) -> Result<u64, Box<dyn Error>> {
+    if page_bytes == 0 {
+        return Err("bounded readahead OS page size is zero".into());
+    }
+    source_bytes
+        .checked_add(page_bytes - 1)
+        .map(|bytes| bytes / page_bytes * page_bytes)
+        .ok_or_else(|| "bounded readahead page-aligned cap overflow".into())
+}
+
+fn os_page_bytes() -> Result<u64, Box<dyn Error>> {
+    unsafe extern "C" {
+        fn getpagesize() -> i32;
+    }
+    // SAFETY: getpagesize has no arguments or side effects.
+    u64::try_from(unsafe { getpagesize() }).map_err(Into::into)
+}
+
+fn bounded_readahead_metadata_page_cap(model_dir: &std::path::Path) -> Result<u64, Box<dyn Error>> {
+    let max_source_bytes = (0..v4_state::V4_LAYER_COUNT)
+        .map(|layer| {
+            fixed_layer_bounded_readahead_source(model_dir, layer).map(|plan| plan.source_bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("bounded readahead metadata plan is empty")?;
+    bounded_readahead_page_cap(max_source_bytes, os_page_bytes()?)
+}
+
+fn production_bounded_readahead(
+    model_dir: &std::path::Path,
+    layer: usize,
+    page_cap: Option<u64>,
+) -> BoundedReadaheadTelemetry {
+    let skipped = |reason| BoundedReadaheadTelemetry {
+        layer,
+        issued: false,
+        skipped_reason: Some(reason),
+        bytes: 0,
+        ranges: Vec::new(),
+        advice_us: 0,
+    };
+    if !cfg!(target_os = "linux") {
+        return skipped("not_linux");
+    }
+    let Some(page_cap) = page_cap else {
+        return skipped("metadata_cap_unavailable");
+    };
+    match host_available_bytes() {
+        Ok(available) if available >= BOUNDED_READAHEAD_MIN_AVAILABLE_BYTES => {}
+        Ok(_) => return skipped("mem_available_below_4gib"),
+        Err(_) => return skipped("mem_available_unavailable"),
+    }
+    let plan = match fixed_layer_bounded_readahead_source(model_dir, layer) {
+        Ok(plan) => plan,
+        Err(_) => return skipped("invalid_span"),
+    };
+    let ranges = plan.spans.iter().map(|span| span.range).collect::<Vec<_>>();
+    let ranges = match safetensors::merge_adjacent_ranges(&ranges) {
+        Ok(ranges) => ranges,
+        Err(_) => return skipped("invalid_span"),
+    };
+    let bytes = match bounded_readahead_window_bytes(&ranges) {
+        Ok(bytes) if plan.source_bytes <= page_cap && bytes <= page_cap => bytes,
+        Ok(_) => return skipped("metadata_page_cap"),
+        Err(_) => return skipped("invalid_span"),
+    };
+    let started = std::time::Instant::now();
+    if plan.shard.advise_willneed_ranges(&ranges).is_err() {
+        return BoundedReadaheadTelemetry {
+            layer,
+            issued: false,
+            skipped_reason: Some("syscall_error"),
+            bytes,
+            ranges,
+            advice_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        };
+    }
+    BoundedReadaheadTelemetry {
+        layer,
+        issued: true,
+        skipped_reason: None,
+        bytes,
+        ranges,
+        advice_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    }
+}
+
+fn bounded_readahead_json(
+    telemetry: Option<&BoundedReadaheadTelemetry>,
+    following_prepare_read_service_ns: u64,
+) -> Option<serde_json::Value> {
+    telemetry.map(|telemetry| {
+        serde_json::json!({
+            "issued": telemetry.issued,
+            "skipped_reason": telemetry.skipped_reason,
+            "bytes": telemetry.bytes,
+            "ranges": telemetry.ranges.iter().map(|range| serde_json::json!({"offset": range.offset, "len": range.len})).collect::<Vec<_>>(),
+            "advice_us": telemetry.advice_us,
+            "following_prepare_read_service_ns": following_prepare_read_service_ns,
+        })
+    })
+}
+
 fn max_fixed_layer_device_bytes(
     model_dir: &std::path::Path,
 ) -> Result<(usize, usize), Box<dyn Error>> {
@@ -11938,6 +13390,8 @@ struct DeviceAttentionCapacityPlan {
     device_token_state_total_bytes: usize,
     rope_lut_bytes: usize,
     tid2eid_transient_max_bytes: usize,
+    certified_argmax_device_temp_bytes: usize,
+    certified_argmax_host_temp_bytes: usize,
     headroom_bytes: usize,
     required_bytes: usize,
 }
@@ -11947,6 +13401,7 @@ fn device_attention_capacity_plan(
     qd4_enabled: bool,
     qd4_immutable_expert_cache: bool,
     request_rope_rows: usize,
+    certified_argmax_production: bool,
 ) -> Result<DeviceAttentionCapacityPlan, Box<dyn Error>> {
     let (fixed_layer, max_fixed_device_bytes) = max_fixed_layer_device_bytes(model_dir)?;
     let qd4_device_bytes = usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES;
@@ -11958,6 +13413,10 @@ fn device_attention_capacity_plan(
     let short_device_decode = request_rope_rows > V4_REQUEST_ROPE_LUT_ROWS;
     let rope_lut_bytes = 2 * request_rope_rows * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
     let tid2eid_transient_max_bytes = V4_TID2EID_TRANSIENT_MAX_BYTES;
+    let certified_argmax_device_temp_bytes =
+        usize::from(certified_argmax_production) * CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES;
+    let certified_argmax_host_temp_bytes =
+        usize::from(certified_argmax_production) * CERTIFIED_ARGMAX_HOST_TEMP_BYTES;
     let manifests = v4_state::serial_layer_manifests(0)?;
     let (hca_states, csa_states) =
         manifests
@@ -11992,6 +13451,7 @@ fn device_attention_capacity_plan(
         device_token_state_total_bytes,
         rope_lut_bytes,
         tid2eid_transient_max_bytes,
+        certified_argmax_device_temp_bytes,
         V4_DEVICE_CAPACITY_HEADROOM_BYTES,
     ]
     .into_iter()
@@ -12011,6 +13471,8 @@ fn device_attention_capacity_plan(
         device_token_state_total_bytes,
         rope_lut_bytes,
         tid2eid_transient_max_bytes,
+        certified_argmax_device_temp_bytes,
+        certified_argmax_host_temp_bytes,
         headroom_bytes: V4_DEVICE_CAPACITY_HEADROOM_BYTES,
         required_bytes,
     })
@@ -12021,6 +13483,7 @@ fn validate_device_attention_capacity(
     qd4_enabled: bool,
     qd4_immutable_expert_cache: bool,
     request_rope_rows: usize,
+    certified_argmax_production: bool,
     available_bytes: usize,
 ) -> Result<DeviceAttentionCapacityPlan, Box<dyn Error>> {
     let plan = device_attention_capacity_plan(
@@ -12028,10 +13491,11 @@ fn validate_device_attention_capacity(
         qd4_enabled,
         qd4_immutable_expert_cache,
         request_rope_rows,
+        certified_argmax_production,
     )?;
     if available_bytes < plan.required_bytes {
         return Err(format!(
-            "device attention capacity requires {} bytes (QD4={} immutable_cache={} max_fixed={} layer={} states={} state_bytes={} max_state={} hca_state={} rope_lut={} tid2eid_transient={} headroom={}), but cuMemGetInfo reports {} free",
+            "device attention capacity requires {} bytes (QD4={} immutable_cache={} max_fixed={} layer={} states={} state_bytes={} max_state={} hca_state={} rope_lut={} tid2eid_transient={} certified_argmax_temp={} headroom={}), but cuMemGetInfo reports {} free",
             plan.required_bytes,
             plan.qd4_device_bytes,
             plan.qd4_immutable_expert_cache_device_bytes,
@@ -12043,6 +13507,7 @@ fn validate_device_attention_capacity(
             plan.hca_device_token_state_bytes,
             plan.rope_lut_bytes,
             plan.tid2eid_transient_max_bytes,
+            plan.certified_argmax_device_temp_bytes,
             plan.headroom_bytes,
             available_bytes,
         )
@@ -12167,10 +13632,22 @@ impl FixedLayerCache {
     ) -> Result<Self, Box<dyn Error>> {
         let requested_device = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?;
         let requested_host = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB")?;
+        let pinned_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
+        let effective_requested_device = if pinned_pipeline {
+            requested_device
+                .checked_sub(PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES)
+                .ok_or("pinned fixed pipeline device budget cannot hold its next layer and second decode scratch")?
+        } else {
+            requested_device
+        };
         let device_budget_bytes = preflight_cache_budget(
-            requested_device,
+            effective_requested_device,
             device_available_bytes()?,
-            device_reserve_bytes.saturating_add(RAW_FIXED_SCRATCH_BYTES),
+            device_reserve_bytes
+                .saturating_add(RAW_FIXED_SCRATCH_BYTES)
+                .saturating_add(
+                    usize::from(pinned_pipeline) * PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES,
+                ),
             "stationary_raw_device",
         );
         let host_budget_bytes = preflight_cache_budget(
@@ -12206,6 +13683,9 @@ impl FixedLayerCache {
             raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_scratch,
+            raw_device_generation: vec![0; v4_state::V4_LAYER_COUNT],
+            raw_host_generation: vec![0; v4_state::V4_LAYER_COUNT],
+            raw_scratch_generation: 0,
             raw_mode: true,
             host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             device_budget_bytes,
@@ -12270,6 +13750,9 @@ impl FixedLayerCache {
                 raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
                 raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
                 raw_scratch: None,
+                raw_device_generation: vec![0; v4_state::V4_LAYER_COUNT],
+                raw_host_generation: vec![0; v4_state::V4_LAYER_COUNT],
+                raw_scratch_generation: 0,
                 raw_mode,
                 host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
                 plan: Vec::new(),
@@ -12330,6 +13813,9 @@ impl FixedLayerCache {
             raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_scratch,
+            raw_device_generation: vec![0; v4_state::V4_LAYER_COUNT],
+            raw_host_generation: vec![0; v4_state::V4_LAYER_COUNT],
+            raw_scratch_generation: 0,
             raw_mode,
             host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             plan,
@@ -12460,14 +13946,175 @@ impl FixedLayerCache {
         Ok(())
     }
 
-    fn access_stationary_raw<'a>(
-        &'a mut self,
+    fn prepare_stationary_raw_pinned(
+        &mut self,
+        model_dir: &std::path::Path,
+        layer: usize,
+        token_id: i64,
+        module: &kernels::LoadedModule,
+        transfer: &std::sync::Arc<CudaStream>,
+        mut slot: PinnedFixedSlot,
+    ) -> Result<PinnedFixedPrepared, Box<dyn Error>> {
+        self.validate_stationary_key(model_dir)?;
+        slot.generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or("pinned fixed slot generation overflow")?;
+        let generation = slot.generation;
+        let candidate = self.plan.iter().position(|plan| plan.layer == layer);
+        let (device_selected, host_selected, expected_bytes) = candidate
+            .map(|index| {
+                (
+                    self.device_selected[index],
+                    self.host_selected[index],
+                    self.plan[index].raw_device_bytes,
+                )
+            })
+            .ok_or("pinned fixed layer is outside the retention plan")?;
+        if device_selected && self.raw_device[layer].is_some() {
+            self.device_hits += 1;
+            self.stationary_source_bytes_saved = self
+                .stationary_source_bytes_saved
+                .checked_add(self.stationary_source_bytes[layer])
+                .ok_or("pinned fixed source-saved byte overflow")?;
+            self.stationary_h2d_bytes_saved = self
+                .stationary_h2d_bytes_saved
+                .checked_add(self.stationary_h2d_bytes[layer])
+                .ok_or("pinned fixed H2D-saved byte overflow")?;
+            let cached = self.raw_device[layer]
+                .take()
+                .ok_or("pinned fixed device cache entry disappeared")?;
+            self.raw_device_generation[layer] = self.raw_device_generation[layer]
+                .checked_add(1)
+                .ok_or("pinned fixed device generation overflow")?;
+            let RawLoadedLayerRuntime {
+                mut runtime,
+                wo_a_raw,
+                resident_bytes,
+            } = cached;
+            slot.h2d_start.record(transfer)?;
+            slot.h2d_end.record(transfer)?;
+            let mut wo_a = slot
+                .scratch
+                .replace(unsafe { DeviceBuffer::uninitialized_async(transfer, 0)? })
+                .ok_or("pinned fixed device hit lost its scratch")?;
+            launch_e4m3fn_to_bf16(module, transfer, &wo_a_raw, &mut wo_a)?;
+            std::mem::swap(&mut runtime.weights.wo_a, &mut wo_a);
+            slot.ready.record(transfer)?;
+            return Ok(PinnedFixedPrepared {
+                slot,
+                generation,
+                runtime_done_recorded: false,
+                lease: StationaryRawLease {
+                    layer,
+                    device_generation: Some(self.raw_device_generation[layer]),
+                    host_generation: None,
+                    scratch_generation: None,
+                    runtime: Some(runtime),
+                    raw_device: Some(wo_a_raw),
+                    raw_host: None,
+                    scratch: None,
+                    resident_bytes,
+                    decoded_wo_a_in_scratch: false,
+                },
+                telemetry: FixedLoadTelemetry {
+                    cache_status: "stationary_pinned_device_hit",
+                    ..FixedLoadTelemetry::default()
+                },
+            });
+        }
+        let mut telemetry;
+        let runtime;
+        let raw_wo_a;
+        let copied;
+        if host_selected && self.raw_host[layer].is_some() {
+            self.host_hits += 1;
+            self.stationary_source_bytes_saved = self
+                .stationary_source_bytes_saved
+                .checked_add(self.stationary_source_bytes[layer])
+                .ok_or("pinned fixed host source-saved byte overflow")?;
+            let mut cached = self.raw_host[layer]
+                .take()
+                .ok_or("pinned fixed host cache entry disappeared")?;
+            self.raw_host_generation[layer] = self.raw_host_generation[layer]
+                .checked_add(1)
+                .ok_or("pinned fixed host generation overflow")?;
+            let host_generation = self.raw_host_generation[layer];
+            if cached.host.tail.wo_a_raw.is_some() || cached.wo_a_raw.is_empty() {
+                return Err("pinned fixed host cache raw payload ownership drift".into());
+            }
+            cached.host.tail.wo_a_raw = Some(std::mem::take(&mut cached.wo_a_raw));
+            let uploaded = upload_pinned_layer_runtime_raw(
+                model_dir,
+                layer,
+                &cached.host,
+                module,
+                transfer,
+                &mut slot,
+            );
+            cached.wo_a_raw = cached
+                .host
+                .tail
+                .wo_a_raw
+                .take()
+                .ok_or("pinned fixed host cache lost its raw payload")?;
+            (runtime, raw_wo_a, copied) = uploaded?;
+            if self.raw_host[layer].is_some() || self.raw_host_generation[layer] != host_generation
+            {
+                return Err("pinned fixed host restore rejected an ABA replacement".into());
+            }
+            let _ = self.raw_host[layer].insert(cached);
+            telemetry = FixedLoadTelemetry {
+                cache_status: "stationary_pinned_host_hit",
+                ..FixedLoadTelemetry::default()
+            };
+        } else {
+            self.misses += 1;
+            let (host, loaded) = load_layer_host_raw_wo_a(model_dir, layer, &[token_id])?;
+            telemetry = loaded;
+            (runtime, raw_wo_a, copied) = upload_pinned_layer_runtime_raw(
+                model_dir, layer, &host, module, transfer, &mut slot,
+            )?;
+            telemetry.cache_status = "stationary_pinned_miss";
+        }
+        if copied != expected_bytes || copied > PHASE1_CSA_PAYLOAD_BYTES {
+            return Err(format!(
+                "pinned fixed layer {layer} copied {copied} bytes, expected {expected_bytes}"
+            )
+            .into());
+        }
+        telemetry.fixed_h2d_bytes = copied;
+        telemetry.raw_h2d_bytes = raw_wo_a.num_bytes();
+        Ok(PinnedFixedPrepared {
+            slot,
+            generation,
+            runtime_done_recorded: false,
+            lease: StationaryRawLease {
+                layer,
+                device_generation: None,
+                host_generation: None,
+                scratch_generation: None,
+                runtime: Some(runtime),
+                // Keep the async upload source alive until runtime_done closes
+                // the transfer-stream happens-before chain.
+                raw_device: Some(raw_wo_a),
+                raw_host: None,
+                scratch: None,
+                resident_bytes: 0,
+                decoded_wo_a_in_scratch: false,
+            },
+            telemetry,
+        })
+    }
+
+    fn access_stationary_raw(
+        &mut self,
         model_dir: &std::path::Path,
         layer: usize,
         token_ids: &[i64],
         module: &kernels::LoadedModule,
         stream: &CudaStream,
-    ) -> Result<(StationaryRawLease<'a>, FixedLoadTelemetry), Box<dyn Error>> {
+    ) -> Result<(StationaryRawLease, FixedLoadTelemetry), Box<dyn Error>> {
         self.validate_stationary_key(model_dir)?;
         let candidate_index = self
             .plan
@@ -12486,14 +14133,21 @@ impl FixedLayerCache {
                 .stationary_h2d_bytes_saved
                 .checked_add(self.stationary_h2d_bytes[layer])
                 .ok_or("stationary H2D-saved byte overflow")?;
-            let device_slot = &mut self.raw_device[layer];
-            let cached = device_slot
+            let cached = self.raw_device[layer]
                 .take()
                 .ok_or("stationary raw device cache entry disappeared")?;
-            let scratch_slot = &mut self.raw_scratch;
-            let mut scratch = scratch_slot
+            self.raw_device_generation[layer] = self.raw_device_generation[layer]
+                .checked_add(1)
+                .ok_or("stationary raw device generation overflow")?;
+            let device_generation = self.raw_device_generation[layer];
+            let mut scratch = self
+                .raw_scratch
                 .take()
                 .ok_or("stationary raw device scratch disappeared")?;
+            self.raw_scratch_generation = self
+                .raw_scratch_generation
+                .checked_add(1)
+                .ok_or("stationary raw scratch generation overflow")?;
             let RawLoadedLayerRuntime {
                 mut runtime,
                 wo_a_raw,
@@ -12507,10 +14161,11 @@ impl FixedLayerCache {
             std::mem::swap(&mut runtime.weights.wo_a, &mut scratch);
             return Ok((
                 StationaryRawLease {
+                    layer,
+                    device_generation: Some(device_generation),
+                    host_generation: None,
+                    scratch_generation: Some(self.raw_scratch_generation),
                     runtime: Some(runtime),
-                    device_slot: Some(device_slot),
-                    host_slot: None,
-                    scratch_slot: Some(scratch_slot),
                     raw_device: Some(wo_a_raw),
                     raw_host: None,
                     scratch: Some(scratch),
@@ -12530,14 +14185,21 @@ impl FixedLayerCache {
                 .stationary_source_bytes_saved
                 .checked_add(self.stationary_source_bytes[layer])
                 .ok_or("stationary source-saved byte overflow")?;
-            let host_slot = &mut self.raw_host[layer];
-            let cached = host_slot
+            let cached = self.raw_host[layer]
                 .take()
                 .ok_or("stationary raw host cache entry disappeared")?;
-            let scratch_slot = &mut self.raw_scratch;
-            let mut scratch = scratch_slot
+            self.raw_host_generation[layer] = self.raw_host_generation[layer]
+                .checked_add(1)
+                .ok_or("stationary raw host generation overflow")?;
+            let host_generation = self.raw_host_generation[layer];
+            let mut scratch = self
+                .raw_scratch
                 .take()
                 .ok_or("stationary raw host scratch disappeared")?;
+            self.raw_scratch_generation = self
+                .raw_scratch_generation
+                .checked_add(1)
+                .ok_or("stationary raw scratch generation overflow")?;
             let h2d_started = std::time::Instant::now();
             let mut runtime = upload_layer_runtime(model_dir, layer, &cached.host, stream)?;
             stream.synchronize()?;
@@ -12560,10 +14222,11 @@ impl FixedLayerCache {
                 .ok_or("stationary raw host H2D byte overflow")?;
             return Ok((
                 StationaryRawLease {
+                    layer,
+                    device_generation: None,
+                    host_generation: Some(host_generation),
+                    scratch_generation: Some(self.raw_scratch_generation),
                     runtime: Some(runtime),
-                    device_slot: None,
-                    host_slot: Some(host_slot),
-                    scratch_slot: Some(scratch_slot),
                     raw_device: None,
                     raw_host: Some(cached),
                     scratch: Some(scratch),
@@ -12594,10 +14257,11 @@ impl FixedLayerCache {
         drop(wo_a_raw);
         Ok((
             StationaryRawLease {
+                layer,
+                device_generation: None,
+                host_generation: None,
+                scratch_generation: None,
                 runtime: Some(runtime),
-                device_slot: None,
-                host_slot: None,
-                scratch_slot: None,
                 raw_device: None,
                 raw_host: None,
                 scratch: None,
@@ -12945,6 +14609,162 @@ fn upload_layer_runtime_raw_wo_a(
             ..FixedLoadTelemetry::default()
         },
         raw_wo_a,
+    ))
+}
+
+fn upload_pinned_layer_runtime_raw(
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    slot: &mut PinnedFixedSlot,
+) -> Result<(LoadedLayerRuntime, DeviceBuffer<u8>, usize), Box<dyn Error>> {
+    let mut cursor = 0_usize;
+    macro_rules! copy {
+        ($source:expr) => {{
+            let source = $source;
+            let bytes = std::mem::size_of_val(source);
+            let end = cursor
+                .checked_add(bytes)
+                .ok_or("pinned fixed slot cursor overflow")?;
+            if end > slot.host.len() {
+                return Err("pinned fixed layer exceeds its CSA-max slot".into());
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr().cast::<u8>(),
+                    slot.host.as_mut_ptr().add(cursor),
+                    bytes,
+                );
+            }
+            let device = unsafe { DeviceBuffer::uninitialized_async(stream, source.len())? };
+            let result = unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    device.cu_deviceptr(),
+                    slot.host.as_ptr().add(cursor).cast(),
+                    bytes,
+                    stream.cu_stream(),
+                )
+            };
+            if result != 0 {
+                return Err(format!("pinned fixed H2D enqueue failed with {result:?}").into());
+            }
+            cursor = end;
+            device
+        }};
+    }
+    macro_rules! fp8 {
+        ($matrix:expr) => {{
+            let matrix = $matrix;
+            DeviceFp8Matrix {
+                weight: copy!(matrix.weight.as_slice()),
+                scale: copy!(matrix.scale.as_slice()),
+                in_features: matrix.in_features,
+                out_features: matrix.out_features,
+            }
+        }};
+    }
+    let state = &host.state;
+    let projections = &host.projections;
+    let tail = &host.tail;
+    let router_bias = match &state.router {
+        v4_state::LayerRouterWeights::Hash { .. } => {
+            vec![0.0_f32; v4_router::V4_ROUTED_EXPERTS]
+        }
+        v4_state::LayerRouterWeights::Learned { bias } => bias.clone(),
+    };
+    slot.h2d_start.record(stream)?;
+    let hc_attn_fn = copy!(state.hc_fn.as_slice());
+    let hc_attn_base = copy!(state.hc_base.as_slice());
+    let hc_attn_scale = copy!(state.hc_scale.as_slice());
+    let attn_norm = copy!(state.attn_norm.as_slice());
+    let wq_a = fp8!(&projections.wq_a.matrix);
+    let q_norm = copy!(projections.wq_a.norm.as_slice());
+    let wq_b = fp8!(&projections.wq_b);
+    let wkv = fp8!(&projections.wkv.matrix);
+    let kv_norm = copy!(projections.wkv.norm.as_slice());
+    let compressor_wkv = copy!(state.compressor.wkv_bf16.as_slice());
+    let compressor_wgate = copy!(state.compressor.wgate_bf16.as_slice());
+    let compressor_ape = copy!(state.compressor.ape_f32.as_slice());
+    let compressor_norm = copy!(state.compressor.norm_bf16.as_slice());
+    let indexer = state
+        .indexer
+        .as_ref()
+        .map(|indexer| {
+            Ok::<_, Box<dyn Error>>(DeviceLayerIndexer {
+                wq_b: fp8!(&indexer.wq_b),
+                weights_proj: copy!(indexer.weights_proj_bf16.as_slice()),
+                compressor_wkv: copy!(indexer.compressor.wkv_bf16.as_slice()),
+                compressor_wgate: copy!(indexer.compressor.wgate_bf16.as_slice()),
+                compressor_ape: copy!(indexer.compressor.ape_f32.as_slice()),
+                compressor_norm: copy!(indexer.compressor.norm_bf16.as_slice()),
+            })
+        })
+        .transpose()?;
+    let attn_sink = copy!(tail.attn_sink.as_slice());
+    let raw_wo_a = copy!(
+        tail.wo_a_raw
+            .as_deref()
+            .ok_or("pinned fixed upload requires raw wo_a")?
+    );
+    let wo_b = fp8!(&tail.wo_b);
+    let hc_ffn_fn = copy!(tail.hc_ffn_fn.as_slice());
+    let hc_ffn_base = copy!(tail.hc_ffn_base.as_slice());
+    let hc_ffn_scale = copy!(tail.hc_ffn_scale.as_slice());
+    let ffn_norm = copy!(state.ffn_norm.as_slice());
+    let gate = copy!(state.gate.as_slice());
+    let router_bias = copy!(router_bias.as_slice());
+    let shared_w1 = fp8!(&tail.shared.w1);
+    let shared_w2 = fp8!(&tail.shared.w2);
+    let shared_w3 = fp8!(&tail.shared.w3);
+    slot.h2d_end.record(stream)?;
+    let mut wo_a = slot
+        .scratch
+        .replace(unsafe { DeviceBuffer::uninitialized_async(stream, 0)? })
+        .ok_or("pinned fixed slot lost its decode scratch")?;
+    launch_e4m3fn_to_bf16(module, stream, &raw_wo_a, &mut wo_a)?;
+    slot.ready.record(stream)?;
+    let expert_shard = safetensors::ShardFile::open(
+        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
+    )?;
+    Ok((
+        LoadedLayerRuntime {
+            weights: LayerDeviceWeights {
+                layer,
+                compression_ratio: state.compression_ratio,
+                hc_attn_fn,
+                hc_attn_base,
+                hc_attn_scale,
+                attn_norm,
+                wq_a,
+                q_norm,
+                wq_b,
+                wkv,
+                kv_norm,
+                compressor_wkv,
+                compressor_wgate,
+                compressor_ape,
+                compressor_norm,
+                indexer,
+                attn_sink,
+                wo_a,
+                wo_b,
+                hc_ffn_fn,
+                hc_ffn_base,
+                hc_ffn_scale,
+                ffn_norm,
+                gate,
+                router_bias,
+                hash_router: matches!(state.router, v4_state::LayerRouterWeights::Hash { .. }),
+                shared_w1,
+                shared_w2,
+                shared_w3,
+            },
+            expert_shard,
+        },
+        raw_wo_a,
+        cursor,
     ))
 }
 
@@ -16380,6 +18200,121 @@ impl LayerStageTelemetry {
     }
 }
 
+fn fixed_prepare_dual_accounting(
+    fixed: &FixedLoadTelemetry,
+    main_exposed_prepare_ns: u64,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let service_work_sum_ns = fixed
+        .fixed_read_alloc_ns
+        .checked_add(fixed.fixed_h2d_ns)
+        .and_then(|value| value.checked_add(fixed.fixed_decode_ns))
+        .ok_or("fixed prepare service-work sum overflow")?;
+    if fixed.raw_source_bytes > fixed.fixed_source_bytes
+        || fixed.raw_h2d_bytes > fixed.fixed_h2d_bytes
+        || fixed.raw_h2d_ns > fixed.fixed_h2d_ns
+    {
+        return Err(format!(
+            "fixed prepare nested byte/service accounting is invalid: raw_source_bytes={} source_bytes={} raw_h2d_bytes={} h2d_bytes={} raw_h2d_ns={} h2d_ns={}",
+            fixed.raw_source_bytes,
+            fixed.fixed_source_bytes,
+            fixed.raw_h2d_bytes,
+            fixed.fixed_h2d_bytes,
+            fixed.raw_h2d_ns,
+            fixed.fixed_h2d_ns,
+        )
+        .into());
+    }
+    let (origin, device_hit_count, host_hit_count, source_load_count) = match fixed.cache_status {
+        "stationary_pinned_device_hit" | "stationary_raw_device_hit" => {
+            ("device_hit", 1_usize, 0_usize, 0_usize)
+        }
+        "stationary_pinned_host_hit" | "stationary_raw_host_hit" => ("host_hit", 0, 1, 0),
+        "stationary_pinned_miss" | "stationary_raw_miss" | "prefetched_blocking_h2d" | "miss" => {
+            ("source_load", 0, 0, 1)
+        }
+        status => {
+            return Err(format!("fixed prepare has unknown origin status {status}").into());
+        }
+    };
+    let origin_count = device_hit_count + host_hit_count + source_load_count;
+    let origin_bytes_valid = match origin {
+        "device_hit" => fixed.fixed_source_bytes == 0 && fixed.fixed_h2d_bytes == 0,
+        "host_hit" => fixed.fixed_source_bytes == 0 && fixed.fixed_h2d_bytes > 0,
+        "source_load" => fixed.fixed_source_bytes > 0 && fixed.fixed_h2d_bytes > 0,
+        _ => unreachable!(),
+    };
+    if origin_count != 1 || !origin_bytes_valid {
+        return Err(format!(
+            "fixed prepare origin/byte accounting is invalid: status={} device_hit_count={} host_hit_count={} source_load_count={} source_bytes={} h2d_bytes={}",
+            fixed.cache_status,
+            device_hit_count,
+            host_hit_count,
+            source_load_count,
+            fixed.fixed_source_bytes,
+            fixed.fixed_h2d_bytes,
+        )
+        .into());
+    }
+    let exposed_service_bound_ns = service_work_sum_ns.min(main_exposed_prepare_ns);
+    let derived_overlap_credit_ns = service_work_sum_ns - exposed_service_bound_ns;
+    let queue_or_overhead_ns = main_exposed_prepare_ns - exposed_service_bound_ns;
+    if service_work_sum_ns
+        != exposed_service_bound_ns
+            .checked_add(derived_overlap_credit_ns)
+            .ok_or("fixed prepare service dual-ledger overflow")?
+        || main_exposed_prepare_ns
+            != exposed_service_bound_ns
+                .checked_add(queue_or_overhead_ns)
+                .ok_or("fixed prepare exposed dual-ledger overflow")?
+    {
+        return Err(format!(
+            "fixed prepare dual-ledger closure is invalid: service_work_sum_ns={} main_exposed_prepare_ns={} exposed_service_bound_ns={} derived_overlap_credit_ns={} queue_or_overhead_ns={}",
+            service_work_sum_ns,
+            main_exposed_prepare_ns,
+            exposed_service_bound_ns,
+            derived_overlap_credit_ns,
+            queue_or_overhead_ns,
+        )
+        .into());
+    }
+    Ok(serde_json::json!({
+        "cache_status": fixed.cache_status,
+        "origin": {
+            "class": origin,
+            "device_hit_count": device_hit_count,
+            "host_hit_count": host_hit_count,
+            "source_load_count": source_load_count,
+            "count_closure_exact": origin_count == 1,
+        },
+        "service": {
+            "work_sum_ns": service_work_sum_ns,
+            "read_alloc_ns": fixed.fixed_read_alloc_ns,
+            "h2d_ns": fixed.fixed_h2d_ns,
+            "decode_ns": fixed.fixed_decode_ns,
+            "internal_closure": "work_sum_ns == read_alloc_ns + h2d_ns + decode_ns",
+        },
+        "critical": {
+            "main_exposed_prepare_ns": main_exposed_prepare_ns,
+            "exposed_service_bound_ns": exposed_service_bound_ns,
+            "derived_overlap_credit_ns": derived_overlap_credit_ns,
+            "queue_or_overhead_ns": queue_or_overhead_ns,
+            "service_closure": "work_sum_ns == exposed_service_bound_ns + derived_overlap_credit_ns",
+            "main_closure": "main_exposed_prepare_ns == exposed_service_bound_ns + queue_or_overhead_ns",
+            "interpretation": "dual-ledger algebra; derived_overlap_credit_ns is not a directly measured causal overlap",
+        },
+        "bytes": {
+            "source_bytes": fixed.fixed_source_bytes,
+            "h2d_bytes": fixed.fixed_h2d_bytes,
+            "raw_source_bytes": fixed.raw_source_bytes,
+            "raw_h2d_bytes": fixed.raw_h2d_bytes,
+        },
+        "nested": {
+            "raw_read_ns": fixed.raw_read_ns,
+            "raw_h2d_ns": fixed.raw_h2d_ns,
+        },
+    }))
+}
+
 fn stationary_layer_phase_profile_json(
     request_start_ns: u64,
     request_end_ns: u64,
@@ -16391,17 +18326,15 @@ fn stationary_layer_phase_profile_json(
     if request_end_ns < request_start_ns {
         return Err("stationary phase profile layer span is not monotonic".into());
     }
-    let fixed_wall_ns = fixed.map_or(0, |fixed| {
-        fixed
-            .fixed_read_alloc_ns
-            .saturating_add(fixed.fixed_decode_ns)
-            .saturating_add(fixed.fixed_h2d_ns)
-    });
-    if stage.layer_prepare_count > 1
+    let expected_prepare_count = usize::from(fixed.is_some());
+    if stage.layer_prepare_count != expected_prepare_count
         || (stage.layer_prepare_count == 0 && stage.layer_prepare_ns != 0)
-        || (stage.layer_prepare_count == 1 && fixed_wall_ns > stage.layer_prepare_ns)
     {
-        return Err("stationary layer-prepare accounting is invalid".into());
+        return Err(format!(
+            "stationary layer-prepare count accounting is invalid: count={} expected_count={} main_exposed_prepare_ns={}",
+            stage.layer_prepare_count, expected_prepare_count, stage.layer_prepare_ns
+        )
+        .into());
     }
     let attention_wall_ns = stage
         .device_state_setup_ns
@@ -16445,21 +18378,9 @@ fn stationary_layer_phase_profile_json(
     {
         return Err("stationary nested diagnostic exceeds its parent scope".into());
     }
-    let fixed_load = fixed.map(|fixed| {
-        serde_json::json!({
-            "wall_ns": fixed_wall_ns,
-            "cache_status": fixed.cache_status,
-            "read_alloc_ns": fixed.fixed_read_alloc_ns,
-            "decode_ns": fixed.fixed_decode_ns,
-            "h2d_ns": fixed.fixed_h2d_ns,
-            "source_bytes": fixed.fixed_source_bytes,
-            "h2d_bytes": fixed.fixed_h2d_bytes,
-            "raw_read_ns": fixed.raw_read_ns,
-            "raw_source_bytes": fixed.raw_source_bytes,
-            "raw_h2d_ns": fixed.raw_h2d_ns,
-            "raw_h2d_bytes": fixed.raw_h2d_bytes,
-        })
-    });
+    let fixed_load = fixed
+        .map(|fixed| fixed_prepare_dual_accounting(fixed, stage.layer_prepare_ns))
+        .transpose()?;
     let layer_prepare = (stage.layer_prepare_count == 1).then(|| {
         serde_json::json!({
             "wall_ns": stage.layer_prepare_ns,
@@ -16514,7 +18435,7 @@ fn stationary_layer_phase_profile_json(
     };
     Ok((
         serde_json::json!({
-            "schema": "colibri-v4-stationary-phase-profile-v4",
+            "schema": "colibri-v4-stationary-phase-profile-v5",
             "clock": "monotonic_host_ns; nested CUDA event durations are diagnostics only",
             "outer": {
                 "request_start_ns": request_start_ns,
@@ -17099,6 +19020,9 @@ impl DeviceExactCompressorScratch {
 impl DeviceTokenState {
     fn new(stream: &CudaStream, weights: &LayerDeviceWeights) -> Result<Self, Box<dyn Error>> {
         let csa = weights.compression_ratio == v4_state::CompressionRatio::Csa4;
+        if weights.wq_a.out_features != V4_Q_LORA_RANK {
+            return Err("device token-state Q-LoRA rank differs from its capacity ledger".into());
+        }
         let compressor_width = if csa { 1_024 } else { v4_state::Q_HEAD_DIM };
         let compressor_rows = weights.compression_ratio.get() * (1 + usize::from(csa));
         let mut topk_csa = Vec::with_capacity(V4_SHORT_DEVICE_DECODE_MAX_ROWS - 3);
@@ -17112,7 +19036,7 @@ impl DeviceTokenState {
             let (window, _) = v4_state::window_topk_cpu(1, position, v4_state::KV_WINDOW)?;
             topk_raw.push(DeviceBuffer::from_host(stream, &window)?);
         }
-        Ok(Self {
+        let state = Self {
             layer: weights.layer,
             committed_rows: 0,
             compressor_width,
@@ -17202,7 +19126,16 @@ impl DeviceTokenState {
             attention_f32: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
             attention: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
             after_attention: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HIDDEN)?,
-        })
+        };
+        let planned = device_token_state_ledger_bytes(csa, weights.wq_a.out_features);
+        if state.num_bytes() != planned {
+            return Err(format!(
+                "device token-state constructor bytes {} != shared ledger {planned}",
+                state.num_bytes()
+            )
+            .into());
+        }
+        Ok(state)
     }
 
     fn reset_for_layer(
@@ -20017,6 +21950,315 @@ fn run_real_v4_wavefront_attention_bench(
     Ok(())
 }
 
+fn run_pinned_fixed_worker_boundary_gate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    const LAYERS: [usize; 3] = [0, 1, 2];
+    let result_path = std::env::var_os("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_RESULT_JSONL")?;
+    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
+        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_PREFILL").is_some()
+        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some()
+        || std::env::var_os("COLIBRI_V4_GREEDY_STEPS").is_some()
+        || std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PRODUCTION").is_some()
+        || std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_AUDIT").is_some()
+    {
+        return Err(
+            "pinned fixed worker boundary gate is isolated from full61, D, and hot modes".into(),
+        );
+    }
+    if !optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")? || !raw_wo_a_gpu_decode_enabled()? {
+        return Err(
+            "pinned fixed worker boundary gate requires pinned pipeline and raw wo_a decode".into(),
+        );
+    }
+    if v4_state::compression_ratio_for_layer(LAYERS[0])? != v4_state::CompressionRatio::Hca128
+        || v4_state::compression_ratio_for_layer(LAYERS[1])? != v4_state::CompressionRatio::Hca128
+        || v4_state::compression_ratio_for_layer(LAYERS[2])? != v4_state::CompressionRatio::Csa4
+    {
+        return Err("pinned fixed worker boundary HCA/CSA layer selection drift".into());
+    }
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let model_dir = v4_model_dir()?;
+    let before_bytes = device_available_bytes()?;
+    let transfer = context.new_stream()?;
+    let mut cache = FixedLayerCache::stationary_raw_from_env(&model_dir, &LAYERS, 0, 0, stream)?;
+    let l2_index = cache
+        .plan
+        .iter()
+        .position(|plan| plan.layer == LAYERS[2])
+        .ok_or("layer 2 is outside the pinned fixed retention plan")?;
+    if cache.device_selected[l2_index] || !cache.host_selected[l2_index] {
+        return Err("pinned fixed worker boundary gate requires layer 2 host retention".into());
+    }
+    let (l2_host, mut l2_origin) = load_layer_host_raw_wo_a(&model_dir, LAYERS[2], &[0])?;
+    let (l2_runtime, l2_upload, l2_raw) =
+        upload_layer_runtime_raw_wo_a(&model_dir, LAYERS[2], &l2_host, module, stream)?;
+    l2_origin.fixed_h2d_ns = l2_upload.fixed_h2d_ns;
+    l2_origin.fixed_h2d_bytes = l2_upload.fixed_h2d_bytes;
+    l2_origin.raw_h2d_ns = l2_upload.raw_h2d_ns;
+    l2_origin.raw_h2d_bytes = l2_upload.raw_h2d_bytes;
+    cache.capture_stationary_raw(
+        &model_dir, LAYERS[2], 1, l2_host, l2_runtime, l2_raw, &l2_origin, stream,
+    )?;
+    stream.synchronize()?;
+    let after_origin_setup_bytes = device_available_bytes()?;
+    let first_scratch = cache
+        .raw_scratch
+        .take()
+        .ok_or("request phase setup: pinned fixed cache has no decode scratch")?;
+    let second_scratch =
+        DeviceBuffer::<u16>::zeroed(stream, RAW_FIXED_SCRATCH_BYTES / std::mem::size_of::<u16>())?;
+    let slots = vec![
+        PinnedFixedSlot::new(context, first_scratch)?,
+        PinnedFixedSlot::new(context, second_scratch)?,
+    ];
+    let started = std::time::Instant::now();
+    let (cache, layer_records) = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<PinnedFixedRequest>(2);
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<PinnedFixedReply>(2);
+        let main = std::sync::Arc::clone(stream);
+        let transfer_worker = std::sync::Arc::clone(&transfer);
+        let mut worker = Some(scope.spawn(move || {
+            run_pinned_fixed_request_worker(
+                cache,
+                slots,
+                &model_dir,
+                module,
+                &main,
+                &transfer_worker,
+                request_rx,
+                reply_tx,
+                false,
+            )
+        }));
+        let mut request_tx = Some(request_tx);
+        for (index, &layer) in LAYERS[..2].iter().enumerate() {
+            request_tx
+                .as_ref()
+                .ok_or("request phase prepost: pinned fixed sender disappeared")?
+                .send((None, Some((layer, 0, LAYERS.get(index + 1).copied()))))
+                .map_err(|_| {
+                    format!("layer {layer} phase prepost: pinned fixed worker receiver closed")
+                })?;
+        }
+        let mut records = Vec::with_capacity(LAYERS.len());
+        for (layer_position, &expected_layer) in LAYERS.iter().enumerate() {
+            let prepare_started_ns =
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let reply = match reply_rx.recv() {
+                Ok(reply) => reply,
+                Err(_) => {
+                    drop(request_tx.take());
+                    return match worker
+                            .take()
+                            .ok_or("pinned fixed worker handle disappeared")?
+                            .join()
+                        {
+                            Ok(Err(message)) => Err(format!(
+                                "pinned fixed worker failed before layer {expected_layer} preparation: {message}"
+                            )
+                            .into()),
+                            Ok(Ok(_)) => Err(format!(
+                                "pinned fixed worker response channel closed before layer {expected_layer} preparation after a successful worker exit"
+                            )
+                            .into()),
+                            Err(_) => Err(format!(
+                                "pinned fixed worker panicked before layer {expected_layer} preparation"
+                            )
+                            .into()),
+                        };
+                }
+            };
+            let mut prepared = reply
+                .map_err(|message| -> Box<dyn Error> { message.into() })?
+                .ok_or("pinned fixed worker returned an early drain acknowledgement")?;
+            if prepared.lease.layer != expected_layer {
+                return Err(format!(
+                    "pinned fixed worker returned layer {}, expected {expected_layer}",
+                    prepared.lease.layer
+                )
+                .into());
+            }
+            let ready_received_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            prepared.wait_ready(stream)?;
+            let ready_wait_done_ns =
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let actual_ratio = prepared.runtime().weights.compression_ratio;
+            if actual_ratio != v4_state::compression_ratio_for_layer(expected_layer)? {
+                return Err(format!(
+                    "layer {expected_layer} phase ready: runtime compression ratio drift"
+                )
+                .into());
+            }
+            let generation = prepared.generation;
+            let expected_generation = if layer_position < 2 { 1 } else { 2 };
+            if generation != expected_generation {
+                return Err(format!(
+                    "layer {expected_layer} slot generation {generation} != expected {expected_generation}"
+                )
+                .into());
+            }
+            let free_at_ready_bytes = device_available_bytes()?;
+            let telemetry = std::mem::take(&mut prepared.telemetry);
+            let main_exposed_prepare_ns = ready_wait_done_ns
+                .checked_sub(prepare_started_ns)
+                .ok_or("pinned fixed gate prepare span is not monotonic")?;
+            let fixed_accounting =
+                fixed_prepare_dual_accounting(&telemetry, main_exposed_prepare_ns)?;
+            prepared.record_runtime_done(stream).map_err(|error| {
+                format!("layer {expected_layer} phase runtime_done_record: {error}")
+            })?;
+            let runtime_done_recorded_ns =
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let next = LAYERS
+                .get(layer_position + 2)
+                .map(|&layer| (layer, 0, LAYERS.get(layer_position + 3).copied()));
+            request_tx
+                .as_ref()
+                .ok_or("request phase runtime_done: pinned fixed sender disappeared")?
+                .send((Some(prepared), next))
+                .map_err(|_| {
+                    format!(
+                        "layer {expected_layer} phase runtime_done_send: pinned fixed worker receiver closed"
+                    )
+                })?;
+            records.push(serde_json::json!({
+                "layer": expected_layer,
+                "compression_ratio": actual_ratio.get(),
+                "slot_generation": generation,
+                "worker_command": {
+                    "completed_layer": expected_layer,
+                    "finish_before_prepare": true,
+                    "next_layer": next.map(|(layer, _, _)| layer),
+                },
+                "phase": {
+                    "prepare_started_ns": prepare_started_ns,
+                    "ready_received_ns": ready_received_ns,
+                    "ready_wait_done_ns": ready_wait_done_ns,
+                    "runtime_done_recorded_ns": runtime_done_recorded_ns,
+                },
+                "fixed_accounting": fixed_accounting,
+                "fixed_source_bytes": telemetry.fixed_source_bytes,
+                "fixed_h2d_bytes": telemetry.fixed_h2d_bytes,
+                "raw_h2d_bytes": telemetry.raw_h2d_bytes,
+                "fixed_h2d_ns": telemetry.fixed_h2d_ns,
+                "fixed_decode_ns": telemetry.fixed_decode_ns,
+                "cache_status": telemetry.cache_status,
+                "device_available_at_ready_bytes": free_at_ready_bytes,
+            }));
+        }
+        let drained = match reply_rx.recv() {
+            Ok(reply) => reply,
+            Err(_) => {
+                drop(request_tx.take());
+                return match worker
+                        .take()
+                        .ok_or("pinned fixed worker handle disappeared")?
+                        .join()
+                    {
+                        Ok(Err(message)) => Err(format!(
+                            "pinned fixed worker failed before request drain: {message}"
+                        )
+                        .into()),
+                        Ok(Ok(_)) => Err(
+                            "pinned fixed worker response channel closed before request drain after a successful worker exit"
+                                .into(),
+                        ),
+                        Err(_) => Err(
+                            "pinned fixed worker panicked before request drain".into(),
+                        ),
+                    };
+            }
+        };
+        if drained
+            .map_err(|message| -> Box<dyn Error> { message.into() })?
+            .is_some()
+        {
+            return Err("pinned fixed worker returned a layer instead of drain".into());
+        }
+        drop(request_tx.take());
+        let cache = worker
+            .take()
+            .ok_or("pinned fixed worker handle disappeared")?
+            .join()
+            .map_err(|_| "pinned fixed worker panicked during request shutdown")?
+            .map_err(|message| -> Box<dyn Error> {
+                format!("pinned fixed worker failed during request shutdown: {message}").into()
+            })?;
+        Ok((cache, records))
+    })?;
+    let after_drain_bytes = device_available_bytes()?;
+    let generation_restore = serde_json::json!({
+        "raw_scratch_restored": cache.raw_scratch.is_some(),
+        "raw_scratch_generation": cache.raw_scratch_generation,
+        "layer_device_generations": LAYERS.map(|layer| cache.raw_device_generation[layer]),
+        "layer_host_generations": LAYERS.map(|layer| cache.raw_host_generation[layer]),
+        "device_hits": cache.device_hits,
+        "host_hits": cache.host_hits,
+        "misses": cache.misses,
+    });
+    drop(cache);
+    drop(transfer);
+    stream.synchronize()?;
+    let after_release_bytes = device_available_bytes()?;
+    if after_release_bytes < before_bytes {
+        return Err(format!(
+            "pinned fixed worker boundary left GPU residue: before={before_bytes} after_release={after_release_bytes}"
+        )
+        .into());
+    }
+    writeln!(
+        result.file_mut(),
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-pinned-fixed-worker-boundary-v2",
+            "provenance": benchmark_provenance()?,
+            "model_revision": v4_state::REVISION,
+            "layers": LAYERS,
+            "slot_count": 2,
+            "request_channel_capacity": 2,
+            "reply_channel_capacity": 2,
+            "production_worker_loop": "run_pinned_fixed_request_worker",
+            "compute": "none; main records runtime_done immediately after ready",
+            "host_origin_setup": {
+                "layer": LAYERS[2],
+                "fixed_source_bytes": l2_origin.fixed_source_bytes,
+                "fixed_h2d_bytes": l2_origin.fixed_h2d_bytes,
+                "raw_h2d_bytes": l2_origin.raw_h2d_bytes,
+                "device_available_after_bytes": after_origin_setup_bytes,
+            },
+            "ledger": {
+                "hca_device_token_state_bytes": V4_DEVICE_TOKEN_STATE_HCA_BYTES,
+                "csa_device_token_state_bytes": V4_DEVICE_TOKEN_STATE_MAX_BYTES,
+                "full61_device_token_state_bytes": 31 * V4_DEVICE_TOKEN_STATE_HCA_BYTES
+                    + 30 * V4_DEVICE_TOKEN_STATE_MAX_BYTES,
+            },
+            "layers_observed": layer_records,
+            "generation_restore": generation_restore,
+            "drain_status": "PASS",
+            "join_status": "PASS",
+            "cuMemGetInfo": {
+                "available_before_bytes": before_bytes,
+                "available_after_drain_bytes": after_drain_bytes,
+                "available_after_release_bytes": after_release_bytes,
+                "recovery_exact": after_release_bytes == before_bytes,
+            },
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-pinned-fixed-worker-boundary\",\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
 fn run_device_attention_preflight_gate(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
@@ -20035,7 +22277,8 @@ fn run_device_attention_preflight_gate(
     }
     let mut result = PendingResultFile::reserve(result_path)?;
     let model_dir = v4_model_dir()?;
-    let plan = device_attention_capacity_plan(&model_dir, true, false, V4_REQUEST_ROPE_LUT_ROWS)?;
+    let plan =
+        device_attention_capacity_plan(&model_dir, true, false, V4_REQUEST_ROPE_LUT_ROWS, false)?;
     let relevant_config_fingerprint = normalized_config_fingerprint(serde_json::json!({
         "allocation_scope": "qd4_4_lanes+max_csa_fixed+request_rope_lut+max_csa_device_state+hca_device_state+tid2eid_transient+headroom",
         "headroom_bytes": plan.headroom_bytes,
@@ -20150,6 +22393,41 @@ fn run_device_attention_preflight_gate(
         "stage": "after_tid2eid_transient",
         "available_bytes": after_lut_bytes,
     }));
+    let pinned_fixed_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
+    let pinned_fixed_diagnostic = if pinned_fixed_pipeline {
+        let transfer = context.new_stream()?;
+        let mut cache = FixedLayerCache::stationary_raw_from_env(&model_dir, &[0], 0, 0, stream)?;
+        let scratch = cache
+            .raw_scratch
+            .take()
+            .ok_or("layer 0 phase diagnostic_setup: pinned fixed cache has no decode scratch")?;
+        let slot = PinnedFixedSlot::new(context, scratch)?;
+        let before_prepare_bytes = device_available_bytes()?;
+        let mut prepared =
+            cache.prepare_stationary_raw_pinned(&model_dir, 0, 0, module, &transfer, slot)?;
+        prepared.wait_ready(stream)?;
+        let telemetry = std::mem::take(&mut prepared.telemetry);
+        let mut slot = prepared.finish(&mut cache, stream, &transfer)?;
+        transfer.synchronize()?;
+        cache.raw_scratch = slot.scratch.take();
+        let after_finish_bytes = device_available_bytes()?;
+        Some(serde_json::json!({
+            "layer": 0,
+            "token_id": 0,
+            "status": "PASS",
+            "boundary": "typed prepare/upload/ready/finish",
+            "cache_status": telemetry.cache_status,
+            "fixed_source_bytes": telemetry.fixed_source_bytes,
+            "fixed_h2d_bytes": telemetry.fixed_h2d_bytes,
+            "raw_h2d_bytes": telemetry.raw_h2d_bytes,
+            "fixed_h2d_ns": telemetry.fixed_h2d_ns,
+            "fixed_decode_ns": telemetry.fixed_decode_ns,
+            "device_available_before_prepare_bytes": before_prepare_bytes,
+            "device_available_after_finish_bytes": after_finish_bytes,
+        }))
+    } else {
+        None
+    };
     drop(tid2eid);
     drop(state);
     drop(hca_state);
@@ -20196,6 +22474,7 @@ fn run_device_attention_preflight_gate(
             "rope_lut_status": "device_request_global",
             "tid2eid_transient_max_bytes": plan.tid2eid_transient_max_bytes,
             "headroom_bytes": plan.headroom_bytes,
+            "pinned_fixed_diagnostic": pinned_fixed_diagnostic,
             "cuMemGetInfo": {
                 "available_before_bytes": before_bytes,
                 "available_after_release_bytes": after_release_bytes,
@@ -20250,6 +22529,7 @@ fn run_real_v4_device_token_state_gate(
         false,
         false,
         V4_REQUEST_ROPE_LUT_ROWS,
+        false,
         device_available_bytes()?,
     )?;
     let token_ids = qd4_gate_prompt_ids(&model_dir)?;
@@ -23859,7 +26139,7 @@ mod tests {
         assert_eq!(V4_SHORT_DEVICE_DECODE_MAX_ROWS, 9);
         assert_eq!(
             31 * V4_DEVICE_TOKEN_STATE_HCA_BYTES + 30 * V4_DEVICE_TOKEN_STATE_MAX_BYTES,
-            3_763_637_590
+            3_763_828_054
         );
         assert_eq!(
             2 * V4_SHORT_DEVICE_DECODE_MAX_ROWS * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>(),
@@ -23869,11 +26149,11 @@ mod tests {
             140_845_056
                 + 1_126_760_448
                 + 494_348_312
-                + 3_763_637_590
+                + 3_763_828_054
                 + 4_608
                 + 48
                 + V4_DEVICE_CAPACITY_HEADROOM_BYTES,
-            7_673_079_710
+            7_673_270_174
         );
         assert_eq!(csa_compressed_rows_after(3), 1);
         assert_eq!(csa_compressed_rows_after(6), 1);
@@ -23998,7 +26278,7 @@ mod tests {
             fixed_decode_ns: 20,
             fixed_h2d_ns: 30,
             fixed_source_bytes: 7,
-            fixed_h2d_bytes: 8,
+            fixed_h2d_bytes: 10,
             raw_h2d_ns: 9,
             raw_h2d_bytes: 10,
             cache_status: "miss",
@@ -24037,14 +26317,14 @@ mod tests {
         assert_eq!(outer, 300);
         assert_eq!(attributed, 292);
         assert_eq!(profile["unattributed_gap_ns"], 8);
-        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v4");
+        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v5");
         assert_eq!(profile["top_level"]["layer_prepare"]["wall_ns"], 70);
         assert_eq!(
-            profile["top_level"]["layer_prepare"]["fixed_load"]["wall_ns"],
+            profile["top_level"]["layer_prepare"]["fixed_load"]["service"]["work_sum_ns"],
             60
         );
         assert_eq!(
-            profile["top_level"]["layer_prepare"]["fixed_load"]["raw_h2d_ns"],
+            profile["top_level"]["layer_prepare"]["fixed_load"]["nested"]["raw_h2d_ns"],
             9
         );
         assert_eq!(
@@ -24063,6 +26343,7 @@ mod tests {
         let host_hit = FixedLoadTelemetry {
             fixed_h2d_ns: a + b,
             fixed_decode_ns: c,
+            fixed_h2d_bytes: 1,
             cache_status: "stationary_raw_host_hit",
             ..FixedLoadTelemetry::default()
         };
@@ -24075,14 +26356,16 @@ mod tests {
             stationary_layer_phase_profile_json(0, 60, Some(&host_hit), &host_stage, 0, false)
                 .is_ok()
         );
-        let old_overlap = FixedLoadTelemetry {
-            fixed_h2d_ns: a + b + c,
-            ..host_hit
-        };
-        assert!(
-            stationary_layer_phase_profile_json(0, 60, Some(&old_overlap), &host_stage, 0, false)
-                .is_err()
-        );
+        for (main_exposed, exposed, credit, overhead) in [
+            (40_u64, 40_u64, 20_u64, 0_u64),
+            (60, 60, 0, 0),
+            (80, 60, 0, 20),
+        ] {
+            let accounting = fixed_prepare_dual_accounting(&host_hit, main_exposed).unwrap();
+            assert_eq!(accounting["critical"]["exposed_service_bound_ns"], exposed);
+            assert_eq!(accounting["critical"]["derived_overlap_credit_ns"], credit);
+            assert_eq!(accounting["critical"]["queue_or_overhead_ns"], overhead);
+        }
         assert!(profile["closure"]["exact"].as_bool().unwrap());
         assert_eq!(profile["top_level"]["routed"]["wall_ns"], 100);
         assert_eq!(
@@ -24362,6 +26645,34 @@ mod tests {
     }
 
     #[test]
+    fn bounded_readahead_cap_rounds_metadata_to_os_pages() {
+        let ranges = [
+            safetensors::FileRange { offset: 1, len: 7 },
+            safetensors::FileRange { offset: 9, len: 11 },
+        ];
+        assert_eq!(bounded_readahead_window_bytes(&ranges).unwrap(), 18);
+        assert_eq!(
+            bounded_readahead_page_cap(427_243_544, 4_096).unwrap(),
+            427_245_568
+        );
+        assert!(bounded_readahead_page_cap(1, 0).is_err());
+    }
+
+    #[test]
+    fn phase1_flow_shop_gate_uses_exact_p6_counts_and_threshold() {
+        assert_eq!(
+            phase1_predicted_p6_ns(10, 20, 30, 40),
+            PHASE1_P6_WITH_FINAL_NS - PHASE1_P6_FIXED_PREPARE_NS
+                + PHASE1_P6_HCA_TRANSFERS * 20
+                + PHASE1_P6_CSA_TRANSFERS * 40
+        );
+        assert_eq!(
+            PHASE1_P6_WITH_FINAL_NS.saturating_mul(80) / 100,
+            13_730_223_273
+        );
+    }
+
+    #[test]
     fn routed_qd4_lane_budget_is_exact() {
         assert_eq!(
             v4_expert::V4_ROUTED_EXPERT_BYTES,
@@ -24483,9 +26794,23 @@ mod tests {
                     })
             })
             .collect::<Vec<_>>();
+        let expected_sumabs = weight
+            .chunks_exact(INPUTS)
+            .map(|row| {
+                input
+                    .iter()
+                    .zip(row)
+                    .map(|(&input, &weight)| {
+                        v4_router::bf16_to_f32(input).abs() * v4_router::bf16_to_f32(weight).abs()
+                    })
+                    .sum()
+            })
+            .collect::<Vec<f32>>();
         let input = DeviceBuffer::from_host(&stream, &input).unwrap();
         let weight = DeviceBuffer::from_host(&stream, &weight).unwrap();
         let mut output = DeviceBuffer::<f32>::zeroed(&stream, OUTPUTS).unwrap();
+        let mut sumabs = DeviceBuffer::<f32>::zeroed(&stream, OUTPUTS).unwrap();
+        let mut status = DeviceBuffer::<u32>::zeroed(&stream, OUTPUTS).unwrap();
         // SAFETY: one complete warp owns each fully initialized output row.
         unsafe {
             module
@@ -24495,19 +26820,34 @@ mod tests {
                     &input,
                     &weight,
                     &mut output,
+                    &mut sumabs,
+                    &mut status,
                     INPUTS as u32,
                     OUTPUTS as u32,
                 )
                 .unwrap();
         }
         let actual = output.to_host_vec(&stream).unwrap();
+        let actual_sumabs = sumabs.to_host_vec(&stream).unwrap();
+        let actual_status = status.to_host_vec(&stream).unwrap();
         assert_close("streamed BF16 head slice", &actual, &expected);
+        assert_close(
+            "streamed BF16 head sumabs",
+            &actual_sumabs,
+            &expected_sumabs,
+        );
+        assert_eq!(actual_status, vec![0; OUTPUTS]);
         let argmax = |values: &[f32]| {
             (0..values.len())
                 .max_by(|&left, &right| values[left].total_cmp(&values[right]))
                 .unwrap()
         };
         assert_eq!(argmax(&actual), argmax(&expected));
+    }
+
+    #[test]
+    fn certified_argmax_coefficient_is_the_preregistered_formula() {
+        assert_eq!(certified_argmax_coeff().to_bits(), 0x3f3c_e62a_a18b_476c);
     }
 
     #[test]

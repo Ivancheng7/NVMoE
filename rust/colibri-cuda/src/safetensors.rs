@@ -28,6 +28,19 @@ pub struct RangeReadTelemetry {
     pub physical_bytes: usize,
 }
 
+/// Exact byte range in the backing shard, including the safetensors header offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileRange {
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl FileRange {
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.len)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorDtype {
     Bf16,
@@ -302,12 +315,58 @@ impl ShardFile {
                 tensor_len: entry.info.byte_len,
             });
         }
+        let range = self.tensor_file_range(name, offset, len_u64)?;
+        self.advise_dontneed_ranges(&[range])
+    }
+
+    /// Returns the exact backing-file span read by `read_at(name, offset, ..)`.
+    pub fn tensor_file_range(
+        &self,
+        name: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<FileRange, SafetensorsError> {
+        let entry = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| SafetensorsError::MissingTensor(name.to_owned()))?;
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > entry.info.byte_len)
+        {
+            return Err(SafetensorsError::RangeOutOfBounds {
+                tensor: name.to_owned(),
+                offset,
+                len,
+                tensor_len: entry.info.byte_len,
+            });
+        }
         let absolute = self
             .data_start
             .checked_add(entry.offset)
             .and_then(|start| start.checked_add(offset))
             .ok_or_else(|| SafetensorsError::InvalidOffsets(name.to_owned()))?;
-        advise_dontneed(&self.file, name, absolute, len_u64)
+        Ok(FileRange {
+            offset: absolute,
+            len,
+        })
+    }
+
+    /// Hints the exact ranges on this shard FD after coalescing only overlap or
+    /// adjacency; callers retain the unmerged source trace for accounting.
+    pub fn advise_willneed_ranges(
+        &self,
+        ranges: &[FileRange],
+    ) -> Result<Vec<FileRange>, SafetensorsError> {
+        let ranges = merge_adjacent_ranges(ranges)?;
+        advise_ranges(&self.file, &ranges, 3)?;
+        Ok(ranges)
+    }
+
+    /// Drops every supplied exact range. A successful call is the gate's
+    /// support check before either replay arm runs.
+    pub fn advise_dontneed_ranges(&self, ranges: &[FileRange]) -> Result<(), SafetensorsError> {
+        advise_ranges(&self.file, ranges, 4)
     }
 
     pub fn read_at_mode(
@@ -412,20 +471,59 @@ impl ShardFile {
     }
 }
 
+/// Sorts a single-FD range set and combines only overlapping or exactly
+/// adjacent ranges; it never fills a gap in the requested trace.
+pub fn merge_adjacent_ranges(ranges: &[FileRange]) -> Result<Vec<FileRange>, SafetensorsError> {
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|range| range.offset);
+    let mut merged: Vec<FileRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.len == 0 {
+            continue;
+        }
+        let end = range
+            .end()
+            .ok_or_else(|| SafetensorsError::InvalidOffsets("range end overflows u64".into()))?;
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.end().ok_or_else(|| {
+                SafetensorsError::InvalidOffsets("range end overflows u64".into())
+            })?;
+            if range.offset <= last_end {
+                last.len = last_end.max(end) - last.offset;
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    Ok(merged)
+}
+
+fn advise_ranges(file: &File, ranges: &[FileRange], advice: i32) -> Result<(), SafetensorsError> {
+    for range in ranges {
+        let offset = i64::try_from(range.offset)
+            .map_err(|_| SafetensorsError::InvalidOffsets("advice offset exceeds i64".into()))?;
+        let len = i64::try_from(range.len)
+            .map_err(|_| SafetensorsError::InvalidOffsets("advice length exceeds i64".into()))?;
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: the descriptor remains live and the supplied range was
+        // validated against this shard before entering the gate.
+        let error = unsafe { posix_fadvise(file.as_raw_fd(), offset, len, advice) };
+        if error != 0 {
+            return Err(SafetensorsError::Io(io::Error::from_raw_os_error(error)));
+        }
+    }
+    Ok(())
+}
+
+unsafe extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+
 fn advise_dontneed(file: &File, name: &str, offset: u64, len: u64) -> Result<(), SafetensorsError> {
-    unsafe extern "C" {
-        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
-    }
-    let offset =
-        i64::try_from(offset).map_err(|_| SafetensorsError::InvalidOffsets(name.to_owned()))?;
-    let len = i64::try_from(len).map_err(|_| SafetensorsError::InvalidOffsets(name.to_owned()))?;
-    // SAFETY: the descriptor remains live and POSIX_FADV_DONTNEED is advisory.
-    let error = unsafe { posix_fadvise(file.as_raw_fd(), offset, len, 4) };
-    if error == 0 {
-        Ok(())
-    } else {
-        Err(SafetensorsError::Io(io::Error::from_raw_os_error(error)))
-    }
+    let _ = name;
+    advise_ranges(file, &[FileRange { offset, len }], 4)
 }
 
 fn read_direct_aligned(
@@ -761,6 +859,31 @@ mod tests {
         assert_eq!(direct_telemetry.logical_bytes, buffered.len());
         assert!(direct_telemetry.physical_bytes >= buffered.len());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn merges_only_overlapping_or_adjacent_file_ranges() {
+        let merged = merge_adjacent_ranges(&[
+            FileRange { offset: 40, len: 5 },
+            FileRange {
+                offset: 10,
+                len: 10,
+            },
+            FileRange { offset: 20, len: 7 },
+            FileRange { offset: 24, len: 9 },
+            FileRange { offset: 60, len: 0 },
+        ])
+        .unwrap();
+        assert_eq!(
+            merged,
+            [
+                FileRange {
+                    offset: 10,
+                    len: 23
+                },
+                FileRange { offset: 40, len: 5 },
+            ]
+        );
     }
 
     #[test]

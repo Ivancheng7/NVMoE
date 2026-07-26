@@ -828,6 +828,19 @@ pub struct FinalHeadCpuRun {
     pub wall_ns: u64,
 }
 
+/// Canonical final-head row reduction.  Strict `>` at the caller preserves
+/// the lowest token ID on exact ties.
+pub fn canonical_final_head_row_dot(normalized_bf16: &[u16], row_bf16: &[u16]) -> f32 {
+    assert_eq!(normalized_bf16.len(), HIDDEN);
+    assert_eq!(row_bf16.len(), HIDDEN);
+    normalized_bf16
+        .iter()
+        .zip(row_bf16)
+        .fold(0.0_f32, |sum, (&input, &weight)| {
+            sum + bf16_to_f32(input) * bf16_to_f32(weight)
+        })
+}
+
 impl FinalHeadWeights {
     pub fn advise_head_dontneed(&self) -> Result<(), Box<dyn Error>> {
         Ok(self.shard.advise_tensor_dontneed("head.weight")?)
@@ -1083,6 +1096,7 @@ pub fn final_checkpoint_head_cpu_timed(
     base.logits_f32 = vec![0.0; rows * VOCAB];
     base.argmax.fill(0);
     let mut bytes = vec![0_u8; CHUNK_ROWS * HIDDEN * 2];
+    let mut row_bf16 = vec![0_u16; HIDDEN];
     let mut read_ns = 0_u64;
     for token_start in (0..VOCAB).step_by(CHUNK_ROWS) {
         let chunk_rows = (VOCAB - token_start).min(CHUNK_ROWS);
@@ -1093,13 +1107,17 @@ pub fn final_checkpoint_head_cpu_timed(
             .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         for row in 0..rows {
             for token_offset in 0..chunk_rows {
-                let mut logit = 0.0_f32;
                 let weight_start = token_offset * HIDDEN * 2;
-                for column in 0..HIDDEN {
-                    let byte = weight_start + column * 2;
-                    let weight = bf16_to_f32(u16::from_le_bytes([bytes[byte], bytes[byte + 1]]));
-                    logit += bf16_to_f32(base.normalized_bf16[row * HIDDEN + column]) * weight;
+                for (weight, bytes) in row_bf16
+                    .iter_mut()
+                    .zip(bytes[weight_start..weight_start + HIDDEN * 2].chunks_exact(2))
+                {
+                    *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
                 }
+                let logit = canonical_final_head_row_dot(
+                    &base.normalized_bf16[row * HIDDEN..(row + 1) * HIDDEN],
+                    &row_bf16,
+                );
                 let token = token_start + token_offset;
                 base.logits_f32[row * VOCAB + token] = logit;
                 if token == 0 || logit > base.logits_f32[row * VOCAB + base.argmax[row]] {
