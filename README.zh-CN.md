@@ -1,111 +1,107 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-# localMoE：想不想在你的游戏本上亲自部署全量1.6T参数MoE？
+# localMoE：想不想在你的游戏本上亲自部署全量1.6T参数DeepSeek-V4-Pro？
 
-localMoE在配备RTX4080Laptop GPU、12GB显存和32GB RAM的笔记本上，从本地SSD调度完整`864.7GB`、61层的DeepSeek-V4-Pro检查点。该模型是1.6T参数MoE，包含64个官方混合FP4-FP8权重分片。Rust把移动工作集限制在有界窗口中，完整检查点留在本地。
+localMoE是一个Rust/CUDA运行时，面向“完整开源MoE检查点远大于笔记本内存”的本地推理问题。当前压力测试是DeepSeek-V4-Pro：61层、64个官方混合FP4-FP8分片、`864.7GB`权重，运行平台为RTX4080Laptop GPU、`12GB`显存和`32GB` RAM。
 
-## 完整请求快2.23倍，模型与exact状态检查保持一致
+| **1.6T参数** | **12GB显存** | **快2.23倍** |
+| --- | --- | --- |
+| 完整V4-Pro检查点留在本地 | GPU工作集保持有界 | exact完整请求开发结果 |
 
-主结果比较两次完整P5/N3请求。它们使用同一固定模型版本、prompt IDs、贪心输出、61层调度和状态审计约束。V8记录QD4关闭，V9记录QD4开启。两次run-identified source identity不同，因此该比率属于描述性开发比较。
+![exact完整请求加速](docs/assets/readme/19-full-request-speedup.svg)
 
-![V8到V9的完整请求加速](docs/assets/readme/19-full-request-speedup.svg)
+我们想做的事情很直接：个人电脑也应当能够保存并执行通常只会被当作数据中心任务的大模型。localMoE把存储与状态调度写成明确的运行时约束，再把它压进笔记本可承受的有界工作集。
 
-| 完整请求条件 | 请求墙钟时间 | 输出速率 | 状态结果 |
-| --- | ---: | ---: | --- |
-| V8，QD4关闭 | `198.947779573 s` | `0.015079334 tok/s` | PASS |
-| V9，QD4开启 | `89.277349596 s` | `0.033603148 tok/s` | PASS |
+## 这是一个带语义约束的放置问题
 
-描述性比率为`2.228423900x`，请求延迟降低`55.125234%`。两次运行都输出`[115287,115287,115287]`，走完61层，完成427次事务式提交，并在P4、P5和P6通过183次层状态审计。JSONL的SHA-256身份分别为`781ccffe…`和`52d7c04b…`。每个条件`n=1`，当前证据记录两次开发运行。[Benchmark ledger](docs/assets/readme/cost-figures-provenance.json)记录完整artifact hash、完整run-identified source identity、输入、公式与适用范围。
+MoE每个token只激活部分参数，完整检查点依然要随时可用。V4-Pro的形状更苛刻：每个生成token都要串行经过61层，每层都有重复出现的工作，路由专家又会改变下一步需要搬运的字节。
 
-这里的exact指记录下来的Rust规范路由、归约和状态边界。官方PyTorch full61一致性有独立验收门槛。
-
-## 最大模型的压力测试
-
-检查点大于两级快速内存。运行时需要流式搬运权重，同时保持规范归约顺序，避免提交部分持久状态。
+难点超过了把文件放进SSD。运行时需要在极小工作集里移动权重，同时保持路由选择、归约顺序，以及下一个token要读取的持久注意力状态。
 
 ![检查点容量与笔记本内存层级](docs/assets/readme/01-capacity.svg)
 
-| 记录硬件 | 数值 |
-| --- | --- |
+| 记录的笔记本压力测试 | 数值 |
+| --- | ---: |
 | GPU | NVIDIA GeForce RTX4080Laptop，`12,282MiB`显存 |
 | 主机内存 | `32GB` RAM |
-| 检查点 | 64个固定分片，实际文件共`864,721,029,744B` |
+| 检查点 | 64个固定分片，共`864,721,029,744B` |
 | 已执行路径 | 完整61层Rust规范机制路径 |
 
-这里的完整指每个固定分片都在本地，记录的路径走完全部61层。通用聊天、采样、长上下文、热稳定持续吞吐、服务行为和官方参考一致性仍需要独立评估。
+完整路径让每个固定源分片保持在本地，走完全部层，并检查自身的路由、归约与状态边界。它提供了一个足够严苛的优化对象：存储和内存都很紧张，语义捷径会让结果失去意义。
 
-## 机制证据
+## 有界流式执行
 
-完整请求比较持续检查规范路由和状态提交，同时记录每次运行的QD4配置。
+localMoE把一次请求写成一连串lease与commit。固定主干指每层都会出现的工作，包括重复的张量与状态流量。路由专家由该层router选择。两者经过同一条有界流水线：
 
-局部L4/P5门槛把路由墙钟时间从`486.604659ms`降到`118.169615ms`，加速`4.117849x`，全部`4/4`配对exact。它的估计量是路由层墙钟时间；完整请求吞吐使用上方独立的完整请求运行。
+`SSD -> RAM decode -> pinned host staging -> GPU lease -> canonical reduction -> transactional state commit`
 
-独立的full61 ABBA数据包把prompt E2E从`199.431954s`降到`148.555131s`，中位数比为`1.342477723x`。`4/4`配对都exact，每对包含305条层记录和最终输出。
+![有界的SSD、RAM与VRAM执行路径](docs/assets/readme/02-execution-path.svg)
 
-![4组配对full61 QD4提示词运行](docs/assets/readme/12-qd4-full61.svg)
+worker准备下一份payload时，GPU消费当前payload。layer-stationary状态布局让每个模型层保留一份持久状态，每个请求保留一份scratch空间。cache lease保证worker持有slot期间不会发生复用。只有某一层成功完成后，事务才会提交持久状态。
 
-其他保留实验说明了流式路径为什么还有可移动的空间：
+这改变了优化目标。引擎可以减少存储读取、decode、H2D和空转等待，同时保证更快的调度不会改变模型可观察到的状态。
 
-| 机制与估计量 | 观察结果 | 证据边界 |
-| --- | --- | --- |
-| 原始GPU固定解码，full61 H2D | `29.062GB`降到`24.968GB`，减少`14.1%` | 每臂`n=2`配对开发证据 |
-| 不可变32槽路由缓存，每字段字节数 | `64.223GB`降到`29.620GB`，减少`53.9%` | 配对开发证据与严格账本审计 |
-| 原始GPU固定解码，请求E2E中位数 | `1.171788x` | 每臂`n=2`配对开发证据 |
-| 路由缓存，路由墙钟中位数 | `1.430045x` | 每臂`n=2`配对开发证据 |
-| 路由缓存，请求E2E中位数 | `1.068977x` | 每臂`n=2`配对开发证据 |
+路由cache展示了这一点。严格full61账本审计把记录工作负载的路由源读取与路由H2D逐字段从`64.223GB`降到`29.620GB`，减少`53.9%`。
 
-![固定权重H2D减少](docs/assets/readme/13-fixed-h2d-savings.svg)
+![路由cache传输减少](docs/assets/readme/14-routed-cache-savings.svg)
 
-![路由缓存传输减少](docs/assets/readme/14-routed-cache-savings.svg)
+## 性能
 
-![配对开发计时](docs/assets/readme/15-development-paired-timings.svg)
+主结果比较最早保留的exact完整请求基线与当前exact引擎，工作负载相同，均为P5/N3请求。两者使用同一固定V4-Pro权重、prompt IDs、贪心输出、61层调度和内部状态审计约束。
 
-每个比率回答不同估计量。局部`4.117849x`门槛、`1.342477723x`提示词数据包和`2.228423900x`P5/N3完整请求比较各自保持独立。
+| exact P5/N3完整请求 | 墙钟时间 | 输出速率 | 变化 |
+| --- | ---: | ---: | ---: |
+| exact基线 | `198.95s` | `0.0151tok/s` | `1.00x` |
+| 当前exact引擎 | `89.28s` | `0.0336tok/s` | **`2.228x`** |
 
-## Rust路径为什么重要
+完整请求延迟降低`55.13%`。结果包含3个输出token。持续聊天服务速率需要单独测量。
 
-![有界SSD、RAM和VRAM执行路径](docs/assets/readme/02-execution-path.svg)
+当前热态下一个token轨迹为`14.789s/token`，即`0.0676tok/s`。最早保留的同一固定权重家族exact轨迹为`36.979s/token`，构成另一条请求形状不同的`2.500x`开发计时改进。
 
-当前运行时使用move-only lease管理缓存所有权，用带类型的FP4-FP8 geometry做容量检查，用有界worker和pinned staging处理搬运，用规范路由归约和事务式状态提交保持语义边界。Colibri自有CUDA kernel由`cuda-oxide`实现。这些约束使存储、CPU decode、H2D和GPU执行可以重叠，同时留下可审计的状态边界。
+最大的局部机制结果是`4.118x`：QD4路由层门槛把记录的L4/P5路由墙钟时间从`486.605ms`降到`118.170ms`，4组配对检查均为exact。这属于路由层结果，应与完整请求结果并列阅读。
 
-## 第二条开发谱系
+| 发生变化的对象 | 观测效果 | 范围 |
+| --- | ---: | --- |
+| 完整exact请求 | 快`2.228x` | 每个条件1个P5/N3请求 |
+| 热态下一个token轨迹 | 快`2.500x` | 每个条件1个P6轨迹 |
+| 路由QD4门槛 | 快`4.118x` | 4组局部L4/P5配对检查 |
+| 路由cache流量 | 少`53.9%` | full61账本审计 |
 
-最早的P6下一个token轨迹从`36.979170611s/token`降到`14.789027100s/token`，描述性变化为`2.500446470x`，延迟降低`60.007142%`。倒数速率从`0.0270422506tok/s`升到`0.0676177002tok/s`。
+## 从1.6T压力测试走向家用推理
 
-![原始P6单token计时账本](docs/assets/readme/16-pos5-one-token-dag.svg)
+V4-Pro的条件刻意苛刻。它暴露了巨型固定payload、稀疏专家并集、状态流量和输出头穿过小型内存层级的成本。更小的MoE会改变这些项，因此同一引擎在桌面级GPU上有机会变得更实用。
 
-![P6开发下一个token谱系](docs/assets/readme/18-p6-throughput.svg)
-
-图中记录的是更窄的P6 pre-pipeline比较，结果为`1.1605x`。旧的`36.979170611s/token`工件已在账本和保留图中标识。当前`14.789027100s/token`记录复制到tracked artifact packet的工作仍待完成，因此这条谱系属于次级开发证据。它使用同一固定模型家族和exact运行时边界，请求形状与P5/N3主比较不同。
-
-## Flash预测范围
-
-本仓库中的DeepSeek-V4-Flash运行次数为`0`。下列速率是未来Flash移植的重新计算预测范围。Flash实现和实测运行会构成基准证据。
-
-![已观测开发结果与预测Flash证据阶梯](docs/assets/readme/17-hardware-evidence-ladder.svg)
+DeepSeek-V4-Flash是第一个计划中的目标。当前仓库中它的运行次数为0。下列速率是未来移植的预测范围，来自模型特定工作预算，全部明确标为预测。
 
 ![预测的Flash家用硬件范围](docs/assets/readme/20-flash-projection-envelope.svg)
 
-| 硬件与方案 | 预测提交速率 | 假设 |
-| --- | ---: | --- |
-| 冷H1，12GiB | `0.103至0.125tok/s` | Flash运行次数`0` |
-| 固定权重常驻H1，16GiB | `0.313至0.658tok/s` | 固定权重常驻尚未实现 |
-| 固定权重常驻H2，24GiB，`q=0.8` | `0.548至1.153tok/s` | 草稿和回滚成本未测 |
-| 固定权重常驻H5，32至48GiB，`q=0.8` | `0.500至1.052tok/s` | 路由并集和调度跨度未测 |
+| 未来V4-Flash方案 | 预测提交速率 |
+| --- | ---: |
+| 冷H1，12GiB | `0.103至0.125tok/s` |
+| 固定权重常驻H1，16GiB | `0.313至0.658tok/s` |
+| 固定权重常驻H2，24GiB，`q=0.8` | `0.548至1.153tok/s` |
+| 固定权重常驻H5，32至48GiB，`q=0.8` | `0.500至1.052tok/s` |
 
-H2和H5范围对条件接受率假设`q`敏感：
+面对其他开源MoE，localMoE的规划模型会计算fixed-miss字节、路由专家并集字节、PCIe与GPU服务、持久状态工作和输出头成本。这些量构成可迁移的roofline。当前运行时实现了V4-Pro；新增模型家族需要各自的metadata、路由语义、KV layout和验收门槛。
 
-| `q` | H2提交速率 | H5提交速率 |
-| ---: | ---: | ---: |
-| `0.7` | `0.492至1.035tok/s` | `0.399至0.839tok/s` |
-| `0.8` | `0.548至1.153tok/s` | `0.500至1.052tok/s` |
-| `0.9` | `0.609至1.281tok/s` | `0.635至1.336tok/s` |
+## 为什么用Rust
 
-Flash固定权重常驻、草稿成本、回滚、实际路由并集、调度跨度和`q`都等待测量。更小的开源MoE应使用参数化roofline评估，输入包括active fixed-miss bytes、routed-expert union、PCIe/GPU服务时间和输出头成本。这些活跃的数据移动和计算项决定速度。
+Rust属于执行模型的一部分，GEMM速度仍然取决于kernel和硬件。
 
-## 复现当前路径
+| 运行时约束 | Rust/CUDA机制 |
+| --- | --- |
+| 一个cache slot只有一个活跃owner | move-only lease让所有权保持明确 |
+| 执行前必须完成容量闭合 | 带类型FP4-FP8 layout生成字节预算 |
+| I/O与GPU工作需要重叠 | 有界worker、pinned staging、stream与event |
+| 并行工作仍需规范语义 | 有序归约遵循规范专家顺序 |
+| 状态只能在成功后改变 | transactional commit为每层建立清晰边界 |
+| kernel需要原生路径 | Colibri自有CUDA kernel使用`cuda-oxide` |
 
-环境需要WSL2/Linux、CUDA12.x、LLVM/NVPTX、libclang和Ada `sm_89`GPU。检查点必须存放在WSL原生ext4文件系统。环境约束会拒绝把`/mnt/c`和`/mnt/d`用于模型存储。按照[full61环境约束](rust/colibri-cuda/tools/V4_FULL61_ORACLE.md)设置`COLIBRI_DSV4_MODEL_DIR`、`COLIBRI_ORACLE_PYTHON`和`COLIBRI_CUBLAS_EXACT_LIB`。
+这样得到的运行时可以检查每个放置决策。当单个token依赖许多异步传输，微小数值差异又可能影响后续路由选择时，这一点尤其重要。
+
+## 快速开始
+
+当前路径面向WSL2/Linux、CUDA12.x、LLVM/NVPTX、libclang和Ada `sm_89`GPU。模型权重必须存放在WSL原生ext4块设备。环境约束会拒绝将`/mnt/c`和`/mnt/d`用于模型存储。
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
@@ -116,21 +112,22 @@ cargo check --locked -p colibri-cuda
 ./run-identified.sh test --arch sm_89
 ```
 
-[机制实验记录](docs/experiments/v4-pro-mechanisms-2026-07-24.md)包含模型运行命令和故障关闭预检。[Benchmark ledger](docs/assets/readme/cost-figures-provenance.json)记录紧凑公开身份和图表输入。
+完整full61 oracle运行需要按照[full61环境约束](rust/colibri-cuda/tools/V4_FULL61_ORACLE.md)设置`COLIBRI_DSV4_MODEL_DIR`、`COLIBRI_ORACLE_PYTHON`和`COLIBRI_CUBLAS_EXACT_LIB`。[机制实验记录](docs/experiments/v4-pro-mechanisms-2026-07-24.md)包含模型运行命令和故障关闭预检。
 
-## 仓库结构
+<details>
+<summary>证据边界与预测假设</summary>
 
-```text
-rust/colibri-cuda/          Rust + cuda-oxide V4-Pro prototype
-rust/colibri-cuda/tools/    oracle、trace和evidence工具
-docs/assets/readme/         确定性图表和紧凑证据工件
-c/                          保留的上游C/CUDA oracle和baseline
-```
+完整请求比较每个条件只有`n=1`，属于描述性开发证据。它检查记录的Rust规范路由、归约和事务式状态边界。官方PyTorch full61一致性有独立验收门槛。
 
-## 许可证
+P6的`14.789s/token`记录属于次级计时谱系。当前公开artifact packet仍在补充，因此P5/N3比较是主要公开结果。
 
-代码继续采用[Apache License 2.0](LICENSE)。模型权重及相关材料遵循模型发布页面上的条款。保留的上游代码和素材继续遵循原有署名与许可条款。
+观测输出速率使用`输出token数/请求墙钟时间`。Flash规划表达式基于fixed miss、路由专家并集服务、H2D/GPU工作、串行状态工作和输出头构成的验证下界。对于推测跨度`H`，示例提交token因子为`E[C_H] = (1 - q^(H+1)) / (1 - q)`。预测H2与H5行使用`q=0.8`；固定权重常驻、草稿成本、回滚、实际专家并集和调度跨度等待测量。
 
-## 灵感来源
+[Benchmark ledger](docs/assets/readme/cost-figures-provenance.json)保留图表输入、公式、artifact身份和底层基线/当前谱系。两次完整请求开发运行的source identity不同，因此`2.228x`比较标为描述性结果。
+</details>
 
-localMoE受[JustVugg/colibri](https://github.com/JustVugg/colibri)启发，并希望把本地MoE执行继续往前推进。
+## 许可证与灵感来源
+
+代码采用[Apache License 2.0](LICENSE)。模型权重及相关材料遵循各自发布条款。保留的上游代码和素材继续遵循原有署名与许可条款。
+
+localMoE受[JustVugg/colibri](https://github.com/JustVugg/colibri)启发，探索exact流式MoE执行在现有家用硬件上能够走到多远。

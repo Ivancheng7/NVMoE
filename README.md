@@ -1,111 +1,107 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-# localMoE: Want to run a full 1.6T-parameter MoE on your gaming laptop?
+# localMoE: Want to run the full 1.6T-parameter DeepSeek-V4-Pro on a gaming laptop?
 
-localMoE schedules the complete `864.7 GB`, 61-layer DeepSeek-V4-Pro checkpoint from local SSD on a laptop with an RTX 4080 Laptop GPU, 12 GB of VRAM, and 32 GB of RAM. The model is a 1.6T-parameter MoE stored as 64 official mixed FP4-FP8 shards. Rust keeps the moving window bounded; the checkpoint stays local.
+localMoE is a Rust/CUDA runtime for running a full open-weight MoE checkpoint from local storage when the checkpoint is far larger than laptop memory. Its current pressure test is DeepSeek-V4-Pro: 61 layers, 64 official mixed FP4-FP8 shards, and `864.7 GB` of weights on a laptop with an RTX 4080 Laptop GPU, `12 GB` of VRAM, and `32 GB` of RAM.
 
-## 2.23x faster full request, with the same model and exact state checks
+| **1.6T parameters** | **12GB VRAM** | **2.23x faster** |
+| --- | --- | --- |
+| Full V4-Pro checkpoint stays local | Bounded GPU working set | Exact full-request development result |
 
-The main result compares two complete P5/N3 requests. They use the same pinned model revision, prompt IDs, greedy output, 61-layer schedule, and state-audit contract. V8 recorded QD4 off; V9 recorded QD4 on. Their run-identified source identities differ, so the ratio is a descriptive development comparison.
+![Exact full-request speedup](docs/assets/readme/19-full-request-speedup.svg)
 
-![Full request speedup from V8 to V9](docs/assets/readme/19-full-request-speedup.svg)
+The ambition is simple: a personal machine should be able to hold and execute a model that would usually be treated as datacenter-only. localMoE makes the storage and state schedule explicit, then keeps that schedule bounded enough for laptop hardware.
 
-| Full-request condition | Request wall time | Emitted rate | State result |
-| --- | ---: | ---: | --- |
-| V8, QD4 off | `198.947779573 s` | `0.015079334 tok/s` | PASS |
-| V9, QD4 on | `89.277349596 s` | `0.033603148 tok/s` | PASS |
+## The problem is placement under a semantic contract
 
-The descriptive ratio is `2.228423900x`, with `55.125234%` lower request latency. Both runs emitted `[115287, 115287, 115287]`, traversed all 61 layers, made 427 transactional commits, and passed 183 audited layer-state comparisons at P4, P5, and P6. Their JSONL SHA-256 identities are `781ccffe…` and `52d7c04b…`. With `n=1` per condition, this evidence records two development runs. The [Benchmark ledger](docs/assets/readme/cost-figures-provenance.json) records full artifact hashes, full run-identified source identities, inputs, formulas, and scope.
+A mixture-of-experts model activates only a fraction of its parameters for each token. The full checkpoint still has to be available. V4-Pro adds a harder shape: every generated token walks through 61 serial layers, each layer has recurring work, and each routed expert choice can change the bytes that must arrive next.
 
-The exactness claim here covers the recorded Rust canonical route, reduction, and state boundary. Official PyTorch full61 parity has its own acceptance gate.
+The question is larger than fitting files on an SSD. A runtime must move weights through a tiny working set while preserving route choices, reduction order, and the persistent attention state that the next token will read.
 
-## The pressure test
+![Checkpoint capacity versus laptop memory tiers](docs/assets/readme/01-capacity.svg)
 
-The checkpoint is larger than either fast-memory tier. The runtime has to stream weights without changing canonical reduction order or committing partial persistent state.
-
-![Checkpoint capacity versus the recorded laptop memory tiers](docs/assets/readme/01-capacity.svg)
-
-| Recorded system | Value |
-| --- | --- |
-| GPU | NVIDIA GeForce RTX 4080 Laptop, `12,282 MiB` VRAM |
-| Host memory | `32 GB` RAM |
-| Checkpoint | 64 pinned shards, `864,721,029,744 B` actual files |
+| Recorded laptop pressure test | Value |
+| --- | ---: |
+| GPU | NVIDIA GeForce RTX 4080 Laptop, `12,282MiB` VRAM |
+| Host memory | `32GB` RAM |
+| Checkpoint | `864,721,029,744B` across 64 pinned shards |
 | Executed path | Complete 61-layer Rust canonical mechanism path |
 
-Complete means every pinned shard is local and the recorded path traverses all 61 layers. General chat, sampling, long context, thermally sustained throughput, service behavior, and official-reference parity still need separate evaluation.
+The complete path keeps every pinned source shard local, visits every layer, and checks its own route, reduction, and state boundaries. It gives a hard system to optimize: storage and memory are scarce, while semantic shortcuts would make the result meaningless.
 
-## The mechanism evidence
+## A bounded streaming engine
 
-The full-request comparison keeps the canonical route and state commitments checked while recording the QD4 configuration in each run.
+localMoE treats a request as a sequence of leases and commits. The fixed trunk is the always-present work at each layer, including the recurrent tensor and state traffic. Routed experts are selected by that layer's router. Both travel through the same bounded pipeline:
 
-The local L4/P5 gate cut routed wall time from `486.604659 ms` to `118.169615 ms`, a `4.117849x` speedup. All `4/4` pairs were exact. Its estimand is routed-layer wall time; full-request throughput uses the separate complete-request runs above.
-
-The independent full61 ABBA packet reduced prompt E2E from `199.431954 s` to `148.555131 s`, a `1.342477723x` ratio of medians. It has `4/4` exact pairs and 305 layer records plus the final output in each pair.
-
-![Four paired full61 QD4 prompt runs](docs/assets/readme/12-qd4-full61.svg)
-
-The other retained experiments show why the streaming path has room to move:
-
-| Mechanism and estimand | Observed result | Evidence boundary |
-| --- | --- | --- |
-| Raw GPU fixed decode, full61 H2D | `29.062 GB` to `24.968 GB`, `14.1%` less | paired development, `n=2` per arm |
-| Immutable 32-slot routed cache, bytes per field | `64.223 GB` to `29.620 GB`, `53.9%` less | paired development, strict accounting audit |
-| Raw GPU fixed decode, request E2E median | `1.171788x` | paired development, `n=2` per arm |
-| Routed cache, routed-wall median | `1.430045x` | paired development, `n=2` per arm |
-| Routed cache, request E2E median | `1.068977x` | paired development, `n=2` per arm |
-
-![Fixed-weight H2D reduction](docs/assets/readme/13-fixed-h2d-savings.svg)
-
-![Routed-cache transfer reduction](docs/assets/readme/14-routed-cache-savings.svg)
-
-![Paired development timings](docs/assets/readme/15-development-paired-timings.svg)
-
-Each ratio answers its own estimand. The local `4.117849x` gate, the `1.342477723x` prompt packet, and the `2.228423900x` P5/N3 request comparison remain separate measurements.
-
-## Why the Rust path matters
+`SSD -> RAM decode -> pinned host staging -> GPU lease -> canonical reduction -> transactional state commit`
 
 ![Bounded SSD, RAM, and VRAM execution path](docs/assets/readme/02-execution-path.svg)
 
-The current runtime uses move-only leases for cache ownership, typed FP4-FP8 geometry for capacity checks, bounded workers with pinned staging, canonical routed reduction, and transactional state commit. Colibri-owned CUDA kernels use `cuda-oxide`. Those constraints make it possible to overlap storage, CPU decode, H2D, and GPU execution while retaining a concrete state boundary to audit.
+The worker prepares the next payload while the GPU consumes the current one. A layer-stationary state layout keeps one persistent state per model layer and one request scratch space. Cache leases prevent a slot from being recycled while a worker still owns it. A transaction commits persistent state only after that layer has completed successfully.
 
-## A second development lineage
+This changes the optimization target. The engine can reduce storage reads, decode work, H2D traffic, and idle gaps without allowing a faster schedule to alter the model's observable state.
 
-The original P6 next-token trace fell from `36.979170611 s/token` to `14.789027100 s/token`, a descriptive `2.500446470x` change or `60.007142%` lower latency. The reciprocal rate rose from `0.0270422506 tok/s` to `0.0676177002 tok/s`.
+The routed cache shows the value of that framing. A strict full61 accounting audit cut routed source reads and routed H2D, field by field, from `64.223GB` to `29.620GB`: `53.9%` fewer bytes for the recorded workload.
 
-![Original P6 one-token timing ledger](docs/assets/readme/16-pos5-one-token-dag.svg)
+![Routed cache transfer reduction](docs/assets/readme/14-routed-cache-savings.svg)
 
-![P6 development next-token lineage](docs/assets/readme/18-p6-throughput.svg)
+## Performance
 
-The chart records a narrower P6 pre-pipeline comparison of `1.1605x`. The old `36.979170611 s/token` artifact is identified in the ledger and retained diagrams. Copying the current `14.789027100 s/token` record into the tracked artifact packet is pending, so this lineage remains secondary development evidence. It uses the same pinned model family and exact runtime boundary with a request shape distinct from the P5/N3 main comparison.
+The headline compares the earliest retained exact full-request baseline with the current exact engine on the same P5/N3 request. Both use the same pinned V4-Pro weights, prompt IDs, greedy output, 61-layer schedule, and internal state-audit contract.
 
-## Flash projection envelope
+| Exact P5/N3 full request | Wall time | Emitted rate | Change |
+| --- | ---: | ---: | ---: |
+| Exact baseline | `198.95s` | `0.0151tok/s` | `1.00x` |
+| Current exact engine | `89.28s` | `0.0336tok/s` | **`2.228x`** |
 
-DeepSeek-V4-Flash runs in this repository: `0`. The rates below are recalculated projection envelopes for a future Flash port. Benchmark evidence begins with the Flash implementation and its measured runs.
+That is a `55.13%` reduction in complete-request latency. The result contains three emitted tokens. Sustained chat-service rate needs a separate measurement.
 
-![Observed development and projected Flash evidence ladder](docs/assets/readme/17-hardware-evidence-ladder.svg)
+The current hot next-token trace is `14.789s/token`, or `0.0676tok/s`. The earliest retained exact trace on the same pinned weight family was `36.979s/token`, a separate `2.500x` development timing improvement with a different request shape.
+
+The largest local mechanism result is `4.118x`: the QD4 routed-layer gate reduced recorded L4/P5 routed wall time from `486.605ms` to `118.170ms`, with all four paired checks exact. Its estimand is routed-layer wall time. The whole-request result uses its own measurement.
+
+| What moved | Observed effect | Scope |
+| --- | ---: | --- |
+| Full exact request | `2.228x` faster | One P5/N3 request per condition |
+| Hot next-token trace | `2.500x` faster | One P6 trace per condition |
+| Routed QD4 gate | `4.118x` faster | Four paired local L4/P5 checks |
+| Routed cache traffic | `53.9%` less | Full61 accounting audit |
+
+## From a 1.6T pressure test to home inference
+
+V4-Pro is deliberately unforgiving. It exposes the cost of streaming huge fixed payloads, sparse expert unions, state traffic, and the output head through a small memory hierarchy. A smaller MoE changes those terms, which is why the same engine should become much more useful on a desktop-class GPU.
+
+DeepSeek-V4-Flash is the first planned target. It has zero runs in this repository today. The following rates are projected envelopes for a future port, computed from a model-specific work budget and labeled as projections throughout.
 
 ![Projected Flash home-hardware envelope](docs/assets/readme/20-flash-projection-envelope.svg)
 
-| Hardware and plan | Projected committed rate | Assumptions |
-| --- | ---: | --- |
-| Cold H1, 12 GiB | `0.103 to 0.125 tok/s` | Flash run count `0` |
-| Fixed-resident H1, 16 GiB | `0.313 to 0.658 tok/s` | fixed residency unimplemented |
-| Fixed-resident H2, 24 GiB, `q=0.8` | `0.548 to 1.153 tok/s` | draft and rollback costs unmeasured |
-| Fixed-resident H5, 32 to 48 GiB, `q=0.8` | `0.500 to 1.052 tok/s` | route union and scheduler span unmeasured |
+| Future V4-Flash plan | Projected committed rate |
+| --- | ---: |
+| Cold H1, 12GiB | `0.103 to 0.125tok/s` |
+| Fixed-resident H1, 16GiB | `0.313 to 0.658tok/s` |
+| Fixed-resident H2, 24GiB, `q=0.8` | `0.548 to 1.153tok/s` |
+| Fixed-resident H5, 32 to 48GiB, `q=0.8` | `0.500 to 1.052tok/s` |
 
-The H2 and H5 ranges are sensitive to the conditional acceptance assumption `q`:
+For another open-weight MoE, localMoE's planning model counts fixed-miss bytes, routed-expert union bytes, PCIe and GPU service, persistent-state work, and output-head cost. Those quantities form a portable roofline. The current runtime implements V4-Pro; each additional family needs its own metadata, routing semantics, KV layout, and acceptance gate.
 
-| `q` | H2 committed rate | H5 committed rate |
-| ---: | ---: | ---: |
-| `0.7` | `0.492 to 1.035 tok/s` | `0.399 to 0.839 tok/s` |
-| `0.8` | `0.548 to 1.153 tok/s` | `0.500 to 1.052 tok/s` |
-| `0.9` | `0.609 to 1.281 tok/s` | `0.635 to 1.336 tok/s` |
+## Why Rust
 
-Flash fixed residency, draft cost, rollback, actual route union, scheduler span, and `q` await measurement. A smaller open-weight MoE should be evaluated with a parameterized roofline based on its active fixed-miss bytes, routed-expert union, PCIe/GPU service, and output-head cost. Those active data-movement and compute terms determine speed.
+Rust contributes to the execution model. GEMM speed follows the kernel and hardware.
 
-## Reproduce the current path
+| Runtime constraint | Rust/CUDA mechanism |
+| --- | --- |
+| A cache slot has one live owner | Move-only leases make ownership explicit |
+| Capacity must close before execution | Typed FP4-FP8 layouts produce byte budgets |
+| I/O and GPU work must overlap | Bounded workers, pinned staging, streams, and events |
+| Parallel work needs canonical semantics | Ordered reduction follows the canonical expert order |
+| State may change only on success | Transactional commit gives each layer a clear boundary |
+| Kernels need a native path | Colibri-owned CUDA kernels use `cuda-oxide` |
 
-Use WSL2/Linux, CUDA 12.x, LLVM/NVPTX, libclang, and an Ada `sm_89` GPU. Store the checkpoint on WSL-native ext4. The environment contract rejects `/mnt/c` and `/mnt/d` for model storage. Set `COLIBRI_DSV4_MODEL_DIR`, `COLIBRI_ORACLE_PYTHON`, and `COLIBRI_CUBLAS_EXACT_LIB` as described in the [full61 environment contract](rust/colibri-cuda/tools/V4_FULL61_ORACLE.md).
+The result is a runtime whose placement decisions are inspectable. That matters when a single token depends on many asynchronous transfers and a small numerical difference can affect a later routing decision.
+
+## Quickstart
+
+The current path targets WSL2/Linux, CUDA12.x, LLVM/NVPTX, libclang, and an Ada `sm_89` GPU. Store model weights on a WSL-native ext4 block device. The environment contract rejects `/mnt/c` and `/mnt/d` for model storage.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
@@ -116,21 +112,22 @@ cargo check --locked -p colibri-cuda
 ./run-identified.sh test --arch sm_89
 ```
 
-The [mechanism experiment record](docs/experiments/v4-pro-mechanisms-2026-07-24.md) contains the model-run commands and fail-closed preflight. The [Benchmark ledger](docs/assets/readme/cost-figures-provenance.json) records compact public identities and figure inputs.
+For a full61 oracle run, set `COLIBRI_DSV4_MODEL_DIR`, `COLIBRI_ORACLE_PYTHON`, and `COLIBRI_CUBLAS_EXACT_LIB` as described in the [full61 environment contract](rust/colibri-cuda/tools/V4_FULL61_ORACLE.md). The [mechanism experiment record](docs/experiments/v4-pro-mechanisms-2026-07-24.md) contains the model-run commands and fail-closed preflight.
 
-## Repository layout
+<details>
+<summary>Evidence boundary and projection assumptions</summary>
 
-```text
-rust/colibri-cuda/          Rust + cuda-oxide V4-Pro prototype
-rust/colibri-cuda/tools/    oracle, trace, and evidence tools
-docs/assets/readme/         deterministic figures and compact evidence artifacts
-c/                          retained upstream C/CUDA oracle and baseline
-```
+The full-request comparison has `n=1` per condition and is descriptive development evidence. It checks the recorded Rust canonical route, reduction, and transactional state boundary. Official PyTorch full61 parity has a separate acceptance gate.
 
-## License
+The P6 `14.789s/token` record is a secondary timing lineage. Its current public artifact packet is pending, so the P5/N3 comparison is the primary public result.
 
-Code remains under [Apache License 2.0](LICENSE). Model weights and associated materials follow the terms on the model release page. Retained upstream code and assets keep their existing notices and license terms.
+Observed emitted rate uses `emitted tokens / request wall time`. The Flash planning expression uses a verification lower bound built from fixed misses, routed-expert union service, H2D/GPU work, serialized state work, and the head. For speculative horizon `H`, the illustrative committed-token factor is `E[C_H] = (1 - q^(H+1)) / (1 - q)`. The projected H2 and H5 rows use `q=0.8`; fixed residency, draft cost, rollback, actual expert union, and scheduler span await measurement.
 
-## Inspiration
+The [Benchmark ledger](docs/assets/readme/cost-figures-provenance.json) retains figure inputs, formulas, artifact identities, and the underlying baseline/current lineage. The source identities differ across the two full-request development runs, which is why the `2.228x` comparison is labeled descriptive.
+</details>
 
-localMoE is inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) and aims to take local MoE execution further.
+## License and inspiration
+
+Code is available under the [Apache License 2.0](LICENSE). Model weights and associated materials follow their release terms. Retained upstream code and assets keep their existing notices and license terms.
+
+localMoE is inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri). It explores how far exact streamed MoE execution can go on hardware people already own.

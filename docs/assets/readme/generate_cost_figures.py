@@ -769,11 +769,11 @@ def full_request_speedup_figure() -> str:
     maximum, x0, x1 = 220.0, 290.0, 780.0
     scale = lambda seconds: x0 + seconds / maximum * (x1 - x0)
     ratio = v8["seconds"] / v9["seconds"]
-    body = text(48, 42, "Exact full request: V9 completes the same P5/N3 request 2.23x faster", 25, weight="bold")
+    body = text(48, 42, "Exact full request: P5/N3 runs 2.23x faster", 25, weight="bold")
     body += text(48, 70, "P5/N3, 61 layers, same prompt IDs and greedy output, one development request per condition", 14, C["muted"])
     for y, label_value, item, fill_value, pattern in (
-        (135, "V8, QD4 off", v8, C["blue"], "url(#hatch-sky)"),
-        (265, "V9, QD4 on", v9, C["vermillion"], C["vermillion"]),
+        (135, "Exact baseline", v8, C["blue"], "url(#hatch-sky)"),
+        (265, "Current exact engine", v9, C["vermillion"], C["vermillion"]),
     ):
         end = scale(item["seconds"])
         body += text(x0 - 18, y + 31, label_value, 17, C["ink"], "end", "bold")
@@ -782,8 +782,8 @@ def full_request_speedup_figure() -> str:
     body += axis(x0, x1, 365, maximum, [0, 50, 100, 150, 200], "full request wall time, seconds")
     body += text(48, 438, f"{ratio:.9f}x faster  |  latency down 55.125234%  |  0.015079334 to 0.033603148 emitted tok/s", 17, C["vermillion"], weight="bold")
     body += text(48, 466, "PASS: 427 transactional commits and 183 exact layer-state audits. n=1 per condition; descriptive development evidence.", 13, C["muted"])
-    body += footer("V8 QD4 OFF AND V9 QD4 ON, FULL-REQUEST DEVELOPMENT COMPARISON", height)
-    return svg("Exact full-request speedup", "V8 and V9 full-request wall times shown from zero with exact internal-state checks.", body, height)
+    body += footer("EXACT BASELINE AND CURRENT ENGINE, FULL-REQUEST DEVELOPMENT COMPARISON", height)
+    return svg("Exact full-request speedup", "Exact baseline and current exact engine full-request wall times shown from zero with internal-state checks.", body, height)
 
 
 def flash_projection_envelope_figure() -> str:
