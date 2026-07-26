@@ -8,6 +8,14 @@ change.
 The V4-Pro storage/compute separation contract is
 [`docs/DISAGGREGATED_EXPERT_ARCHITECTURE.md`](docs/DISAGGREGATED_EXPERT_ARCHITECTURE.md).
 
+## Frozen README titles
+
+- `README.md` uses `Want to Try Deploying a Full 1.6T MoE Model on Your Gaming Laptop?`;
+  `README.zh-CN.md` uses `想不想在你的游戏本上试试亲自全量部署1.6T的MoE大模型呢？`.
+  The visible descriptions are `Does Your Next LLM Infrastructure Really Need to Be an H100?`
+  and `你的下一台LLM基础设施，何必是H100`, respectively. Agents must not change either
+  title or description unless the user explicitly specifies new text.
+
 ## Rewrite target
 
 - The end state rewrites host logic and every Colibri-owned CUDA kernel in Rust
