@@ -13,7 +13,6 @@ from xml.sax.saxutils import escape
 OUT = Path(__file__).resolve().parent
 REPO = OUT.parents[2]
 DEFAULT_ARTIFACT_ROOT = Path("/mnt/colibri-native/.logs")
-FLASH_REPORT = REPO / "docs" / "FLASH_MIGRATION_RESEARCH.md"
 W = 960
 
 # Okabe-Ito plus neutral grays. Every categorical use also has a non-color cue.
@@ -80,6 +79,34 @@ RAW_KEYS = ("raw_gpu_pair1", "raw_gpu_pair2")
 HOST_KEYS = ("host_bf16_pair1", "host_bf16_pair2")
 CACHE_OFF_KEYS = ("cache_off_pair1", "cache_off_pair2")
 CACHE_ON_KEYS = ("cache_on_pair1", "cache_on_pair2")
+
+FULL_REQUEST = {
+    "prompt": [0, 128803, 6366, 128804, 128822],
+    "generated": [115287, 115287, 115287],
+    "model_revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+    "layers": 61,
+    "commits": 427,
+    "state_audits": 183,
+    "v8": {
+        "seconds": 198.947779573,
+        "sha256": "781ccffe6ff3f35f83663d6421c36500a70684e8a4aca2c232b9461a570ac102",
+        "source_identity_sha256": "72e71ae8b5b5ca7c43ad012bb1430289b7eae6363fe71e7a65e43ca036e0eb9f",
+        "qd4": False,
+    },
+    "v9": {
+        "seconds": 89.277349596,
+        "sha256": "52d7c04b1e15b6c5450fd49d2eda4c14cf06372fd5d80fbabc77149c4c311cb3",
+        "source_identity_sha256": "5889c47ff142ce3805ed02708be0111916437be2fbd66c3000a2b8011ddb081d",
+        "qd4": True,
+    },
+}
+
+FLASH_PROJECTED = {
+    "cold_h1_12_gib": (0.103, 0.125),
+    "fixed_h1_16_gib": (0.313, 0.658),
+    "h2": {0.7: (0.492, 1.035), 0.8: (0.548, 1.153), 0.9: (0.609, 1.281)},
+    "h5": {0.7: (0.399, 0.839), 0.8: (0.500, 1.052), 0.9: (0.635, 1.336)},
+}
 
 
 def sha256_bytes(raw: bytes) -> str:
@@ -714,111 +741,81 @@ def pos5_figure(data: dict) -> str:
 
 
 def hardware_ladder_figure(data: dict) -> str:
-    height = 650
-    title_value = "Measured / Calibrated / Target hardware evidence map"
+    height = 530
+    title_value = "Evidence ladder: observed V4-Pro and projected Flash"
     body = text(48, 42, title_value, 25, weight="bold")
-    body += text(
-        48,
-        70,
-        "Current evidence and future gates are separated because their models, estimands, and assumptions differ.",
-        14,
-        C["muted"],
-    )
-    body += text(
-        48,
-        93,
-        "Separate rate frames preserve the distinct models, estimands, and assumptions.",
-        13,
-        C["vermillion"],
-        weight="bold",
-    )
-    body += text(48, 132, "CURRENT EVIDENCE", 13, C["ink"], weight="bold")
-    body += text(480, 132, "FUTURE ACCEPTANCE GATES", 13, C["ink"], weight="bold")
+    body += text(48, 70, "Observed runs and future estimates use separate evidence labels; read each rate within its workload.", 14, C["muted"])
+    cards = [
+        ("OBSERVED DEVELOPMENT", "V4-Pro P5/N3", "0.015 to 0.034 emitted tok/s", "V8 and V9, one full request per condition", C["blue"], ""),
+        ("PROJECTED, FLASH RUNS 0", "Flash cold H1, 12 GiB", "0.103 to 0.125 tok/s", "projection envelope", C["orange"], "8 5"),
+        ("PROJECTED, FLASH RUNS 0", "Flash fixed-resident H1, 16 GiB", "0.313 to 0.658 tok/s", "residency is unimplemented", C["green"], "8 5"),
+        ("PROJECTED, FLASH RUNS 0", "Flash fixed-resident H2, 24 GiB", "0.548 to 1.153 committed tok/s", "q=0.8; draft and rollback costs unmeasured", C["purple"], "8 5"),
+    ]
+    for index, (tier, model, band, note, color, dash) in enumerate(cards):
+        y = 105 + index * 93
+        body += rect(48, y, 864, 73, C["paper"], color, 8, 2.2, dash)
+        body += text(70, y + 25, tier, 12, color, weight="bold")
+        body += text(70, y + 52, model, 17, C["ink"], weight="bold")
+        body += text(890, y + 52, band, 17, color, "end", "bold")
+        body += text(70, y + 68, note, 12, C["muted"])
+    body += text(48, 490, "Flash projections assume a future port. Measured q, route union, residency, and scheduler span can change them.", 12, C["muted"])
+    body += footer("OBSERVED DEVELOPMENT AND PROJECTED ENVELOPES", height)
+    return svg(title_value, "Observed V4-Pro development results and explicitly projected Flash envelopes.", body, height)
 
-    # Measured: solid border + solid point.
-    body += rect(48, 150, 392, 126, C["paper"], C["blue"], 8, 2.5)
-    body += circle(72, 176, 8, C["blue"], C["ink"], 1.5)
-    body += text(92, 181, "MEASURED DEVELOPMENT", 12, C["blue"], weight="bold")
-    body += text(70, 215, "Pro · 12 GiB", 18, C["ink"], weight="bold")
-    body += text(
-        418,
-        215,
-        f"{data['pos5']['rate_tok_s']:.3f} next-token/s",
-        18,
-        C["blue"],
-        "end",
-        "bold",
-    )
-    body += text(70, 245, "One position-5 decode; sustained rate remains unmeasured.", 12, C["muted"])
 
-    # Calibrated: hatched cue and explicit run-count boundary.
-    body += rect(48, 296, 392, 126, C["paper"], C["orange"], 8, 2.5)
-    body += rect(64, 316, 18, 18, "url(#hatch-orange)", C["orange"], 1, 1.5)
-    body += text(92, 330, "CALIBRATED", 12, C["orange"], weight="bold")
-    body += text(70, 364, "Flash · 12 GiB", 18, C["ink"], weight="bold")
-    body += text(418, 364, "0.08 to 0.12 token/s", 18, C["orange"], "end", "bold")
-    body += text(70, 394, "Cold H1 projection from Pro service · Flash run count: 0.", 12, C["muted"])
+def full_request_speedup_figure() -> str:
+    height = 520
+    v8, v9 = FULL_REQUEST["v8"], FULL_REQUEST["v9"]
+    maximum, x0, x1 = 220.0, 290.0, 780.0
+    scale = lambda seconds: x0 + seconds / maximum * (x1 - x0)
+    ratio = v8["seconds"] / v9["seconds"]
+    body = text(48, 42, "Exact full request: V9 completes the same P5/N3 request 2.23x faster", 25, weight="bold")
+    body += text(48, 70, "P5/N3, 61 layers, same prompt IDs and greedy output, one development request per condition", 14, C["muted"])
+    for y, label_value, item, fill_value, pattern in (
+        (135, "V8, QD4 off", v8, C["blue"], "url(#hatch-sky)"),
+        (265, "V9, QD4 on", v9, C["vermillion"], C["vermillion"]),
+    ):
+        end = scale(item["seconds"])
+        body += text(x0 - 18, y + 31, label_value, 17, C["ink"], "end", "bold")
+        body += rect(x0, y, end - x0, 54, pattern, fill_value, 2, 2)
+        body += text(end + 12, y + 34, f"{item['seconds']:.9f} s", 16, C["ink"], weight="bold")
+    body += axis(x0, x1, 365, maximum, [0, 50, 100, 150, 200], "full request wall time, seconds")
+    body += text(48, 438, f"{ratio:.9f}x faster  |  latency down 55.125234%  |  0.015079334 to 0.033603148 emitted tok/s", 17, C["vermillion"], weight="bold")
+    body += text(48, 466, "PASS: 427 transactional commits and 183 exact layer-state audits. n=1 per condition; descriptive development evidence.", 13, C["muted"])
+    body += footer("V8 QD4 OFF AND V9 QD4 ON, FULL-REQUEST DEVELOPMENT COMPARISON", height)
+    return svg("Exact full-request speedup", "V8 and V9 full-request wall times shown from zero with exact internal-state checks.", body, height)
 
-    def target_card(
-        y: float,
-        model: str,
-        band: str,
-        assumption: str,
-        current_path: str = "",
-    ) -> str:
-        card = rect(480, y, 432, 105, C["paper"], C["green"], 8, 2.5, "8 5")
-        card += rect(496, y + 15, 20, 20, C["paper"], C["green"], 1, 2, "5 3")
-        card += text(526, y + 31, "TARGET · FUTURE ACCEPTANCE GATE", 12, C["green"], weight="bold")
-        card += text(502, y + 63, model, 17, C["ink"], weight="bold")
-        card += text(890, y + 63, band, 17, C["green"], "end", "bold")
-        card += text(502, y + 88, assumption, 12, C["muted"])
-        if current_path:
-            card += text(890, y + 88, current_path, 11, C["vermillion"], "end", "bold")
-        return card
 
-    body += target_card(
-        150,
-        "Flash · 16 GiB",
-        "0.25 to 0.40 tok/s",
-        "Resident-fixed H1 implementation remains pending.",
-    )
-    body += target_card(
-        272,
-        "Flash · 24 GiB",
-        "0.50 to 1.00 committed tok/s",
-        "H2 · q=0.8 planning assumption.",
-        "current H2 calibration: 0.20 to 0.29",
-    )
-    body += target_card(
-        394,
-        "Flash · 32 to 48 GiB",
-        "0.70 to 1.50 committed tok/s",
-        "H5 · q=0.8 planning assumption.",
-        "current H5 calibration: 0.26 to 0.37",
-    )
-    body += text(
-        48,
-        548,
-        "TARGET defines a future pass/fail threshold. Hardware rate estimation remains a separate gate.",
-        13,
-        C["vermillion"],
-        weight="bold",
-    )
-    body += text(
-        48,
-        576,
-        "Target gates still require measured SSD/PCIe service, residency, context, q, route-hit, and overlap.",
-        12,
-        C["muted"],
-    )
-    body += footer("EVIDENCE TIERS · MEASURED DEVELOPMENT · CALIBRATED · TARGET", height)
-    return svg(title_value, "Current evidence and future hardware acceptance gates use separate rate frames.", body, height)
+def flash_projection_envelope_figure() -> str:
+    height = 560
+    maximum, x0, x1 = 1.4, 330.0, 900.0
+    scale = lambda rate: x0 + rate / maximum * (x1 - x0)
+    rows = [
+        ("Cold H1, 12 GiB", FLASH_PROJECTED["cold_h1_12_gib"], C["orange"]),
+        ("Fixed-resident H1, 16 GiB", FLASH_PROJECTED["fixed_h1_16_gib"], C["green"]),
+        ("Fixed-resident H2, 24 GiB, q=0.8", FLASH_PROJECTED["h2"][0.8], C["blue"]),
+        ("Fixed-resident H5, 32 to 48 GiB, q=0.8", FLASH_PROJECTED["h5"][0.8], C["purple"]),
+    ]
+    body = text(48, 42, "Flash home-hardware projection envelope", 25, weight="bold")
+    body += text(48, 70, "PROJECTED. Flash runs: 0. Interval marks denote estimated rate ranges.", 15, C["vermillion"], weight="bold")
+    for index, (label_value, interval, color) in enumerate(rows):
+        y = 142 + index * 76
+        lo, hi = interval
+        body += text(x0 - 18, y + 5, label_value, 14, C["ink"], "end", "bold")
+        body += line(x0, y, x1, y, C["grid"], 1)
+        body += line(scale(lo), y, scale(hi), y, color, 8)
+        body += circle(scale(lo), y, 6, C["paper"], color, 2)
+        body += square(scale(hi), y, 6, C["paper"], color, 2)
+        body += text(scale(hi) + 13, y + 5, f"{lo:.3f} to {hi:.3f}", 14, color, weight="bold")
+    body += axis(x0, x1, 460, maximum, [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4], "projected committed tokens per second")
+    body += text(48, 525, "Inputs still unmeasured: fixed residency, draft cost, rollback, actual route union, scheduler span, and q.", 12, C["muted"])
+    body += footer("PROJECTED FLASH ENVELOPE, RUN COUNT 0", height)
+    return svg("Flash projection envelope", "Projected Flash rate intervals from zero; no Flash benchmark is represented.", body, height)
 
 
 def provenance(data: dict, metadata: dict[str, dict]) -> dict:
     timing = data["timings"]
     pos5 = data["pos5"]
-    flash_report_sha = sha256_path(FLASH_REPORT)
     return {
         "schema": "colibri-readme-cost-figures-v1",
         "generator": "docs/assets/readme/generate_cost_figures.py",
@@ -829,14 +826,7 @@ def provenance(data: dict, metadata: dict[str, dict]) -> dict:
             "rate": "tokens per second",
             "hardware_capacity": "GiB",
         },
-        "artifact_identity": {
-            **metadata,
-            "flash_migration_research": {
-                "path": "docs/FLASH_MIGRATION_RESEARCH.md",
-                "sha256": flash_report_sha,
-                "role": "calibration formulas and projection boundary; no Flash run",
-            },
-        },
+        "artifact_identity": metadata,
         "figures": {
             "13-fixed-h2d-savings.svg": {
                 "evidence_class": "Measured",
@@ -901,53 +891,73 @@ def provenance(data: dict, metadata: dict[str, dict]) -> dict:
                 "note": "One development next-token decode; not sustained throughput.",
             },
             "17-hardware-evidence-ladder.svg": {
-                "display_structure": "Current evidence and future gates are separated; there is no shared rate axis.",
-                "mixed_workload_warning": "Rows are not like-for-like benchmark speedups.",
+                "display_structure": "Observed V4-Pro development and projected Flash envelopes are separated by evidence label.",
+                "flash_runs": 0,
                 "rows": [
                     {
                         "model": "V4-Pro",
-                        "vram_gib": 12,
-                        "evidence_class": "Measured",
-                        "rate_tok_s": pos5["rate_tok_s"],
-                        "formula": "1e9 / measured position-5 decode_outer_ns",
-                        "scope": "one H1 next-token development decode; not sustained throughput",
+                        "evidence_class": "Observed development",
+                        "rate_tok_s": [
+                            3 / FULL_REQUEST["v8"]["seconds"],
+                            3 / FULL_REQUEST["v9"]["seconds"],
+                        ],
+                        "formula": "emitted_rate = 3 / full_request_seconds",
+                        "scope": "P5/N3 full request, one V8 and one V9 development run",
                     },
                     {
                         "model": "V4-Flash",
                         "vram_gib": 12,
-                        "evidence_class": "Calibrated",
-                        "hardcoded_display_band_tok_s": [0.08, 0.12],
-                        "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3",
-                        "formula": "cold H1 projection 8-12 s gives reciprocal 0.083-0.125 tok/s; display band is conservatively rounded",
+                        "evidence_class": "Projected",
+                        "band_tok_s": FLASH_PROJECTED["cold_h1_12_gib"],
+                        "formula": "frozen projection input; Flash runs = 0",
                     },
                     {
                         "model": "V4-Flash",
                         "vram_gib": 16,
-                        "evidence_class": "Target",
-                        "hardcoded_band_tok_s": [0.25, 0.40],
-                        "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3 resident-fixed H1 hypothesis",
-                        "formula": "1 / [4.0, 2.5] s; requires unimplemented short-context fixed residency",
+                        "evidence_class": "Projected",
+                        "band_tok_s": FLASH_PROJECTED["fixed_h1_16_gib"],
+                        "formula": "frozen projection input; fixed residency is unimplemented",
                     },
                     {
                         "model": "V4-Flash",
                         "vram_gib": 24,
-                        "evidence_class": "Target",
-                        "hardcoded_band_tok_s": [0.5, 1.0],
+                        "evidence_class": "Projected",
+                        "band_tok_s": FLASH_PROJECTED["h2"][0.8],
                         "assumptions": {"H": 2, "q": 0.8},
-                        "current_path_calibrated_band_tok_s": [0.20, 0.29],
-                        "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.44-4.88 s; that consequence is not evidence.",
-                        "source": "README planning brief; current report calibrates only 0.20-0.29 committed tok/s for H2",
+                        "formula": "frozen projection input; q, draft, and rollback costs remain unmeasured",
                     },
                     {
                         "model": "V4-Flash",
                         "vram_gib": [32, 48],
-                        "evidence_class": "Target",
-                        "hardcoded_band_tok_s": [0.7, 1.5],
+                        "evidence_class": "Projected",
+                        "band_tok_s": FLASH_PROJECTED["h5"][0.8],
                         "assumptions": {"H": 5, "q": 0.8},
-                        "current_path_calibrated_band_tok_s": [0.26, 0.37],
-                        "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.46-5.27 s; that consequence is not evidence.",
-                        "source": "README planning brief; current report calibrates only 0.26-0.37 committed tok/s for H5",
+                        "formula": "frozen projection input; q, route union, and scheduler span remain unmeasured",
                     },
+                ],
+            },
+            "19-full-request-speedup.svg": {
+                "evidence_class": "Measured development",
+                "n_per_condition": 1,
+                "workload": "same P5/N3 full request",
+                "inputs": FULL_REQUEST,
+                "formulas": [
+                    "speedup = v8.seconds / v9.seconds",
+                    "latency_reduction_percent = 100 * (1 - v9.seconds / v8.seconds)",
+                    "emitted_rate = 3 / seconds",
+                ],
+            },
+            "20-flash-projection-envelope.svg": {
+                "evidence_class": "Projected",
+                "flash_runs": 0,
+                "inputs": FLASH_PROJECTED,
+                "assumptions_not_measured": [
+                    "fixed residency",
+                    "draft cost",
+                    "rollback",
+                    "actual routed expert union",
+                    "scheduler span",
+                    "conditional acceptance q",
                 ],
             },
         },
@@ -971,7 +981,7 @@ def render_all(data: dict, metadata: dict[str, dict]) -> dict[str, bytes]:
             "MEASURED DEVELOPMENT · paired fixed-weight transfer evidence",
         ),
         "14-routed-cache-savings.svg": byte_savings_figure(
-            "Measured routed cache: 34.603 GB less source and H2D each",
+            "Measured routed cache: 34.603 GB less storage read and H2D each",
             "V4-Pro full61 · development ABBA · n=2 per arm · 32-slot immutable cache",
             "Cache off",
             "32-slot cache",
@@ -985,6 +995,8 @@ def render_all(data: dict, metadata: dict[str, dict]) -> dict[str, bytes]:
         "15-development-paired-timings.svg": timings_figure(data),
         "16-pos5-one-token-dag.svg": pos5_figure(data),
         "17-hardware-evidence-ladder.svg": hardware_ladder_figure(data),
+        "19-full-request-speedup.svg": full_request_speedup_figure(),
+        "20-flash-projection-envelope.svg": flash_projection_envelope_figure(),
     }
     outputs["cost-figures-provenance.json"] = (
         json.dumps(provenance(data, metadata), indent=2, sort_keys=True, ensure_ascii=False) + "\n"

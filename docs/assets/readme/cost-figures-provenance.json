@@ -30,11 +30,6 @@
       "path": "/mnt/colibri-native/.logs/full61-qd4-immutable-cache-strict-audit-b43-20260725.jsonl",
       "sha256": "6d0972b01ee945bfb88c47f92acb5b306de2cd8e1eb3cd3c0696deeb90e920c1"
     },
-    "flash_migration_research": {
-      "path": "docs/FLASH_MIGRATION_RESEARCH.md",
-      "role": "calibration formulas and projection boundary; no Flash run",
-      "sha256": "93323873a7f7ee190599576bacb718b002537042d3385941d1b5cc62096ba3fa"
-    },
     "host_bf16_pair1": {
       "bytes": 870566,
       "lines": 307,
@@ -179,37 +174,37 @@
       "token_position": 5
     },
     "17-hardware-evidence-ladder.svg": {
-      "display_structure": "Current evidence and future gates are separated; there is no shared rate axis.",
-      "mixed_workload_warning": "Rows are not like-for-like benchmark speedups.",
+      "display_structure": "Observed V4-Pro development and projected Flash envelopes are separated by evidence label.",
+      "flash_runs": 0,
       "rows": [
         {
-          "evidence_class": "Measured",
-          "formula": "1e9 / measured position-5 decode_outer_ns",
+          "evidence_class": "Observed development",
+          "formula": "emitted_rate = 3 / full_request_seconds",
           "model": "V4-Pro",
-          "rate_tok_s": 0.02704225063670128,
-          "scope": "one H1 next-token development decode; not sustained throughput",
+          "rate_tok_s": [
+            0.015079333915859104,
+            0.033603148094961066
+          ],
+          "scope": "P5/N3 full request, one V8 and one V9 development run"
+        },
+        {
+          "band_tok_s": [
+            0.103,
+            0.125
+          ],
+          "evidence_class": "Projected",
+          "formula": "frozen projection input; Flash runs = 0",
+          "model": "V4-Flash",
           "vram_gib": 12
         },
         {
-          "evidence_class": "Calibrated",
-          "formula": "cold H1 projection 8-12 s gives reciprocal 0.083-0.125 tok/s; display band is conservatively rounded",
-          "hardcoded_display_band_tok_s": [
-            0.08,
-            0.12
+          "band_tok_s": [
+            0.313,
+            0.658
           ],
+          "evidence_class": "Projected",
+          "formula": "frozen projection input; fixed residency is unimplemented",
           "model": "V4-Flash",
-          "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3",
-          "vram_gib": 12
-        },
-        {
-          "evidence_class": "Target",
-          "formula": "1 / [4.0, 2.5] s; requires unimplemented short-context fixed residency",
-          "hardcoded_band_tok_s": [
-            0.25,
-            0.4
-          ],
-          "model": "V4-Flash",
-          "source": "docs/FLASH_MIGRATION_RESEARCH.md section 6.3 resident-fixed H1 hypothesis",
           "vram_gib": 16
         },
         {
@@ -217,18 +212,13 @@
             "H": 2,
             "q": 0.8
           },
-          "current_path_calibrated_band_tok_s": [
-            0.2,
-            0.29
+          "band_tok_s": [
+            0.548,
+            1.153
           ],
-          "evidence_class": "Target",
-          "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.44-4.88 s; that consequence is not evidence.",
-          "hardcoded_band_tok_s": [
-            0.5,
-            1.0
-          ],
+          "evidence_class": "Projected",
+          "formula": "frozen projection input; q, draft, and rollback costs remain unmeasured",
           "model": "V4-Flash",
-          "source": "README planning brief; current report calibrates only 0.20-0.29 committed tok/s for H2",
           "vram_gib": 24
         },
         {
@@ -236,24 +226,109 @@
             "H": 5,
             "q": 0.8
           },
-          "current_path_calibrated_band_tok_s": [
-            0.26,
-            0.37
+          "band_tok_s": [
+            0.5,
+            1.052
           ],
-          "evidence_class": "Target",
-          "formula": "No predictive formula: this is a hardcoded acceptance gate. At q=0.8, meeting it would require T_verify=2.46-5.27 s; that consequence is not evidence.",
-          "hardcoded_band_tok_s": [
-            0.7,
-            1.5
-          ],
+          "evidence_class": "Projected",
+          "formula": "frozen projection input; q, route union, and scheduler span remain unmeasured",
           "model": "V4-Flash",
-          "source": "README planning brief; current report calibrates only 0.26-0.37 committed tok/s for H5",
           "vram_gib": [
             32,
             48
           ]
         }
       ]
+    },
+    "19-full-request-speedup.svg": {
+      "evidence_class": "Measured development",
+      "formulas": [
+        "speedup = v8.seconds / v9.seconds",
+        "latency_reduction_percent = 100 * (1 - v9.seconds / v8.seconds)",
+        "emitted_rate = 3 / seconds"
+      ],
+      "inputs": {
+        "commits": 427,
+        "generated": [
+          115287,
+          115287,
+          115287
+        ],
+        "layers": 61,
+        "model_revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+        "prompt": [
+          0,
+          128803,
+          6366,
+          128804,
+          128822
+        ],
+        "state_audits": 183,
+        "v8": {
+          "qd4": false,
+          "seconds": 198.947779573,
+          "sha256": "781ccffe6ff3f35f83663d6421c36500a70684e8a4aca2c232b9461a570ac102",
+          "source_identity_sha256": "72e71ae8b5b5ca7c43ad012bb1430289b7eae6363fe71e7a65e43ca036e0eb9f"
+        },
+        "v9": {
+          "qd4": true,
+          "seconds": 89.277349596,
+          "sha256": "52d7c04b1e15b6c5450fd49d2eda4c14cf06372fd5d80fbabc77149c4c311cb3",
+          "source_identity_sha256": "5889c47ff142ce3805ed02708be0111916437be2fbd66c3000a2b8011ddb081d"
+        }
+      },
+      "n_per_condition": 1,
+      "workload": "same P5/N3 full request"
+    },
+    "20-flash-projection-envelope.svg": {
+      "assumptions_not_measured": [
+        "fixed residency",
+        "draft cost",
+        "rollback",
+        "actual routed expert union",
+        "scheduler span",
+        "conditional acceptance q"
+      ],
+      "evidence_class": "Projected",
+      "flash_runs": 0,
+      "inputs": {
+        "cold_h1_12_gib": [
+          0.103,
+          0.125
+        ],
+        "fixed_h1_16_gib": [
+          0.313,
+          0.658
+        ],
+        "h2": {
+          "0.7": [
+            0.492,
+            1.035
+          ],
+          "0.8": [
+            0.548,
+            1.153
+          ],
+          "0.9": [
+            0.609,
+            1.281
+          ]
+        },
+        "h5": {
+          "0.7": [
+            0.399,
+            0.839
+          ],
+          "0.8": [
+            0.5,
+            1.052
+          ],
+          "0.9": [
+            0.635,
+            1.336
+          ]
+        }
+      }
     }
   },
   "generator": "docs/assets/readme/generate_cost_figures.py",
