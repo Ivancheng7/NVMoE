@@ -30,11 +30,11 @@ One layer is consumed while the next payload is prepared. Fixed payloads can rem
 
 ## Share the work that the model already shares
 
-Independent requests have independent routes and state, but they visit the same fixed work in every layer. localMoE can advance a row set through one layer together, keep each request's state separate, and pay the fixed work once for the group.
+> Four full61 requests shared each layer's fixed work and reached `1.1690x` aggregate decode throughput, a `16.9%` gain across four paired comparisons.
 
-![B2 row-set aggregate throughput](docs/assets/readme/21-b2-rowset-full61.svg)
+![B4 four-request aggregate decode throughput](docs/assets/readme/22-b4-greedy-throughput.svg)
 
-For two independent full61 requests, layer-stationary execution reached `1.9417x` aggregate completion throughput across the sealed exact comparison. Fixed source traffic and fixed H2D traffic were each halved for the request pair. This is a throughput result for a two-request cohort. Single-request latency remains a separate target.
+B4 keeps four request states independent while the row set pays the fixed work once per layer. Across all four pairs, 4/4 ordered layer digests, final semantics, and the physical ledger matched exactly under default buffered, one-step greedy execution.
 
 ## The path from gaming laptop to desktop build
 
@@ -104,18 +104,20 @@ Run the measured P5/N3 single-request path with a text prompt:
   "$PWD/target/release/colibri-cuda"
 ```
 
-Run two full61 greedy requests through one B2 row set:
+Run the measured default-buffered B4 arm, which advances four independent full61 requests through one row set:
 
 ```bash
-/usr/bin/time -f 'b2_cohort_wall=%e s' env \
-  COLIBRI_V4_B2_GENERATE=1 \
-  COLIBRI_V4_B2_TOKEN_IDS='0;1' \
+/usr/bin/time -f 'b4_cohort_wall=%e s' env \
+  COLIBRI_V4_STREAM_READ_MODE=buffered \
+  COLIBRI_V4_B4_GREEDY_ABBA_BENCH=1 \
+  COLIBRI_V4_B4_GREEDY_ABBA_ARM=B \
+  COLIBRI_V4_B4_TOKEN_IDS='0;1;2;3' \
   COLIBRI_V4_GREEDY_STEPS=1 \
-  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/b2.jsonl" \
+  COLIBRI_V4_B4_GREEDY_ABBA_RESULT_JSONL="$LOCALMOE_RUN_DIR/b4.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-Both paths fail closed on strict canonical checks and commit their result only after all 61 layers complete. `request_e2e_ns` is the model request timing used for the headline; `/usr/bin/time` includes process startup and teardown. The result JSONL contains emitted IDs and final digests for the exact check.
+The sealed reproduction record used fresh processes in the fixed `AB, BA, BA, AB` order, aggregate SHA-256 `7049525af8b0b5e246175920e51d6904749f7a4cd07d3fc590b3a77d4a57e4d0`, and binary SHA-256 `9a34c61754a7c66fc0124850e2fcc11056f25915c43bd4cff886ade784a04fbb`. Every arm stayed below the 14.726GiB RSS cap with zero sampled swap. Both runnable paths fail closed on strict canonical checks and commit their result only after all 61 layers complete.
 
 Code is available under the [Apache License 2.0](LICENSE). Model weights follow their own release terms.
 

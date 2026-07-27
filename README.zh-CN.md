@@ -30,11 +30,11 @@ localMoE让检查点拥有一个移动的工作集：
 
 ## 共享模型本来就在共享的工作
 
-独立请求各自拥有路由与状态，但它们在每一层都会经过相同的固定工作。localMoE可以让一组行一起穿过同一层，同时分开保存每条请求的状态，并让整组请求只支付一次固定工作。
+> 四条full61请求共享每层固定工作，在四组配对比较中达到`1.1690倍`聚合decode吞吐，提升`16.9%`。
 
-![B2行集合聚合吞吐](docs/assets/readme/21-b2-rowset-full61.svg)
+![B4四请求聚合decode吞吐](docs/assets/readme/22-b4-greedy-throughput.svg)
 
-对于两条独立full61请求，逐层行集合执行在密封exact比较中达到`1.9417倍`聚合完成吞吐。每个请求对的固定source流量和固定H2D流量都减半。这是双请求cohort的吞吐结果，单请求延迟仍是独立目标。
+B4分别保存四条请求的状态，让整个row-set每层只承担一次固定工作。在default-buffered一步greedy执行下，四组比较中的4/4有序层digest、final semantics和physical ledger均通过exact检查。
 
 ## 从游戏本走向桌面平台
 
@@ -104,18 +104,20 @@ export LOCALMOE_RUN_DIR="$(mktemp -d)"
   "$PWD/target/release/colibri-cuda"
 ```
 
-让两条full61 greedy请求通过同一个B2行集合：
+使用实测default-buffered B4 arm，让四条独立full61请求通过同一个row-set：
 
 ```bash
-/usr/bin/time -f 'b2_cohort_wall=%e s' env \
-  COLIBRI_V4_B2_GENERATE=1 \
-  COLIBRI_V4_B2_TOKEN_IDS='0;1' \
+/usr/bin/time -f 'b4_cohort_wall=%e s' env \
+  COLIBRI_V4_STREAM_READ_MODE=buffered \
+  COLIBRI_V4_B4_GREEDY_ABBA_BENCH=1 \
+  COLIBRI_V4_B4_GREEDY_ABBA_ARM=B \
+  COLIBRI_V4_B4_TOKEN_IDS='0;1;2;3' \
   COLIBRI_V4_GREEDY_STEPS=1 \
-  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/b2.jsonl" \
+  COLIBRI_V4_B4_GREEDY_ABBA_RESULT_JSONL="$LOCALMOE_RUN_DIR/b4.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-两条路径都会对严格规范检查执行fail closed，并在61层全部完成后提交结果。头条采用JSONL中的`request_e2e_ns`模型请求时间，`/usr/bin/time`还包含进程启动与退出。结果JSONL保存输出ID和final digest，用于exact检查。
+密封复现记录使用独立新进程，固定顺序为`AB, BA, BA, AB`，aggregate SHA-256为`7049525af8b0b5e246175920e51d6904749f7a4cd07d3fc590b3a77d4a57e4d0`，binary SHA-256为`9a34c61754a7c66fc0124850e2fcc11056f25915c43bd4cff886ade784a04fbb`。所有arm均低于14.726GiB RSS上限，采样swap为0。两条可运行路径都会对严格规范检查执行fail closed，并在61层全部完成后提交结果。
 
 代码采用[Apache License 2.0](LICENSE)。模型权重遵循各自的发布条款。
 
