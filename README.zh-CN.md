@@ -30,17 +30,37 @@ GPU消费当前层时，运行时同步准备后续payload。immutable expert ca
 
 ## 密封实验支持的结论
 
-3个ABBA门槛都使用P5/N3 full61 exact执行。每个配置在冻结的`A1, B1, B2, A2`顺序中都有2个完整arm，所有完整arm都进入对称估计。
+4个门槛都使用full61 exact执行。3个单请求配置使用P5/N3，并在冻结的`A1,B1,B2,A2`顺序中各有2个完整arm。B2包使用两条独立的position-0请求，每个顺序分层各有2次重复。
 
 | 密封机制门槛 | 候选变化 | 对称E2E比值 | 注册计时门槛 |
 | --- | --- | ---: | ---: |
 | immutable expert cache | 从关闭cache到32个slot | `0.7007` | TTFT `0.7901`，hot total `0.6328` |
 | host retention | `12GiB`到`13GiB` | `0.8946` | TTFT `0.8862`，hot total `0.9039` |
 | device retention | `3.5GiB`到`4.0GiB` | `0.9260` | TTFT `0.9268`，hot total `0.9248` |
+| B2行集合 | 串行双请求到逐层行集合 | `1.9417倍`聚合完成吞吐 | 两个顺序分层为`2.0413倍`、`1.8469倍`;4/4个exact配对 |
 
 cache门槛把物理专家加载次数从`2,562`降至`1,576`，路由存储读取与路由H2D流量分别减少`34.603GB`。host retention提升至`13GiB`后，固定权重源读取再减少`2.563GB`。device retention提升至`4.0GiB`后，固定权重源读取减少`1.709GB`，固定H2D流量减少`1.568GB`。
 
 密封N6 device-retention overlay把实测每token时间从`17.8409426951s`降至`16.5992631988s`，变化为`-1.2416794963s/token`（`6.96%`）。每token减少`1,708,974,176B`权重源读取和`783,919,152B`H2D流量，同时保持引擎声明的exact语义。该估计中每个配置`n=2`。配对漂移把结果范围限定在已记录的P5/N3设置，不能据此外推通用吞吐。
+
+### 两条独立请求共享固定工作
+
+![B2行集合聚合吞吐](docs/assets/readme/21-b2-rowset-full61.svg)
+
+密封B2包运行两条独立的L0-L60请求。每条请求保留自己的router元数据和routed payload。行集合复用固定工作。4/4个exact ABBA配对的聚合完成吞吐对称几何平均为`1.9417倍`，serial-then-stationary与stationary-then-serial两个顺序分层分别为`2.0413倍`和`1.8469倍`。
+
+每个请求对中，固定source流量从`58,123,632,496B`降至`29,061,816,248B`，固定H2D从`66,310,423,408B`降至`33,155,211,704B`。router元数据保持每条请求`288B`，routed source与H2D各保持`25,689,194,496B`。单请求完成延迟不在本结果范围内。
+
+当前产品B2模式通过L0严格门槛。这条证据链将该产品检查与密封full61机制测量相连。完整产品B2 E2E复跑仍待完成。资源闭合较弱：GPU遥测前后均为`1,241MiB`，GNU time记录的最大RSS为`925,472KiB`且swap为零，系统SwapFree减少`27,688KiB`。连续child RSS/VmSwap轨迹因wrapper sampler缺陷缺失。
+
+使用两个由分号分隔的token-ID列表，并显式设置greedy步数：
+
+```bash
+COLIBRI_V4_B2_GENERATE=1 \
+COLIBRI_V4_B2_TOKEN_IDS='0;1' \
+COLIBRI_V4_GREEDY_STEPS=1 \
+cargo run --manifest-path rust/Cargo.toml --release -p colibri-cuda
+```
 
 ## 实测游戏本上的预期时间
 
@@ -68,9 +88,9 @@ decode速率只来自2个实测interval，证据范围限于短序列。持续�
 
 ## 此处exact的含义
 
-`exact`指Rust引擎声明的规范约束。所有验收通过的arm在p4、p5和p6输出token `115287`，规范化BF16摘要依次为`519e76cfedc01504`、`7017c61decbc4151`和`3bed9be0e5ebd27c`。路由顺序、归约、KV更新、lease释放和transactional state commit也通过对应的记录门槛。
+`exact`指Rust引擎声明的规范约束。单请求门槛在p4、p5和p6输出token`115287`，规范化BF16摘要依次为`519e76cfedc01504`、`7017c61decbc4151`和`3bed9be0e5ebd27c`。密封B2包在其冻结谱系内匹配每条独立请求的61层记录，以及最终argmax、collapsed、normalized和logits摘要。路由顺序、归约、KV更新、lease释放和transactional state commit也通过对应的记录门槛。
 
-官方PyTorch完整模型一致性、长上下文行为、多prompt文本质量、sampling和持续吞吐仍有各自的验收目标。头条`3.58倍`来自跨来源谱系比较，证据性质为描述性结果。上方3个ABBA比值承担配对机制主张。
+官方PyTorch完整模型一致性、长上下文行为、多prompt文本质量、sampling和持续吞吐仍有各自的验收目标。头条`3.58倍`来自跨来源谱系比较，证据性质为描述性结果。3个单请求ABBA比值与冻结B2聚合比值分别承担对应的配对机制主张。
 
 ## 为什么使用Rust
 

@@ -1159,11 +1159,13 @@ pub struct FinalHeadWeights {
     pub hc_base_f32: Vec<f32>,
     pub hc_scale_f32: f32,
     pub norm_bf16: Vec<u16>,
+    pub loader_source_bytes: usize,
 }
 
 pub struct FinalHeadCpuRun {
     pub output: FinalHeadOutput,
     pub read_ns: u64,
+    pub streamed_source_bytes: usize,
     pub wall_ns: u64,
 }
 
@@ -1253,12 +1255,21 @@ pub fn load_final_head(model_dir: &Path) -> Result<FinalHeadWeights, Box<dyn Err
             return Err(format!("V4 final {name} tensor contract mismatch").into());
         }
     }
-    let hc_scale = read_f32(&shard, "hc_head_scale", &[1])?[0];
+    let hc_fn_f32 = read_f32(&shard, "hc_head_fn", &[HC, HC * HIDDEN])?;
+    let hc_base_f32 = read_f32(&shard, "hc_head_base", &[HC])?;
+    let hc_scale_f32 = read_f32(&shard, "hc_head_scale", &[1])?;
+    let norm_bf16 = read_bf16(&shard, "norm.weight", &[HIDDEN])?;
+    let loader_source_bytes = std::mem::size_of_val(hc_fn_f32.as_slice())
+        .checked_add(std::mem::size_of_val(hc_base_f32.as_slice()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(hc_scale_f32.as_slice())))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(norm_bf16.as_slice())))
+        .ok_or("V4 final head loader source byte counter overflow")?;
     Ok(FinalHeadWeights {
-        hc_fn_f32: read_f32(&shard, "hc_head_fn", &[HC, HC * HIDDEN])?,
-        hc_base_f32: read_f32(&shard, "hc_head_base", &[HC])?,
-        hc_scale_f32: hc_scale,
-        norm_bf16: read_bf16(&shard, "norm.weight", &[HIDDEN])?,
+        hc_fn_f32,
+        hc_base_f32,
+        hc_scale_f32: hc_scale_f32[0],
+        norm_bf16,
+        loader_source_bytes,
         shard,
     })
 }
@@ -1437,11 +1448,15 @@ pub fn final_checkpoint_head_cpu_timed(
     let mut bytes = vec![0_u8; CHUNK_ROWS * HIDDEN * 2];
     let mut row_bf16 = vec![0_u16; HIDDEN];
     let mut read_ns = 0_u64;
+    let mut streamed_source_bytes = 0_usize;
     for token_start in (0..VOCAB).step_by(CHUNK_ROWS) {
         let chunk_rows = (VOCAB - token_start).min(CHUNK_ROWS);
         let chunk_bytes = chunk_rows * HIDDEN * 2;
         let read_started = std::time::Instant::now();
         weights.read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])?;
+        streamed_source_bytes = streamed_source_bytes
+            .checked_add(chunk_bytes)
+            .ok_or("V4 final head streamed source byte counter overflow")?;
         read_ns = read_ns
             .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         for row in 0..rows {
@@ -1468,6 +1483,7 @@ pub fn final_checkpoint_head_cpu_timed(
     Ok(FinalHeadCpuRun {
         output: base,
         read_ns,
+        streamed_source_bytes,
         wall_ns: u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
     })
 }
@@ -2067,13 +2083,19 @@ pub fn load(model_dir: &Path, ids: &[i64]) -> Result<L0State, Box<dyn Error>> {
     let hc_base = read_f32(&l0, "layers.0.hc_attn_base", &[MIX])?;
     let hc_scale = read_f32(&l0, "layers.0.hc_attn_scale", &[3])?;
     let attn_norm = read_bf16(&l0, "layers.0.attn_norm.weight", &[HIDDEN])?;
+    let range_bytes = std::mem::size_of_val(embedding.as_slice())
+        .checked_add(std::mem::size_of_val(hc_fn.as_slice()))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(hc_base.as_slice())))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(hc_scale.as_slice())))
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(attn_norm.as_slice())))
+        .ok_or("V4 initial state source byte counter overflow")?;
     Ok(L0State {
         embedding,
         hc_fn,
         hc_base,
         hc_scale,
         attn_norm,
-        range_bytes: ids.len() * HIDDEN * 2 + MIX * HC * HIDDEN * 4 + MIX * 4 + 3 * 4 + HIDDEN * 2,
+        range_bytes,
     })
 }
 
@@ -2091,7 +2113,9 @@ pub fn load_layer_state_weights(
     layer: usize,
     ids: &[i64],
 ) -> Result<LayerStateWeights, Box<dyn Error>> {
-    validate_ids(ids)?;
+    if !ids.is_empty() {
+        validate_ids(ids)?;
+    }
     let compression_ratio = compression_ratio_for_layer(layer)?;
     let contracts = layer_tensor_manifest(layer, 0)?;
     let index = indexed_model(model_dir)?;
@@ -2184,12 +2208,16 @@ pub fn load_layer_state_weights(
     };
     let router = if layer < 3 {
         LayerRouterWeights::Hash {
-            ids: read_i64_rows(
-                &shard,
-                &format!("{prefix}.ffn.gate.tid2eid"),
-                ids,
-                crate::v4_router::V4_TOPK,
-            )?,
+            ids: if ids.is_empty() {
+                Vec::new()
+            } else {
+                read_i64_rows(
+                    &shard,
+                    &format!("{prefix}.ffn.gate.tid2eid"),
+                    ids,
+                    crate::v4_router::V4_TOPK,
+                )?
+            },
         }
     } else {
         LayerRouterWeights::Learned {

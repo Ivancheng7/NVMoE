@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Two-request row-set aggregate throughput</title>
+  <desc id="desc">A full61 B2 ABBA measurement. Serial execution has a median two-request workload time of 130.773 seconds and the row-set stationary execution has 70.068 seconds. The symmetric geometric mean throughput ratio is 1.9417x across four exact pairs.</desc>
+  <rect width="960" height="540" fill="#ffffff"/>
+  <text x="48" y="44" font-family="Arial,Helvetica,sans-serif" font-size="27" font-weight="bold" fill="#202124">Two independent requests share fixed work</text>
+  <text x="48" y="72" font-family="Arial,Helvetica,sans-serif" font-size="16" fill="#5f6368">Frozen full61 B2 mechanism result. Aggregate completion throughput for two independent requests.</text>
+  <text x="260" y="112" font-family="Arial,Helvetica,sans-serif" font-size="17" font-weight="bold" text-anchor="middle" fill="#202124">A. Two-request workload time (s)</text>
+  <line x1="80" y1="385" x2="440" y2="385" stroke="#202124" stroke-width="1"/>
+  <line x1="80" y1="140" x2="80" y2="385" stroke="#202124" stroke-width="1"/>
+  <line x1="80" y1="315" x2="440" y2="315" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="80" y1="245" x2="440" y2="245" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="80" y1="175" x2="440" y2="175" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="70" y="390" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">0</text>
+  <text x="70" y="320" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">50</text>
+  <text x="70" y="250" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">100</text>
+  <text x="70" y="180" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">150</text>
+  <rect x="145" y="201.918" width="84" height="183.082" fill="#0072B2"/>
+  <rect x="302" y="286.905" width="84" height="98.095" fill="#E69F00"/>
+  <text x="187" y="193" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#0072B2">130.773</text>
+  <text x="344" y="278" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#B36B00">70.068</text>
+  <text x="187" y="414" font-family="Arial,Helvetica,sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#202124">serial</text>
+  <text x="344" y="414" font-family="Arial,Helvetica,sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#202124">row-set stationary</text>
+  <text x="700" y="112" font-family="Arial,Helvetica,sans-serif" font-size="17" font-weight="bold" text-anchor="middle" fill="#202124">B. Paired throughput ratio</text>
+  <line x1="535" y1="385" x2="900" y2="385" stroke="#202124" stroke-width="1"/>
+  <line x1="535" y1="140" x2="535" y2="385" stroke="#202124" stroke-width="1"/>
+  <line x1="535" y1="329.318" x2="900" y2="329.318" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="535" y1="273.636" x2="900" y2="273.636" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="535" y1="217.955" x2="900" y2="217.955" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <line x1="535" y1="162.273" x2="900" y2="162.273" stroke="#d1d5db" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="525" y="390" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">1.0x</text>
+  <text x="525" y="334" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">1.5x</text>
+  <text x="525" y="279" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">2.0x</text>
+  <text x="525" y="223" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">2.5x</text>
+  <text x="525" y="167" font-family="Arial,Helvetica,sans-serif" font-size="12" text-anchor="end" fill="#5f6368">3.0x</text>
+  <line x1="625" y1="268.78" x2="805" y2="290.53" stroke="#6b7280" stroke-width="2"/>
+  <circle cx="600" cy="246.12" r="4" fill="#0072B2" fill-opacity="0.45"/>
+  <circle cx="650" cy="291.88" r="4" fill="#0072B2" fill-opacity="0.45"/>
+  <path d="M780 285.56l4 4l-4 4l-4-4z" fill="#E69F00" fill-opacity="0.45"/>
+  <path d="M830 285.28l4 4l-4 4l-4-4z" fill="#E69F00" fill-opacity="0.45"/>
+  <circle cx="625" cy="268.78" r="8" fill="#0072B2" stroke="#202124" stroke-width="1"/>
+  <rect x="797" y="282.53" width="16" height="16" fill="#E69F00" stroke="#202124" stroke-width="1"/>
+  <text x="625" y="315" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#0072B2">2.0413x</text>
+  <text x="805" y="323" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#B36B00">1.8469x</text>
+  <text x="625" y="414" font-family="Arial,Helvetica,sans-serif" font-size="13" text-anchor="middle" fill="#202124">serial then stationary</text>
+  <text x="805" y="414" font-family="Arial,Helvetica,sans-serif" font-size="13" text-anchor="middle" fill="#202124">stationary then serial</text>
+  <rect x="625" y="145" width="180" height="70" rx="4" fill="#f3f4f6" stroke="#202124" stroke-width="1"/>
+  <text x="715" y="171" font-family="Arial,Helvetica,sans-serif" font-size="13" text-anchor="middle" fill="#5f6368">symmetric geometric mean</text>
+  <text x="715" y="200" font-family="Arial,Helvetica,sans-serif" font-size="26" font-weight="bold" text-anchor="middle" fill="#202124">1.9417x</text>
+  <text x="48" y="465" font-family="Arial,Helvetica,sans-serif" font-size="15" font-weight="bold" fill="#202124">4 exact ABBA pairs. Fixed-weight reads and fixed H2D traffic each halve per request pair.</text>
+  <text x="48" y="492" font-family="Arial,Helvetica,sans-serif" font-size="14" fill="#5f6368">Full61, two independent position-0 requests. Aggregate throughput is the estimand; single-request completion latency remains outside scope.</text>
+</svg>

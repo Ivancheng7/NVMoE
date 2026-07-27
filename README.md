@@ -30,17 +30,37 @@ The runtime prepares future payloads while the GPU consumes the current layer. A
 
 ## What the sealed experiments support
 
-All three ABBA gates used P5/N3 full61 exact execution. Each configuration has two complete arms in the frozen `A1, B1, B2, A2` order, and every complete arm remains in its symmetric estimate.
+All four gates use full61 exact execution. The three single-request configurations use P5/N3 and two complete arms in the frozen `A1, B1, B2, A2` order. The B2 packet uses two independent position-0 requests, with two repeats in each order stratum.
 
 | Sealed mechanism gate | Candidate change | Symmetric E2E ratio | Registered timing gate |
 | --- | --- | ---: | ---: |
 | Immutable expert cache | cache off to 32 slots | `0.7007` | TTFT `0.7901`, hot total `0.6328` |
 | Host retention | `12GiB` to `13GiB` | `0.8946` | TTFT `0.8862`, hot total `0.9039` |
 | Device retention | `3.5GiB` to `4.0GiB` | `0.9260` | TTFT `0.9268`, hot total `0.9248` |
+| B2 row set | serial two-request execution to a layer-stationary row set | `1.9417x` aggregate completion throughput | `2.0413x`, `1.8469x` by order; 4/4 exact pairs |
 
 The cache gate cut physical expert loads from `2,562` to `1,576` and removed `34.603GB` from both routed storage reads and routed H2D traffic. Moving to `13GiB` host retention removed another `2.563GB` of fixed source reads. Moving to `4.0GiB` device retention removed `1.709GB` of fixed source reads and `1.568GB` of fixed H2D traffic.
 
 The sealed N6 device-retention overlay reduced the measured per-token interval from `17.8409426951s` to `16.5992631988s`, a change of `-1.2416794963s/token` (`6.96%`). Per token, it avoided `1,708,974,176 B` of source reads and `783,919,152 B` of H2D traffic while preserving the engine's declared exact semantics. This estimate has `n=2` per configuration. Paired drift bounds the supported claim to the recorded P5/N3 setup.
+
+### Fixed work shared across two independent requests
+
+![B2 row-set aggregate throughput](docs/assets/readme/21-b2-rowset-full61.svg)
+
+The sealed B2 packet runs two independent L0-L60 requests. Each keeps its router metadata and routed payloads. The row set shares fixed work. Across four exact ABBA pairs, aggregate completion throughput had a symmetric geometric mean of `1.9417x`; the serial-then-stationary and stationary-then-serial strata were `2.0413x` and `1.8469x`.
+
+Per pair, fixed source traffic fell from `58,123,632,496 B` to `29,061,816,248 B`, and fixed H2D fell from `66,310,423,408 B` to `33,155,211,704 B`. Router metadata remained `288 B` per request, while routed source and H2D traffic each remained `25,689,194,496 B`. Single-request completion latency remains outside this result.
+
+The current product B2 mode passes the L0 strict gate. This evidence chain joins that product check to a sealed full61 mechanism measurement. A full product B2 E2E rerun remains pending. Resource closure is weak: GPU telemetry was `1,241 MiB` before and after, GNU time recorded `925,472 KiB` maximum RSS with zero swaps, and system SwapFree declined `27,688 KiB`. The continuous child RSS/VmSwap trace is missing because of a wrapper sampler defect.
+
+Use two semicolon-separated token-ID lists and set greedy steps explicitly:
+
+```bash
+COLIBRI_V4_B2_GENERATE=1 \
+COLIBRI_V4_B2_TOKEN_IDS='0;1' \
+COLIBRI_V4_GREEDY_STEPS=1 \
+cargo run --manifest-path rust/Cargo.toml --release -p colibri-cuda
+```
 
 ## Expected timing on the measured laptop
 
@@ -68,9 +88,9 @@ This measured configuration is the current reference point. General minimum requ
 
 ## What exact means here
 
-`exact` refers to the Rust engine's declared canonical contract. Across every accepted arm, p4, p5, and p6 emitted token `115287` with normalized BF16 digests `519e76cfedc01504`, `7017c61decbc4151`, and `3bed9be0e5ebd27c`. Route order, reductions, KV updates, lease release, and transactional state commits also passed their recorded gates.
+`exact` refers to the Rust engine's declared canonical contract. The single-request gates at p4, p5, and p6 emitted token `115287` with normalized BF16 digests `519e76cfedc01504`, `7017c61decbc4151`, and `3bed9be0e5ebd27c`. The sealed B2 packet matched each independent request's 61-layer records and final argmax plus collapsed, normalized, and logits digests within its frozen lineage. Route order, reductions, KV updates, lease release, and transactional state commits also passed their recorded gates.
 
-Official PyTorch full-model parity, long-context behavior, text quality across prompts, sampling, and sustained throughput remain separate acceptance targets. The headline `3.58x` compares different source lineages, so it is descriptive evidence. The three ABBA ratios above carry the paired mechanism claims.
+Official PyTorch full-model parity, long-context behavior, text quality across prompts, sampling, and sustained throughput remain separate acceptance targets. The headline `3.58x` compares different source lineages, so it is descriptive evidence. The three single-request ABBA ratios and the frozen B2 aggregate ratio carry their respective paired mechanism claims.
 
 ## Why Rust
 

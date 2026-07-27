@@ -2484,6 +2484,7 @@ fn benchmark_provenance() -> Result<serde_json::Value, Box<dyn Error>> {
 
 struct PendingResultFile {
     path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
     file: Option<std::fs::File>,
     committed: bool,
 }
@@ -2493,18 +2494,43 @@ impl PendingResultFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                format!(
-                    "refusing to overwrite V4 B1 trace artifact {}: {error}",
-                    path.display()
-                )
-            })?;
+        if path.exists() {
+            return Err(
+                format!("refusing to overwrite V4 trace artifact {}: final path exists", path.display())
+                    .into(),
+            );
+        }
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let file_name = path
+            .file_name()
+            .ok_or("V4 trace artifact path has no filename")?
+            .to_string_lossy();
+        static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (temp_path, file) = loop {
+            let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let temp_path = parent.join(format!(
+                ".{file_name}.tmp-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => break (temp_path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "create pending V4 trace artifact {}: {error}",
+                        temp_path.display()
+                    )
+                    .into())
+                }
+            }
+        };
         Ok(Self {
             path,
+            temp_path,
             file: Some(file),
             committed: false,
         })
@@ -2521,6 +2547,40 @@ impl PendingResultFile {
     fn commit(&mut self) -> Result<(), Box<dyn Error>> {
         self.file_mut().flush()?;
         self.file_mut().sync_all()?;
+        drop(self.file.take());
+        if self.path.exists() {
+            return Err(
+                format!(
+                    "refusing to overwrite V4 trace artifact {}: final path exists",
+                    self.path.display()
+                )
+                .into(),
+            );
+        }
+        match std::fs::hard_link(&self.temp_path, &self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "refusing to overwrite V4 trace artifact {}: final path exists",
+                    self.path.display()
+                )
+                .into())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "atomically publish V4 trace artifact {} from {}: {error}",
+                    self.path.display(),
+                    self.temp_path.display()
+                )
+                .into())
+            }
+        }
+        std::fs::remove_file(&self.temp_path).map_err(|error| {
+            format!(
+                "remove published V4 trace temp artifact {}: {error}",
+                self.temp_path.display()
+            )
+        })?;
         self.committed = true;
         Ok(())
     }
@@ -2530,7 +2590,7 @@ impl Drop for PendingResultFile {
     fn drop(&mut self) {
         if !self.committed {
             drop(self.file.take());
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.temp_path);
         }
     }
 }
@@ -3015,6 +3075,12 @@ fn main() {
     {
         run_real_v4_b2_layer_stationary(&context, &module, &stream)
             .expect("run real V4 B2 layer-stationary benchmark");
+        return;
+    }
+
+    if optional_one_flag("COLIBRI_V4_B2_GENERATE").expect("validate V4 B2 generate flag") {
+        run_real_v4_b2_generate(&context, &module, &stream)
+            .expect("run real V4 B2 greedy generation");
         return;
     }
 
@@ -18298,21 +18364,222 @@ struct B2RequestResult {
     output_digest: u64,
 }
 
+fn parse_b2_generate_token_ids(value: &str) -> Result<[Vec<i64>; 2], Box<dyn Error>> {
+    let mut prompts = value.split(';');
+    let parse_prompt = |prompt: Option<&str>| -> Result<Vec<i64>, Box<dyn Error>> {
+        let prompt = prompt
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .ok_or("COLIBRI_V4_B2_TOKEN_IDS requires two non-empty comma-separated token lists")?;
+        let ids = prompt
+            .split(',')
+            .map(str::trim)
+            .map(str::parse::<i64>)
+            .collect::<Result<Vec<_>, _>>()?;
+        v4_state::validate_ids(&ids)?;
+        Ok(ids)
+    };
+    let first = parse_prompt(prompts.next())?;
+    let second = parse_prompt(prompts.next())?;
+    if prompts.next().is_some() {
+        return Err(
+            "COLIBRI_V4_B2_TOKEN_IDS requires exactly two token lists separated by one ';'".into(),
+        );
+    }
+    Ok([first, second])
+}
+
+fn validate_b2_generate_inputs(
+    prompts: &[Vec<i64>; 2],
+    greedy_steps: usize,
+) -> Result<[usize; 2], Box<dyn Error>> {
+    if greedy_steps == 0 {
+        return Err("COLIBRI_V4_GREEDY_STEPS must be at least 1 for B2 generation".into());
+    }
+    let forward_tokens = |request: usize| -> Result<usize, Box<dyn Error>> {
+        let forward_tokens = greedy_forward_tokens(prompts[request].len(), greedy_steps)?;
+        if forward_tokens > v4_state::KV_WINDOW {
+            return Err(format!(
+                "B2 request {request} prompt plus greedy decode exceeds the existing V4 KV window"
+            )
+            .into());
+        }
+        Ok(forward_tokens)
+    };
+    Ok([forward_tokens(0)?, forward_tokens(1)?])
+}
+
+fn b2_generate_inputs_from_env() -> Result<([Vec<i64>; 2], usize, [usize; 2]), Box<dyn Error>> {
+    let prompts = parse_b2_generate_token_ids(
+        &std::env::var("COLIBRI_V4_B2_TOKEN_IDS")
+            .map_err(|_| "set COLIBRI_V4_B2_TOKEN_IDS='<ids>;<ids>'")?,
+    )?;
+    let greedy_steps = std::env::var("COLIBRI_V4_GREEDY_STEPS")
+        .map_err(|_| "set COLIBRI_V4_GREEDY_STEPS for B2 generation")?
+        .parse::<usize>()?;
+    let forward_tokens = validate_b2_generate_inputs(&prompts, greedy_steps)?;
+    Ok((prompts, greedy_steps, forward_tokens))
+}
+
 #[derive(Default)]
 struct B2Physical {
     fixed_source_bytes: usize,
     fixed_h2d_bytes: usize,
+    request_router_metadata_source_bytes: usize,
+    request_router_metadata_h2d_bytes: usize,
     routed_source_bytes: usize,
     routed_h2d_bytes: usize,
+    initial_state_source_bytes: usize,
+    final_head_source_bytes: usize,
+}
+
+#[derive(Default)]
+struct B2RequestPhysical {
+    initial_state_source_bytes: usize,
+    final_head_source_bytes: usize,
+}
+
+struct B2GenerateRequest {
+    prompt_ids: Vec<i64>,
+    input_ids: Vec<i64>,
+    position: usize,
+    persistent: v4_state::V4SerialPersistentState,
+    hidden: Vec<u16>,
+    generated_ids: Vec<i64>,
+    stop_reason: Option<GreedyStopReason>,
+    tokens: Vec<serde_json::Value>,
+    finals: Vec<serde_json::Value>,
+    physical: B2RequestPhysical,
+}
+
+fn b2_generate_active_indices(active: &[bool; 2]) -> Vec<usize> {
+    active
+        .iter()
+        .enumerate()
+        .filter_map(|(request, &live)| live.then_some(request))
+        .collect()
+}
+
+fn b2_generate_stop_reason(reason: GreedyStopReason) -> &'static str {
+    match reason {
+        GreedyStopReason::Eos => "eos",
+        GreedyStopReason::MaxNewTokens => "max_new_tokens",
+    }
+}
+
+fn b2_generate_request_json(request: usize, state: &B2GenerateRequest) -> serde_json::Value {
+    serde_json::json!({
+        "request": request,
+        "prompt_ids": state.prompt_ids,
+        "emitted_token_ids": state.input_ids,
+        "generated_ids": state.generated_ids,
+        "stop_reason": state.stop_reason.map(b2_generate_stop_reason),
+        "tokens": state.tokens,
+        "finals": state.finals,
+        "physical": state.physical.json(),
+    })
+}
+
+fn b2_router_metadata_row<'a>(
+    hash_router: bool,
+    ids: &'a [i64],
+    request: usize,
+    requests: usize,
+) -> Result<&'a [i64], Box<dyn Error>> {
+    if !hash_router {
+        if ids.is_empty() {
+            return Ok(&[]);
+        }
+        return Err("B2 learned router received request metadata".into());
+    }
+    let start = request
+        .checked_mul(v4_router::V4_TOPK)
+        .ok_or("B2 router metadata row offset overflow")?;
+    let end = start
+        .checked_add(v4_router::V4_TOPK)
+        .ok_or("B2 router metadata row end overflow")?;
+    if request >= requests || ids.len() != requests * v4_router::V4_TOPK {
+        return Err("B2 hash router metadata rows do not match the row set".into());
+    }
+    Ok(&ids[start..end])
 }
 
 impl B2Physical {
+    fn record_initial_state_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+        self.initial_state_source_bytes = self
+            .initial_state_source_bytes
+            .checked_add(bytes)
+            .ok_or("B2 initial state source byte overflow")?;
+        Ok(())
+    }
+
+    fn record_final_head_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+        self.final_head_source_bytes = self
+            .final_head_source_bytes
+            .checked_add(bytes)
+            .ok_or("B2 final head source byte overflow")?;
+        Ok(())
+    }
+
+    fn record_request_router_metadata(
+        &mut self,
+        hash_router: bool,
+        ids: &[i64],
+    ) -> Result<(), Box<dyn Error>> {
+        if hash_router {
+            if ids.len() != v4_router::V4_TOPK {
+                return Err("B2 hash router metadata row is incomplete".into());
+            }
+        } else if !ids.is_empty() {
+            return Err("B2 learned router received request metadata".into());
+        }
+        let bytes = std::mem::size_of_val(ids);
+        self.request_router_metadata_source_bytes = self
+            .request_router_metadata_source_bytes
+            .checked_add(bytes)
+            .ok_or("B2 router metadata source byte overflow")?;
+        self.request_router_metadata_h2d_bytes = self
+            .request_router_metadata_h2d_bytes
+            .checked_add(bytes)
+            .ok_or("B2 router metadata H2D byte overflow")?;
+        Ok(())
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "fixed_source_bytes": self.fixed_source_bytes,
             "fixed_h2d_bytes": self.fixed_h2d_bytes,
+            "request_router_metadata_source_bytes": self.request_router_metadata_source_bytes,
+            "request_router_metadata_h2d_bytes": self.request_router_metadata_h2d_bytes,
             "routed_source_bytes": self.routed_source_bytes,
             "routed_h2d_bytes": self.routed_h2d_bytes,
+            "initial_state_source_bytes": self.initial_state_source_bytes,
+            "final_head_source_bytes": self.final_head_source_bytes,
+        })
+    }
+}
+
+impl B2RequestPhysical {
+    fn record_initial_state_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+        self.initial_state_source_bytes = self
+            .initial_state_source_bytes
+            .checked_add(bytes)
+            .ok_or("B2 request initial state source byte overflow")?;
+        Ok(())
+    }
+
+    fn record_final_head_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+        self.final_head_source_bytes = self
+            .final_head_source_bytes
+            .checked_add(bytes)
+            .ok_or("B2 request final head source byte overflow")?;
+        Ok(())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "initial_state_source_bytes": self.initial_state_source_bytes,
+            "final_head_source_bytes": self.final_head_source_bytes,
         })
     }
 }
@@ -18326,10 +18593,12 @@ struct B2RawRuntime {
 fn load_b2_raw_runtime(
     model_dir: &std::path::Path,
     layer: usize,
-    token_id: i64,
     stream: &CudaStream,
 ) -> Result<B2RawRuntime, Box<dyn Error>> {
-    let (host, telemetry) = load_layer_host(model_dir, layer, &[token_id])?;
+    // Request-specific router metadata belongs to the request ledger, not the
+    // immutable layer runtime. `load_layer_state_weights` accepts this empty
+    // row set only to build the hash-router mode without reading a request row.
+    let (host, telemetry) = load_layer_host(model_dir, layer, &[])?;
     let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
     let decoded_h2d_bytes = runtime.weights.num_bytes();
     let (raw, _, raw_source_bytes, _, raw_h2d_bytes) =
@@ -18350,6 +18619,7 @@ fn run_b2_layer(
     hash_ids: &[i64],
     hidden: &[u16],
     token_id: i64,
+    token_position: usize,
     persistent: &mut v4_state::V4SerialPersistentState,
 ) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
     let layer = runtime.weights.layer;
@@ -18366,7 +18636,7 @@ fn run_b2_layer(
             hash_ids,
             hidden,
             &[token_id],
-            0,
+            token_position,
             Some(state),
             None,
             None,
@@ -18451,12 +18721,21 @@ fn prepare_b2_initial_hidden(
     model_dir: &std::path::Path,
     token_id: i64,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    let embedding = v4_state::load(model_dir, &[token_id])?.embedding;
+    Ok(prepare_b2_initial_hidden_with_source_bytes(model_dir, token_id)?.0)
+}
+
+fn prepare_b2_initial_hidden_with_source_bytes(
+    model_dir: &std::path::Path,
+    token_id: i64,
+) -> Result<(Vec<u16>, usize), Box<dyn Error>> {
+    let state = v4_state::load(model_dir, &[token_id])?;
+    let initial_state_source_bytes = state.range_bytes;
+    let embedding = state.embedding;
     let mut hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
     for _ in 0..v4_state::HC {
         hidden.extend_from_slice(&embedding);
     }
-    Ok(hidden)
+    Ok((hidden, initial_state_source_bytes))
 }
 
 fn prepare_two_token_prefix(
@@ -18562,10 +18841,14 @@ fn run_b2_serial_request(
     let mut persistent = v4_state::V4SerialPersistentState::new(1)?;
     let mut digests = Vec::with_capacity(layers.len());
     for &layer in layers {
-        let mut loaded = load_b2_raw_runtime(model_dir, layer, token_id, stream)?;
+        let mut loaded = load_b2_raw_runtime(model_dir, layer, stream)?;
         let hash_ids = load_layer_hash_ids(model_dir, layer, &[token_id])?;
+        let row_hash_ids =
+            b2_router_metadata_row(loaded.raw.runtime.weights.hash_router, &hash_ids, 0, 1)?;
         physical.fixed_source_bytes += loaded.fixed_source_bytes;
         physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+        physical
+            .record_request_router_metadata(loaded.raw.runtime.weights.hash_router, row_hash_ids)?;
         *peak_device_bytes = (*peak_device_bytes).max(device_used_bytes()?);
         launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
         stream.synchronize()?;
@@ -18576,9 +18859,10 @@ fn run_b2_serial_request(
             stream,
             &loaded.raw.runtime,
             lanes,
-            &hash_ids,
+            row_hash_ids,
             &hidden,
             token_id,
+            0,
             &mut persistent,
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
@@ -18710,10 +18994,19 @@ fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
         return Err("layer-stationary layers must be contiguous".into());
     }
     for &layer in layers {
-        let mut loaded = load_b2_raw_runtime(model_dir, layer, token_ids[0], stream)?;
+        let mut loaded = load_b2_raw_runtime(model_dir, layer, stream)?;
         let hash_ids = load_layer_hash_ids(model_dir, layer, &token_ids)?;
         physical.fixed_source_bytes += loaded.fixed_source_bytes;
         physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+        for request in 0..REQUESTS {
+            let row = b2_router_metadata_row(
+                loaded.raw.runtime.weights.hash_router,
+                &hash_ids,
+                request,
+                REQUESTS,
+            )?;
+            physical.record_request_router_metadata(loaded.raw.runtime.weights.hash_router, row)?;
+        }
         *peak_device_bytes = (*peak_device_bytes).max(device_used_bytes()?);
         launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
         stream.synchronize()?;
@@ -18730,13 +19023,15 @@ fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 stream,
                 &loaded.raw.runtime,
                 lanes,
-                if loaded.raw.runtime.weights.hash_router {
-                    &hash_ids[request * v4_router::V4_TOPK..(request + 1) * v4_router::V4_TOPK]
-                } else {
-                    &[]
-                },
+                b2_router_metadata_row(
+                    loaded.raw.runtime.weights.hash_router,
+                    &hash_ids,
+                    request,
+                    REQUESTS,
+                )?,
                 &hidden[request],
                 token_ids[request],
+                0,
                 &mut state[request],
             ) {
                 Ok((next, digest, stage)) => {
@@ -18805,6 +19100,241 @@ fn run_b2_batch_pair(
         scratch,
         peak_device_bytes,
     )
+}
+
+fn run_real_v4_b2_generate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let (prompts, greedy_steps, forward_tokens) = b2_generate_inputs_from_env()?;
+    let result_path = std::env::var_os("COLIBRI_V4_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_RESULT_JSONL")?;
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let model_dir = v4_model_dir()?;
+    let final_weights = v4_state::load_final_head(&model_dir)?;
+    let mut lanes = (0..V4_QD4_LANES)
+        .map(|_| {
+            let lane_stream = context.new_stream()?;
+            ExpertSlot::new_empty(context, module, &lane_stream)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut scratch =
+        DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
+    let mut requests = prompts
+        .into_iter()
+        .enumerate()
+        .map(|(request, prompt_ids)| {
+            Ok(B2GenerateRequest {
+                input_ids: prompt_ids.clone(),
+                prompt_ids,
+                position: 0,
+                persistent: v4_state::V4SerialPersistentState::new(forward_tokens[request])?,
+                hidden: Vec::new(),
+                generated_ids: Vec::with_capacity(greedy_steps),
+                stop_reason: None,
+                tokens: Vec::with_capacity(forward_tokens[request]),
+                finals: Vec::with_capacity(greedy_steps),
+                physical: B2RequestPhysical::default(),
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut active = [true; 2];
+    let mut physical = B2Physical::default();
+    // The final-head fixed tensors are shared by this B=2 run. Attribute their
+    // one real loader read to the first request so request ledgers sum exactly
+    // to the global physical ledger; streamed head rows stay per decision.
+    requests[0]
+        .physical
+        .record_final_head_source_bytes(final_weights.loader_source_bytes)?;
+    physical.record_final_head_source_bytes(final_weights.loader_source_bytes)?;
+    let mut peak_device_bytes = device_used_bytes()?;
+    let request_started = std::time::Instant::now();
+
+    while !b2_generate_active_indices(&active).is_empty() {
+        let active_requests = b2_generate_active_indices(&active);
+        let token_ids = active_requests
+            .iter()
+            .map(|&request| {
+                requests[request]
+                    .input_ids
+                    .get(requests[request].position)
+                    .copied()
+                    .ok_or("B2 request has no input token at its active position")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
+            let (hidden, initial_state_source_bytes) =
+                prepare_b2_initial_hidden_with_source_bytes(&model_dir, token_id)?;
+            requests[request]
+                .physical
+                .record_initial_state_source_bytes(initial_state_source_bytes)?;
+            physical.record_initial_state_source_bytes(initial_state_source_bytes)?;
+            requests[request].hidden = hidden;
+        }
+        let mut layers = (0..2)
+            .map(|_| Vec::with_capacity(v4_state::V4_LAYER_COUNT))
+            .collect::<Vec<Vec<B2LayerDigest>>>();
+        let token_started = std::time::Instant::now();
+        for layer in 0..v4_state::V4_LAYER_COUNT {
+            let mut loaded = load_b2_raw_runtime(&model_dir, layer, stream)?;
+            let hash_ids = load_layer_hash_ids(&model_dir, layer, &token_ids)?;
+            let router_rows = active_requests
+                .iter()
+                .enumerate()
+                .map(|(row, _)| {
+                    b2_router_metadata_row(
+                        loaded.raw.runtime.weights.hash_router,
+                        &hash_ids,
+                        row,
+                        active_requests.len(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            physical.fixed_source_bytes += loaded.fixed_source_bytes;
+            physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+            for row in &router_rows {
+                physical
+                    .record_request_router_metadata(loaded.raw.runtime.weights.hash_router, row)?;
+            }
+            peak_device_bytes = peak_device_bytes.max(device_used_bytes()?);
+            launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, &mut scratch)?;
+            stream.synchronize()?;
+            std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
+            let layer_run = (|| -> Result<(), Box<dyn Error>> {
+                for ((row, &request), &token_id) in
+                    active_requests.iter().enumerate().zip(&token_ids)
+                {
+                    let state = &mut requests[request];
+                    let (next, digest, stage) = run_b2_layer(
+                        context,
+                        module,
+                        stream,
+                        &loaded.raw.runtime,
+                        &mut lanes,
+                        router_rows[row],
+                        &state.hidden,
+                        token_id,
+                        state.position,
+                        &mut state.persistent,
+                    )?;
+                    physical.routed_source_bytes += stage.routed_source_bytes;
+                    physical.routed_h2d_bytes += stage.routed_h2d_bytes;
+                    state.hidden = next;
+                    layers[request].push(digest);
+                }
+                Ok(())
+            })();
+            std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
+            layer_run?;
+        }
+        let elapsed_ns = u64::try_from(token_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
+            let state = &mut requests[request];
+            if layers[request].len() != v4_state::V4_LAYER_COUNT {
+                return Err("B2 request committed fewer than 61 layers".into());
+            }
+            let input_kind = if state.position < state.prompt_ids.len() {
+                "prompt"
+            } else {
+                "generated"
+            };
+            state.tokens.push(serde_json::json!({
+                "token_position": state.position,
+                "input_id": token_id,
+                "input_kind": input_kind,
+                "e2e_ns": elapsed_ns,
+                "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&state.hidden)),
+                "layers": layers[request].iter().map(B2LayerDigest::json).collect::<Vec<_>>(),
+            }));
+            if b1_needs_final_head(state.prompt_ids.len(), state.position) {
+                let cpu =
+                    v4_state::final_checkpoint_head_cpu_timed(&final_weights, &state.hidden, 1)?;
+                state
+                    .physical
+                    .record_final_head_source_bytes(cpu.streamed_source_bytes)?;
+                physical.record_final_head_source_bytes(cpu.streamed_source_bytes)?;
+                let next_id = i64::try_from(cpu.output.argmax[0])?;
+                let decision = greedy_argmax_decision(
+                    state.prompt_ids.len(),
+                    state.position,
+                    state.generated_ids.len(),
+                    greedy_steps,
+                    next_id,
+                );
+                let decision_name = match decision {
+                    GreedyDecision::IgnorePrompt => "ignore_prompt",
+                    GreedyDecision::EmitAndContinue => "emit_and_continue",
+                    GreedyDecision::EmitAndStop(GreedyStopReason::Eos) => "emit_and_stop_eos",
+                    GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens) => {
+                        "emit_and_stop_max_new_tokens"
+                    }
+                };
+                state.finals.push(serde_json::json!({
+                    "token_position": state.position,
+                    "input_id": token_id,
+                    "input_kind": input_kind,
+                    "head": "canonical_cpu_streamed_bf16",
+                    "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
+                    "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+                    "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+                    "argmax": cpu.output.argmax[0],
+                    "decision": decision_name,
+                    "status": "PASS",
+                }));
+                match decision {
+                    GreedyDecision::IgnorePrompt => {}
+                    GreedyDecision::EmitAndContinue => {
+                        state.generated_ids.push(next_id);
+                        state.input_ids.push(next_id);
+                    }
+                    GreedyDecision::EmitAndStop(reason) => {
+                        state.generated_ids.push(next_id);
+                        state.input_ids.push(next_id);
+                        state.stop_reason = Some(reason);
+                        active[request] = false;
+                    }
+                }
+            }
+            state.position = state
+                .position
+                .checked_add(1)
+                .ok_or("B2 token position overflow")?;
+        }
+    }
+    if requests.iter().any(|request| request.stop_reason.is_none()) {
+        return Err("B2 greedy generation ended without a stop reason".into());
+    }
+    let request_e2e_ns = u64::try_from(request_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    writeln!(
+        result.file_mut(),
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-v4-b2-greedy-rowset-v1",
+            "implementation": "rust-cuda",
+            "generation_mode": "id_only_greedy_argmax",
+            "model_revision": v4_state::REVISION,
+            "model_dir": model_dir,
+            "layers": v4_state::V4_LAYER_COUNT,
+            "greedy_steps": greedy_steps,
+            "eos_token_id": V4_EOS_TOKEN_ID,
+            "final_head": "canonical_cpu_streamed_bf16",
+            "qd4_lanes": V4_QD4_LANES,
+            "raw_scratch_bytes": scratch.num_bytes(),
+            "request_e2e_ns": request_e2e_ns,
+            "physical": physical.json(),
+            "requests": requests.iter().enumerate().map(|(request, state)| b2_generate_request_json(request, state)).collect::<Vec<_>>(),
+            "peak_device_used_bytes": peak_device_bytes,
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-b2-greedy-rowset\",\"requests\":2,\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
 }
 
 fn b2_serial_first(repeat: usize) -> bool {
@@ -20773,13 +21303,20 @@ fn l0_pos0_compressor_probe_enabled(layer: usize, start_pos: usize) -> bool {
 }
 
 fn strict_compressor_enabled() -> bool {
+    strict_compressor_enabled_with(|name| {
+        std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+fn strict_compressor_enabled_with(enabled: impl Fn(&str) -> bool) -> bool {
     [
         "COLIBRI_V4_FULL61_B1",
+        "COLIBRI_V4_B2_GENERATE",
         "COLIBRI_V4_DEVICE_TOKEN_STATE_GATE",
         "COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE",
     ]
     .into_iter()
-    .any(|name| std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1")))
+    .any(enabled)
 }
 
 fn print_l0_pos0_compressor_probe(source: &str, kv: &[f32], score: &[f32], score_plus_ape: &[f32]) {
@@ -32785,6 +33322,165 @@ mod tests {
     use super::*;
 
     #[test]
+    fn b2_generate_flag_enables_strict_compressor_without_global_env_mutation() {
+        assert!(!strict_compressor_enabled_with(|_| false));
+        assert!(strict_compressor_enabled_with(|name| name == "COLIBRI_V4_B2_GENERATE"));
+    }
+
+    #[test]
+    fn b2_generate_env_and_context_validation_require_two_bounded_prompts() {
+        let prompts = parse_b2_generate_token_ids("0, 1; 2").unwrap();
+        assert_eq!(prompts, [vec![0, 1], vec![2]]);
+        assert_eq!(validate_b2_generate_inputs(&prompts, 1).unwrap(), [2, 1]);
+        assert!(parse_b2_generate_token_ids("0;").is_err());
+        assert!(parse_b2_generate_token_ids("0;1;2").is_err());
+        assert!(parse_b2_generate_token_ids("0, nope;1").is_err());
+        assert!(validate_b2_generate_inputs(&prompts, 0).is_err());
+        let at_window = [vec![0; v4_state::KV_WINDOW], vec![1]];
+        assert!(validate_b2_generate_inputs(&at_window, 2).is_err());
+    }
+
+    #[test]
+    fn b2_generate_active_set_keeps_the_survivor_after_peer_eos() {
+        let mut active = [true, true];
+        assert_eq!(b2_generate_active_indices(&active), vec![0, 1]);
+        assert_eq!(
+            greedy_argmax_decision(1, 0, 0, 2, V4_EOS_TOKEN_ID),
+            GreedyDecision::EmitAndStop(GreedyStopReason::Eos)
+        );
+        active[0] = false;
+        assert_eq!(b2_generate_active_indices(&active), vec![1]);
+        assert_eq!(
+            greedy_argmax_decision(1, 0, 0, 2, 42),
+            GreedyDecision::EmitAndContinue
+        );
+        assert_eq!(b2_generate_active_indices(&active), vec![1]);
+    }
+
+    #[test]
+    fn b2_generate_result_includes_final_digest_and_request_ledgers() {
+        let request = B2GenerateRequest {
+            prompt_ids: vec![7],
+            input_ids: vec![7, 42],
+            position: 1,
+            persistent: v4_state::V4SerialPersistentState::new(1).unwrap(),
+            hidden: Vec::new(),
+            generated_ids: vec![42],
+            stop_reason: Some(GreedyStopReason::MaxNewTokens),
+            tokens: vec![serde_json::json!({"token_position": 0, "input_id": 7})],
+            finals: vec![serde_json::json!({
+                "argmax": 42,
+                "logits_f32_digest": "000000000000002a",
+            })],
+            physical: B2RequestPhysical {
+                initial_state_source_bytes: 14,
+                final_head_source_bytes: 28,
+            },
+        };
+        let request_json = b2_generate_request_json(1, &request);
+        assert_eq!(request_json["request"], 1);
+        assert_eq!(request_json["generated_ids"], serde_json::json!([42]));
+        assert_eq!(request_json["stop_reason"], "max_new_tokens");
+        assert_eq!(request_json["finals"][0]["logits_f32_digest"], "000000000000002a");
+        assert_eq!(request_json["physical"]["initial_state_source_bytes"], 14);
+        assert_eq!(request_json["physical"]["final_head_source_bytes"], 28);
+
+        let mut physical = B2Physical {
+            fixed_source_bytes: 101,
+            fixed_h2d_bytes: 202,
+            routed_source_bytes: 606,
+            routed_h2d_bytes: 606,
+            ..B2Physical::default()
+        };
+        physical
+            .record_request_router_metadata(true, &[1, 2, 3, 4, 5, 6])
+            .unwrap();
+        physical.record_initial_state_source_bytes(14).unwrap();
+        physical.record_final_head_source_bytes(28).unwrap();
+        let ledger = physical.json();
+        assert_eq!(ledger["fixed_source_bytes"], 101);
+        assert_eq!(ledger["request_router_metadata_source_bytes"], 48);
+        assert_eq!(ledger["routed_h2d_bytes"], 606);
+        assert_eq!(ledger["initial_state_source_bytes"], 14);
+        assert_eq!(ledger["final_head_source_bytes"], 28);
+    }
+
+    #[test]
+    fn b2_generation_source_ledgers_conserve_request_decisions() {
+        let mut total = B2Physical::default();
+        let mut first = B2RequestPhysical::default();
+        let mut second = B2RequestPhysical::default();
+        for (request, initial_state, final_head) in [(&mut first, 14, 100), (&mut second, 28, 200)] {
+            request.record_initial_state_source_bytes(initial_state).unwrap();
+            request.record_final_head_source_bytes(final_head).unwrap();
+            total.record_initial_state_source_bytes(initial_state).unwrap();
+            total.record_final_head_source_bytes(final_head).unwrap();
+        }
+        assert_eq!(
+            total.initial_state_source_bytes,
+            first.initial_state_source_bytes + second.initial_state_source_bytes
+        );
+        assert_eq!(
+            total.final_head_source_bytes,
+            first.final_head_source_bytes + second.final_head_source_bytes
+        );
+    }
+
+    #[test]
+    fn b2_row_set_keeps_router_metadata_request_local_and_conserves_ledgers() {
+        let hash_rows = [[11_i64, 12, 13, 14, 15, 16], [21_i64, 22, 23, 24, 25, 26]].concat();
+        let first = b2_router_metadata_row(true, &hash_rows, 0, 2).unwrap();
+        let second = b2_router_metadata_row(true, &hash_rows, 1, 2).unwrap();
+        assert_eq!(first, &[11, 12, 13, 14, 15, 16]);
+        assert_eq!(second, &[21, 22, 23, 24, 25, 26]);
+        assert_ne!(first, second, "request metadata crossed row-set ownership");
+        assert_eq!(
+            b2_router_metadata_row(false, &[] as &[i64], 0, 2).unwrap(),
+            &[] as &[i64]
+        );
+        assert!(b2_router_metadata_row(false, &hash_rows, 0, 2).is_err());
+
+        let mut serial = B2Physical {
+            fixed_source_bytes: 101,
+            fixed_h2d_bytes: 202,
+            routed_source_bytes: 606,
+            routed_h2d_bytes: 606,
+            ..B2Physical::default()
+        };
+        serial.record_request_router_metadata(true, first).unwrap();
+        serial.fixed_source_bytes += 101;
+        serial.fixed_h2d_bytes += 202;
+        serial.record_request_router_metadata(true, second).unwrap();
+
+        let mut stationary = B2Physical {
+            fixed_source_bytes: 101,
+            fixed_h2d_bytes: 202,
+            routed_source_bytes: 606,
+            routed_h2d_bytes: 606,
+            ..B2Physical::default()
+        };
+        stationary
+            .record_request_router_metadata(true, first)
+            .unwrap();
+        stationary
+            .record_request_router_metadata(true, second)
+            .unwrap();
+
+        assert_eq!(stationary.fixed_source_bytes * 2, serial.fixed_source_bytes);
+        assert_eq!(stationary.fixed_h2d_bytes * 2, serial.fixed_h2d_bytes);
+        assert_eq!(
+            stationary.request_router_metadata_source_bytes,
+            serial.request_router_metadata_source_bytes
+        );
+        assert_eq!(
+            stationary.request_router_metadata_h2d_bytes,
+            serial.request_router_metadata_h2d_bytes
+        );
+        assert_eq!(stationary.routed_source_bytes, serial.routed_source_bytes);
+        assert_eq!(stationary.routed_h2d_bytes, serial.routed_h2d_bytes);
+    }
+
+    #[test]
     fn post_mtp_guard_covers_committed_rows_and_every_persistent_field() {
         let baseline = PersistentStateAudit {
             kv: vec![1],
@@ -34283,20 +34979,39 @@ mod tests {
         std::fs::remove_file(existing).unwrap();
 
         let aborted = path("aborted");
+        let aborted_temp;
         {
             let mut result = PendingResultFile::reserve(aborted.clone()).unwrap();
+            let temp = result.temp_path.clone();
+            assert!(temp.exists());
             writeln!(result.file_mut(), "partial").unwrap();
+            aborted_temp = temp;
         }
         assert!(!aborted.exists());
+        assert!(!aborted_temp.exists());
 
         let committed = path("committed");
         {
             let mut result = PendingResultFile::reserve(committed.clone()).unwrap();
+            let temp = result.temp_path.clone();
             writeln!(result.file_mut(), "complete").unwrap();
             result.commit().unwrap();
+            assert!(!temp.exists());
         }
         assert_eq!(std::fs::read_to_string(&committed).unwrap(), "complete\n");
         std::fs::remove_file(committed).unwrap();
+
+        let publish_collision = path("publish-collision");
+        let mut result = PendingResultFile::reserve(publish_collision.clone()).unwrap();
+        let temp = result.temp_path.clone();
+        writeln!(result.file_mut(), "pending").unwrap();
+        std::fs::write(&publish_collision, b"keep").unwrap();
+        let error = result.commit().unwrap_err().to_string();
+        assert!(error.contains("final path exists"));
+        drop(result);
+        assert_eq!(std::fs::read(&publish_collision).unwrap(), b"keep");
+        assert!(!temp.exists());
+        std::fs::remove_file(publish_collision).unwrap();
     }
 
     #[test]
