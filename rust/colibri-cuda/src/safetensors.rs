@@ -22,6 +22,22 @@ pub enum RangeReadMode {
     Direct,
 }
 
+impl RangeReadMode {
+    pub fn from_stream_env() -> Result<Self, SafetensorsError> {
+        match std::env::var("COLIBRI_V4_STREAM_READ_MODE") {
+            Ok(value) if value == "buffered" => Ok(Self::Buffered),
+            Ok(value) if value == "fadvise" => Ok(Self::Fadvise),
+            Ok(value) if value == "direct" => Ok(Self::Direct),
+            Ok(value) => Err(SafetensorsError::InvalidReadMode(value)),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Buffered),
+            Err(error) => Err(SafetensorsError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                error,
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeReadTelemetry {
     pub logical_bytes: usize,
@@ -108,6 +124,7 @@ struct TensorEntry {
 #[derive(Debug)]
 pub enum SafetensorsError {
     Io(io::Error),
+    InvalidReadMode(String),
     InvalidIndex(String),
     UnknownShard(String),
     HeaderTooLarge(u64),
@@ -139,6 +156,10 @@ impl std::fmt::Display for SafetensorsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "{error}"),
+            Self::InvalidReadMode(value) => write!(
+                formatter,
+                "COLIBRI_V4_STREAM_READ_MODE must be buffered, fadvise, or direct; got {value}"
+            ),
             Self::InvalidIndex(message) | Self::InvalidHeader(message) => {
                 write!(formatter, "{message}")
             }
@@ -377,7 +398,7 @@ impl ShardFile {
         mode: RangeReadMode,
     ) -> Result<RangeReadTelemetry, SafetensorsError> {
         if mode == RangeReadMode::Buffered {
-            self.read_at(name, offset, out)?;
+            self.read_at_buffered(name, offset, out)?;
             return Ok(RangeReadTelemetry {
                 logical_bytes: out.len(),
                 physical_bytes: out.len(),
@@ -436,6 +457,16 @@ impl ShardFile {
     }
 
     pub fn read_at(&self, name: &str, offset: u64, out: &mut [u8]) -> Result<(), SafetensorsError> {
+        self.read_at_mode(name, offset, out, RangeReadMode::from_stream_env()?)
+            .map(|_| ())
+    }
+
+    fn read_at_buffered(
+        &self,
+        name: &str,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), SafetensorsError> {
         let entry = self
             .tensors
             .get(name)

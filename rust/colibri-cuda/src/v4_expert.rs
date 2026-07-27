@@ -183,18 +183,7 @@ impl RoutedExpertRangePlan {
         shard: &ShardFile,
         buffers: [&mut [u8]; 6],
     ) -> Result<(), Box<dyn Error>> {
-        let mode = match std::env::var("COLIBRI_V4_STREAM_READ_MODE") {
-            Ok(value) if value == "buffered" => crate::safetensors::RangeReadMode::Buffered,
-            Ok(value) if value == "fadvise" => crate::safetensors::RangeReadMode::Fadvise,
-            Ok(value) if value == "direct" => crate::safetensors::RangeReadMode::Direct,
-            Ok(_) => {
-                return Err(
-                    "COLIBRI_V4_STREAM_READ_MODE must be buffered, fadvise, or direct".into(),
-                );
-            }
-            Err(std::env::VarError::NotPresent) => crate::safetensors::RangeReadMode::Buffered,
-            Err(error) => return Err(error.into()),
-        };
+        let mode = crate::safetensors::RangeReadMode::from_stream_env()?;
         self.read_into_mode(shard, buffers, mode)?;
         Ok(())
     }
