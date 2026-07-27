@@ -10,106 +10,112 @@ Does Your Next LLM Infrastructure Really Need to Be an H100?
 
 ![Exact full-request speedup](docs/assets/readme/19-full-request-speedup.svg)
 
-localMoE runs the complete DeepSeek-V4-Pro checkpoint from a WSL-native ext4 volume and keeps only a bounded working set in RAM and VRAM. On the measured laptop, the accepted P5/N3 candidate completed a full request in a geometric mean of `55.550s`, down from the recorded `198.948s` exact baseline. That is a descriptive `3.58x` cross-lineage speedup and a `72.1%` reduction in wall time.
+localMoE is a Rust and CUDA runtime for one stubborn idea: a gaming laptop should be able to run the full DeepSeek-V4-Pro checkpoint in its full-weight form. The weights stay on a WSL-native ext4 volume. RAM and VRAM carry a moving working set. The runtime decides which bytes must move next and which work can stay shared.
 
-The final candidate itself passed a sealed ABBA gate with `n=2` per configuration. Every arm emitted the same three token IDs and the same normalized BF16 digest sequence.
+On the measured RTX 4080 Laptop GPU with 12GB VRAM, the accepted P5/N3 request finished in `55.550s`; the recorded exact baseline took `198.948s`. That makes the visible result a `3.58x` descriptive cross-lineage speedup, with `72.1%` less wall time. The raw traces behind this historical local comparison remain in the local evidence archive and are absent from the repository. The commands below reproduce the workload against current source.
 
-## The 1.6T problem on a 12GB GPU
+## A large MoE asks for a different runtime
 
-An MoE activates a sparse subset of experts for each token. V4-Pro still crosses 61 serial layers, and every layer combines fixed work with router-selected expert payloads. The full expert set must remain addressable even though only a small fraction can live on the GPU.
+V4-Pro has 61 serial layers. Each layer mixes fixed weights with router-selected experts. The GPU cannot keep the full 810GiB checkpoint resident, yet every layer still needs the right weights at the right instant. The hard part is therefore scheduling data movement without changing routes, reduction order, KV state, or the final committed state.
 
-localMoE turns that constraint into a tiered execution path:
+localMoE gives the checkpoint a travelling working set:
 
 `ext4 SSD -> CPU read and decode -> pinned RAM -> retained VRAM -> canonical GPU reduction -> transactional state commit`
 
 ![Bounded SSD, RAM, and VRAM execution path](docs/assets/readme/02-execution-path.svg)
 
-The runtime prepares future payloads while the GPU consumes the current layer. An immutable expert cache loads each prefill expert union once, host retention keeps more fixed payloads away from storage, and device retention removes another part of the H2D path. The route order and state transition remain canonical throughout the request.
+One layer is consumed while the next payload is prepared. Fixed payloads can remain in host or device retention. Routed experts use an immutable cache. CUDA streams and bounded Rust channels keep disk reads, CPU decode, H2D copies, and GPU execution in flight together. Ownership is explicit: move-only leases hold cache slots until GPU work is done, and RAII closes pinned-memory, event, and device-buffer lifetimes on every exit path.
 
 ![Checkpoint capacity versus laptop memory tiers](docs/assets/readme/01-capacity.svg)
 
-## What the sealed experiments support
+## Share the work that the model already shares
 
-All four gates use full61 exact execution. The three single-request configurations use P5/N3 and two complete arms in the frozen `A1, B1, B2, A2` order. The B2 packet uses two independent position-0 requests, with two repeats in each order stratum.
-
-| Sealed mechanism gate | Candidate change | Symmetric E2E ratio | Registered timing gate |
-| --- | --- | ---: | ---: |
-| Immutable expert cache | cache off to 32 slots | `0.7007` | TTFT `0.7901`, hot total `0.6328` |
-| Host retention | `12GiB` to `13GiB` | `0.8946` | TTFT `0.8862`, hot total `0.9039` |
-| Device retention | `3.5GiB` to `4.0GiB` | `0.9260` | TTFT `0.9268`, hot total `0.9248` |
-| B2 row set | serial two-request execution to a layer-stationary row set | `1.9417x` aggregate completion throughput | `2.0413x`, `1.8469x` by order; 4/4 exact pairs |
-
-The cache gate cut physical expert loads from `2,562` to `1,576` and removed `34.603GB` from both routed storage reads and routed H2D traffic. Moving to `13GiB` host retention removed another `2.563GB` of fixed source reads. Moving to `4.0GiB` device retention removed `1.709GB` of fixed source reads and `1.568GB` of fixed H2D traffic.
-
-The sealed N6 device-retention overlay reduced the measured per-token interval from `17.8409426951s` to `16.5992631988s`, a change of `-1.2416794963s/token` (`6.96%`). Per token, it avoided `1,708,974,176 B` of source reads and `783,919,152 B` of H2D traffic while preserving the engine's declared exact semantics. This estimate has `n=2` per configuration. Paired drift bounds the supported claim to the recorded P5/N3 setup.
-
-### Fixed work shared across two independent requests
+Independent requests have independent routes and state, but they visit the same fixed work in every layer. localMoE can advance a row set through one layer together, keep each request's state separate, and pay the fixed work once for the group.
 
 ![B2 row-set aggregate throughput](docs/assets/readme/21-b2-rowset-full61.svg)
 
-The sealed B2 packet runs two independent L0-L60 requests. Each keeps its router metadata and routed payloads. The row set shares fixed work. Across four exact ABBA pairs, aggregate completion throughput had a symmetric geometric mean of `1.9417x`; the serial-then-stationary and stationary-then-serial strata were `2.0413x` and `1.8469x`.
+For two independent full61 requests, layer-stationary execution reached `1.9417x` aggregate completion throughput across the sealed exact comparison. Fixed source traffic and fixed H2D traffic were each halved for the request pair. This is a throughput result for a two-request cohort. Single-request latency remains a separate target.
 
-Per pair, fixed source traffic fell from `58,123,632,496 B` to `29,061,816,248 B`, and fixed H2D fell from `66,310,423,408 B` to `33,155,211,704 B`. Router metadata remained `288 B` per request, while routed source and H2D traffic each remained `25,689,194,496 B`. Single-request completion latency remains outside this result.
+## The path from gaming laptop to desktop build
 
-The current product B2 mode passes the L0 strict gate. This evidence chain joins that product check to a sealed full61 mechanism measurement. A full product B2 E2E rerun remains pending. Resource closure is weak: GPU telemetry was `1,241 MiB` before and after, GNU time recorded `925,472 KiB` maximum RSS with zero swaps, and system SwapFree declined `27,688 KiB`. The continuous child RSS/VmSwap trace is missing because of a wrapper sampler defect.
+The runtime is designed around bounded memory across GPU sizes. More VRAM can retain more fixed work; more host memory can keep more decoded payloads close to the GPU. That gives a clear upgrade path from a 12GB gaming laptop to a desktop with 16GB, 24GB, or 32GB to 48GB of VRAM.
 
-Use two semicolon-separated token-ID lists and set greedy steps explicitly:
+| Home hardware | Flash projection | Assumption |
+| --- | ---: | --- |
+| 12GB gaming laptop | `0.103 to 0.125tok/s` | cold H1 |
+| 16GB desktop | `0.313 to 0.658tok/s` | fixed-resident H1 |
+| 24GB desktop | `0.548 to 1.153 committed tok/s` | fixed-resident H2, `q=0.8` |
+| 32GB desktop | `0.500 to 1.052 committed tok/s` | fixed-resident H5, `q=0.8` |
+| 48GB workstation | `0.500 to 1.052 committed tok/s` | same frozen 32GB to 48GB H5 envelope |
 
-```bash
-COLIBRI_V4_B2_GENERATE=1 \
-COLIBRI_V4_B2_TOKEN_IDS='0;1' \
-COLIBRI_V4_GREEDY_STEPS=1 \
-cargo run --manifest-path rust/Cargo.toml --release -p colibri-cuda
-```
+Compare each row within its scheduler assumption: H2 and H5 use different scheduler spans and continuous commit windows, so a cross-row ranking requires matching assumptions; more VRAM buys a longer usable window and more headroom.
 
-## Expected timing on the measured laptop
+![Flash home-hardware projection envelope](docs/assets/readme/20-flash-projection-envelope.svg)
 
-P5/N3 means a five-token prompt followed by three emitted tokens. The final accepted configuration uses `13GiB` host retention and `4.0GiB` device retention.
+These Flash ranges are design projections, with zero Flash benchmark runs so far. They show what the same scheduling model could unlock as more fixed work becomes resident. The 32GB and 48GB rows share the frozen H5 envelope. Fixed residency, draft cost, rollback, the actual route union, scheduler span, and acceptance rate still need measurement.
 
-| P5/N3 measurement | Geometric center | Derived rate |
-| --- | ---: | ---: |
-| TTFT | `27.631s` | one first emitted token |
-| Two decode intervals | `27.713s` total | `0.0722tok/s` |
-| Complete request E2E | `55.550s` | `0.0540 emitted tok/s` |
+## What "exact" means here
 
-The decode rate comes from two measured intervals. It is short-run evidence, and sustained generation needs a longer benchmark. The E2E number covers the whole recorded request, including TTFT and both decode intervals.
+localMoE preserves the Rust engine's declared canonical contract: route order, reductions, KV updates, lease release, and transactional state commits are checked within the tested lineage. The headline full-request comparison is descriptive because its endpoints come from different source lineages. Official PyTorch full-model parity, long-context behavior, prompt quality, sampling, and sustained throughput remain separate acceptance targets.
 
-The measured starting configuration is:
+The experiment protocol, raw evidence boundaries, and limitations are in the [technical mechanism record](docs/experiments/v4-pro-mechanisms-2026-07-24.md). The README keeps the product story short; that record keeps the claims inspectable.
 
-| Resource | Configuration |
-| --- | --- |
-| GPU | NVIDIA GeForce RTX 4080 Laptop GPU, `12,282MiB` VRAM |
-| Host | `32GB` RAM |
-| WSL2 | about `24GiB` visible memory |
-| Retention | `13GiB` host and `4.0GiB` device budgets |
-| Model storage | WSL-native ext4, at least `810GiB` for the model directory |
+## Run the full checkpoint
 
-This measured configuration is the current reference point. General minimum requirements still need independent validation. Leave additional storage for builds and result artifacts.
-
-## What exact means here
-
-`exact` refers to the Rust engine's declared canonical contract. The single-request gates at p4, p5, and p6 emitted token `115287` with normalized BF16 digests `519e76cfedc01504`, `7017c61decbc4151`, and `3bed9be0e5ebd27c`. The sealed B2 packet matched each independent request's 61-layer records and final argmax plus collapsed, normalized, and logits digests within its frozen lineage. Route order, reductions, KV updates, lease release, and transactional state commits also passed their recorded gates.
-
-Official PyTorch full-model parity, long-context behavior, text quality across prompts, sampling, and sustained throughput remain separate acceptance targets. The headline `3.58x` compares different source lineages, so it is descriptive evidence. The three single-request ABBA ratios and the frozen B2 aggregate ratio carry their respective paired mechanism claims.
-
-## Why Rust
-
-Rust gives the runtime useful constraints at the language boundary. Move-only leases keep cache slots owned until GPU work releases them. RAII closes pinned-memory, CUDA-event, and device-buffer lifetimes on every exit path. Typed FP4 and FP8 layouts make byte budgets explicit. Bounded channels and CUDA streams overlap storage, CPU decode, H2D, and GPU execution without relaxing canonical reduction order.
-
-The result is a resource scheduler whose ownership rules are inspectable in code, while GEMM performance still comes from CUDA kernels and the GPU.
-
-## Quickstart
-
-The current path targets WSL2/Linux, CUDA 12.x, LLVM/NVPTX, libclang, and Ada `sm_89`. Store model weights on a WSL-native ext4 block device. The environment contract rejects `/mnt/c` and `/mnt/d` for model storage.
+The current path targets WSL2/Linux, CUDA 12.4, LLVM/NVPTX, libclang, and Ada `sm_89`. Store the pinned model revision on a WSL-native ext4 block device. The runtime rejects `/mnt/c` and `/mnt/d`.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
+
+export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-pro-b5968e9190ef611bbf34a7229255be88a0e937c1
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
+export LD_LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+
 cargo oxide doctor
-cargo fmt --check
-cargo check --locked -p colibri-cuda
-./run-identified.sh test --arch sm_89
+./run-identified.sh build --arch sm_89 -- --release -p colibri-cuda
+export COLIBRI_SOURCE_IDENTITY_MANIFEST="$PWD/.source-identity.manifest"
+export COLIBRI_SOURCE_IDENTITY="$(sha256sum "$COLIBRI_SOURCE_IDENTITY_MANIFEST" | cut -d' ' -f1)"
+export LOCALMOE_RUN_DIR="$(mktemp -d)"
 ```
+
+Run the measured P5/N3 single-request path with a text prompt:
+
+```bash
+/usr/bin/time -f 'single_request_wall=%e s' env \
+  COLIBRI_V4_FULL61_B1=1 \
+  COLIBRI_V4_LAYER_STATIONARY_PREFILL=1 \
+  COLIBRI_V4_GENERIC_DEVICE_STATIONARY=1 \
+  COLIBRI_V4_CHAT_USER=hi \
+  COLIBRI_V4_GREEDY_STEPS=3 \
+  COLIBRI_V4_MAX_LAYERS=61 \
+  COLIBRI_V4_DEVICE_FIXED_CACHE_GIB=0 \
+  COLIBRI_V4_HOST_FIXED_CACHE_GIB=0 \
+  COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB=4.0 \
+  COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB=13 \
+  COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH=1 \
+  COLIBRI_V4_RAW_WO_A_GPU_DECODE=1 \
+  COLIBRI_V4_PINNED_FIXED_PIPELINE=1 \
+  COLIBRI_V4_BOUNDED_READAHEAD=1 \
+  COLIBRI_V4_ROUTED_QD4=1 \
+  COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE=1 \
+  COLIBRI_V4_SPARSE_ATTN_ARM=sm89_crossover \
+  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/single.jsonl" \
+  "$PWD/target/release/colibri-cuda"
+```
+
+Run two full61 greedy requests through one B2 row set:
+
+```bash
+/usr/bin/time -f 'b2_cohort_wall=%e s' env \
+  COLIBRI_V4_B2_GENERATE=1 \
+  COLIBRI_V4_B2_TOKEN_IDS='0;1' \
+  COLIBRI_V4_GREEDY_STEPS=1 \
+  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/b2.jsonl" \
+  "$PWD/target/release/colibri-cuda"
+```
+
+Both paths fail closed on strict canonical checks and commit their result only after all 61 layers complete. `request_e2e_ns` is the model request timing used for the headline; `/usr/bin/time` includes process startup and teardown. The result JSONL contains emitted IDs and final digests for the exact check.
 
 Code is available under the [Apache License 2.0](LICENSE). Model weights follow their own release terms.
 
