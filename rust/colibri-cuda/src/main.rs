@@ -3,7 +3,7 @@
 
 #![recursion_limit = "256"]
 
-#[allow(dead_code)] // wired into model dispatch after the current CUDA smoke phase
+#[allow(dead_code)]// wired into model dispatch after the current CUDA smoke phase
 mod cublas_exact;
 mod safetensors;
 mod v4_certified;
@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::error::Error;
 use std::io::Write;
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer, sys};
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
+use cuda_core::{sys, CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer};
+use cuda_device::{cuda_module, kernel, thread, warp, DisjointSlice};
 
 const CERTIFIED_HEAD_NONFINITE: u32 = 1;
 const CERTIFIED_HEAD_SUBNORMAL: u32 = 2;
@@ -83,7 +83,11 @@ mod kernels {
             (1.0 + mantissa as f32 / 8.0)
                 * f32::from_bits(((exponent as i32 - 7 + 127) as u32) << 23)
         };
-        if negative { -value } else { value }
+        if negative {
+            -value
+        } else {
+            value
+        }
     }
 
     fn quantize_e4m3fn_bits(value: f32) -> u8 {
@@ -720,15 +724,51 @@ mod kernels {
         let mut numerator = 0.0_f32;
         for slot in 0..4 {
             let index = slot * value_width + dimension;
-            let weight = libm::expf(persistent_score[index] - maximum);
+            let weight = v4_state::pytorch_sleef_expf(persistent_score[index] - maximum);
             denominator += weight;
-            numerator += persistent_kv[index] * weight;
+            numerator = libm::fmaf(persistent_kv[index], weight, numerator);
         }
         for slot in 0..4 {
             let index = (4 + slot) * value_width + head_dim + dimension;
-            let weight = libm::expf(persistent_score[index] - maximum);
+            let weight = v4_state::pytorch_sleef_expf(persistent_score[index] - maximum);
             denominator += weight;
-            numerator += persistent_kv[index] * weight;
+            numerator = libm::fmaf(persistent_kv[index], weight, numerator);
+        }
+        unsafe { *output.as_mut_ptr().add(dimension) = numerator / denominator }
+    }
+
+    /// Ratio-128 HCA boundary pooling.  One thread owns one output channel and
+    /// scans slots in the same 0..128 order as `V4CompressorState`, avoiding a
+    /// nondeterministic parallel reduction at the long-context boundary.
+    #[kernel]
+    pub fn compressor_pool_ratio128_v4_f32(
+        persistent_kv: &[f32],
+        persistent_score: &[f32],
+        mut output: DisjointSlice<f32>,
+        head_dim: u32,
+    ) {
+        let dimension = thread::index_1d().get() as usize;
+        let head_dim = head_dim as usize;
+        const RATIO: usize = 128;
+        if head_dim == 0
+            || output.len() != head_dim
+            || persistent_kv.len() != RATIO * head_dim
+            || persistent_score.len() != RATIO * head_dim
+            || dimension >= head_dim
+        {
+            return;
+        }
+        let mut maximum = f32::NEG_INFINITY;
+        for slot in 0..RATIO {
+            maximum = maximum.max(persistent_score[slot * head_dim + dimension]);
+        }
+        let mut denominator = 0.0_f32;
+        let mut numerator = 0.0_f32;
+        for slot in 0..RATIO {
+            let index = slot * head_dim + dimension;
+            let weight = v4_state::pytorch_sleef_expf(persistent_score[index] - maximum);
+            denominator += weight;
+            numerator = libm::fmaf(persistent_kv[index], weight, numerator);
         }
         unsafe { *output.as_mut_ptr().add(dimension) = numerator / denominator }
     }
@@ -825,7 +865,7 @@ mod kernels {
             || head_dim == 0
             || keys == 0
             || q.len() != rows * heads * head_dim
-            || kv.len() != keys * head_dim
+            || kv.len() < keys * head_dim
             || weights.len() != rows * heads
             || scores.len() < rows * keys
             || output >= rows * keys
@@ -1268,7 +1308,7 @@ mod kernels {
             || kv.len() % DIM != 0
             || attn_sink.len() != HEADS
             || topk_per_row == 0
-            || topk.len() != q.len() / (HEADS * DIM) * topk_per_row
+            || topk.len() < q.len() / (HEADS * DIM) * topk_per_row
             || index >= output.len()
         {
             return;
@@ -1345,7 +1385,7 @@ mod kernels {
             || kv.len() % DIM != 0
             || attn_sink.len() != HEADS
             || topk_per_row == 0
-            || topk.len() != rows * topk_per_row
+            || topk.len() < rows * topk_per_row
             || scores.len() < rows * HEADS * topk_per_row
             || probabilities.len() < rows * HEADS * topk_per_row
             || valid_counts.len() != rows * HEADS
@@ -1421,7 +1461,7 @@ mod kernels {
         if q.len() % (HEADS * DIM) != 0
             || kv.len() % DIM != 0
             || topk_per_row == 0
-            || topk.len() != q.len() / (HEADS * DIM) * topk_per_row
+            || topk.len() < q.len() / (HEADS * DIM) * topk_per_row
             || scores.len() < score_len
             || index >= score_len
         {
@@ -1467,7 +1507,7 @@ mod kernels {
             || attn_sink.len() != HEADS
             || kv.len() % 512 != 0
             || topk_per_row == 0
-            || topk.len() != rows * topk_per_row
+            || topk.len() < rows * topk_per_row
             || scores.len() < rows * HEADS * topk_per_row
             || probabilities.len() < rows * HEADS * topk_per_row
             || index >= denominators.len()
@@ -1528,7 +1568,7 @@ mod kernels {
         if output.len() != rows * HEADS * DIM
             || kv.len() % DIM != 0
             || topk_per_row == 0
-            || topk.len() != rows * topk_per_row
+            || topk.len() < rows * topk_per_row
             || probabilities.len() < rows * HEADS * topk_per_row
             || denominators.len() != rows * HEADS
             || valid_counts.len() != rows * HEADS
@@ -2511,6 +2551,20 @@ fn optional_one_flag(name: &str) -> Result<bool, Box<dyn Error>> {
     parse_optional_one_flag(name, value.as_deref())
 }
 
+fn mtp1_draft_max_scored_transitions() -> Result<usize, Box<dyn Error>> {
+    match std::env::var("COLIBRI_V4_MTP1_MAX_SCORED_TRANSITIONS") {
+        Ok(value) => {
+            let limit = value.parse::<usize>()?;
+            if limit > 8 {
+                return Err("COLIBRI_V4_MTP1_MAX_SCORED_TRANSITIONS must be at most 8".into());
+            }
+            Ok(limit)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(MTP1_DRAFT_DEFAULT_MAX_SCORED_TRANSITIONS),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn parse_default_true_zero_one_flag(
     name: &str,
     value: Option<&std::ffi::OsStr>,
@@ -2756,7 +2810,84 @@ impl Full61Preflight {
     }
 }
 
+fn run_frozen_alpaca_tokenizer_preflight() -> Result<bool, Box<dyn Error>> {
+    let Some(path) = std::env::var_os("COLIBRI_V4_TOKENIZER_ONLY_ALPACA_JSON") else {
+        return Ok(false);
+    };
+    let rows: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let rows = rows
+        .as_array()
+        .ok_or("tokenizer-only Alpaca input must be a JSON array")?;
+    if rows.len() < 16 {
+        return Err("tokenizer-only Alpaca input needs the frozen first 16 rows".into());
+    }
+    let tokenizer = v4_tokenizer::V4Tokenizer::open(&v4_model_dir()?)?;
+    let empty = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n";
+    let with_input = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n";
+    let mut records = Vec::with_capacity(16);
+    let mut lengths = Vec::with_capacity(16);
+    for (index, row) in rows.iter().take(16).enumerate() {
+        let instruction = row["instruction"]
+            .as_str()
+            .ok_or("frozen Alpaca row lacks instruction")?;
+        let input = row["input"]
+            .as_str()
+            .ok_or("frozen Alpaca row lacks input")?;
+        let prompt = if input.is_empty() {
+            empty.replace("{instruction}", instruction)
+        } else {
+            with_input
+                .replace("{instruction}", instruction)
+                .replace("{input}", input)
+        };
+        let ids = tokenizer.encode_raw(&prompt)?;
+        lengths.push(ids.len());
+        records.push(serde_json::json!({
+            "frozen_index": index,
+            "input_nonempty": !input.is_empty(),
+            "prompt_chars": prompt.len(),
+            "raw_token_count": ids.len(),
+            "prompt_digest": format!("{:016x}", fnv1a_bytes(prompt.as_bytes())),
+        }));
+    }
+    let uniformly_truncate_to_120 = lengths.iter().any(|&length| length > 128);
+    for (record, &raw_token_count) in records.iter_mut().zip(&lengths) {
+        record["runner_token_count"] = serde_json::json!(if uniformly_truncate_to_120 {
+            raw_token_count.min(120)
+        } else {
+            raw_token_count
+        });
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "frozen_alpaca_tokenizer_preflight",
+            "rows": records,
+            "raw_prompt_tokens_total": lengths.iter().sum::<usize>(),
+            "raw_prompt_tokens_min": lengths.iter().copied().min().unwrap_or(0),
+            "raw_prompt_tokens_max": lengths.iter().copied().max().unwrap_or(0),
+            "uniform_120_token_fallback": uniformly_truncate_to_120,
+            "runner_prompt_tokens_total": lengths.iter().map(|&length| if uniformly_truncate_to_120 { length.min(120) } else { length }).sum::<usize>(),
+            "runner_input": if uniformly_truncate_to_120 { "COLIBRI_V4_TOKEN_IDS" } else { "COLIBRI_V4_PROMPT_TEXT" },
+            "model_execution": false,
+        })
+    );
+    Ok(true)
+}
+
 fn main() {
+    if run_frozen_alpaca_tokenizer_preflight().expect("run frozen Alpaca tokenizer-only preflight")
+    {
+        return;
+    }
+    if run_stationary_mtp1_scratch_constructor_preflight()
+        .expect("run stationary MTP1 scratch constructor preflight")
+    {
+        return;
+    }
+    if run_stationary_mtp1_capacity_preflight().expect("run stationary MTP1 capacity preflight") {
+        return;
+    }
     let benchmark_requested = std::env::var_os("COLIBRI_V4_B2_LAYER_STATIONARY_BENCH").is_some()
         || std::env::var_os("COLIBRI_V4_B4_LAYER_STATIONARY_BENCH").is_some()
         || std::env::var_os("COLIBRI_V4_B4_FULL61_PROMOTION").is_some()
@@ -3082,6 +3213,19 @@ struct StreamedFinalHeadRun {
     wall_ns: u64,
 }
 
+struct StreamedLmHeadNormalizedRun {
+    candidate: usize,
+    logits_f32: Vec<f32>,
+    sumabs_f32: Vec<f32>,
+    status: Vec<u32>,
+    read_ns: u64,
+    h2d_ns: u64,
+    kernel_ns: u64,
+    d2h_ns: u64,
+    cpu_preprocess_ns: u64,
+    wall_ns: u64,
+}
+
 fn f32_ulp_distance(left: f32, right: f32) -> u32 {
     let ordered = |value: f32| {
         let bits = value.to_bits();
@@ -3282,12 +3426,46 @@ fn run_streamed_final_head_gpu(
         &vec![0.0; v4_state::HIDDEN],
         1,
     )?;
-    output.logits_f32 = vec![0.0; v4_state::VOCAB];
-    output.argmax[0] = 0;
-    let mut cpu_preprocess_ns = u64::try_from(cpu_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let cpu_preprocess_ns = u64::try_from(cpu_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let streamed = run_streamed_lm_head_gpu_normalized(
+        context,
+        module,
+        stream,
+        weights,
+        &output.normalized_bf16,
+    )?;
+    output.logits_f32 = streamed.logits_f32;
+    output.argmax[0] = streamed.candidate;
+    Ok(StreamedFinalHeadRun {
+        output,
+        sumabs_f32: streamed.sumabs_f32,
+        status: streamed.status,
+        read_ns: streamed.read_ns,
+        h2d_ns: streamed.h2d_ns,
+        kernel_ns: streamed.kernel_ns,
+        d2h_ns: streamed.d2h_ns,
+        cpu_preprocess_ns: cpu_preprocess_ns.saturating_add(streamed.cpu_preprocess_ns),
+        wall_ns: u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
+}
 
+/// The shared streamed LM-head execution after a caller has produced one
+/// normalized BF16 row.  Teacher certification and the MTP draft differ only
+/// in how that row is formed; this keeps the chunk upload/dot/argmax mechanism
+/// single-sourced.
+fn run_streamed_lm_head_gpu_normalized(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    weights: &v4_state::FinalHeadWeights,
+    normalized_bf16: &[u16],
+) -> Result<StreamedLmHeadNormalizedRun, Box<dyn Error>> {
+    if normalized_bf16.len() != v4_state::HIDDEN {
+        return Err("streamed LM head requires one normalized hidden row".into());
+    }
+    let wall_started = std::time::Instant::now();
     let input_upload_started = std::time::Instant::now();
-    let device_input = DeviceBuffer::from_host(stream, &output.normalized_bf16)?;
+    let device_input = DeviceBuffer::from_host(stream, normalized_bf16)?;
     let mut h2d_ns = u64::try_from(input_upload_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let device_weight =
         DeviceBuffer::<u16>::zeroed(stream, CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN)?;
@@ -3301,6 +3479,8 @@ fn run_streamed_final_head_gpu(
     let mut read_ns = 0_u64;
     let mut kernel_ns = 0_u64;
     let mut d2h_ns = 0_u64;
+    let mut cpu_preprocess_ns = 0_u64;
+    let mut logits_f32 = vec![0.0_f32; v4_state::VOCAB];
     let mut sumabs_f32 = vec![0.0_f32; v4_state::VOCAB];
     let mut status = vec![0_u32; v4_state::VOCAB];
     for token_start in (0..v4_state::VOCAB).step_by(CERTIFIED_ARGMAX_CHUNK_ROWS) {
@@ -3360,19 +3540,20 @@ fn run_streamed_final_head_gpu(
         d2h_ns = d2h_ns.saturating_add(
             u64::try_from(download_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        output.logits_f32[token_start..token_start + chunk_rows]
-            .copy_from_slice(&chunk[..chunk_rows]);
+        logits_f32[token_start..token_start + chunk_rows].copy_from_slice(&chunk[..chunk_rows]);
         sumabs_f32[token_start..token_start + chunk_rows]
             .copy_from_slice(&chunk_sumabs[..chunk_rows]);
         status[token_start..token_start + chunk_rows].copy_from_slice(&chunk_status[..chunk_rows]);
     }
+    let mut candidate = 0_usize;
     for token in 1..v4_state::VOCAB {
-        if output.logits_f32[token] > output.logits_f32[output.argmax[0]] {
-            output.argmax[0] = token;
+        if logits_f32[token] > logits_f32[candidate] {
+            candidate = token;
         }
     }
-    Ok(StreamedFinalHeadRun {
-        output,
+    Ok(StreamedLmHeadNormalizedRun {
+        candidate,
+        logits_f32,
         sumabs_f32,
         status,
         read_ns,
@@ -3695,6 +3876,7 @@ fn id_only_final_record(
     state: &str,
     decision: &IdOnlyFinalHeadDecision,
     input_hidden_bf16: Option<&[u16]>,
+    request_elapsed_to_final_ns: u64,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut record = serde_json::json!({
         "event": "final",
@@ -3705,6 +3887,7 @@ fn id_only_final_record(
         "head": if decision.certificate.is_some() { "bf16_streamed_gpu_certificate" } else { "canonical_cpu_streamed_bf16" },
         "argmax": decision.token,
         "status": "PASS",
+        "request_elapsed_to_final_ns": request_elapsed_to_final_ns,
     });
     let object = record
         .as_object_mut()
@@ -3748,6 +3931,123 @@ fn id_only_final_record(
 
 const V4_EOS_TOKEN_ID: i64 = 1;
 const V4_LAYER_EXPERT_RETAINED_SLOTS: usize = 32;
+
+/// Request-scoped bookkeeping for the generic stationary device path.  It is
+/// deliberately data-only: the worker/cache remain the existing
+/// `FixedLayerCache` and `run_pinned_fixed_request_worker` implementation.
+/// Keeping this boundary small makes the failure rule observable without
+/// inventing a second scheduler.
+#[derive(Debug)]
+struct GenericStationaryLifecycle {
+    committed_rows: Vec<usize>,
+    poisoned: bool,
+    live_leases: usize,
+    telemetry: GenericStationaryTelemetry,
+}
+
+#[derive(Debug, Default)]
+struct GenericStationaryTelemetry {
+    layer_commits: usize,
+    device_peak_bytes: usize,
+    host_peak_bytes: usize,
+    pinned_peak_bytes: usize,
+    live_lease_peak: usize,
+}
+
+/// State-root observation is determined by which authoritative store exists,
+/// not by whether a device-attention implementation happens to be enabled.
+/// Generic stationary has device-owned state and deliberately no host store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentStateDigestSource {
+    ObservedDevice,
+    HostPersistent,
+    Unobserved,
+}
+
+const fn persistent_state_digest_source(
+    observed_device_state: bool,
+    generic_device_stationary: bool,
+    host_persistent_available: bool,
+) -> PersistentStateDigestSource {
+    if observed_device_state {
+        PersistentStateDigestSource::ObservedDevice
+    } else if generic_device_stationary {
+        PersistentStateDigestSource::Unobserved
+    } else if host_persistent_available {
+        PersistentStateDigestSource::HostPersistent
+    } else {
+        PersistentStateDigestSource::Unobserved
+    }
+}
+
+impl GenericStationaryLifecycle {
+    fn new(layers: usize) -> Result<Self, Box<dyn Error>> {
+        if layers != v4_state::V4_LAYER_COUNT {
+            return Err("generic stationary lifecycle requires all 61 layer stores".into());
+        }
+        Ok(Self {
+            committed_rows: vec![0; layers],
+            poisoned: false,
+            live_leases: 0,
+            telemetry: GenericStationaryTelemetry::default(),
+        })
+    }
+
+    /// Checks the causal boundary before a layer touches its persistent store.
+    fn begin_layer(&self, layer: usize, position: usize) -> Result<(), Box<dyn Error>> {
+        if self.poisoned || self.committed_rows.get(layer).copied() != Some(position) {
+            return Err("generic stationary layer is not at its causal commit boundary".into());
+        }
+        Ok(())
+    }
+
+    /// The sole semantic commit point.  Call only after attention, FFN, and
+    /// the terminal hidden row have all succeeded.
+    fn commit_layer(&mut self, layer: usize, position: usize) -> Result<(), Box<dyn Error>> {
+        self.begin_layer(layer, position)?;
+        let next = position
+            .checked_add(1)
+            .ok_or("generic stationary committed-row overflow")?;
+        *self
+            .committed_rows
+            .get_mut(layer)
+            .ok_or("generic stationary layer is outside the 61 stores")? = next;
+        self.telemetry.layer_commits = self.telemetry.layer_commits.saturating_add(1);
+        Ok(())
+    }
+
+    /// A failed prepared row never changes any committed counter.  The request
+    /// is fail-closed so no later row can observe a partially prepared cache.
+    fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn acquire_lease(&mut self) {
+        self.live_leases = self.live_leases.saturating_add(1);
+        self.telemetry.live_lease_peak = self.telemetry.live_lease_peak.max(self.live_leases);
+    }
+
+    fn release_lease(&mut self) -> Result<(), Box<dyn Error>> {
+        self.live_leases = self
+            .live_leases
+            .checked_sub(1)
+            .ok_or("generic stationary released a non-live lease")?;
+        Ok(())
+    }
+
+    fn observe_peaks(&mut self, device: usize, host: usize, pinned: usize) {
+        self.telemetry.device_peak_bytes = self.telemetry.device_peak_bytes.max(device);
+        self.telemetry.host_peak_bytes = self.telemetry.host_peak_bytes.max(host);
+        self.telemetry.pinned_peak_bytes = self.telemetry.pinned_peak_bytes.max(pinned);
+    }
+
+    fn assert_drained(&self) -> Result<(), Box<dyn Error>> {
+        if self.live_leases != 0 {
+            return Err("generic stationary request ended with a live fixed lease".into());
+        }
+        Ok(())
+    }
+}
 
 fn should_retain_layer_expert(retained: usize) -> bool {
     retained < V4_LAYER_EXPERT_RETAINED_SLOTS
@@ -4124,11 +4424,9 @@ fn run_real_v4_full61_b1(
                 .map(str::trim)
                 .map(str::parse::<i64>)
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(std::env::VarError::NotPresent) => vec![
-                std::env::var("COLIBRI_V4_TOKEN_ID")
-                    .map_err(|_| "set COLIBRI_V4_TOKEN_ID or COLIBRI_V4_TOKEN_IDS")?
-                    .parse::<i64>()?,
-            ],
+            Err(std::env::VarError::NotPresent) => vec![std::env::var("COLIBRI_V4_TOKEN_ID")
+                .map_err(|_| "set COLIBRI_V4_TOKEN_ID or COLIBRI_V4_TOKEN_IDS")?
+                .parse::<i64>()?],
             Err(error) => return Err(error.into()),
         }
     };
@@ -4225,17 +4523,39 @@ fn run_real_v4_full61_b1(
     let max_forward_tokens = greedy_forward_tokens(prompt_len, greedy_steps)?;
     let layer_stationary_prefill = preflight.layer_stationary_prefill;
     let device_short_decode = optional_one_flag("COLIBRI_V4_DEVICE_ONE_TOKEN_DECODE")?;
+    let mtp1_draft_p0 = optional_one_flag("COLIBRI_V4_MTP1_DRAFT_P0")?;
+    let mtp1_max_scored_transitions = mtp1_draft_p0
+        .then(mtp1_draft_max_scored_transitions)
+        .transpose()?
+        .unwrap_or(0);
+    if mtp1_draft_p0
+        && (layer_stationary_prefill
+            || max_layers != v4_state::V4_LAYER_COUNT
+            || qd4_enabled
+            || parse_gib_budget("COLIBRI_V4_DEVICE_FIXED_CACHE_GIB")? != 0)
+    {
+        return Err(
+            "COLIBRI_V4_MTP1_DRAFT_P0 requires non-stationary full61, QD4/cache-device-off teacher execution"
+                .into(),
+        );
+    }
     let layer_stationary_expert_reuse = preflight.layer_stationary_expert_reuse;
     let phase_profile = preflight.phase_profile;
     if layer_stationary_prefill {
-        validate_layer_stationary_prefill(
-            prompt_len,
-            greedy_steps,
-            max_layers,
-            true,
-            preflight.qd4_bench,
-            device_short_decode,
-        )?;
+        if optional_one_flag("COLIBRI_V4_GENERIC_DEVICE_STATIONARY")? {
+            if prompt_len == 0 || greedy_steps == 0 || max_layers != v4_state::V4_LAYER_COUNT {
+                return Err("generic device stationary requires a nonempty full61 prompt and COLIBRI_V4_GREEDY_STEPS>=1".into());
+            }
+        } else {
+            validate_layer_stationary_prefill(
+                prompt_len,
+                greedy_steps,
+                max_layers,
+                true,
+                preflight.qd4_bench,
+                device_short_decode,
+            )?;
+        }
         return run_real_v4_layer_stationary_prefill(
             context,
             module,
@@ -4305,6 +4625,14 @@ fn run_real_v4_full61_b1(
     let mut greedy_finals = Vec::with_capacity(max_forward_tokens);
     let mut generated_ids = Vec::with_capacity(greedy_steps);
     let mut greedy_stop_reason = None;
+    // A draft state is created once for this request and never aliases teacher
+    // state.  It stays alive across prompt and greedy positions.
+    let mut mtp1_draft_state = mtp1_draft_p0
+        .then(|| MtpDraftState::new(stream))
+        .transpose()?;
+    let mut mtp1_draft_disabled = None::<String>;
+    let mut mtp1_scored_transitions = 0_usize;
+    let mut mtp1_draft_records = Vec::with_capacity(max_forward_tokens);
     for token_position in 0..max_forward_tokens {
         let token_id = token_ids[token_position];
         let embedding = v4_state::load(&root, &[token_id])?.embedding;
@@ -4353,6 +4681,7 @@ fn run_real_v4_full61_b1(
                             false,
                             timeline_origin,
                             false,
+                            None,
                             None,
                         )
                     },
@@ -4508,6 +4837,50 @@ fn run_real_v4_full61_b1(
         }));
         layer_records.extend(current_records);
         last_hidden = hidden;
+        let mtp1_draft = if mtp1_draft_p0 {
+            let teacher_digest_before = fnv1a_u16(&last_hidden);
+            let draft = match mtp1_draft_state.as_mut() {
+                Some(state) if mtp1_requires_full_candidate(prompt_len, token_position) => {
+                    MtpDraftStep::Candidate(run_mtp1_draft_candidate(
+                        context,
+                        module,
+                        stream,
+                        &root,
+                        final_weights
+                            .as_ref()
+                            .ok_or("MTP1 draft candidate has no request-scoped final head")?,
+                        None,
+                        Some(MTP1_DRAFT_EXTRA_CAPACITY_BYTES),
+                        &last_hidden,
+                        token_id,
+                        token_position,
+                        state,
+                    ))
+                }
+                Some(state) => MtpDraftStep::Prefix(advance_mtp1_draft_state(
+                    module,
+                    stream,
+                    &root,
+                    &last_hidden,
+                    token_id,
+                    token_position,
+                    state,
+                )),
+                None => MtpDraftStep::Candidate(Err(std::io::Error::other(
+                    mtp1_draft_disabled
+                        .as_deref()
+                        .unwrap_or("MTP1 draft state is unavailable"),
+                )
+                .into())),
+            };
+            let teacher_digest_after = fnv1a_u16(&last_hidden);
+            if teacher_digest_after != teacher_digest_before {
+                return Err("MTP1 draft mutated teacher hidden state".into());
+            }
+            Some((teacher_digest_before, teacher_digest_after, draft))
+        } else {
+            None
+        };
         if b1_needs_final_head(prompt_len, token_position) {
             if let Some(weights) = &final_weights {
                 let cpu = v4_state::final_checkpoint_head_cpu_timed(weights, &last_hidden, 1)?;
@@ -4543,10 +4916,127 @@ fn run_real_v4_full61_b1(
                 "argmax": cpu.output.argmax[0],
                 "status": "PASS",
             }));
-                if greedy_stop_reason.is_some() {
-                    break;
+            }
+        }
+        if let Some((teacher_digest_before, teacher_digest_after, draft)) = mtp1_draft {
+            let target_position = token_position + 1;
+            let target_id = token_ids.get(target_position).copied();
+            let (alignment, scored, exclusion) = match target_id {
+                None => ("target_unavailable", false, Some("no_next_teacher_token")),
+                Some(_) if target_position < prompt_len => {
+                    ("prompt_forced", false, Some("prompt_forced_transition"))
+                }
+                Some(_) if token_position + 1 == prompt_len => {
+                    if mtp1_scored_transitions < mtp1_max_scored_transitions {
+                        ("last_prompt_to_first_greedy", true, None)
+                    } else {
+                        (
+                            "last_prompt_to_first_greedy",
+                            false,
+                            Some("per_prompt_score_cap"),
+                        )
+                    }
+                }
+                Some(_) if mtp1_scored_transitions < mtp1_max_scored_transitions => {
+                    ("greedy_to_greedy", true, None)
+                }
+                Some(_) => ("greedy_to_greedy", false, Some("per_prompt_score_cap")),
+            };
+            match draft {
+                MtpDraftStep::Prefix(Ok(draft)) => {
+                    if draft.persistent_bytes != MTP1_DRAFT_PERSISTENT_BYTES {
+                        return Err("MTP1 draft prefix capacity assertion failed".into());
+                    }
+                    mtp1_draft_records.push(serde_json::json!({
+                        "event": "mtp1_draft",
+                        "status": "DRAFT_STATE_ADVANCED",
+                        "candidate_pos": token_position,
+                        "target_pos": target_position,
+                        "input_id": token_id,
+                        "candidate": serde_json::Value::Null,
+                        "target_teacher_token": target_id,
+                        "alignment": alignment,
+                        "scored": false,
+                        "match": serde_json::Value::Null,
+                        "exclusion": "prompt_forced_transition",
+                        "mtp_kv_persistent_bytes": draft.persistent_bytes,
+                        "mtp_kv_position": draft.kv_position,
+                        "mtp_kv_digest": format!("{:016x}", draft.kv_digest),
+                        "teacher_digest_before": format!("{teacher_digest_before:016x}"),
+                        "teacher_digest_after": format!("{teacher_digest_after:016x}"),
+                    }));
+                }
+                MtpDraftStep::Candidate(Ok(draft)) => {
+                    if draft.persistent_bytes != MTP1_DRAFT_PERSISTENT_BYTES
+                        || draft.persistent_bytes + draft.transient_expert_peak_bytes
+                            > MTP1_DRAFT_EXTRA_CAPACITY_BYTES
+                    {
+                        return Err("MTP1 draft capacity assertion failed".into());
+                    }
+                    let matched = target_id.map(|target| draft.candidate == target);
+                    if scored {
+                        mtp1_scored_transitions += 1;
+                    }
+                    mtp1_draft_records.push(serde_json::json!({
+                        "event": "mtp1_draft",
+                        "status": "DRAFT_ALIGNED",
+                        "candidate_pos": token_position,
+                        "target_pos": target_position,
+                        "input_id": token_id,
+                        "candidate": draft.candidate,
+                        "target_teacher_token": target_id,
+                        "alignment": alignment,
+                        "scored": scored,
+                        "match": matched,
+                        "exclusion": exclusion,
+                        "scored_transition_index": scored.then_some(mtp1_scored_transitions),
+                        "route_ids": draft.routes.ids,
+                        "route_weights_f32": draft.routes.weights,
+                        "source_bytes": draft.source_bytes,
+                        "source_read_ns": draft.source_read_ns,
+                        "h2d_ns": draft.h2d_ns,
+                        "h2d_bytes": draft.h2d_bytes,
+                        "kernel_ns": draft.kernel_ns,
+                        "head_read_ns": draft.head_read_ns,
+                        "head_h2d_ns": draft.head_h2d_ns,
+                        "head_kernel_ns": draft.head_kernel_ns,
+                        "head_d2h_ns": draft.head_d2h_ns,
+                        "head_wall_ns": draft.head_wall_ns,
+                        "total_ns": draft.total_ns,
+                        "mtp_kv_persistent_bytes": draft.persistent_bytes,
+                        "mtp_kv_position": draft.kv_position,
+                        "mtp_kv_digest": format!("{:016x}", draft.kv_digest),
+                        "transient_expert_peak_bytes": draft.transient_expert_peak_bytes,
+                        "extra_capacity_limit_bytes": MTP1_DRAFT_EXTRA_CAPACITY_BYTES,
+                        "expert_lifecycle": "single transient ExpertSlot; expert IDs ascending; drop before next",
+                        "teacher_digest_before": format!("{teacher_digest_before:016x}"),
+                        "teacher_digest_after": format!("{teacher_digest_after:016x}"),
+                    }));
+                }
+                MtpDraftStep::Prefix(Err(error)) | MtpDraftStep::Candidate(Err(error)) => {
+                    let reason = error.to_string();
+                    mtp1_draft_disabled = Some(reason.clone());
+                    mtp1_draft_state = None;
+                    mtp1_draft_records.push(serde_json::json!({
+                        "event": "mtp1_draft",
+                        "status": "DRAFT_FAIL",
+                        "candidate_pos": token_position,
+                        "target_pos": target_position,
+                        "input_id": token_id,
+                        "target_teacher_token": target_id,
+                        "alignment": alignment,
+                        "scored": false,
+                        "match": serde_json::Value::Null,
+                        "exclusion": "draft_failed",
+                        "reason": reason,
+                        "teacher_digest_before": format!("{teacher_digest_before:016x}"),
+                        "teacher_digest_after": format!("{teacher_digest_after:016x}"),
+                    }));
                 }
             }
+        }
+        if greedy_stop_reason.is_some() {
+            break;
         }
     }
     let forward_input_len = token_records.len();
@@ -4658,6 +5148,15 @@ fn run_real_v4_full61_b1(
         "routed_qd4_startup_setup_ns": qd4_startup_setup_ns,
         "routed_qd4_pinned_host_bytes": qd4_host_reserve_bytes,
         "routed_qd4_device_bytes": qd4_device_reserve_bytes,
+        "mtp1_draft_acceptance": {
+            "enabled": mtp1_draft_p0,
+            "persistent_state_scope": "single_request",
+            "candidate_target_alignment": "candidate_pos predicts teacher token at candidate_pos + 1",
+            "prompt_forced_scored": false,
+            "max_scored_transitions_per_prompt": mtp1_max_scored_transitions,
+            "scored_transitions": mtp1_scored_transitions,
+        },
+        "mtp1_draft_p0": &mtp1_draft_records,
     });
     if prompt_text.is_some() || chat_user.is_some() {
         let tokenizer = tokenizer
@@ -4738,7 +5237,11 @@ fn run_real_v4_full61_b1(
                 "device"
             }
         } else if cache.host_selected[index] {
-            if cache.raw_mode { "raw_host" } else { "host" }
+            if cache.raw_mode {
+                "raw_host"
+            } else {
+                "host"
+            }
         } else {
             "uncached"
         };
@@ -4900,6 +5403,9 @@ fn run_real_v4_layer_stationary_prefill(
         return Err("QD4 immutable expert cache requires persistent QD4 lanes".into());
     }
     let device_attention = optional_one_flag("COLIBRI_V4_DEVICE_ATTENTION_PRODUCTION")?;
+    let generic_device_stationary = optional_one_flag("COLIBRI_V4_GENERIC_DEVICE_STATIONARY")?;
+    let stationary_mtp1_draft = optional_one_flag("COLIBRI_V4_STATIONARY_MTP1_DRAFT")?;
+    let generic_device_state_audit = optional_one_flag("COLIBRI_V4_GENERIC_DEVICE_STATE_AUDIT")?;
     let device_attention_audit = optional_one_flag("COLIBRI_V4_DEVICE_ATTENTION_AUDIT")?;
     if device_attention_audit && !device_attention {
         return Err(
@@ -4907,13 +5413,27 @@ fn run_real_v4_layer_stationary_prefill(
                 .into(),
         );
     }
+    if generic_device_stationary
+        && (device_attention || device_attention_audit || device_short_decode || greedy_steps == 0)
+    {
+        return Err("generic device stationary requires full61 with device attention, audit, and short decode off plus greedy_steps >= 1".into());
+    }
+    if generic_device_state_audit && !generic_device_stationary {
+        return Err(
+            "generic device state audit requires COLIBRI_V4_GENERIC_DEVICE_STATIONARY=1".into(),
+        );
+    }
+    stationary_mtp1_enabled(generic_device_stationary, stationary_mtp1_draft)?;
     if device_short_decode && !device_attention {
         return Err("short device decode requires device-attention production".into());
     }
     let l0_cutpoint = optional_one_flag("COLIBRI_V4_L0_POS0_CUTPOINT")?;
     let raw_wo_a_gpu_decode = raw_wo_a_gpu_decode_enabled()?;
-    let fixed_prefetch_wo_a_arm =
-        fixed_prefetch_wo_a_decode_arm(fixed_prefetch, device_attention, raw_wo_a_gpu_decode);
+    let fixed_prefetch_wo_a_arm = fixed_prefetch_wo_a_decode_arm(
+        fixed_prefetch,
+        device_attention || generic_device_stationary,
+        raw_wo_a_gpu_decode,
+    );
     let fixed_prefetch_raw_wo_a = fixed_prefetch_wo_a_arm == "raw_fp8_gpu_decode";
     let pinned_fixed_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
     let bounded_readahead = pinned_fixed_pipeline
@@ -4925,10 +5445,17 @@ fn run_real_v4_layer_stationary_prefill(
     if device_short_decode && !fixed_prefetch_raw_wo_a {
         return Err("short device decode requires raw wo_a fixed prefetch".into());
     }
-    if pinned_fixed_pipeline && (!device_short_decode || !fixed_prefetch_raw_wo_a) {
+    if pinned_fixed_pipeline
+        && (!(device_short_decode || generic_device_stationary) || !fixed_prefetch_raw_wo_a)
+    {
         return Err(
             "pinned fixed pipeline requires short device decode and raw wo_a fixed prefetch".into(),
         );
+    }
+    if generic_device_stationary
+        && (!fixed_prefetch || !fixed_prefetch_raw_wo_a || !pinned_fixed_pipeline)
+    {
+        return Err("generic device stationary requires raw wo_a fixed prefetch and the existing pinned two-slot worker".into());
     }
     if certified_argmax_audit
         && (targeted_attention_audit
@@ -5026,6 +5553,23 @@ fn run_real_v4_layer_stationary_prefill(
             )
         })
         .transpose()?;
+    let stationary_mtp1_peak_reserve_bytes = stationary_mtp1_draft
+        .then(|| mtp1_stationary_peak_reserve_bytes(root, qd4_enabled))
+        .transpose()?
+        .unwrap_or(0);
+    let generic_stationary_reserve_plan = generic_device_stationary
+        .then(|| v4_state::LayerStationaryRequestPlan::new(prompt_len, greedy_steps))
+        .transpose()?;
+    let generic_stationary_device_reserve_bytes = generic_stationary_reserve_plan
+        .map(|plan| {
+            generic_stationary_persistent_reserve_bytes(manifests, plan)?
+                .checked_add(generic_stationary_scratch_reserve_bytes(plan)?)
+                .ok_or_else(|| -> Box<dyn Error> {
+                    "generic stationary device reserve overflow".into()
+                })
+        })
+        .transpose()?
+        .unwrap_or(0);
     let request_started = std::time::Instant::now();
     let stationary_host_reserve_bytes = fixed_prefetch_max_future_host_bytes
         .unwrap_or(0)
@@ -5044,20 +5588,53 @@ fn run_real_v4_layer_stationary_prefill(
                     .map_or(0, |plan| plan.certified_argmax_host_temp_bytes),
             )
         })
+        .and_then(|bytes| bytes.checked_add(mtp1_stationary_pinned_host_reserve_bytes(qd4_enabled)))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                usize::from(generic_device_stationary && pinned_fixed_pipeline)
+                    * PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES,
+            )
+        })
         .ok_or("stationary raw host reserve overflow")?;
     let stationary_layers = manifests
         .iter()
         .map(|manifest| manifest.layer)
         .collect::<Vec<_>>();
-    let mut stationary_raw_retention = device_short_decode
+    let decode_retention_overlay = parse_default_true_zero_one_flag(
+        "COLIBRI_V4_DECODE_RETENTION_OVERLAY",
+        std::env::var_os("COLIBRI_V4_DECODE_RETENTION_OVERLAY").as_deref(),
+    )?;
+    let mut stationary_raw_retention = (device_short_decode || generic_device_stationary)
         .then(|| {
             FixedLayerCache::stationary_raw_from_env(
                 root,
                 &stationary_layers,
                 device_attention_capacity
                     .as_ref()
-                    .map_or(0, |plan| plan.required_bytes),
+                    .map_or(0, |plan| plan.required_bytes)
+                    .checked_add(
+                        usize::from(generic_device_stationary && qd4_enabled) * V4_QD4_DEVICE_BYTES,
+                    )
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            usize::from(generic_device_stationary && qd4_immutable_expert_cache)
+                                * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                        )
+                    })
+                    .and_then(|bytes| bytes.checked_add(stationary_mtp1_peak_reserve_bytes))
+                    .and_then(|bytes| bytes.checked_add(generic_stationary_device_reserve_bytes))
+                    .ok_or("stationary raw device reserve overflow")?,
                 stationary_host_reserve_bytes,
+                usize::from(
+                    generic_device_stationary
+                        && qd4_immutable_expert_cache
+                        && decode_retention_overlay,
+                ) * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                usize::from(
+                    generic_device_stationary
+                        && qd4_immutable_expert_cache
+                        && decode_retention_overlay,
+                ) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
                 stream,
             )
         })
@@ -5083,14 +5660,31 @@ fn run_real_v4_layer_stationary_prefill(
             Ok::<_, Box<dyn Error>>(row)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let host_persistent_rows = if device_short_decode && device_attention_audit {
+    let host_persistent_rows = if generic_device_state_audit {
+        prompt_len
+            .checked_add(greedy_steps)
+            .ok_or("generic device state audit host context overflow")?
+    } else if device_short_decode && device_attention_audit {
         short_decode_rows
     } else {
         prompt_len
     };
-    let mut persistent = (!device_attention || device_attention_audit)
+    let mut persistent = (generic_device_state_audit
+        || (!generic_device_stationary && (!device_attention || device_attention_audit)))
         .then(|| v4_state::V4SerialPersistentState::new(host_persistent_rows))
         .transpose()?;
+    let generic_plan = generic_stationary_reserve_plan;
+    let mut generic_states = generic_device_stationary.then(|| {
+        std::iter::repeat_with(|| None)
+            .take(v4_state::V4_LAYER_COUNT)
+            .collect::<Vec<Option<DeviceLayerPersistentState>>>()
+    });
+    let mut generic_scratch = None;
+    let mut generic_lifecycle = generic_device_stationary
+        .then(|| GenericStationaryLifecycle::new(v4_state::V4_LAYER_COUNT))
+        .transpose()?;
+    let mut generic_device_state_audit_heads = Vec::new();
+    let mut generic_device_state_audit_wall_ns = 0_u64;
     let mut layer_records = (0..prompt_len)
         .map(|_| Vec::with_capacity(manifests.len()))
         .collect::<Vec<Vec<serde_json::Value>>>();
@@ -5143,6 +5737,9 @@ fn run_real_v4_layer_stationary_prefill(
     let mut qd4_immutable_cache = qd4_immutable_expert_cache
         .then(|| Qd4ImmutableExpertCache::new(context, module))
         .transpose()?;
+    let mut qd4_immutable_cache_telemetry = None;
+    let mut generic_prefill_peak = None::<(usize, usize, usize)>;
+    let mut generic_decode_overlay_peak = None::<(usize, usize, usize)>;
     let qd4_startup_setup_ns = qd4_enabled
         .then(|| u64::try_from(qd4_setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
@@ -5400,20 +5997,125 @@ fn run_real_v4_layer_stationary_prefill(
                     } else {
                         &[]
                     };
-                    let kv_rows_before = device_state.as_ref().map_or_else(
-                        || {
-                            persistent
-                                .as_ref()
-                                .and_then(|state| state.layer(manifest.layer))
-                                .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
-                        },
-                        |state| state.committed_rows,
-                    );
+                    let kv_rows_before = if let Some(states) = generic_states.as_ref() {
+                        states
+                            .get(manifest.layer)
+                            .and_then(Option::as_ref)
+                            .map_or(0, |state| state.committed_rows)
+                    } else {
+                        device_state.as_ref().map_or_else(
+                            || {
+                                persistent
+                                    .as_ref()
+                                    .and_then(|state| state.layer(manifest.layer))
+                                    .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
+                            },
+                            |state| state.committed_rows,
+                        )
+                    };
                     let cutpoint_pre_hidden =
                         l0_cutpoint.then(|| format!("{:016x}", fnv1a_u16(&hidden[token_position])));
                     let mut observed_state = None;
                     let mut completed = None;
-                    if device_attention && !device_attention_audit {
+                    if generic_device_stationary {
+                        run_generic_device_state_audit_mirror(
+                            generic_device_state_audit,
+                            persistent.as_mut(),
+                            manifest.layer,
+                            &hidden[token_position],
+                            |host_state, mirror_hidden| {
+                                run_real_layer_attention_rows(
+                                    module,
+                                    stream,
+                                    &runtime,
+                                    mirror_hidden,
+                                    token_position,
+                                    host_state,
+                                    None,
+                                    strict_scratch.as_mut(),
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+                        let audit_expected_compressed_prefix = if generic_device_state_audit
+                            && (token_position + 1).is_multiple_of(manifest.compression_ratio.get())
+                        {
+                            Some(
+                                persistent
+                                    .as_ref()
+                                    .and_then(|host| host.layer(manifest.layer))
+                                    .ok_or("generic boundary audit host mirror lost its layer")?
+                                    .compressed_kv_bf16(),
+                            )
+                        } else {
+                            None
+                        };
+                        let plan =
+                            generic_plan.ok_or("generic stationary request plan disappeared")?;
+                        let states = generic_states
+                            .as_mut()
+                            .ok_or("generic stationary stores disappeared during prefill")?;
+                        let state = states
+                            .get_mut(manifest.layer)
+                            .ok_or("generic stationary layer is outside its 61 stores")?;
+                        if state.is_none() {
+                            *state = Some(DeviceLayerPersistentState::new(
+                                stream,
+                                &runtime.weights,
+                                plan,
+                            )?);
+                        }
+                        let state = state
+                            .as_mut()
+                            .ok_or("generic stationary layer store disappeared")?;
+                        if generic_scratch.is_none() {
+                            let scratch =
+                                DeviceRequestScratch::new(stream, &runtime.weights, plan)?;
+                            if scratch.num_bytes()
+                                != generic_stationary_scratch_reserve_bytes(plan)?
+                            {
+                                return Err("generic stationary scratch allocation diverged from pre-cache peak ledger".into());
+                            }
+                            generic_scratch = Some(scratch);
+                        }
+                        let scratch = generic_scratch
+                            .as_mut()
+                            .ok_or("generic stationary scratch disappeared")?;
+                        let lifecycle = generic_lifecycle
+                            .as_mut()
+                            .ok_or("generic stationary lifecycle disappeared")?;
+                        lifecycle.begin_layer(manifest.layer, token_position)?;
+                        let run = run_real_layer_rows(
+                            context,
+                            module,
+                            stream,
+                            &runtime,
+                            qd4_lanes.as_deref_mut(),
+                            qd4_immutable_cache.as_mut(),
+                            None,
+                            row_hash_ids,
+                            &hidden[token_position],
+                            &[token_id],
+                            token_position,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                            false,
+                            Some((state, scratch, audit_expected_compressed_prefix)),
+                            None,
+                        );
+                        let run = match run {
+                            Ok(run) => run,
+                            Err(error) => {
+                                lifecycle.poison();
+                                return Err(error);
+                            }
+                        };
+                        lifecycle.commit_layer(manifest.layer, token_position)?;
+                        completed = Some(run);
+                    } else if device_attention && !device_attention_audit {
                         completed = Some(run_real_layer_rows(
                             context,
                             module,
@@ -5432,6 +6134,7 @@ fn run_real_v4_layer_stationary_prefill(
                             false,
                             None,
                             false,
+                            None,
                             None,
                         )?);
                     } else {
@@ -5492,6 +6195,7 @@ fn run_real_v4_layer_stationary_prefill(
                                 device_attention_audit,
                                 None,
                                 false,
+                                None,
                                 strict_scratch.as_mut(),
                             )?;
                             if let Some((expected_output, expected_topk, expected_state, oracle_ns)) =
@@ -5591,48 +6295,64 @@ fn run_real_v4_layer_stationary_prefill(
                         run.stage.layer_prepare_ns = layer_prepare_ns;
                         run.stage.layer_prepare_count = 1;
                     }
-                    let kv_rows_after = device_state.as_ref().map_or_else(
-                        || {
-                            persistent
-                                .as_ref()
-                                .and_then(|state| state.layer(manifest.layer))
-                                .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
-                        },
-                        |state| state.committed_rows,
-                    );
+                    let kv_rows_after = if let Some(states) = generic_states.as_ref() {
+                        states
+                            .get(manifest.layer)
+                            .and_then(Option::as_ref)
+                            .map_or(0, |state| state.committed_rows)
+                    } else {
+                        device_state.as_ref().map_or_else(
+                            || {
+                                persistent
+                                    .as_ref()
+                                    .and_then(|state| state.layer(manifest.layer))
+                                    .map_or(0, v4_state::V4LayerPersistentState::committed_kv_rows)
+                            },
+                            |state| state.committed_rows,
+                        )
+                    };
                     if kv_rows_after != kv_rows_before + 1 {
                         return Err(
                             "layer-stationary prefill committed a noncontiguous KV row".into()
                         );
                     }
-                    let state_digests = if let Some(state) = observed_state.as_ref() {
-                        Some((
-                            fnv1a_u16(&state.kv),
-                            fnv1a_u16(&state.compressed_kv),
-                            fnv1a_f32(&state.main_kv),
-                            fnv1a_f32(&state.main_score),
-                            fnv1a_u16(&state.indexer_kv),
-                            state.indexer_main_kv.as_deref().map(fnv1a_f32),
-                            state.indexer_main_score.as_deref().map(fnv1a_f32),
-                        ))
-                    } else if !device_attention {
-                        let state = persistent
-                            .as_ref()
-                            .and_then(|state| state.layer(manifest.layer))
-                            .ok_or("host layer state disappeared after commit")?;
-                        let main = state.compressor();
-                        let indexer = state.indexer();
-                        Some((
-                            fnv1a_u16(state.kv_bf16()),
-                            fnv1a_u16(state.compressed_kv_bf16()),
-                            fnv1a_f32(main.kv()),
-                            fnv1a_f32(main.score()),
-                            fnv1a_u16(state.indexer_kv_bf16()),
-                            indexer.map(|value| fnv1a_f32(value.kv())),
-                            indexer.map(|value| fnv1a_f32(value.score())),
-                        ))
-                    } else {
-                        None
+                    let state_digests = match persistent_state_digest_source(
+                        observed_state.is_some(),
+                        generic_device_stationary,
+                        persistent.is_some(),
+                    ) {
+                        PersistentStateDigestSource::ObservedDevice => {
+                            let state = observed_state
+                                .as_ref()
+                                .expect("observed device state disappeared before digesting");
+                            Some((
+                                fnv1a_u16(&state.kv),
+                                fnv1a_u16(&state.compressed_kv),
+                                fnv1a_f32(&state.main_kv),
+                                fnv1a_f32(&state.main_score),
+                                fnv1a_u16(&state.indexer_kv),
+                                state.indexer_main_kv.as_deref().map(fnv1a_f32),
+                                state.indexer_main_score.as_deref().map(fnv1a_f32),
+                            ))
+                        }
+                        PersistentStateDigestSource::HostPersistent => {
+                            let state = persistent
+                                .as_ref()
+                                .and_then(|state| state.layer(manifest.layer))
+                                .ok_or("host layer state disappeared after commit")?;
+                            let main = state.compressor();
+                            let indexer = state.indexer();
+                            Some((
+                                fnv1a_u16(state.kv_bf16()),
+                                fnv1a_u16(state.compressed_kv_bf16()),
+                                fnv1a_f32(main.kv()),
+                                fnv1a_f32(main.score()),
+                                fnv1a_u16(state.indexer_kv_bf16()),
+                                indexer.map(|value| fnv1a_f32(value.kv())),
+                                indexer.map(|value| fnv1a_f32(value.score())),
+                            ))
+                        }
+                        PersistentStateDigestSource::Unobserved => None,
                     };
                     let topk_observed = run.attention_topk.is_some();
                     let record = serde_json::json!({
@@ -5666,7 +6386,7 @@ fn run_real_v4_layer_stationary_prefill(
                         run.indexer_topk_gpu_ns,
                         run.device_transfer,
                     );
-                    if device_attention {
+                    if device_attention || generic_device_stationary {
                         let transfer = transfer
                             .ok_or("device attention dispatch omitted transfer telemetry")?;
                         device_attention_dispatches = device_attention_dispatches.saturating_add(1);
@@ -5790,15 +6510,147 @@ fn run_real_v4_layer_stationary_prefill(
     if fixed_prefetch && fixed_prefetch_records.len() != manifests.len().saturating_sub(1) {
         return Err("layer-stationary fixed prefetch did not record every transition".into());
     }
-    if persistent
-        .as_ref()
-        .is_some_and(|state| state.allocated_layers() != v4_state::V4_LAYER_COUNT)
-        || layer_records
-            .iter()
-            .any(|records| records.len() != v4_state::V4_LAYER_COUNT)
+    if !generic_device_stationary
+        && (persistent
+            .as_ref()
+            .is_some_and(|state| state.allocated_layers() != v4_state::V4_LAYER_COUNT)
+            || layer_records
+                .iter()
+                .any(|records| records.len() != v4_state::V4_LAYER_COUNT))
     {
         return Err("layer-stationary prefill did not commit every layer/position pair".into());
     }
+    if generic_device_stationary && qd4_immutable_expert_cache {
+        let cache = qd4_immutable_cache
+            .take()
+            .ok_or("generic stationary lost its immutable-cache owner after prefill")?;
+        if cache.layer.is_some()
+            || !cache.resident.is_empty()
+            || cache.free.len() != V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        {
+            return Err("generic stationary immutable cache was not drained before handoff".into());
+        }
+        qd4_immutable_cache_telemetry = Some(cache.telemetry);
+        drop(cache);
+    }
+    if generic_device_stationary {
+        let lifecycle = generic_lifecycle
+            .as_mut()
+            .ok_or("generic stationary lifecycle disappeared after prefill")?;
+        let persistent_device_bytes = generic_states
+            .as_ref()
+            .ok_or("generic stationary stores disappeared after prefill")?
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map_or(0, DeviceLayerPersistentState::num_bytes)
+            })
+            .try_fold(0_usize, |total, bytes| total.checked_add(bytes))
+            .ok_or("generic stationary device ledger overflow")?;
+        let raw_cache_device_bytes = stationary_raw_retention
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .plan
+                    .iter()
+                    .zip(&cache.device_selected)
+                    .filter_map(|(plan, selected)| selected.then_some(plan.raw_device_bytes))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let raw_cache_host_bytes = stationary_raw_retention
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .plan
+                    .iter()
+                    .zip(&cache.host_selected)
+                    .filter_map(|(plan, selected)| selected.then_some(plan.raw_host_bytes))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        let generic_scratch_bytes = generic_scratch
+            .as_ref()
+            .map_or(0, DeviceRequestScratch::num_bytes);
+        let base_device_bytes = persistent_device_bytes
+            .checked_add(generic_scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    usize::from(qd4_immutable_expert_cache)
+                        * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                )
+            })
+            .and_then(|bytes| bytes.checked_add(raw_cache_device_bytes))
+            // Scratch remains allocated after the worker drain; prepared
+            // runtimes are accounted as a separate maximum below.
+            .and_then(|bytes| bytes.checked_add(PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES))
+            .ok_or("generic stationary lifecycle base device ledger overflow")?;
+        let device_bytes = base_device_bytes
+            .checked_add(stationary_mtp1_peak_reserve_bytes)
+            .ok_or("generic stationary lifecycle MTP device ledger overflow")?
+            .max(
+                base_device_bytes
+                    .checked_add(PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES)
+                    .ok_or("generic stationary lifecycle prepared device ledger overflow")?,
+            );
+        let audit_mirror_host_bytes = if generic_device_state_audit {
+            generic_stationary_audit_mirror_host_bytes(
+                manifests,
+                generic_plan.ok_or("generic stationary audit has no request plan")?,
+            )?
+        } else {
+            0
+        };
+        let host_bytes = raw_cache_host_bytes
+            .checked_add(audit_mirror_host_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    usize::from(stationary_mtp1_draft) * CERTIFIED_ARGMAX_HOST_TEMP_BYTES,
+                )
+            })
+            .ok_or("generic stationary lifecycle host ledger overflow")?;
+        let pinned_bytes = usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES
+            + usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES
+            + PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES
+            + mtp1_stationary_pinned_host_reserve_bytes(qd4_enabled);
+        generic_prefill_peak = Some((device_bytes, host_bytes, pinned_bytes));
+        lifecycle.observe_peaks(device_bytes, host_bytes, pinned_bytes);
+        if lifecycle.telemetry.layer_commits != prompt_len * v4_state::V4_LAYER_COUNT {
+            return Err(
+                "generic stationary lifecycle commit ledger diverged from prefill rows".into(),
+            );
+        }
+        lifecycle.assert_drained()?;
+    }
+    let initial_teacher_state_before_mtp = if generic_device_state_audit {
+        let (audit, snapshot) = generic_device_state_audit_head(
+            stream,
+            generic_states
+                .as_ref()
+                .ok_or("generic device state audit stores disappeared after prefill")?,
+            persistent
+                .as_ref()
+                .ok_or("generic device state audit host mirror disappeared after prefill")?,
+            generic_lifecycle
+                .as_ref()
+                .ok_or("generic device state audit lifecycle disappeared after prefill")?,
+            generic_scratch
+                .as_ref()
+                .ok_or("generic device state audit scratch disappeared after prefill")?,
+            prompt_len - 1,
+        )
+        .map_err(|error| -> Box<dyn Error> {
+            format!("pre-MTP generic device state audit failed: {error}").into()
+        })?;
+        generic_device_state_audit_wall_ns = generic_device_state_audit_wall_ns
+            .saturating_add(audit["audit_wall_ns"].as_u64().unwrap_or(u64::MAX));
+        generic_device_state_audit_heads.push(audit);
+        Some(snapshot)
+    } else {
+        None
+    };
     if device_attention {
         let expected_dispatches = prompt_len * v4_state::V4_LAYER_COUNT;
         let expected_csa_boundary_copies = manifests
@@ -5835,7 +6687,7 @@ fn run_real_v4_layer_stationary_prefill(
             return Err("device attention measured transfer/dispatch accounting diverged from the strict five-token contract".into());
         }
     }
-    if qd4_enabled {
+    if qd4_enabled && !generic_device_stationary {
         let expected_loads = qd4_expected_routed_loads(manifests.len(), prompt_len)?;
         if let Some(cache) = qd4_immutable_cache.as_ref() {
             let telemetry = &cache.telemetry;
@@ -5899,6 +6751,58 @@ fn run_real_v4_layer_stationary_prefill(
                 .into(),
         );
     }
+    let mut stationary_mtp1_state = None;
+    let mut stationary_mtp1_disabled = None::<String>;
+    let mut stationary_mtp1_records = Vec::new();
+    if stationary_mtp1_draft {
+        generic_lifecycle
+            .as_ref()
+            .ok_or("stationary MTP lost generic lifecycle")?
+            .assert_drained()?;
+        stationary_mtp1_state = match MtpDraftState::new(stream) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                stationary_mtp1_disabled = Some(error.to_string());
+                None
+            }
+        };
+        for position in 0..prompt_len.saturating_sub(1) {
+            let alignment = mtp1_alignment(prompt_len, position)?;
+            let Some(state) = stationary_mtp1_state.as_mut() else {
+                break;
+            };
+            match advance_mtp1_draft_state(
+                module,
+                stream,
+                root,
+                &hidden[position],
+                token_ids[position],
+                alignment.kv_write_pos,
+                state,
+            ) {
+                Ok(draft) => stationary_mtp1_records.push(serde_json::json!({
+                    "event": "mtp1_draft", "status": "DRAFT_STATE_ADVANCED",
+                    "input_pos": alignment.input_pos, "teacher_hidden_pos": alignment.teacher_hidden_pos,
+                    "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                    "input_id": token_ids[position], "candidate": serde_json::Value::Null,
+                    "target_teacher_token": token_ids.get(alignment.teacher_target_pos),
+                    "scored": false, "prompt_forced": alignment.prompt_forced,
+                    "mtp_kv_position": draft.kv_position, "mtp_kv_digest": format!("{:016x}", draft.kv_digest),
+                    "mtp_kv_persistent_bytes": draft.persistent_bytes,
+                })),
+                Err(error) => {
+                    let reason = error.to_string();
+                    stationary_mtp1_records.push(serde_json::json!({
+                        "event": "mtp1_draft", "status": "DRAFT_FAIL",
+                        "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                        "scored": false, "reason": reason,
+                    }));
+                    stationary_mtp1_disabled = Some(error.to_string());
+                    stationary_mtp1_state = None;
+                }
+            }
+        }
+    }
     let final_scope_started_ns = phase_profile.then(|| timeline_elapsed_ns(request_started));
     let final_load_started = phase_profile.then(std::time::Instant::now);
     let final_weights = v4_state::load_final_head(root)?;
@@ -5913,6 +6817,85 @@ fn run_real_v4_layer_stationary_prefill(
         certified_argmax_production,
         certified_argmax_audit,
     )?;
+    let final_decision_elapsed_ns = timeline_elapsed_ns(request_started);
+    if let Some(state) = stationary_mtp1_state.as_mut() {
+        let position = prompt_len - 1;
+        let alignment = mtp1_alignment(prompt_len, position)?;
+        let Mtp1Qd4Attempt { result, loan } =
+            run_with_mtp1_qd4_loan(qd4_lanes.as_deref_mut(), true, |borrowed_qd4_lane| {
+                run_mtp1_draft_candidate(
+                    context,
+                    module,
+                    stream,
+                    root,
+                    &final_weights,
+                    borrowed_qd4_lane,
+                    None,
+                    &hidden[position],
+                    token_ids[position],
+                    alignment.kv_write_pos,
+                    state,
+                )
+            });
+        match result {
+            Ok(draft) => {
+                let mut record = serde_json::json!({
+                    "event": "mtp1_draft", "status": "DRAFT_ALIGNED",
+                    "input_pos": alignment.input_pos, "teacher_hidden_pos": alignment.teacher_hidden_pos,
+                    "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                    "input_id": token_ids[position], "candidate": draft.candidate,
+                    "target_teacher_token": final_decision.token, "scored": true,
+                    "prompt_forced": alignment.prompt_forced,
+                    "match": draft.candidate == i64::try_from(final_decision.token)?,
+                    "source_bytes": draft.source_bytes, "source_read_ns": draft.source_read_ns,
+                    "h2d_ns": draft.h2d_ns, "h2d_bytes": draft.h2d_bytes,
+                    "kernel_ns": draft.kernel_ns, "head_read_ns": draft.head_read_ns,
+                    "head_h2d_ns": draft.head_h2d_ns, "head_kernel_ns": draft.head_kernel_ns,
+                    "head_d2h_ns": draft.head_d2h_ns, "head_wall_ns": draft.head_wall_ns,
+                    "total_ns": draft.total_ns, "mtp_kv_position": draft.kv_position,
+                    "mtp_kv_digest": format!("{:016x}", draft.kv_digest),
+                    "mtp_kv_persistent_bytes": draft.persistent_bytes,
+                    "transient_expert_peak_bytes": draft.transient_expert_peak_bytes,
+                    "device_peak_bytes": draft.device_peak_bytes,
+                    "borrowed_qd4_lane": draft.borrowed_qd4_lane,
+                });
+                append_mtp1_qd4_telemetry(
+                    &mut record,
+                    Some(&draft.routes.ids),
+                    Some(draft.routed_source_bytes),
+                    Some(draft.routed_h2d_bytes),
+                    loan,
+                )?;
+                stationary_mtp1_records.push(record);
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                let mut record = serde_json::json!({
+                    "event": "mtp1_draft", "status": "DRAFT_FAIL",
+                    "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                    "scored": false, "reason": reason,
+                });
+                append_mtp1_qd4_telemetry(&mut record, None, None, None, loan)?;
+                stationary_mtp1_records.push(record);
+                stationary_mtp1_disabled = Some(error.to_string());
+                stationary_mtp1_state = None;
+            }
+        }
+    }
+    if stationary_mtp1_draft {
+        if let Some(expected) = initial_teacher_state_before_mtp.as_deref() {
+            let audit_wall_ns = check_generic_device_state_unchanged(
+                stream,
+                generic_states.as_ref().ok_or(
+                    "post-MTP teacher-state clobber: stores disappeared after initial draft",
+                )?,
+                expected,
+                prompt_len - 1,
+            )?;
+            generic_device_state_audit_wall_ns =
+                generic_device_state_audit_wall_ns.saturating_add(audit_wall_ns);
+        }
+    }
     let (final_head_wall_ns, final_head_read_ns) = final_head_profile_metrics(&final_decision);
     let mut final_phase_profile = None;
     if let Some(request_start_ns) = final_scope_started_ns {
@@ -5931,7 +6914,7 @@ fn run_real_v4_layer_stationary_prefill(
     }
     let argmax = final_decision.token;
     let generated_id = i64::try_from(argmax)?;
-    let stop_reason = if generated_id == V4_EOS_TOKEN_ID {
+    let mut stop_reason = if generated_id == V4_EOS_TOKEN_ID {
         "eos"
     } else {
         "max_new_tokens"
@@ -5942,7 +6925,670 @@ fn run_real_v4_layer_stationary_prefill(
     let mut short_decode_fixed_h2d_bytes = 0_usize;
     let mut short_decode_routed_source_bytes = 0_usize;
     let mut short_decode_routed_h2d_bytes = 0_usize;
-    let mut generated_ids = vec![generated_id];
+    let mut generated_ids = if generic_device_stationary {
+        Vec::new()
+    } else {
+        vec![generated_id]
+    };
+    if generic_device_stationary {
+        let mut pipeline_cache = stationary_raw_retention
+            .take()
+            .ok_or("generic stationary lost its request-local fixed retention")?;
+        let planned_raw_slots = pipeline_cache
+            .device_selected
+            .iter()
+            .chain(&pipeline_cache.host_selected)
+            .filter(|&&selected| selected)
+            .count();
+        let retained_raw_slots = pipeline_cache
+            .raw_device
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
+            .saturating_add(
+                pipeline_cache
+                    .raw_host
+                    .iter()
+                    .filter(|entry| entry.is_some())
+                    .count(),
+            );
+        if planned_raw_slots == 0
+            || retained_raw_slots != planned_raw_slots
+            || pipeline_cache.raw_scratch.is_none()
+            || pipeline_cache
+                .raw_device_generation
+                .iter()
+                .any(|&value| value != 0)
+            || pipeline_cache
+                .raw_host_generation
+                .iter()
+                .any(|&value| value != 0)
+            || pipeline_cache.raw_scratch_generation != 0
+        {
+            return Err("generic stationary pinned decode retention was not fully captured before worker start".into());
+        }
+        let transfer = context.new_stream()?;
+        let first_scratch = pipeline_cache
+            .raw_scratch
+            .take()
+            .ok_or("generic stationary pinned worker lost its retained decode scratch")?;
+        let second_scratch = DeviceBuffer::<u16>::zeroed(
+            stream,
+            RAW_FIXED_SCRATCH_BYTES / std::mem::size_of::<u16>(),
+        )?;
+        let slots = vec![
+            PinnedFixedSlot::new(context, first_scratch)?,
+            PinnedFixedSlot::new(context, second_scratch)?,
+        ];
+        let restored_pipeline_cache = std::thread::scope(
+            |scope| -> Result<FixedLayerCache, Box<dyn Error>> {
+                let (request_tx, request_rx) =
+                    std::sync::mpsc::sync_channel::<PinnedFixedRequest>(2);
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<PinnedFixedReply>(2);
+                let main = std::sync::Arc::clone(stream);
+                let transfer_worker = std::sync::Arc::clone(&transfer);
+                let mut worker = Some(scope.spawn(move || {
+                    run_pinned_fixed_request_worker(
+                        pipeline_cache,
+                        slots,
+                        root,
+                        module,
+                        &main,
+                        &transfer_worker,
+                        request_rx,
+                        reply_tx,
+                        bounded_readahead,
+                    )
+                }));
+                let mut request_tx = Some(request_tx);
+                let mut decision = greedy_argmax_decision(
+                    prompt_len,
+                    prompt_len - 1,
+                    0,
+                    greedy_steps,
+                    generated_id,
+                );
+                let mut input_id = generated_id;
+                let decode_result = (|| -> Result<(), Box<dyn Error>> {
+                    loop {
+                        match decision {
+                            GreedyDecision::IgnorePrompt => {
+                                return Err(
+                                    "generic stationary final head ignored its prompt boundary"
+                                        .into(),
+                                );
+                            }
+                            GreedyDecision::EmitAndStop(reason) => {
+                                generated_ids.push(input_id);
+                                stop_reason = match reason {
+                                    GreedyStopReason::Eos => "eos",
+                                    GreedyStopReason::MaxNewTokens => "max_new_tokens",
+                                };
+                                break;
+                            }
+                            GreedyDecision::EmitAndContinue => generated_ids.push(input_id),
+                        }
+                        let token_position = prompt_len
+                            .checked_add(generated_ids.len() - 1)
+                            .ok_or("generic stationary decode position overflow")?;
+                        let first = manifests
+                            .first()
+                            .ok_or("generic stationary decode has no layers")?;
+                        let second = manifests
+                            .get(1)
+                            .ok_or("generic stationary decode has one layer")?;
+                        request_tx
+                            .as_ref()
+                            .ok_or("generic stationary pinned sender disappeared")?
+                            .send((None, Some((first.layer, input_id, None))))?;
+                        request_tx
+                            .as_ref()
+                            .ok_or("generic stationary pinned sender disappeared")?
+                            .send((
+                                None,
+                                Some((
+                                    second.layer,
+                                    input_id,
+                                    manifests.get(2).map(|next| next.layer),
+                                )),
+                            ))?;
+                        let embedding = v4_state::load(root, &[input_id])?.embedding;
+                        let mut decode_hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+                        for _ in 0..v4_state::HC {
+                            decode_hidden.extend_from_slice(&embedding);
+                        }
+                        for (layer_position, manifest) in manifests.iter().enumerate() {
+                            let layer_scope_started_ns =
+                                phase_profile.then(|| timeline_elapsed_ns(request_started));
+                            let layer_prepare_started = phase_profile.then(std::time::Instant::now);
+                            let reply = reply_rx.recv().map_err(|_| {
+                            "generic stationary pinned worker response channel closed before layer preparation"
+                        })?;
+                            let mut prepared = reply
+                            .map_err(|message| -> Box<dyn Error> { message.into() })?
+                            .ok_or("generic stationary pinned worker returned an early drain acknowledgement")?;
+                            if prepared.lease.layer != manifest.layer {
+                                return Err(format!(
+                                "generic stationary pinned worker returned layer {}, expected {}",
+                                prepared.lease.layer, manifest.layer
+                            )
+                                .into());
+                            }
+                            prepared.wait_ready(stream)?;
+                            let fixed = std::mem::take(&mut prepared.telemetry);
+                            fixed_source_bytes =
+                                fixed_source_bytes.saturating_add(fixed.fixed_source_bytes);
+                            fixed_h2d_bytes = fixed_h2d_bytes.saturating_add(fixed.fixed_h2d_bytes);
+                            let hash_ids = load_layer_hash_ids(root, manifest.layer, &[input_id])?;
+                            let runtime = prepared.runtime();
+                            let layer_prepare_ns = layer_prepare_started
+                                .map(|started| {
+                                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                                })
+                                .unwrap_or(0);
+                            run_generic_device_state_audit_mirror(
+                                generic_device_state_audit,
+                                persistent.as_mut(),
+                                manifest.layer,
+                                &decode_hidden,
+                                |host_state, mirror_hidden| {
+                                    run_real_layer_attention_rows(
+                                        module,
+                                        stream,
+                                        runtime,
+                                        mirror_hidden,
+                                        token_position,
+                                        host_state,
+                                        None,
+                                        strict_scratch.as_mut(),
+                                    )?;
+                                    Ok(())
+                                },
+                            )?;
+                            let audit_expected_compressed_prefix = if generic_device_state_audit
+                                && (token_position + 1)
+                                    .is_multiple_of(manifest.compression_ratio.get())
+                            {
+                                Some(
+                                    persistent
+                                        .as_ref()
+                                        .and_then(|host| host.layer(manifest.layer))
+                                        .ok_or("generic boundary audit host mirror lost its layer")?
+                                        .compressed_kv_bf16(),
+                                )
+                            } else {
+                                None
+                            };
+                            let states = generic_states
+                                .as_mut()
+                                .ok_or("generic stationary stores disappeared during decode")?;
+                            let state = states
+                                .get_mut(manifest.layer)
+                                .and_then(Option::as_mut)
+                                .ok_or("generic stationary decode layer store disappeared")?;
+                            let scratch = generic_scratch
+                                .as_mut()
+                                .ok_or("generic stationary scratch disappeared during decode")?;
+                            let lifecycle = generic_lifecycle
+                                .as_mut()
+                                .ok_or("generic stationary lifecycle disappeared during decode")?;
+                            lifecycle.begin_layer(manifest.layer, token_position)?;
+                            lifecycle.acquire_lease();
+                            let before = state.committed_rows;
+                            let run = {
+                                let runtime = prepared.runtime();
+                                run_real_layer_rows(
+                                    context,
+                                    module,
+                                    stream,
+                                    runtime,
+                                    qd4_lanes.as_deref_mut(),
+                                    None,
+                                    None,
+                                    if runtime.weights.hash_router {
+                                        &hash_ids
+                                    } else {
+                                        &[]
+                                    },
+                                    &decode_hidden,
+                                    &[input_id],
+                                    token_position,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                    None,
+                                    false,
+                                    Some((state, scratch, audit_expected_compressed_prefix)),
+                                    None,
+                                )
+                            };
+                            let mut run = match run {
+                                Ok(run) => run,
+                                Err(error) => {
+                                    lifecycle.release_lease()?;
+                                    lifecycle.poison();
+                                    return Err(error);
+                                }
+                            };
+                            if phase_profile {
+                                run.stage.layer_prepare_ns = layer_prepare_ns;
+                                run.stage.layer_prepare_count = 1;
+                            }
+                            if let Err(error) =
+                                lifecycle.commit_layer(manifest.layer, token_position)
+                            {
+                                lifecycle.release_lease()?;
+                                lifecycle.poison();
+                                return Err(error);
+                            }
+                            if state.committed_rows != before + 1 {
+                                lifecycle.release_lease()?;
+                                lifecycle.poison();
+                                return Err(
+                                    "generic stationary decode committed a noncontiguous KV row"
+                                        .into(),
+                                );
+                            }
+                            if let Err(error) = prepared.record_runtime_done(stream) {
+                                lifecycle.release_lease()?;
+                                lifecycle.poison();
+                                return Err(error);
+                            }
+                            let next = manifests.get(layer_position + 2).map(|next| {
+                                (
+                                    next.layer,
+                                    input_id,
+                                    manifests.get(layer_position + 3).map(|next| next.layer),
+                                )
+                            });
+                            let tx = match request_tx.as_ref() {
+                                Some(tx) => tx,
+                                None => {
+                                    lifecycle.release_lease()?;
+                                    lifecycle.poison();
+                                    return Err(
+                                        "generic stationary pinned sender disappeared".into()
+                                    );
+                                }
+                            };
+                            if let Err(error) = tx.send((Some(prepared), next)) {
+                                lifecycle.release_lease()?;
+                                lifecycle.poison();
+                                return Err(error.into());
+                            }
+                            lifecycle.release_lease()?;
+                            routed_source_bytes =
+                                routed_source_bytes.saturating_add(run.stage.routed_source_bytes);
+                            routed_h2d_bytes =
+                                routed_h2d_bytes.saturating_add(run.stage.routed_h2d_bytes);
+                            routed_expert_loads =
+                                routed_expert_loads.saturating_add(run.stage.routed_expert_loads);
+                            let mut record = serde_json::json!({
+                                "event": "layer", "token_position": token_position, "token_id": input_id,
+                                "layer": manifest.layer, "generic_stationary": true,
+                                "kv_rows_before": before, "kv_rows_after": state.committed_rows,
+                                "fixed_source_bytes": fixed.fixed_source_bytes,
+                                "fixed_h2d_bytes": fixed.fixed_h2d_bytes,
+                                "fixed_cache_status": fixed.cache_status,
+                                "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&run.output)),
+                            });
+                            if let Some(request_start_ns) = layer_scope_started_ns {
+                                let request_end_ns = timeline_elapsed_ns(request_started);
+                                let (profile, attributed_ns, outer_ns) =
+                                    stationary_layer_phase_profile_json(
+                                        request_start_ns,
+                                        request_end_ns,
+                                        Some(&fixed),
+                                        &run.stage,
+                                        run.indexer_topk_gpu_ns,
+                                        qd4_enabled,
+                                    )?;
+                                record
+                                    .as_object_mut()
+                                    .ok_or("generic decode layer record is not an object")?
+                                    .insert("phase_profile".into(), profile);
+                                phase_profile_top_level_ns =
+                                    phase_profile_top_level_ns.saturating_add(attributed_ns);
+                                one_token_decode_phase_profile_layer_outer_ns =
+                                    one_token_decode_phase_profile_layer_outer_ns
+                                        .saturating_add(outer_ns);
+                            }
+                            short_decode_records.push(record);
+                            decode_hidden = run.output;
+                        }
+                        let drained = reply_rx.recv().map_err(|_| {
+                        "generic stationary pinned worker response channel closed before token drain"
+                    })?;
+                        let worker_drained = drained
+                            .map_err(|message| -> Box<dyn Error> { message.into() })?
+                            .is_none();
+                        if !worker_drained {
+                            return Err(
+                            "generic stationary pinned worker returned a layer instead of drain"
+                                .into(),
+                        );
+                        }
+                        generic_lifecycle
+                            .as_ref()
+                            .ok_or("generic stationary lifecycle disappeared at token drain")?
+                            .assert_drained()?;
+                        let teacher_state_before_mtp = if generic_device_state_audit {
+                            let (audit, snapshot) = generic_device_state_audit_head(
+                                stream,
+                                generic_states.as_ref().ok_or(
+                                    "generic device state audit stores disappeared during decode",
+                                )?,
+                                persistent.as_ref().ok_or(
+                                    "generic device state audit host mirror disappeared during decode",
+                                )?,
+                            generic_lifecycle.as_ref().ok_or(
+                                "generic device state audit lifecycle disappeared during decode",
+                            )?,
+                            generic_scratch.as_ref().ok_or(
+                                "generic device state audit scratch disappeared during decode",
+                            )?,
+                            token_position,
+                            )
+                            .map_err(|error| -> Box<dyn Error> {
+                                format!("pre-MTP generic device state audit failed: {error}").into()
+                            })?;
+                            generic_device_state_audit_wall_ns = generic_device_state_audit_wall_ns
+                                .saturating_add(
+                                    audit["audit_wall_ns"].as_u64().unwrap_or(u64::MAX),
+                                );
+                            generic_device_state_audit_heads.push(audit);
+                            Some(snapshot)
+                        } else {
+                            None
+                        };
+                        let next_final_scope_started_ns =
+                            phase_profile.then(|| timeline_elapsed_ns(request_started));
+                        let next = run_id_only_final_head(
+                            context,
+                            module,
+                            stream,
+                            &final_weights,
+                            &decode_hidden,
+                            certified_argmax_production,
+                            certified_argmax_audit,
+                        )?;
+                        let next_decision_elapsed_ns = timeline_elapsed_ns(request_started);
+                        let (next_final_wall_ns, next_final_read_ns) =
+                            final_head_profile_metrics(&next);
+                        let mut next_profile = None;
+                        if let Some(request_start_ns) = next_final_scope_started_ns {
+                            let (profile, attributed_ns) = stationary_final_phase_profile_json(
+                                request_start_ns,
+                                next_decision_elapsed_ns,
+                                0,
+                                next_final_wall_ns,
+                                next_final_read_ns,
+                                qd4_enabled,
+                            )?;
+                            next_profile = Some(profile);
+                            phase_profile_top_level_ns =
+                                phase_profile_top_level_ns.saturating_add(attributed_ns);
+                            one_token_decode_phase_profile_final_outer_ns =
+                                one_token_decode_phase_profile_final_outer_ns
+                                    .saturating_add(next_decision_elapsed_ns - request_start_ns);
+                        }
+                        if let Some(state) = stationary_mtp1_state.as_mut() {
+                            generic_lifecycle
+                                .as_ref()
+                                .ok_or("stationary MTP lost lifecycle after worker drain")?
+                                .assert_drained()?;
+                            let alignment = mtp1_alignment(prompt_len, token_position)?;
+                            let Mtp1Qd4Attempt { result, loan } = run_with_mtp1_qd4_loan(
+                                qd4_lanes.as_deref_mut(),
+                                worker_drained,
+                                |borrowed_qd4_lane| {
+                                    run_mtp1_draft_candidate(
+                                        context,
+                                        module,
+                                        stream,
+                                        root,
+                                        &final_weights,
+                                        borrowed_qd4_lane,
+                                        None,
+                                        &decode_hidden,
+                                        input_id,
+                                        alignment.kv_write_pos,
+                                        state,
+                                    )
+                                },
+                            );
+                            match result {
+                                Ok(draft) => {
+                                    let mut record = serde_json::json!({
+                                        "event": "mtp1_draft", "status": "DRAFT_ALIGNED",
+                                        "input_pos": alignment.input_pos, "teacher_hidden_pos": alignment.teacher_hidden_pos,
+                                        "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                                        "input_id": input_id, "candidate": draft.candidate,
+                                        "target_teacher_token": next.token, "scored": true,
+                                        "prompt_forced": alignment.prompt_forced,
+                                        "match": draft.candidate == i64::try_from(next.token)?,
+                                        "source_bytes": draft.source_bytes, "source_read_ns": draft.source_read_ns,
+                                        "h2d_ns": draft.h2d_ns, "h2d_bytes": draft.h2d_bytes,
+                                        "kernel_ns": draft.kernel_ns, "head_read_ns": draft.head_read_ns,
+                                        "head_h2d_ns": draft.head_h2d_ns, "head_kernel_ns": draft.head_kernel_ns,
+                                        "head_d2h_ns": draft.head_d2h_ns, "head_wall_ns": draft.head_wall_ns,
+                                        "total_ns": draft.total_ns, "mtp_kv_position": draft.kv_position,
+                                        "mtp_kv_digest": format!("{:016x}", draft.kv_digest),
+                                        "mtp_kv_persistent_bytes": draft.persistent_bytes,
+                                        "transient_expert_peak_bytes": draft.transient_expert_peak_bytes,
+                                        "device_peak_bytes": draft.device_peak_bytes,
+                                        "borrowed_qd4_lane": draft.borrowed_qd4_lane,
+                                    });
+                                    append_mtp1_qd4_telemetry(
+                                        &mut record,
+                                        Some(&draft.routes.ids),
+                                        Some(draft.routed_source_bytes),
+                                        Some(draft.routed_h2d_bytes),
+                                        loan,
+                                    )?;
+                                    stationary_mtp1_records.push(record);
+                                }
+                                Err(error) => {
+                                    let reason = error.to_string();
+                                    let mut record = serde_json::json!({
+                                        "event": "mtp1_draft", "status": "DRAFT_FAIL",
+                                        "candidate_pos": alignment.candidate_pos, "target_pos": alignment.teacher_target_pos,
+                                        "scored": false, "reason": reason,
+                                    });
+                                    append_mtp1_qd4_telemetry(&mut record, None, None, None, loan)?;
+                                    stationary_mtp1_records.push(record);
+                                    stationary_mtp1_disabled = Some(error.to_string());
+                                    stationary_mtp1_state = None;
+                                }
+                            }
+                        }
+                        if stationary_mtp1_draft {
+                            if let Some(expected) = teacher_state_before_mtp.as_deref() {
+                                generic_device_state_audit_wall_ns =
+                                    generic_device_state_audit_wall_ns.saturating_add(
+                                        check_generic_device_state_unchanged(
+                                            stream,
+                                            generic_states.as_ref().ok_or(
+                                                "post-MTP teacher-state clobber: stores disappeared during decode",
+                                            )?,
+                                            expected,
+                                            token_position,
+                                        )?,
+                                    );
+                            }
+                        }
+                        input_id = i64::try_from(next.token)?;
+                        decision = greedy_argmax_decision(
+                            prompt_len,
+                            token_position,
+                            generated_ids.len(),
+                            greedy_steps,
+                            input_id,
+                        );
+                        short_decode_finals.push((
+                            token_position,
+                            generated_ids
+                                .last()
+                                .copied()
+                                .ok_or("generic stationary lost emitted token")?,
+                            next,
+                            decode_hidden,
+                            next_profile,
+                            next_decision_elapsed_ns,
+                        ));
+                    }
+                    Ok(())
+                })();
+                drop(request_tx.take());
+                let cache = worker
+                    .take()
+                    .ok_or("generic stationary pinned worker handle disappeared")?
+                    .join()
+                    .map_err(|_| "generic stationary pinned worker panicked during request shutdown")?
+                    .map_err(|message| -> Box<dyn Error> {
+                        format!("generic stationary pinned worker failed during request shutdown: {message}").into()
+                    })?;
+                decode_result?;
+                Ok(cache)
+            },
+        )?;
+        if decode_overlay_uses_decode_target(
+            short_decode_records.len(),
+            manifests.len(),
+            restored_pipeline_cache.decode_device_promotions.len(),
+            restored_pipeline_cache.decode_host_promotions.len(),
+        )? {
+            restored_pipeline_cache.validate_decode_overlay_complete()?;
+        } else {
+            restored_pipeline_cache.validate_prefill_residency_complete()?;
+        }
+        let persistent_device_bytes = generic_states
+            .as_ref()
+            .ok_or("generic stationary stores disappeared at overlay ledger")?
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map_or(0, DeviceLayerPersistentState::num_bytes)
+            })
+            .try_fold(0_usize, |total, bytes| total.checked_add(bytes))
+            .ok_or("generic stationary overlay persistent byte overflow")?;
+        let base_device_bytes = persistent_device_bytes
+            .checked_add(
+                generic_scratch
+                    .as_ref()
+                    .map_or(0, DeviceRequestScratch::num_bytes),
+            )
+            .and_then(|bytes| bytes.checked_add(usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES))
+            .and_then(|bytes| bytes.checked_add(restored_pipeline_cache.device_resident_bytes))
+            .and_then(|bytes| bytes.checked_add(PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES))
+            .ok_or("generic stationary overlay base device ledger overflow")?;
+        let overlay_device_bytes = base_device_bytes
+            .checked_add(stationary_mtp1_peak_reserve_bytes)
+            .ok_or("generic stationary overlay MTP device ledger overflow")?
+            .max(
+                base_device_bytes
+                    .checked_add(PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES)
+                    .ok_or("generic stationary overlay prepared device ledger overflow")?,
+            );
+        let audit_mirror_host_bytes = if generic_device_state_audit {
+            generic_stationary_audit_mirror_host_bytes(
+                manifests,
+                generic_plan.ok_or("generic stationary overlay audit has no request plan")?,
+            )?
+        } else {
+            0
+        };
+        let overlay_host_bytes = restored_pipeline_cache
+            .host_resident_bytes
+            .checked_add(audit_mirror_host_bytes)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    usize::from(stationary_mtp1_draft) * CERTIFIED_ARGMAX_HOST_TEMP_BYTES,
+                )
+            })
+            .ok_or("generic stationary overlay host ledger overflow")?;
+        let overlay_pinned_bytes = usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES
+            + PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES
+            + mtp1_stationary_pinned_host_reserve_bytes(qd4_enabled);
+        generic_decode_overlay_peak = Some((
+            overlay_device_bytes,
+            overlay_host_bytes,
+            overlay_pinned_bytes,
+        ));
+        generic_lifecycle
+            .as_mut()
+            .ok_or("generic stationary lifecycle disappeared at overlay ledger")?
+            .observe_peaks(
+                overlay_device_bytes,
+                overlay_host_bytes,
+                overlay_pinned_bytes,
+            );
+        stationary_raw_retention = Some(restored_pipeline_cache);
+        generic_lifecycle
+            .as_ref()
+            .ok_or("generic stationary lifecycle disappeared at final head")?
+            .assert_drained()?;
+        if qd4_enabled {
+            let prefill_route_executions = qd4_expected_routed_loads(manifests.len(), prompt_len)?;
+            let decode_source_loads = short_decode_records
+                .len()
+                .checked_mul(v4_router::V4_TOPK)
+                .ok_or("generic stationary QD4 decode load count overflow")?;
+            let expected_source_loads =
+                if let Some(telemetry) = qd4_immutable_cache_telemetry.as_ref() {
+                    let expected_d2d_bytes = prefill_route_executions
+                        .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                        .ok_or("generic stationary QD4 immutable cache D2D byte count overflow")?;
+                    if telemetry.route_executions != prefill_route_executions
+                    || telemetry.source_loads != telemetry.expert_union_loads
+                    || telemetry.source_bytes
+                        != telemetry
+                            .source_loads
+                            .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                            .ok_or(
+                                "generic stationary QD4 immutable cache source byte count overflow",
+                            )?
+                    || telemetry.h2d_loads != telemetry.source_loads
+                    || telemetry.h2d_bytes != telemetry.source_bytes
+                    || telemetry.hits
+                        != prefill_route_executions.saturating_sub(telemetry.source_loads)
+                    || telemetry.d2d_copies != prefill_route_executions
+                    || telemetry.d2d_bytes != expected_d2d_bytes
+                    || telemetry.max_occupancy > V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+                    || telemetry.completed_layers != manifests.len()
+                    || telemetry.worker_errors != 0
+                    || telemetry.fallbacks != 0
+                {
+                    return Err(
+                        "generic stationary QD4 immutable cache prefill telemetry did not close"
+                            .into(),
+                    );
+                }
+                    telemetry
+                        .source_loads
+                        .checked_add(decode_source_loads)
+                        .ok_or("generic stationary QD4 source load count overflow")?
+                } else {
+                    prefill_route_executions
+                        .checked_add(decode_source_loads)
+                        .ok_or("generic stationary QD4 source load count overflow")?
+                };
+            let expected_bytes = expected_source_loads
+                .checked_mul(v4_expert::V4_ROUTED_EXPERT_BYTES)
+                .ok_or("generic stationary QD4 routed byte count overflow")?;
+            if routed_expert_loads != expected_source_loads
+                || routed_source_bytes != expected_bytes
+                || routed_h2d_bytes != expected_bytes
+            {
+                return Err(
+                    "generic stationary QD4 routed load/byte accounting diverged from its six-route contract"
+                        .into(),
+                );
+            }
+        }
+    }
     if device_short_decode {
         let states = device_states
             .as_mut()
@@ -6142,6 +7788,7 @@ fn run_real_v4_layer_stationary_prefill(
                                         false,
                                         None,
                                         true,
+                                        None,
                                         strict_scratch.as_mut(),
                                     )?;
                                     oracle = Some((run, host_persistent_state_audit(host_state)));
@@ -6182,6 +7829,7 @@ fn run_real_v4_layer_stationary_prefill(
                             device_attention_audit,
                             None,
                             device_attention_audit,
+                            None,
                             None,
                         )?;
                         if phase_profile {
@@ -6355,6 +8003,7 @@ fn run_real_v4_layer_stationary_prefill(
                         certified_argmax_production,
                         certified_argmax_audit,
                     )?;
+                    let decode_decision_elapsed_ns = timeline_elapsed_ns(request_started);
                     let (decode_final_wall_ns, decode_final_read_ns) =
                         final_head_profile_metrics(&decode_decision);
                     let mut decode_profile = None;
@@ -6383,6 +8032,7 @@ fn run_real_v4_layer_stationary_prefill(
                         decode_decision,
                         decode_hidden,
                         decode_profile,
+                        decode_decision_elapsed_ns,
                     ));
                     decode_input_id = next_id;
                 }
@@ -6409,10 +8059,32 @@ fn run_real_v4_layer_stationary_prefill(
             stationary_raw_retention = Some(cache);
         }
     }
-    let request_e2e_ns = timeline_elapsed_ns(request_started);
+    if generic_device_state_audit {
+        let expected_positions = generic_plan
+            .ok_or("generic device state audit request plan disappeared")?
+            .actual_decision_positions(generated_ids.len())?
+            .collect::<Vec<_>>();
+        let actual_positions = generic_device_state_audit_heads
+            .iter()
+            .map(|head| -> Result<usize, Box<dyn Error>> {
+                Ok(usize::try_from(head["position"].as_u64().ok_or(
+                    "generic device state audit head lost its position",
+                )?)?)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if actual_positions != expected_positions {
+            return Err(
+                "generic device state audit did not close its actual decision-position prefix"
+                    .into(),
+            );
+        }
+    }
+    let request_e2e_ns = timeline_elapsed_ns(request_started)
+        .checked_sub(generic_device_state_audit_wall_ns)
+        .ok_or("generic device state audit wall time exceeds request wall time")?;
     let (phase_profiled_outer_ns, phase_profile_request_gap_ns, one_token_decode_outer) =
         if phase_profile {
-            if device_short_decode {
+            if device_short_decode || generic_device_stationary {
                 let (prefill_outer_ns, decode_outer_ns, profiled_outer_ns, request_gap_ns) =
                     stationary_one_token_phase_profile_outer_accounting(
                         phase_profile_layer_outer_ns,
@@ -6447,7 +8119,7 @@ fn run_real_v4_layer_stationary_prefill(
     certificate_rows.extend(
         short_decode_finals
             .iter()
-            .map(|(position, _, decision, _, _)| (*position, decision)),
+            .map(|(position, _, decision, _, _, _)| (*position, decision)),
     );
     if certified_argmax_audit
         && certificate_rows
@@ -6494,9 +8166,30 @@ fn run_real_v4_layer_stationary_prefill(
         SparseAttentionArm::ScoreReuse => "score_reuse:sparse_attn_v4_scores+probabilities+values",
         SparseAttentionArm::Sm89Crossover => "sm89_crossover:K<4=reference,K>=4=score_reuse",
     };
+    let explicit_decode_promotion_plan = std::env::var_os(DECODE_PROMOTION_PLAN_ENV).is_some();
+    let normalized_promotion_targets = stationary_raw_retention
+        .as_ref()
+        .map(|cache| {
+            let (prefill_device, prefill_host) = stationary_raw_prefill_selection(
+                &cache.plan,
+                cache.device_budget_bytes,
+                cache.host_budget_bytes,
+            );
+            normalized_decode_promotion_targets(
+                &cache.plan,
+                &prefill_device,
+                &prefill_host,
+                &cache.decode_device_selected,
+                &cache.decode_host_selected,
+                explicit_decode_promotion_plan,
+            )
+        })
+        .transpose()?;
     let relevant_config_fingerprint = normalized_config_fingerprint(serde_json::json!({
         "device_attention": {
             "production": device_attention,
+            "generic_stationary": generic_device_stationary,
+            "generic_state_audit": generic_device_state_audit,
             "audit_independent_official_host_oracle": device_attention_audit,
             "fallback_policy": "fail_closed",
             "request_rope_lut_rows": short_decode_rows,
@@ -6514,7 +8207,10 @@ fn run_real_v4_layer_stationary_prefill(
             "layout": STATIONARY_RAW_LAYOUT,
             "device_budget_bytes": parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?,
             "host_budget_bytes": parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB")?,
+            "decode_retention_overlay": decode_retention_overlay,
+            "normalized_promotion_targets": normalized_promotion_targets,
         },
+        "stationary_mtp1_draft": stationary_mtp1_draft,
         "l0_pos0_cutpoint": l0_cutpoint,
         "layer_count": manifests.len(),
         "model_revision": v4_state::REVISION,
@@ -6543,6 +8239,10 @@ fn run_real_v4_layer_stationary_prefill(
     let hidden_h2d_bytes = device_attention_h2d_bytes
         .checked_sub(request_rope_lut_h2d_bytes)
         .ok_or("device attention hidden H2D bytes underflow")?;
+    let immutable_cache_telemetry = qd4_immutable_cache
+        .as_ref()
+        .map(|cache| &cache.telemetry)
+        .or(qd4_immutable_cache_telemetry.as_ref());
     let mut run_header = serde_json::json!({
         "event": "run",
         "schema": "colibri-v4-layer-stationary-prefill-v1",
@@ -6550,6 +8250,12 @@ fn run_real_v4_layer_stationary_prefill(
         "execution_layout": "causal_layer_stationary",
         "device_attention_production": device_attention,
         "device_attention_audit": device_attention_audit,
+        "generic_device_state_audit": {
+            "enabled": generic_device_state_audit,
+            "head_positions": generic_device_state_audit_heads.iter().filter_map(|head| head["position"].as_u64()).collect::<Vec<_>>(),
+            "heads": generic_device_state_audit_heads,
+            "wall_ns_excluded_from_request_e2e": generic_device_state_audit_wall_ns,
+        },
         "fixed_prefetch_wo_a_decode_arm": fixed_prefetch_wo_a_arm,
         "relevant_config_fingerprint": relevant_config_fingerprint,
         "device_attention_capacity": device_attention_capacity.as_ref().map(|plan| serde_json::json!({
@@ -6577,14 +8283,14 @@ fn run_real_v4_layer_stationary_prefill(
         "emitted_token_ids": token_ids.iter().copied().chain(generated_ids.iter().copied()).collect::<Vec<_>>(),
         "greedy_steps": greedy_steps,
         "generated_ids": generated_ids,
-        "generation_mode": if device_short_decode { "id_only_greedy_argmax_short_device_decode" } else { "id_only_greedy_argmax" },
+        "generation_mode": if generic_device_stationary { "id_only_greedy_argmax_generic_device_stationary" } else if device_short_decode { "id_only_greedy_argmax_short_device_decode" } else { "id_only_greedy_argmax" },
         "start_pos": 0,
         "layers": v4_state::V4_LAYER_COUNT,
         "executed_layers": v4_state::V4_LAYER_COUNT,
         "model_dir": root,
         "request_e2e_ns": request_e2e_ns,
-        "request_e2e_definition": if certified_argmax_production { "prompt input through layer-stationary causal execution and certified GPU final-head argmax; CPU full final is audit/fallback only" } else if device_short_decode { "prompt input through layer-stationary causal prefill, then full61 short device decode rows and canonical CPU-streamed final logits/argmax after every row" } else { "prompt input through layer-stationary causal prefill and canonical CPU-streamed final logits/argmax" },
-        "final_head": {"mode": if certified_argmax_production { "bf16_streamed_gpu_certificate" } else { "canonical_cpu_streamed_bf16" }, "production_enabled": certified_argmax_production, "audit_cpu": certified_argmax_audit, "invocation": if device_short_decode { "after_last_prompt_position_and_each_short_device_decode_row" } else { "after_last_prompt_position" }, "weight_shard": "model-00063-of-00064.safetensors"},
+        "request_e2e_definition": if certified_argmax_production { "prompt input through layer-stationary causal execution and certified GPU final-head argmax; CPU full final is audit/fallback only" } else if generic_device_stationary { "prompt input through generic 61-store layer-stationary prefill and token-major EOS-aware greedy continuation; final head is reused per emitted row" } else if device_short_decode { "prompt input through layer-stationary causal prefill, then full61 short device decode rows and canonical CPU-streamed final logits/argmax after every row" } else { "prompt input through layer-stationary causal prefill and canonical CPU-streamed final logits/argmax" },
+        "final_head": {"mode": if certified_argmax_production { "bf16_streamed_gpu_certificate" } else { "canonical_cpu_streamed_bf16" }, "production_enabled": certified_argmax_production, "audit_cpu": certified_argmax_audit, "invocation": if generic_device_stationary { "after_last_prompt_position_and_each_generic_stationary_decode_row" } else if device_short_decode { "after_last_prompt_position_and_each_short_device_decode_row" } else { "after_last_prompt_position" }, "weight_shard": "model-00063-of-00064.safetensors"},
         "physical": {
             "fixed_runtime_loads": manifests.len(),
             "fixed_runtime_loads_per_layer": 1,
@@ -6611,6 +8317,8 @@ fn run_real_v4_layer_stationary_prefill(
                 "layout": cache.stationary_layout,
                 "device_budget_bytes": cache.device_budget_bytes,
                 "host_budget_bytes": cache.host_budget_bytes,
+                "decode_device_budget_bytes": cache.decode_device_budget_bytes,
+                "decode_host_budget_bytes": cache.decode_host_budget_bytes,
                 "device_resident_bytes": cache.device_resident_bytes,
                 "host_resident_bytes": cache.host_resident_bytes,
                 "device_entries": cache.raw_device.iter().filter(|entry| entry.is_some()).count(),
@@ -6624,27 +8332,79 @@ fn run_real_v4_layer_stationary_prefill(
                 "source_bytes_saved": cache.stationary_source_bytes_saved,
                 "h2d_bytes_saved": cache.stationary_h2d_bytes_saved,
                 "device_hit_temporary_allocation_count": 0,
-                "selection": "static_budgeted_saved_work_per_byte",
+                "decode_overlay": {
+                    "device_promotions": cache.decode_device_promotions,
+                    "host_promotions": cache.decode_host_promotions,
+                    "ownership": "move_after_runtime_done_and_transfer_wait",
+                    "activation": "after_first_decode_row_before_second_decode_row",
+                },
+                "selection": if explicit_decode_promotion_plan { "explicit_monotone_promotion_plan" } else { "static_budgeted_saved_work_per_byte" },
                 "eviction": "none_request_local",
             })),
-            "routed_qd4_immutable_expert_cache": qd4_immutable_cache.as_ref().map(|cache| serde_json::json!({
-                "route_executions": cache.telemetry.route_executions,
-                "expert_union_loads": cache.telemetry.expert_union_loads,
-                "source_loads": cache.telemetry.source_loads,
-                "source_bytes": cache.telemetry.source_bytes,
-                "h2d_loads": cache.telemetry.h2d_loads,
-                "h2d_bytes": cache.telemetry.h2d_bytes,
-                "hits": cache.telemetry.hits,
-                "d2d_copies": cache.telemetry.d2d_copies,
-                "d2d_bytes": cache.telemetry.d2d_bytes,
-                "max_occupancy": cache.telemetry.max_occupancy,
-                "completed_layers": cache.telemetry.completed_layers,
-                "worker_errors": cache.telemetry.worker_errors,
-                "fallbacks": cache.telemetry.fallbacks,
+            "stationary_peak_reservation": generic_device_stationary.then(|| serde_json::json!({
+                "generic_persistent_device_bytes": generic_stationary_reserve_plan.map(|plan| generic_stationary_persistent_reserve_bytes(manifests, plan)).transpose().expect("preflight already checked generic persistent reserve"),
+                "generic_shared_scratch_device_bytes": generic_stationary_reserve_plan.map(generic_stationary_scratch_reserve_bytes).transpose().expect("preflight already checked generic scratch reserve"),
+                "qd4_device_bytes": usize::from(qd4_enabled) * V4_QD4_DEVICE_BYTES,
+                "qd4_pinned_host_bytes": usize::from(qd4_enabled) * V4_QD4_PINNED_HOST_BYTES,
+                "qd4_immutable_expert_cache_device_bytes": usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+                "qd4_immutable_expert_cache_pinned_host_bytes": usize::from(qd4_immutable_expert_cache) * V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+                "raw_cache_device_bytes": stationary_raw_retention.as_ref().map_or(0, |cache| cache.device_resident_bytes),
+                "raw_cache_host_bytes": stationary_raw_retention.as_ref().map_or(0, |cache| cache.host_resident_bytes),
+                "worker_scratch_device_bytes": PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES,
+                "worker_prepared_runtime_device_bytes": PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES,
+                "worker_pinned_host_bytes": PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES,
+                "mtp_device_peak_bytes": stationary_mtp1_peak_reserve_bytes,
+                "mtp_candidate_local_device_bytes": usize::from(stationary_mtp1_draft) * MTP1_DRAFT_CANDIDATE_LOCAL_BYTES,
+                "mtp_head_host_staging_bytes": usize::from(stationary_mtp1_draft) * CERTIFIED_ARGMAX_HOST_TEMP_BYTES,
+                "mtp_extra_pinned_host_bytes": mtp1_stationary_pinned_host_reserve_bytes(qd4_enabled),
+                "mtp_borrows_qd4_lane": qd4_enabled,
+                "head_streams_per_mtp_candidate": 2,
+                "prefill_immutable_peak": generic_prefill_peak.map(|(device, host, pinned)| serde_json::json!({
+                    "device_bytes": device,
+                    "host_bytes": host,
+                    "pinned_host_bytes": pinned,
+                })),
+                "decode_overlay_peak": generic_decode_overlay_peak.map(|(device, host, pinned)| serde_json::json!({
+                    "device_bytes": device,
+                    "host_bytes": host,
+                    "pinned_host_bytes": pinned,
+                })),
+            })),
+            "routed_qd4_immutable_expert_cache": immutable_cache_telemetry.map(|telemetry| serde_json::json!({
+                "route_executions": telemetry.route_executions,
+                "expert_union_loads": telemetry.expert_union_loads,
+                "source_loads": telemetry.source_loads,
+                "source_bytes": telemetry.source_bytes,
+                "h2d_loads": telemetry.h2d_loads,
+                "h2d_bytes": telemetry.h2d_bytes,
+                "hits": telemetry.hits,
+                "d2d_copies": telemetry.d2d_copies,
+                "d2d_bytes": telemetry.d2d_bytes,
+                "max_occupancy": telemetry.max_occupancy,
+                "completed_layers": telemetry.completed_layers,
+                "worker_errors": telemetry.worker_errors,
+                "fallbacks": telemetry.fallbacks,
                 "slots": V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS,
                 "eviction": "none",
             })),
             "device_attention_dispatches": device_attention_dispatches,
+            "generic_stationary": generic_lifecycle.as_ref().map(|lifecycle| serde_json::json!({
+                "persistent_layer_stores": generic_states.as_ref().map_or(0, |states| states.iter().filter(|state| state.is_some()).count()),
+                "layer_commits": lifecycle.telemetry.layer_commits,
+                "device_peak_bytes": lifecycle.telemetry.device_peak_bytes,
+                "host_peak_bytes": lifecycle.telemetry.host_peak_bytes,
+                "pinned_peak_bytes": lifecycle.telemetry.pinned_peak_bytes,
+                "live_lease_peak": lifecycle.telemetry.live_lease_peak,
+                "live_leases_at_head": lifecycle.live_leases,
+                "mtp": {
+                    "enabled": stationary_mtp1_draft,
+                    "peak_reserve_bytes": stationary_mtp1_peak_reserve_bytes,
+                    "state": if stationary_mtp1_state.is_some() { "active" } else if stationary_mtp1_disabled.is_some() { "disabled" } else { "off" },
+                    "disabled_reason": stationary_mtp1_disabled,
+                    "candidate_target_alignment": "MTP input/teacher hidden/KV write at t; candidate predicts teacher token t+1",
+                    "records": stationary_mtp1_records,
+                },
+            })),
             "host_attention_fallbacks": device_attention_host_fallbacks,
             "device_attention": {
                 "dispatches_actual": device_attention_dispatches,
@@ -6714,7 +8474,16 @@ fn run_real_v4_layer_stationary_prefill(
                 "eviction": "none",
             },
             "expected_routed_expert_loads": qd4_enabled
-                .then(|| qd4_expected_routed_loads(manifests.len(), prompt_len))
+                .then(|| {
+                    qd4_expected_routed_loads(
+                        manifests.len(),
+                        if generic_device_stationary {
+                            greedy_forward_tokens(prompt_len, greedy_steps)?
+                        } else {
+                            prompt_len
+                        },
+                    )
+                })
                 .transpose()?,
         },
     });
@@ -6728,8 +8497,8 @@ fn run_real_v4_layer_stationary_prefill(
                     "schema": "colibri-v4-stationary-phase-profile-v4",
                     "enabled": true,
                     "top_level_scope_model": "layer_prepare (including nested fixed-load diagnostics), attention (including position-0 device-state setup), router, shared, and routed are exclusive host-wall scopes; nested CUDA event and QD4 lane work sums are not additive",
-                    "layer_scope_count": short_decode_rows * manifests.len(),
-                    "layer_prepare_scope_count": (1 + (short_decode_rows - prompt_len)) * manifests.len(),
+                    "layer_scope_count": layer_records.iter().map(Vec::len).sum::<usize>().saturating_add(short_decode_records.len()),
+                    "layer_prepare_scope_count": manifests.len().saturating_add(short_decode_records.len()),
                     "final_scope_count": 1 + short_decode_finals.len(),
                     "top_level_attributed_ns": phase_profile_top_level_ns,
                     "layer_outer_ns": phase_profile_layer_outer_ns.saturating_add(one_token_decode_phase_profile_layer_outer_ns),
@@ -6738,7 +8507,7 @@ fn run_real_v4_layer_stationary_prefill(
                     "request_unprofiled_gap_ns": phase_profile_request_gap_ns,
                     "request_e2e_ns": request_e2e_ns,
                     "closure": "profiled_outer_ns + request_unprofiled_gap_ns == request_e2e_ns",
-                    "short_device_decode_outer": one_token_decode_outer.map(|(prefill_outer_ns, decode_outer_ns)| serde_json::json!({
+                    "short_device_decode_outer": if device_short_decode { one_token_decode_outer.map(|(prefill_outer_ns, decode_outer_ns)| serde_json::json!({
                         "prefill_outer_ns": prefill_outer_ns,
                         "decode_outer_ns": decode_outer_ns,
                         "decode_layer_outer_ns": one_token_decode_phase_profile_layer_outer_ns,
@@ -6748,7 +8517,18 @@ fn run_real_v4_layer_stationary_prefill(
                             .saturating_add(decode_outer_ns)
                             .saturating_add(phase_profile_request_gap_ns)
                             == request_e2e_ns,
-                    })),
+                    })) } else { None },
+                    "generic_decode_outer": if generic_device_stationary { one_token_decode_outer.map(|(prefill_outer_ns, decode_outer_ns)| serde_json::json!({
+                        "prefill_outer_ns": prefill_outer_ns,
+                        "decode_outer_ns": decode_outer_ns,
+                        "decode_layer_outer_ns": one_token_decode_phase_profile_layer_outer_ns,
+                        "decode_final_outer_ns": one_token_decode_phase_profile_final_outer_ns,
+                        "closure": "prefill_outer_ns + decode_outer_ns + request_unprofiled_gap_ns == request_e2e_ns",
+                        "exact": prefill_outer_ns
+                            .saturating_add(decode_outer_ns)
+                            .saturating_add(phase_profile_request_gap_ns)
+                            == request_e2e_ns,
+                    })) } else { None },
                     "request_accounting_valid": phase_profile_top_level_ns <= request_e2e_ns
                         && phase_profiled_outer_ns <= request_e2e_ns
                         && phase_profiled_outer_ns.saturating_add(phase_profile_request_gap_ns)
@@ -6869,11 +8649,14 @@ fn run_real_v4_layer_stationary_prefill(
         "prompt",
         if device_attention {
             "DeviceTokenState"
+        } else if generic_device_stationary {
+            "DeviceLayerPersistentState"
         } else {
             "V4SerialPersistentState"
         },
         &final_decision,
         None,
+        final_decision_elapsed_ns,
     )?;
     if let Some(profile) = final_phase_profile {
         final_record
@@ -6882,15 +8665,27 @@ fn run_real_v4_layer_stationary_prefill(
             .insert("phase_profile".into(), profile);
     }
     writeln!(result.file_mut(), "{final_record}")?;
-    for (position, input_id, decode_decision, decode_hidden, decode_profile) in &short_decode_finals
+    for (
+        position,
+        input_id,
+        decode_decision,
+        decode_hidden,
+        decode_profile,
+        decode_decision_elapsed_ns,
+    ) in &short_decode_finals
     {
         let mut decode_final_record = id_only_final_record(
             *position,
             *input_id,
             "generated",
-            "DeviceTokenState",
+            if generic_device_stationary {
+                "DeviceLayerPersistentState"
+            } else {
+                "DeviceTokenState"
+            },
             decode_decision,
             Some(decode_hidden),
+            *decode_decision_elapsed_ns,
         )?;
         if let Some(profile) = decode_profile {
             decode_final_record
@@ -6903,7 +8698,9 @@ fn run_real_v4_layer_stationary_prefill(
     result.commit()?;
     println!(
         "{{\"status\":\"PASS\",\"mode\":{},\"token_ids\":{},\"generated_ids\":{},\"layers\":{},\"argmax\":{},\"result_jsonl\":{}}}",
-        serde_json::to_string(if device_short_decode {
+        serde_json::to_string(if generic_device_stationary {
+            "v4-generic-device-stationary"
+        } else if device_short_decode {
             "v4-layer-stationary-short-device-decode"
         } else {
             "v4-layer-stationary-prefill"
@@ -7843,17 +9640,13 @@ fn run_v4_two_worker_loopback(
 
     let audit_bytes = audit_samples[0].bytes;
     let certified_bytes = certified_samples[0].bytes;
-    assert!(
-        audit_samples
-            .iter()
-            .all(|sample| sample.bytes == audit_bytes && sample.repair_lanes == 0)
-    );
+    assert!(audit_samples
+        .iter()
+        .all(|sample| sample.bytes == audit_bytes && sample.repair_lanes == 0));
     let repair_lanes = certified_samples[0].repair_lanes;
-    assert!(
-        certified_samples.iter().all(|sample| {
-            sample.bytes == certified_bytes && sample.repair_lanes == repair_lanes
-        })
-    );
+    assert!(certified_samples
+        .iter()
+        .all(|sample| { sample.bytes == certified_bytes && sample.repair_lanes == repair_lanes }));
     print_loopback_timings("AUDIT", &audit_samples, false);
     print_loopback_timings("CERTIFIED", &certified_samples, true);
     println!(
@@ -9235,11 +11028,9 @@ fn print_recovery_case(case: RecoveryCase, samples: &[RecoverySample]) {
     let (e2e_median, e2e_p95) = median_p95_ms(&e2e);
     let (failover_median, failover_p95) = median_p95_ms(&failover);
     let bytes = samples[0].bytes;
-    assert!(
-        samples
-            .iter()
-            .all(|sample| sample.bytes == bytes && sample.failovers == samples[0].failovers)
-    );
+    assert!(samples
+        .iter()
+        .all(|sample| sample.bytes == bytes && sample.failovers == samples[0].failovers));
     println!(
         "RECOVERY_CASE case={} n={} E2E_median/p95={e2e_median:.3}/{e2e_p95:.3}ms failover_count={} failover_latency_median/p95={failover_median:.3}/{failover_p95:.3}ms initial_requests={} audit_responses={} certified_responses={} repair_requests={} repair_responses={} total_bidirectional={} return_side={} BF16_mismatch=0 partial_commit=0",
         case.label(),
@@ -9299,6 +11090,868 @@ fn median_f64(samples: &[f64]) -> f64 {
 
 const V4_QD4_LANES: usize = 4;
 const V4_DEVICE_CAPACITY_HEADROOM_BYTES: usize = 2 * 1024 * 1024 * 1024;
+// MTP P0 owns only its sliding KV persistently.  The routed FFN uses one
+// ordinary ExpertSlot at a time and never enters the teacher cache.
+const MTP1_DRAFT_PERSISTENT_BYTES: usize = 131_072;
+// These are the candidate-owned allocations which outlive the fixed-weight
+// upload through the streamed head.  They are deliberately separate from the
+// fixed tensor ledger: the candidate keeps its sliding-KV input, raw-window
+// attention cache, Q, sparse output, and score-reuse scratch live while the
+// fixed block is resident and while the final head is streamed.
+const MTP1_DRAFT_ENORM_HNORM_BYTES: usize = 2 * v4_state::HIDDEN * std::mem::size_of::<u16>();
+const MTP1_DRAFT_KV_READY_BYTES: usize = v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
+const MTP1_DRAFT_Q_BYTES: usize =
+    v4_state::Q_HEADS * v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
+const MTP1_DRAFT_CACHE_BYTES: usize =
+    v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
+const MTP1_DRAFT_TOPK_BYTES: usize = v4_state::KV_WINDOW * std::mem::size_of::<i32>();
+const MTP1_DRAFT_SPARSE_BYTES: usize =
+    v4_state::Q_HEADS * v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
+const MTP1_DRAFT_SCORE_REUSE_BYTES: usize =
+    2 * v4_state::Q_HEADS * v4_state::KV_WINDOW * std::mem::size_of::<f32>()
+        + v4_state::Q_HEADS * (std::mem::size_of::<f32>() + std::mem::size_of::<u32>());
+const MTP1_DRAFT_CANDIDATE_LOCAL_BYTES: usize = MTP1_DRAFT_ENORM_HNORM_BYTES
+    + MTP1_DRAFT_KV_READY_BYTES
+    + MTP1_DRAFT_Q_BYTES
+    + MTP1_DRAFT_CACHE_BYTES
+    + MTP1_DRAFT_TOPK_BYTES
+    + MTP1_DRAFT_SPARSE_BYTES
+    + MTP1_DRAFT_SCORE_REUSE_BYTES;
+const MTP1_DRAFT_TRANSIENT_EXPERT_SLOT_BYTES: usize = 35_094_528;
+const MTP1_DRAFT_EXTRA_CAPACITY_BYTES: usize = 43_230_456;
+const MTP1_DRAFT_DEFAULT_MAX_SCORED_TRANSITIONS: usize = 8;
+
+fn mtp1_draft_peak_bytes(
+    persistent_bytes: usize,
+    fixed_bytes: usize,
+    e_projection_bytes: usize,
+    h_projection_bytes: usize,
+    expert_slot_bytes: usize,
+    lm_head_bytes: usize,
+) -> Result<usize, Box<dyn Error>> {
+    let add = |left: usize, right: usize| {
+        left.checked_add(right)
+            .ok_or("MTP1 draft peak ledger overflow")
+    };
+    let candidate_base = add(persistent_bytes, MTP1_DRAFT_CANDIDATE_LOCAL_BYTES)?;
+    let projection_peak = add(candidate_base, e_projection_bytes.max(h_projection_bytes))?;
+    let fixed_expert_peak = add(add(candidate_base, fixed_bytes)?, expert_slot_bytes)?;
+    let lm_head_peak = add(candidate_base, lm_head_bytes)?;
+    Ok(projection_peak.max(fixed_expert_peak).max(lm_head_peak))
+}
+
+fn mtp1_draft_fixed_device_bytes(
+    host: &v4_state::MtpDraftWeights,
+) -> Result<usize, Box<dyn Error>> {
+    let fp8 = |matrix: &v4_state::Fp8Matrix| matrix.weight.len().checked_add(matrix.scale.len());
+    let bytes = [
+        host.hc_attn_fn
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        host.hc_attn_base
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        host.hc_attn_scale
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        host.attn_norm.len().checked_mul(std::mem::size_of::<u16>()),
+        fp8(&host.wq_a.matrix),
+        host.wq_a.norm.len().checked_mul(std::mem::size_of::<u16>()),
+        fp8(&host.wq_b),
+        fp8(&host.wkv.matrix),
+        host.wkv.norm.len().checked_mul(std::mem::size_of::<u16>()),
+        host.attn_sink.len().checked_mul(std::mem::size_of::<f32>()),
+        host.wo_a
+            .weight
+            .len()
+            .checked_mul(std::mem::size_of::<u16>()),
+        // Upload converts FP8 wo_a while the raw input remains live.
+        Some(host.wo_a.weight.len()),
+        fp8(&host.wo_b),
+        host.hc_ffn_fn.len().checked_mul(std::mem::size_of::<f32>()),
+        host.hc_ffn_base
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        host.hc_ffn_scale
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        host.ffn_norm.len().checked_mul(std::mem::size_of::<u16>()),
+        host.gate.len().checked_mul(std::mem::size_of::<u16>()),
+        host.router_bias
+            .len()
+            .checked_mul(std::mem::size_of::<f32>()),
+        fp8(&host.shared.w1),
+        fp8(&host.shared.w2),
+        fp8(&host.shared.w3),
+    ];
+    bytes.into_iter().try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(bytes.ok_or("MTP1 fixed device ledger overflow")?)
+            .ok_or("MTP1 fixed device ledger overflow".into())
+    })
+}
+
+fn mtp1_draft_fixed_device_bytes_from_geometry() -> Result<usize, Box<dyn Error>> {
+    let fp8 = |input: usize, output: usize| {
+        input
+            .checked_mul(output)
+            .and_then(|weight| {
+                output
+                    .div_ceil(v4_state::FP8_BLOCK)
+                    .checked_mul(input / v4_state::FP8_BLOCK)
+                    .and_then(|scale| weight.checked_add(scale))
+            })
+            .ok_or("MTP1 geometry fixed ledger overflow")
+    };
+    [
+        v4_state::MIX * v4_state::HC * v4_state::HIDDEN * 4,
+        v4_state::MIX * 4,
+        3 * 4,
+        v4_state::HIDDEN * 2,
+        fp8(v4_state::HIDDEN, V4_Q_LORA_RANK)?,
+        V4_Q_LORA_RANK * 2,
+        fp8(V4_Q_LORA_RANK, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+        fp8(v4_state::HIDDEN, v4_state::Q_HEAD_DIM)?,
+        v4_state::Q_HEAD_DIM * 2,
+        v4_state::Q_HEADS * 4,
+        (v4_state::Q_HEADS * v4_state::Q_HEAD_DIM / v4_state::O_GROUPS)
+            * (v4_state::O_GROUPS * v4_state::O_LORA_RANK)
+            * 3,
+        fp8(v4_state::O_GROUPS * v4_state::O_LORA_RANK, v4_state::HIDDEN)?,
+        v4_state::MIX * v4_state::HC * v4_state::HIDDEN * 4,
+        v4_state::MIX * 4,
+        3 * 4,
+        v4_state::HIDDEN * 2,
+        v4_router::V4_ROUTED_EXPERTS * v4_state::HIDDEN * 2,
+        v4_router::V4_ROUTED_EXPERTS * 4,
+        fp8(v4_state::HIDDEN, v4_expert::V4_EXPERT_INTERMEDIATE)?,
+        fp8(v4_expert::V4_EXPERT_INTERMEDIATE, v4_state::HIDDEN)?,
+        fp8(v4_state::HIDDEN, v4_expert::V4_EXPERT_INTERMEDIATE)?,
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or("MTP1 geometry fixed ledger overflow".into())
+    })
+}
+
+fn mtp1_stationary_peak_reserve_bytes(
+    model_dir: &std::path::Path,
+    borrows_qd4_lane: bool,
+) -> Result<usize, Box<dyn Error>> {
+    let host = v4_state::load_mtp_draft_weights(model_dir)?;
+    mtp1_draft_peak_bytes(
+        MTP1_DRAFT_PERSISTENT_BYTES,
+        mtp1_draft_fixed_device_bytes(&host)?,
+        host.e_proj.source_bytes(),
+        host.h_proj.source_bytes(),
+        usize::from(!borrows_qd4_lane) * MTP1_DRAFT_TRANSIENT_EXPERT_SLOT_BYTES,
+        CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES,
+    )
+}
+
+/// One extra routed slot is needed only when stationary MTP cannot borrow a
+/// drained QD4 lane.  Keep its pinned staging reservation beside the raw-cache
+/// host selection, rather than discovering it after that cache has filled RAM.
+fn mtp1_stationary_pinned_host_reserve_bytes(borrows_qd4_lane: bool) -> usize {
+    if borrows_qd4_lane {
+        0
+    } else {
+        V4_QD4_PINNED_HOST_BYTES / V4_QD4_LANES
+    }
+}
+
+fn generic_stationary_persistent_reserve_bytes(
+    manifests: &[v4_state::LayerExecutionManifest],
+    plan: v4_state::LayerStationaryRequestPlan,
+) -> Result<usize, Box<dyn Error>> {
+    let bytes = |elements: usize, element_bytes: usize| {
+        elements
+            .checked_mul(element_bytes)
+            .ok_or("generic stationary persistent reserve overflow")
+    };
+    let state_bytes = |path: GenericStationaryPath| -> Result<usize, Box<dyn Error>> {
+        let raw = bytes(v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM, 2)?;
+        let tails = bytes(path.tail_elements(), 4)?
+            .checked_mul(2)
+            .ok_or("generic stationary persistent tail reserve overflow")?;
+        let compressed = bytes(path.compressed_rows(plan) * v4_state::Q_HEAD_DIM, 2)?;
+        let indexer = if path.is_csa() {
+            let indexer_kv = bytes(plan.csa_compressed_rows * 128, 2)?;
+            bytes(8 * 256, 4)?
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(indexer_kv))
+                .ok_or("generic stationary indexer reserve overflow")?
+        } else {
+            0
+        };
+        raw.checked_add(tails)
+            .and_then(|value| value.checked_add(compressed))
+            .and_then(|value| value.checked_add(indexer))
+            .ok_or("generic stationary persistent reserve overflow".into())
+    };
+    manifests.iter().try_fold(0usize, |total, manifest| {
+        total
+            .checked_add(state_bytes(GenericStationaryPath::from_ratio(
+                manifest.compression_ratio,
+            ))?)
+            .ok_or("generic stationary persistent reserve overflow".into())
+    })
+}
+
+fn generic_stationary_scratch_reserve_bytes(
+    plan: v4_state::LayerStationaryRequestPlan,
+) -> Result<usize, Box<dyn Error>> {
+    generic_stationary_scratch_reserve_bytes_with_strict(plan, strict_compressor_enabled())
+}
+
+fn generic_stationary_scratch_reserve_bytes_with_strict(
+    plan: v4_state::LayerStationaryRequestPlan,
+    strict: bool,
+) -> Result<usize, Box<dyn Error>> {
+    DeviceRequestScratchGeometry::new(plan, strict)?.num_bytes()
+}
+
+fn stationary_mtp1_target_strict_scratch_contract(
+    plan: v4_state::LayerStationaryRequestPlan,
+    target_strict: bool,
+    pinned_cublas: Option<&std::path::Path>,
+) -> Result<usize, Box<dyn Error>> {
+    if target_strict && pinned_cublas.is_none() {
+        return Err(
+            "strict stationary MTP capacity requires pinned COLIBRI_CUBLAS_EXACT_LIB".into(),
+        );
+    }
+    generic_stationary_scratch_reserve_bytes_with_strict(plan, target_strict)
+}
+
+#[derive(Default)]
+struct StationaryMtpCapacityProbe {
+    device_u8: Vec<DeviceBuffer<u8>>,
+    device_u16: Vec<DeviceBuffer<u16>>,
+    device_f32: Vec<DeviceBuffer<f32>>,
+    device_i32: Vec<DeviceBuffer<i32>>,
+    device_u32: Vec<DeviceBuffer<u32>>,
+    pinned_u8: Vec<PinnedHostBuffer<u8>>,
+    pinned_u16: Vec<PinnedHostBuffer<u16>>,
+    pinned_f32: Vec<PinnedHostBuffer<f32>>,
+    host: Vec<Vec<u8>>,
+    raw_host: Vec<Vec<u8>>,
+    generic_scratch: Option<DeviceRequestScratch>,
+}
+
+const STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA: &str = "colibri-v4-stationary-mtp1-capacity-v2";
+const STATIONARY_MTP1_CAPACITY_PREFLIGHT_TARGET_STRICT: bool = true;
+
+impl StationaryMtpCapacityProbe {
+    fn device_bytes(&self) -> usize {
+        self.device_u8
+            .iter()
+            .map(DeviceBuffer::num_bytes)
+            .sum::<usize>()
+            + self
+                .device_u16
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .device_f32
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .device_i32
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .device_u32
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .generic_scratch
+                .as_ref()
+                .map_or(0, DeviceRequestScratch::num_bytes)
+    }
+
+    fn pinned_bytes(&self) -> usize {
+        self.pinned_u8
+            .iter()
+            .map(PinnedHostBuffer::num_bytes)
+            .sum::<usize>()
+            + self
+                .pinned_u16
+                .iter()
+                .map(PinnedHostBuffer::num_bytes)
+                .sum::<usize>()
+            + self
+                .pinned_f32
+                .iter()
+                .map(PinnedHostBuffer::num_bytes)
+                .sum::<usize>()
+    }
+
+    fn raw_host_bytes(&self) -> usize {
+        self.raw_host.iter().map(Vec::len).sum()
+    }
+
+    fn host_bytes(&self) -> usize {
+        self.host.iter().map(Vec::len).sum()
+    }
+
+    fn u8(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+        self.device_u8.push(DeviceBuffer::zeroed(stream, elements)?);
+        Ok(())
+    }
+
+    fn u16(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+        self.device_u16
+            .push(DeviceBuffer::zeroed(stream, elements)?);
+        Ok(())
+    }
+
+    fn f32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+        self.device_f32
+            .push(DeviceBuffer::zeroed(stream, elements)?);
+        Ok(())
+    }
+
+    fn i32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+        self.device_i32
+            .push(DeviceBuffer::zeroed(stream, elements)?);
+        Ok(())
+    }
+
+    fn u32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+        self.device_u32
+            .push(DeviceBuffer::zeroed(stream, elements)?);
+        Ok(())
+    }
+}
+
+fn generic_stationary_audit_mirror_host_bytes(
+    manifests: &[v4_state::LayerExecutionManifest],
+    plan: v4_state::LayerStationaryRequestPlan,
+) -> Result<usize, Box<dyn Error>> {
+    let compressor_bytes = |ratio: usize, width: usize| {
+        let coefficient = 1 + usize::from(ratio == 4);
+        coefficient
+            .checked_mul(ratio)
+            .and_then(|slots| slots.checked_mul(coefficient))
+            .and_then(|elements| elements.checked_mul(width))
+            .and_then(|elements| elements.checked_mul(2 * std::mem::size_of::<f32>()))
+            .ok_or("generic stationary audit mirror compressor ledger overflow")
+    };
+    let mut total = plan.token_scratch_bytes;
+    for manifest in manifests {
+        let ratio = manifest.compression_ratio.get();
+        let compressed_rows = if ratio == 4 {
+            plan.csa_compressed_rows
+        } else {
+            plan.hca_compressed_rows
+        };
+        let layer = plan
+            .raw_kv_rows
+            .checked_mul(v4_state::Q_HEAD_DIM)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    compressed_rows
+                        .checked_mul(v4_state::Q_HEAD_DIM)
+                        .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))?,
+                )
+            })
+            .and_then(|bytes| {
+                (ratio == 4)
+                    .then(|| {
+                        compressed_rows
+                            .checked_mul(128)
+                            .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+                    })
+                    .flatten()
+                    .map_or(Some(bytes), |indexer| bytes.checked_add(indexer))
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(compressor_bytes(ratio, v4_state::Q_HEAD_DIM).ok()?)
+            })
+            .and_then(|bytes| {
+                if ratio == 4 {
+                    bytes.checked_add(compressor_bytes(4, 128).ok()?)
+                } else {
+                    Some(bytes)
+                }
+            })
+            .ok_or("generic stationary audit mirror layer ledger overflow")?;
+        total = total
+            .checked_add(layer)
+            .ok_or("generic stationary audit mirror ledger overflow")?;
+    }
+    Ok(total)
+}
+
+fn probe_mtp1_candidate_locals(
+    probe: &mut StationaryMtpCapacityProbe,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    // Keep this list in the same ownership shape as run_mtp1_draft_candidate.
+    // `q`, cache, sparse, and score scratch remain live until after the head.
+    probe.u16(stream, v4_state::HIDDEN)?; // enorm
+    probe.u16(stream, v4_state::HIDDEN)?; // hnorm
+    probe.u16(stream, v4_state::Q_HEAD_DIM)?; // kv_ready
+    probe.u16(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?; // q
+    probe.u16(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?; // cache
+    probe.i32(stream, v4_state::KV_WINDOW)?; // topk
+    probe.u16(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?; // sparse
+    probe.f32(stream, 2 * v4_state::Q_HEADS * v4_state::KV_WINDOW)?; // scores/probabilities
+    probe.f32(stream, v4_state::Q_HEADS)?; // denominators
+    probe.u32(stream, v4_state::Q_HEADS)?; // valid_counts
+    let bytes = MTP1_DRAFT_ENORM_HNORM_BYTES
+        + MTP1_DRAFT_KV_READY_BYTES
+        + MTP1_DRAFT_Q_BYTES
+        + MTP1_DRAFT_CACHE_BYTES
+        + MTP1_DRAFT_TOPK_BYTES
+        + MTP1_DRAFT_SPARSE_BYTES
+        + MTP1_DRAFT_SCORE_REUSE_BYTES;
+    if bytes != MTP1_DRAFT_CANDIDATE_LOCAL_BYTES {
+        return Err("MTP1 candidate-local allocation ledger drifted".into());
+    }
+    Ok(())
+}
+
+fn stationary_mtp1_capacity_preflight_rejects_execution_flags() -> Result<(), Box<dyn Error>> {
+    for name in [
+        "COLIBRI_V4_FULL61_B1",
+        "COLIBRI_V4_LAYER_STATIONARY_PREFILL",
+        "COLIBRI_V4_GENERIC_DEVICE_STATIONARY",
+        "COLIBRI_V4_STATIONARY_MTP1_DRAFT",
+        "COLIBRI_V4_MTP1_DRAFT_P0",
+        "COLIBRI_V4_ROUTED_QD4",
+        "COLIBRI_V4_PHASE_PROFILE",
+        "COLIBRI_V4_RESULT_JSONL",
+        "COLIBRI_V4_PROMPT_TEXT",
+        "COLIBRI_V4_CHAT_USER",
+        "COLIBRI_V4_TOKEN_IDS",
+        "COLIBRI_V4_TOKEN_ID",
+        "COLIBRI_V4_GREEDY_STEPS",
+    ] {
+        if std::env::var_os(name).is_some() {
+            return Err(format!(
+                "COLIBRI_V4_STATIONARY_MTP1_CAPACITY_PREFLIGHT=1 rejects execution flag {name}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn stationary_mtp1_preflight_plan(
+    prompt_rows: Option<&std::ffi::OsStr>,
+    max_new_tokens: Option<&std::ffi::OsStr>,
+) -> Result<v4_state::LayerStationaryRequestPlan, Box<dyn Error>> {
+    let (prompt_rows, max_new_tokens) = match (prompt_rows, max_new_tokens) {
+        (None, None) => (5, 3),
+        (Some(prompt_rows), Some(max_new_tokens)) => {
+            let parse = |name: &str, value: &std::ffi::OsStr| -> Result<usize, Box<dyn Error>> {
+                value
+                    .to_str()
+                    .ok_or_else(|| format!("{name} must be valid UTF-8"))?
+                    .parse::<usize>()
+                    .map_err(|_| format!("{name} must be a base-10 usize").into())
+            };
+            (
+                parse("COLIBRI_V4_STATIONARY_PREFLIGHT_PROMPT_ROWS", prompt_rows)?,
+                parse(
+                    "COLIBRI_V4_STATIONARY_PREFLIGHT_MAX_NEW_TOKENS",
+                    max_new_tokens,
+                )?,
+            )
+        }
+        _ => {
+            return Err(
+                "COLIBRI_V4_STATIONARY_PREFLIGHT_PROMPT_ROWS and COLIBRI_V4_STATIONARY_PREFLIGHT_MAX_NEW_TOKENS must be set together"
+                    .into(),
+            );
+        }
+    };
+    if prompt_rows == 0 {
+        return Err("stationary preflight prompt rows must be nonzero".into());
+    }
+    v4_state::LayerStationaryRequestPlan::new(prompt_rows, max_new_tokens)
+}
+
+fn probe_generic_stationary_resources(
+    probe: &mut StationaryMtpCapacityProbe,
+    stream: &CudaStream,
+    manifests: &[v4_state::LayerExecutionManifest],
+    plan: v4_state::LayerStationaryRequestPlan,
+    strict: bool,
+) -> Result<(), Box<dyn Error>> {
+    for manifest in manifests {
+        let path = GenericStationaryPath::from_ratio(manifest.compression_ratio);
+        probe.u16(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?;
+        probe.f32(stream, path.tail_elements())?;
+        probe.f32(stream, path.tail_elements())?;
+        probe.u16(stream, path.compressed_rows(plan) * v4_state::Q_HEAD_DIM)?;
+        if path.is_csa() {
+            probe.f32(stream, 8 * 256)?;
+            probe.f32(stream, 8 * 256)?;
+            probe.u16(stream, plan.csa_compressed_rows * 128)?;
+        }
+    }
+    probe.generic_scratch = Some(DeviceRequestScratch::new_with_strict(stream, plan, strict)?);
+    Ok(())
+}
+
+fn probe_qd4_lanes(
+    probe: &mut StationaryMtpCapacityProbe,
+    context: &std::sync::Arc<CudaContext>,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..V4_QD4_LANES {
+        for bytes in [
+            v4_expert::V4_W1_BYTES,
+            v4_expert::V4_W1_SCALE_BYTES,
+            v4_expert::V4_W2_BYTES,
+            v4_expert::V4_W2_SCALE_BYTES,
+            v4_expert::V4_W1_BYTES,
+            v4_expert::V4_W1_SCALE_BYTES,
+        ] {
+            probe
+                .pinned_u8
+                .push(PinnedHostBuffer::zeroed(context, bytes)?);
+            probe.u8(stream, bytes)?;
+        }
+        probe
+            .pinned_u16
+            .push(PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?);
+        probe
+            .pinned_f32
+            .push(PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?);
+        probe.u16(stream, v4_expert::V4_HIDDEN)?;
+        probe.f32(stream, v4_expert::V4_HIDDEN)?;
+        for elements in [v4_expert::V4_EXPERT_INTERMEDIATE; 3] {
+            probe.u16(stream, elements)?;
+        }
+        probe.f32(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?;
+        probe.u16(stream, v4_expert::V4_HIDDEN)?;
+        probe.f32(stream, v4_expert::V4_HIDDEN)?;
+    }
+    Ok(())
+}
+
+fn run_stationary_mtp1_capacity_preflight() -> Result<bool, Box<dyn Error>> {
+    if !optional_one_flag("COLIBRI_V4_STATIONARY_MTP1_CAPACITY_PREFLIGHT")? {
+        return Ok(false);
+    }
+    stationary_mtp1_capacity_preflight_rejects_execution_flags()?;
+    let root = v4_model_dir()?;
+    let manifests = v4_state::serial_layer_manifests(0)?;
+    let plan = stationary_mtp1_preflight_plan(
+        std::env::var_os("COLIBRI_V4_STATIONARY_PREFLIGHT_PROMPT_ROWS").as_deref(),
+        std::env::var_os("COLIBRI_V4_STATIONARY_PREFLIGHT_MAX_NEW_TOKENS").as_deref(),
+    )?;
+    // This mode may be combined with the audit switch only to account for its
+    // independent host mirror.  It still rejects every execution switch and
+    // returns before loading a CUDA module or launching a model kernel.
+    let generic_state_audit = optional_one_flag("COLIBRI_V4_GENERIC_DEVICE_STATE_AUDIT")?;
+    let static_persistent = generic_stationary_persistent_reserve_bytes(&manifests, plan)?;
+    let isolation_strict_compressor = strict_compressor_enabled();
+    let target_strict_compressor = STATIONARY_MTP1_CAPACITY_PREFLIGHT_TARGET_STRICT;
+    let pinned_cublas = std::env::var_os("COLIBRI_CUBLAS_EXACT_LIB").map(std::path::PathBuf::from);
+    // Full61 is intentionally rejected by this isolated mode.  Its local
+    // switch is therefore false, while the target capacity remains the strict
+    // cuBLAS production configuration.
+    if target_strict_compressor {
+        drop(cublas_exact::CublasExact::load()?);
+    }
+    let static_scratch = stationary_mtp1_target_strict_scratch_contract(
+        plan,
+        target_strict_compressor,
+        pinned_cublas.as_deref(),
+    )?;
+    let audit_mirror_host_bytes = generic_state_audit
+        .then(|| generic_stationary_audit_mirror_host_bytes(&manifests, plan))
+        .transpose()?
+        .unwrap_or(0);
+    let mtp_fixed = mtp1_draft_fixed_device_bytes_from_geometry()?;
+    let mtp_projection =
+        v4_state::HIDDEN * v4_state::HIDDEN + (v4_state::HIDDEN / v4_state::FP8_BLOCK).pow(2);
+    let mtp_head = CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES;
+    let mtp_static_peak = mtp1_draft_peak_bytes(
+        MTP1_DRAFT_PERSISTENT_BYTES,
+        mtp_fixed,
+        mtp_projection,
+        mtp_projection,
+        0,
+        mtp_head,
+    )?;
+    let raw_plans =
+        stationary_raw_layer_plans(&root, &(0..v4_state::V4_LAYER_COUNT).collect::<Vec<_>>())?;
+    let requested_device = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?;
+    let requested_host = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB")?;
+    let raw_device_budget = requested_device
+        .checked_sub(PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES)
+        .ok_or("capacity preflight raw device budget is below pinned worker need")?;
+    let selected_device = select_fixed_cache_layers(
+        &raw_plans,
+        raw_device_budget,
+        &vec![false; raw_plans.len()],
+        true,
+        true,
+    );
+    let selected_host =
+        select_fixed_cache_layers(&raw_plans, requested_host, &selected_device, false, true);
+    let context = CudaContext::new(0)?;
+    let stream = context.default_stream();
+    let device_before = device_available_bytes()?;
+    let mut device_min = device_before;
+    let mut probe = StationaryMtpCapacityProbe::default();
+    probe_generic_stationary_resources(
+        &mut probe,
+        &stream,
+        &manifests,
+        plan,
+        target_strict_compressor,
+    )?;
+    let generic_scratch_actual_bytes = probe
+        .generic_scratch
+        .as_ref()
+        .ok_or("capacity preflight did not retain the generic request scratch")?
+        .num_bytes();
+    if generic_scratch_actual_bytes != static_scratch {
+        return Err(format!(
+            "generic stationary real scratch {generic_scratch_actual_bytes} != geometry ledger {static_scratch}"
+        )
+        .into());
+    }
+    let generic_probe_bytes = probe.device_bytes();
+    let generic_ledger_bytes = static_persistent
+        .checked_add(static_scratch)
+        .ok_or("generic stationary capacity preflight ledger overflow")?;
+    if generic_probe_bytes != generic_ledger_bytes {
+        return Err(format!(
+            "generic stationary typed preflight allocation {generic_probe_bytes} != geometry ledger {generic_ledger_bytes}"
+        )
+        .into());
+    }
+    probe_qd4_lanes(&mut probe, &context, &stream)?;
+    // A stationary MTP candidate loans one already resident lane after the
+    // normal QD4 request is drained.  The loan has no extra expert allocation;
+    // its ownership depth is one and the normal four-lane configuration must
+    // be intact immediately after the scoped candidate ends.
+    let qd4_normal_lanes_before = qd4_lane_count(true);
+    let qd4_loan_depth = usize::from(mtp1_can_borrow_qd4_lane(true, qd4_normal_lanes_before));
+    if qd4_loan_depth != 1 {
+        return Err(
+            "MTP capacity preflight could not establish exactly one drained QD4 loan".into(),
+        );
+    }
+    let loan_drained = context.new_event(None)?;
+    loan_drained.record(&stream)?;
+    loan_drained.synchronize()?;
+    let qd4_normal_lanes_after = qd4_lane_count(true);
+    if qd4_normal_lanes_after != qd4_normal_lanes_before {
+        return Err("MTP capacity preflight QD4 loan changed normal teacher lane count".into());
+    }
+    let raw_generation_before = vec![0_u64; raw_plans.len()];
+    for (selected, layer) in selected_device.iter().zip(&raw_plans) {
+        if *selected {
+            probe.u8(&stream, layer.raw_device_bytes)?;
+        }
+    }
+    for (selected, layer) in selected_host.iter().zip(&raw_plans) {
+        if *selected {
+            probe.raw_host.push(vec![0_u8; layer.raw_host_bytes]);
+        }
+    }
+    if audit_mirror_host_bytes != 0 {
+        probe.host.push(vec![0_u8; audit_mirror_host_bytes]);
+    }
+    for _ in 0..PINNED_FIXED_PIPELINE_WORKER_SLOTS {
+        probe.pinned_u8.push(PinnedHostBuffer::zeroed(
+            &context,
+            PHASE1_CSA_PAYLOAD_BYTES,
+        )?);
+        probe.u16(&stream, RAW_FIXED_SCRATCH_BYTES / 2)?;
+    }
+    stream.synchronize()?;
+    device_min = device_min.min(device_available_bytes()?);
+    let base_device_bytes = probe.device_bytes();
+    let base_pinned_bytes = probe.pinned_bytes();
+    let base_raw_host_bytes = probe.raw_host_bytes();
+    let base_host_bytes = probe.host_bytes();
+    // Two replies can be prepared at once.  Their decoded runtimes are owned
+    // by PinnedFixedPrepared::lease, not by the pinned host buffers.  They are
+    // dropped/restored before the MTP cutpoint, so this is a separate maximum
+    // rather than an MTP overlap.
+    let prepared_runtimes = (0..PINNED_FIXED_PIPELINE_WORKER_SLOTS)
+        .map(|_| DeviceBuffer::<u8>::zeroed(&stream, PHASE1_CSA_PAYLOAD_BYTES))
+        .collect::<Result<Vec<_>, _>>()?;
+    stream.synchronize()?;
+    device_min = device_min.min(device_available_bytes()?);
+    let worker_prepared_peak_bytes = base_device_bytes
+        .checked_add(
+            prepared_runtimes
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>(),
+        )
+        .ok_or("stationary MTP worker prepared peak overflow")?;
+    if worker_prepared_peak_bytes - base_device_bytes
+        != PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES
+    {
+        return Err("stationary MTP worker prepared-runtime ledger drifted".into());
+    }
+    drop(prepared_runtimes);
+    stream.synchronize()?;
+    let mtp_persistent = DeviceBuffer::<u16>::zeroed(&stream, MTP1_DRAFT_PERSISTENT_BYTES / 2)?;
+    probe_mtp1_candidate_locals(&mut probe, &stream)?;
+    let candidate_local_device_bytes = probe
+        .device_bytes()
+        .checked_sub(base_device_bytes)
+        .ok_or("MTP candidate-local typed allocation underflow")?;
+    if candidate_local_device_bytes != MTP1_DRAFT_CANDIDATE_LOCAL_BYTES {
+        return Err(format!("MTP candidate-local typed allocation {candidate_local_device_bytes} != ledger {MTP1_DRAFT_CANDIDATE_LOCAL_BYTES}").into());
+    }
+    // The streamed head holds pageable chunk staging in addition to its device
+    // buffers; account for it explicitly because it is request-local.
+    probe
+        .host
+        .push(vec![0_u8; CERTIFIED_ARGMAX_HOST_TEMP_BYTES]);
+    let projection = DeviceBuffer::<u8>::zeroed(&stream, mtp_projection)?;
+    stream.synchronize()?;
+    device_min = device_min.min(device_available_bytes()?);
+    let projection_peak_bytes =
+        probe.device_bytes() + mtp_persistent.num_bytes() + projection.num_bytes();
+    drop(projection);
+    let fixed = DeviceBuffer::<u8>::zeroed(&stream, mtp_fixed)?;
+    stream.synchronize()?;
+    device_min = device_min.min(device_available_bytes()?);
+    let fixed_peak_bytes = probe.device_bytes() + mtp_persistent.num_bytes() + fixed.num_bytes();
+    drop(fixed);
+    let head_input = DeviceBuffer::<u16>::zeroed(&stream, v4_state::HIDDEN)?;
+    let head_weight =
+        DeviceBuffer::<u16>::zeroed(&stream, CERTIFIED_ARGMAX_CHUNK_ROWS * v4_state::HIDDEN)?;
+    let head_output = DeviceBuffer::<f32>::zeroed(&stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
+    let head_sumabs = DeviceBuffer::<f32>::zeroed(&stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
+    let head_status = DeviceBuffer::<u32>::zeroed(&stream, CERTIFIED_ARGMAX_CHUNK_ROWS)?;
+    stream.synchronize()?;
+    device_min = device_min.min(device_available_bytes()?);
+    let head_peak_bytes = probe.device_bytes()
+        + mtp_persistent.num_bytes()
+        + head_input.num_bytes()
+        + head_weight.num_bytes()
+        + head_output.num_bytes()
+        + head_sumabs.num_bytes()
+        + head_status.num_bytes();
+    let measured_mtp_peak = projection_peak_bytes
+        .max(fixed_peak_bytes)
+        .max(head_peak_bytes)
+        - base_device_bytes;
+    if measured_mtp_peak != mtp_static_peak {
+        return Err(format!("MTP capacity preflight static peak {mtp_static_peak} != typed-allocation peak {measured_mtp_peak}").into());
+    }
+    let raw_generation_after = vec![0_u64; raw_plans.len()];
+    if raw_generation_after != raw_generation_before {
+        return Err("MTP capacity preflight changed raw-cache generation without a request".into());
+    }
+    drop((
+        head_input,
+        head_weight,
+        head_output,
+        head_sumabs,
+        head_status,
+        mtp_persistent,
+        probe,
+    ));
+    stream.synchronize()?;
+    let device_after = device_available_bytes()?;
+    if device_after != device_before {
+        return Err(format!("stationary MTP capacity preflight device recovery mismatch: before={device_before} after={device_after}").into());
+    }
+    let static_total_peak_bytes = worker_prepared_peak_bytes.max(
+        base_device_bytes
+            .checked_add(mtp_static_peak)
+            .ok_or("stationary MTP capacity preflight total peak overflow")?,
+    );
+    let measured_total_peak_bytes = device_before
+        .checked_sub(device_min)
+        .ok_or("stationary MTP capacity preflight free-memory underflow")?;
+    let allocator_fragmentation_bytes = measured_total_peak_bytes
+        .checked_sub(static_total_peak_bytes)
+        .ok_or("stationary MTP capacity preflight measured peak fell below typed ledger")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event":"stationary_mtp1_capacity_preflight", "schema":STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA, "model_execution":false, "layer_execution":false, "kernel_launches":0, "metadata_shards_opened":raw_plans.len(), "tensor_payload_bytes_read":0,
+            "request_plan":{"prompt_rows":plan.prompt_rows,"max_new_tokens":plan.max_new_tokens,"context_rows":plan.context_rows,"csa_compressed_rows":plan.csa_compressed_rows,"hca_compressed_rows":plan.hca_compressed_rows},
+            "generic_persistent_bytes":static_persistent, "generic_scratch_bytes":static_scratch, "generic_scratch_actual_bytes":generic_scratch_actual_bytes, "generic_scratch_instances":1, "target_strict_compressor":target_strict_compressor, "runtime_isolation_strict_compressor":isolation_strict_compressor,
+            "allocation_order":["generic_persistent_and_real_request_scratch","qd4_lanes","raw_device_retention","raw_host_retention","fixed_worker_scratch","prepared_runtimes_separate_peak_then_drop","mtp_persistent_and_candidate_locals","projection_fixed_head_mutually_exclusive_peaks"],
+            "recovery_order":["prepared_runtimes_drop_before_mtp","projection_drop","fixed_drop","head_mtp_and_capacity_probe_drop","stream_synchronize","device_free_exact_check"],
+            "qd4_device_bytes":V4_QD4_DEVICE_BYTES, "qd4_pinned_host_bytes":V4_QD4_PINNED_HOST_BYTES,
+            "worker_device_bytes":PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES, "worker_scratch_device_bytes":PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES, "worker_prepared_runtime_device_bytes":PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES, "worker_pinned_host_bytes":PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES,
+            "raw_device_selected_bytes":raw_plans.iter().zip(&selected_device).filter_map(|(plan, selected)| selected.then_some(plan.raw_device_bytes)).sum::<usize>(),
+            "raw_host_selected_bytes":base_raw_host_bytes, "raw_device_selected_layers":selected_device.iter().filter(|&&v|v).count(), "raw_host_selected_layers":selected_host.iter().filter(|&&v|v).count(),
+            "mtp":{"persistent_bytes":MTP1_DRAFT_PERSISTENT_BYTES,"candidate_local_bytes":MTP1_DRAFT_CANDIDATE_LOCAL_BYTES,"candidate_locals":{"enorm_hnorm":MTP1_DRAFT_ENORM_HNORM_BYTES,"kv_ready":MTP1_DRAFT_KV_READY_BYTES,"q":MTP1_DRAFT_Q_BYTES,"cache":MTP1_DRAFT_CACHE_BYTES,"topk":MTP1_DRAFT_TOPK_BYTES,"sparse":MTP1_DRAFT_SPARSE_BYTES,"score_reuse":MTP1_DRAFT_SCORE_REUSE_BYTES},"projection_peak_bytes":mtp_projection+MTP1_DRAFT_PERSISTENT_BYTES+MTP1_DRAFT_CANDIDATE_LOCAL_BYTES,"fixed_peak_bytes":mtp_fixed+MTP1_DRAFT_PERSISTENT_BYTES+MTP1_DRAFT_CANDIDATE_LOCAL_BYTES,"head_peak_bytes":mtp_head+MTP1_DRAFT_PERSISTENT_BYTES+MTP1_DRAFT_CANDIDATE_LOCAL_BYTES,"head_host_staging_bytes":CERTIFIED_ARGMAX_HOST_TEMP_BYTES,"measured_peak_bytes":measured_mtp_peak,"borrowed_qd4_expert_incremental_bytes":0,"qd4_loan_depth":qd4_loan_depth,"qd4_loan_event_drained":true,"qd4_normal_lanes_before":qd4_normal_lanes_before,"qd4_normal_lanes_after":qd4_normal_lanes_after,"head_streams_per_candidate":2},
+            "worker_prepared_peak_bytes":worker_prepared_peak_bytes,"mtp_prepared_runtime_overlap_bytes":0,"base_device_bytes":base_device_bytes,"base_pinned_host_bytes":base_pinned_bytes,"base_host_bytes":base_host_bytes,"generic_audit_mirror_host_bytes":audit_mirror_host_bytes,"raw_cache_generation_before":raw_generation_before,"raw_cache_generation_after":raw_generation_after,"static_total_peak_bytes":static_total_peak_bytes,"measured_total_peak_bytes":measured_total_peak_bytes,"allocator_fragmentation_bytes":allocator_fragmentation_bytes,"device_free_before":device_before,"device_free_min":device_min,"device_free_after":device_after,"recovered_exact":true
+        })
+    );
+    Ok(true)
+}
+
+/// Builds the same request-shared scratch constructor used by generic Full61
+/// execution, but stops before any layer row or kernel launch.  Strict target
+/// mode is explicit because this isolated process intentionally has no Full61
+/// execution flags set.
+fn run_stationary_mtp1_scratch_constructor_preflight() -> Result<bool, Box<dyn Error>> {
+    if !optional_one_flag("COLIBRI_V4_STATIONARY_MTP1_SCRATCH_CONSTRUCTOR_PREFLIGHT")? {
+        return Ok(false);
+    }
+    stationary_mtp1_capacity_preflight_rejects_execution_flags()?;
+    let plan = stationary_mtp1_preflight_plan(
+        std::env::var_os("COLIBRI_V4_STATIONARY_PREFLIGHT_PROMPT_ROWS").as_deref(),
+        std::env::var_os("COLIBRI_V4_STATIONARY_PREFLIGHT_MAX_NEW_TOKENS").as_deref(),
+    )?;
+    let target_strict_compressor = true;
+    let runtime_strict_compressor = strict_compressor_enabled();
+    let pinned_cublas = std::env::var_os("COLIBRI_CUBLAS_EXACT_LIB").map(std::path::PathBuf::from);
+    let expected_bytes = stationary_mtp1_target_strict_scratch_contract(
+        plan,
+        target_strict_compressor,
+        pinned_cublas.as_deref(),
+    )?;
+    drop(cublas_exact::CublasExact::load()?);
+    let context = CudaContext::new(0)?;
+    let stream = context.default_stream();
+    let scratch = DeviceRequestScratch::new_with_strict(&stream, plan, target_strict_compressor)?;
+    let actual_bytes = scratch.num_bytes();
+    if actual_bytes != expected_bytes {
+        return Err("constructor preflight reached an inconsistent scratch total".into());
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "stationary_mtp1_scratch_constructor_preflight",
+            "model_execution": false,
+            "layer_execution": false,
+            "kernel_launches": 0,
+            "metadata_shards_opened": 0,
+            "tensor_payload_bytes_read": 0,
+            "target": {"prompt_rows": plan.prompt_rows, "max_new_tokens": plan.max_new_tokens, "context_rows": plan.context_rows, "csa_compressed_rows": plan.csa_compressed_rows, "hca_compressed_rows": plan.hca_compressed_rows, "generic_device_stationary": true, "routed_qd4": true, "generic_state_audit": true, "stationary_mtp1_draft": true},
+            "target_strict_compressor": target_strict_compressor,
+            "runtime_strict_compressor": runtime_strict_compressor,
+            "expected_bytes": expected_bytes,
+            "actual_bytes": actual_bytes,
+            "expected_breakdown": DeviceRequestScratchGeometry::new(plan, target_strict_compressor)?.byte_breakdown()?.json(),
+            "actual_breakdown": scratch.byte_breakdown().json(),
+        })
+    );
+    drop(scratch);
+    stream.synchronize()?;
+    Ok(true)
+}
 const V4_Q_LORA_RANK: usize = 1_536;
 const V4_DEVICE_TOKEN_STATE_CSA_WITHOUT_Q_LORA_F32_BYTES: usize =
     83_863_054 - V4_Q_LORA_RANK * std::mem::size_of::<f32>();
@@ -9794,6 +12447,12 @@ impl<'a> ExpertSlot<'a> {
         self.w3_scale_device
             .copy_from_device_async(&source.w3_scale_device, stream)?;
         Ok(())
+    }
+
+    fn finish_qd4_loan(&self) -> Result<bool, Box<dyn Error>> {
+        self.complete.record(&self.stream)?;
+        self.complete.synchronize()?;
+        Ok(true)
     }
 }
 
@@ -12239,6 +14898,75 @@ impl LayerDeviceWeights {
     }
 }
 
+/// MTP reuses the ordinary device weight layout only for the kernels that
+/// consume the identical fixed tensors.  Its ratio-0 attention state is
+/// `MtpDraftState`; the zero-length compressor fields are unreachable guards,
+/// not a second persistent state.
+fn upload_mtp_draft_weights(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    host: &v4_state::MtpDraftWeights,
+) -> Result<LayerDeviceWeights, Box<dyn Error>> {
+    let raw_wo_a = DeviceBuffer::from_host(stream, &host.wo_a.weight)?;
+    let mut wo_a = DeviceBuffer::zeroed(stream, raw_wo_a.len())?;
+    launch_e4m3fn_to_bf16(module, stream, &raw_wo_a, &mut wo_a)?;
+    drop(raw_wo_a);
+    Ok(LayerDeviceWeights {
+        layer: v4_state::V4_LAYER_COUNT,
+        compression_ratio: v4_state::CompressionRatio::Hca128,
+        hc_attn_fn: DeviceBuffer::from_host(stream, &host.hc_attn_fn)?,
+        hc_attn_base: DeviceBuffer::from_host(stream, &host.hc_attn_base)?,
+        hc_attn_scale: DeviceBuffer::from_host(stream, &host.hc_attn_scale)?,
+        attn_norm: DeviceBuffer::from_host(stream, &host.attn_norm)?,
+        wq_a: DeviceFp8Matrix::new(stream, &host.wq_a.matrix)?,
+        q_norm: DeviceBuffer::from_host(stream, &host.wq_a.norm)?,
+        wq_b: DeviceFp8Matrix::new(stream, &host.wq_b)?,
+        wkv: DeviceFp8Matrix::new(stream, &host.wkv.matrix)?,
+        kv_norm: DeviceBuffer::from_host(stream, &host.wkv.norm)?,
+        compressor_wkv: DeviceBuffer::zeroed(stream, 0)?,
+        compressor_wgate: DeviceBuffer::zeroed(stream, 0)?,
+        compressor_ape: DeviceBuffer::zeroed(stream, 0)?,
+        compressor_norm: DeviceBuffer::zeroed(stream, 0)?,
+        indexer: None,
+        attn_sink: DeviceBuffer::from_host(stream, &host.attn_sink)?,
+        wo_a,
+        wo_b: DeviceFp8Matrix::new(stream, &host.wo_b)?,
+        hc_ffn_fn: DeviceBuffer::from_host(stream, &host.hc_ffn_fn)?,
+        hc_ffn_base: DeviceBuffer::from_host(stream, &host.hc_ffn_base)?,
+        hc_ffn_scale: DeviceBuffer::from_host(stream, &host.hc_ffn_scale)?,
+        ffn_norm: DeviceBuffer::from_host(stream, &host.ffn_norm)?,
+        gate: DeviceBuffer::from_host(stream, &host.gate)?,
+        router_bias: DeviceBuffer::from_host(stream, &host.router_bias)?,
+        hash_router: false,
+        shared_w1: DeviceFp8Matrix::new(stream, &host.shared.w1)?,
+        shared_w2: DeviceFp8Matrix::new(stream, &host.shared.w2)?,
+        shared_w3: DeviceFp8Matrix::new(stream, &host.shared.w3)?,
+    })
+}
+
+struct MtpDraftPrefixDeviceWeights {
+    hc_attn_fn: DeviceBuffer<f32>,
+    hc_attn_base: DeviceBuffer<f32>,
+    hc_attn_scale: DeviceBuffer<f32>,
+    attn_norm: DeviceBuffer<u16>,
+    wkv: DeviceFp8Matrix,
+    kv_norm: DeviceBuffer<u16>,
+}
+
+fn upload_mtp_draft_prefix_weights(
+    stream: &CudaStream,
+    host: &v4_state::MtpDraftPrefixWeights,
+) -> Result<MtpDraftPrefixDeviceWeights, Box<dyn Error>> {
+    Ok(MtpDraftPrefixDeviceWeights {
+        hc_attn_fn: DeviceBuffer::from_host(stream, &host.hc_attn_fn)?,
+        hc_attn_base: DeviceBuffer::from_host(stream, &host.hc_attn_base)?,
+        hc_attn_scale: DeviceBuffer::from_host(stream, &host.hc_attn_scale)?,
+        attn_norm: DeviceBuffer::from_host(stream, &host.attn_norm)?,
+        wkv: DeviceFp8Matrix::new(stream, &host.wkv.matrix)?,
+        kv_norm: DeviceBuffer::from_host(stream, &host.wkv.norm)?,
+    })
+}
+
 struct LoadedLayerRuntime {
     weights: LayerDeviceWeights,
     expert_shard: safetensors::ShardFile,
@@ -12465,6 +15193,8 @@ struct FixedLayerCache {
     plan: Vec<FixedLayerPlan>,
     device_selected: Vec<bool>,
     host_selected: Vec<bool>,
+    decode_device_selected: Vec<bool>,
+    decode_host_selected: Vec<bool>,
     device: Vec<Option<LoadedLayerRuntime>>,
     raw_device: Vec<Option<RawLoadedLayerRuntime>>,
     raw_host: Vec<Option<RawDecodedLayerHost>>,
@@ -12476,8 +15206,12 @@ struct FixedLayerCache {
     host: Vec<Option<DecodedLayerHost>>,
     device_budget_bytes: usize,
     host_budget_bytes: usize,
+    decode_device_budget_bytes: usize,
+    decode_host_budget_bytes: usize,
     device_resident_bytes: usize,
     host_resident_bytes: usize,
+    decode_device_promotions: Vec<usize>,
+    decode_host_promotions: Vec<usize>,
     device_hits: usize,
     host_hits: usize,
     misses: usize,
@@ -12490,6 +15224,7 @@ struct FixedLayerCache {
 }
 
 const STATIONARY_RAW_LAYOUT: &str = "deepseek-v4-pro-layer-stationary-raw-v1";
+const DECODE_PROMOTION_PLAN_ENV: &str = "COLIBRI_V4_DECODE_PROMOTION_PLAN";
 const RAW_FIXED_SCRATCH_BYTES: usize = 128 * 1024 * 1024;
 
 fn restore_leased_slot<T>(slot: &mut Option<T>, value: T) {
@@ -12678,6 +15413,11 @@ fn run_pinned_fixed_request_worker(
                 }
             }
         } else if slots.len() == 2 {
+            if let Err(error) = cache.validate_decode_overlay_complete() {
+                let message = format!("request phase overlay_drain: {error}");
+                let _ = reply_tx.send(Err(message.clone()));
+                return Err(message);
+            }
             reply_tx.send(Ok(None)).map_err(|_| {
                 "request phase reply_drained: pinned fixed response receiver closed".to_string()
             })?;
@@ -12709,7 +15449,153 @@ impl std::ops::Deref for StationaryRawLease {
     }
 }
 
+fn decode_device_promotion_residency(
+    device_resident_bytes: usize,
+    host_resident_bytes: usize,
+    promoted_device_bytes: usize,
+    released_host_bytes: Option<usize>,
+    device_budget_bytes: usize,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    let device_resident_bytes = device_resident_bytes
+        .checked_add(promoted_device_bytes)
+        .filter(|&bytes| bytes <= device_budget_bytes)
+        .ok_or("decode overlay device promotion violated its target budget")?;
+    let host_resident_bytes = match released_host_bytes {
+        Some(bytes) => host_resident_bytes
+            .checked_sub(bytes)
+            .ok_or("decode overlay host resident byte underflow")?,
+        None => host_resident_bytes,
+    };
+    Ok((device_resident_bytes, host_resident_bytes))
+}
+
+fn decode_host_promotion_residency(
+    host_resident_bytes: usize,
+    promoted_host_bytes: usize,
+    host_budget_bytes: usize,
+) -> Result<usize, Box<dyn Error>> {
+    host_resident_bytes
+        .checked_add(promoted_host_bytes)
+        .filter(|&bytes| bytes <= host_budget_bytes)
+        .ok_or_else(|| "decode overlay host promotion violated its target budget".into())
+}
+
+fn decode_overlay_uses_decode_target(
+    record_count: usize,
+    layer_count: usize,
+    device_promotion_count: usize,
+    host_promotion_count: usize,
+) -> Result<bool, Box<dyn Error>> {
+    if layer_count == 0 || record_count % layer_count != 0 {
+        return Err("decode overlay layer records did not close complete decode rows".into());
+    }
+    if record_count == 0 && (device_promotion_count != 0 || host_promotion_count != 0) {
+        return Err("stationary raw prefill residency unexpectedly contains promotions".into());
+    }
+    Ok(record_count != 0)
+}
+
 impl FixedLayerCache {
+    fn validate_stationary_raw_residency(
+        &self,
+        expected_device: &[bool],
+        expected_host: &[bool],
+        device_budget_bytes: usize,
+        host_budget_bytes: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if expected_device.len() != self.plan.len()
+            || expected_host.len() != self.plan.len()
+            || self.device_selected.len() != self.plan.len()
+            || self.host_selected.len() != self.plan.len()
+            || self
+                .plan
+                .iter()
+                .map(|plan| plan.layer)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.plan.len()
+            || expected_device
+                .iter()
+                .zip(expected_host)
+                .any(|(&device, &host)| device && host)
+            || self.device_selected != expected_device
+            || self.host_selected != expected_host
+        {
+            return Err("stationary raw residency selection did not close".into());
+        }
+        let device_bytes = self
+            .raw_device
+            .iter()
+            .flatten()
+            .try_fold(0_usize, |total, raw| total.checked_add(raw.resident_bytes))
+            .ok_or("decode overlay device resident byte overflow")?;
+        let host_bytes = self
+            .raw_host
+            .iter()
+            .flatten()
+            .try_fold(0_usize, |total, raw| total.checked_add(raw.resident_bytes))
+            .ok_or("stationary raw host resident byte overflow")?;
+        if self.plan.iter().enumerate().any(|(index, plan)| {
+            self.raw_device
+                .get(plan.layer)
+                .is_none_or(|raw| raw.is_some() != expected_device[index])
+                || self
+                    .raw_host
+                    .get(plan.layer)
+                    .is_none_or(|raw| raw.is_some() != expected_host[index])
+        }) || device_bytes != self.device_resident_bytes
+            || host_bytes != self.host_resident_bytes
+            || device_bytes > device_budget_bytes
+            || host_bytes > host_budget_bytes
+        {
+            return Err("stationary raw residency ownership/accounting did not close".into());
+        }
+        Ok(())
+    }
+
+    fn validate_prefill_residency_complete(&self) -> Result<(), Box<dyn Error>> {
+        if !self.decode_device_promotions.is_empty() || !self.decode_host_promotions.is_empty() {
+            return Err("stationary raw prefill residency unexpectedly contains promotions".into());
+        }
+        let (device_selected, host_selected) = stationary_raw_prefill_selection(
+            &self.plan,
+            self.device_budget_bytes,
+            self.host_budget_bytes,
+        );
+        self.validate_stationary_raw_residency(
+            &device_selected,
+            &host_selected,
+            self.device_budget_bytes,
+            self.host_budget_bytes,
+        )
+    }
+
+    fn validate_decode_overlay_complete(&self) -> Result<(), Box<dyn Error>> {
+        if self
+            .decode_device_promotions
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != self.decode_device_promotions.len()
+            || self
+                .decode_host_promotions
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.decode_host_promotions.len()
+        {
+            return Err("stationary raw decode overlay promotions did not close".into());
+        }
+        self.validate_stationary_raw_residency(
+            &self.decode_device_selected,
+            &self.decode_host_selected,
+            self.decode_device_budget_bytes,
+            self.decode_host_budget_bytes,
+        )
+    }
+
     fn restore_stationary_raw(
         &mut self,
         mut lease: StationaryRawLease,
@@ -12724,6 +15610,16 @@ impl FixedLayerCache {
             self.raw_scratch.is_some() || self.raw_scratch_generation != generation
         }) {
             return Err("stationary raw lease rejected an ABA replacement".into());
+        }
+        let index = self
+            .plan
+            .iter()
+            .position(|plan| plan.layer == lease.layer)
+            .ok_or("stationary raw restore layer is outside the retention plan")?;
+        let promote_device = self.decode_device_selected[index] && !self.device_selected[index];
+        let promote_host = self.decode_host_selected[index] && !self.host_selected[index];
+        if promote_device && promote_host {
+            return Err("decode overlay selected one layer for two tiers".into());
         }
         if lease.decoded_wo_a_in_scratch {
             std::mem::swap(
@@ -12746,6 +15642,86 @@ impl FixedLayerCache {
                     .take()
                     .expect("stationary raw lease lost its return scratch"),
             );
+        }
+        if promote_device {
+            if lease.device_generation.is_some()
+                || self.raw_device[lease.layer].is_some()
+                || self.raw_host[lease.layer].is_some()
+            {
+                return Err("decode overlay device promotion ownership drift".into());
+            }
+            let old_host = match (
+                self.host_selected[index],
+                lease.host_generation,
+                lease.raw_host.take(),
+            ) {
+                (true, Some(_), Some(host)) => Some(host),
+                (false, None, None) => None,
+                _ => return Err("decode overlay device promotion ownership drift".into()),
+            };
+            let runtime = lease
+                .runtime
+                .take()
+                .ok_or("decode overlay device promotion lost its runtime")?;
+            let wo_a_raw = lease
+                .raw_device
+                .take()
+                .ok_or("decode overlay device promotion lost its existing raw wo_a")?;
+            let resident_bytes = runtime
+                .weights
+                .num_bytes()
+                .checked_add(wo_a_raw.num_bytes())
+                .ok_or("decode overlay device resident byte overflow")?;
+            if runtime.weights.wo_a.len() != 0
+                || resident_bytes != self.plan[index].raw_device_bytes
+            {
+                return Err("decode overlay device promotion violated its target budget".into());
+            }
+            (self.device_resident_bytes, self.host_resident_bytes) =
+                decode_device_promotion_residency(
+                    self.device_resident_bytes,
+                    self.host_resident_bytes,
+                    resident_bytes,
+                    old_host.as_ref().map(|host| host.resident_bytes),
+                    self.decode_device_budget_bytes,
+                )?;
+            self.device_selected[index] = true;
+            self.host_selected[index] = false;
+            self.raw_device[lease.layer] = Some(RawLoadedLayerRuntime {
+                runtime,
+                wo_a_raw,
+                resident_bytes,
+            });
+            self.decode_device_promotions.push(lease.layer);
+            return Ok(());
+        }
+        if promote_host {
+            if lease.device_generation.is_some()
+                || lease.host_generation.is_some()
+                || lease.raw_host.is_none()
+                || self.raw_device[lease.layer].is_some()
+                || self.raw_host[lease.layer].is_some()
+            {
+                return Err("decode overlay miss-to-host ownership drift".into());
+            }
+            let raw = lease
+                .raw_host
+                .take()
+                .ok_or("decode overlay host promotion lost its existing decoded payload")?;
+            if raw.resident_bytes != self.plan[index].raw_host_bytes {
+                return Err("decode overlay host promotion violated its target budget".into());
+            }
+            drop(lease.runtime.take());
+            drop(lease.raw_device.take());
+            self.host_resident_bytes = decode_host_promotion_residency(
+                self.host_resident_bytes,
+                raw.resident_bytes,
+                self.decode_host_budget_bytes,
+            )?;
+            self.host_selected[index] = true;
+            self.raw_host[lease.layer] = Some(raw);
+            self.decode_host_promotions.push(lease.layer);
+            return Ok(());
         }
         if lease.device_generation.is_some() {
             let _ = self.raw_device[lease.layer].insert(RawLoadedLayerRuntime {
@@ -12782,6 +15758,272 @@ fn parse_gib_budget(name: &str) -> Result<usize, Box<dyn Error>> {
         return Err(format!("{name} must be a finite non-negative GiB value").into());
     }
     Ok((value * 1024.0 * 1024.0 * 1024.0) as usize)
+}
+
+fn fixed_resident_bytes(
+    plans: &[FixedLayerPlan],
+    device_selected: &[bool],
+    host_selected: &[bool],
+) -> Result<(usize, usize), Box<dyn Error>> {
+    if device_selected.len() != plans.len()
+        || host_selected.len() != plans.len()
+        || device_selected
+            .iter()
+            .zip(host_selected)
+            .any(|(&device, &host)| device && host)
+    {
+        return Err("decode promotion plan selected one layer for two tiers".into());
+    }
+    plans
+        .iter()
+        .zip(device_selected)
+        .zip(host_selected)
+        .try_fold(
+            (0_usize, 0_usize),
+            |(device_bytes, host_bytes), ((plan, &device), &host)| {
+                Ok((
+                    if device {
+                        device_bytes
+                            .checked_add(plan.raw_device_bytes)
+                            .ok_or("decode promotion device byte overflow")?
+                    } else {
+                        device_bytes
+                    },
+                    if host {
+                        host_bytes
+                            .checked_add(plan.raw_host_bytes)
+                            .ok_or("decode promotion host byte overflow")?
+                    } else {
+                        host_bytes
+                    },
+                ))
+            },
+        )
+}
+
+fn normalized_decode_promotion_targets(
+    plans: &[FixedLayerPlan],
+    prefill_device: &[bool],
+    prefill_host: &[bool],
+    decode_device: &[bool],
+    decode_host: &[bool],
+    explicit: bool,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if prefill_device.len() != plans.len()
+        || prefill_host.len() != plans.len()
+        || decode_device.len() != plans.len()
+        || decode_host.len() != plans.len()
+        || plans
+            .iter()
+            .map(|plan| plan.layer)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != plans.len()
+    {
+        return Err("decode promotion targets require unique aligned candidate layers".into());
+    }
+    let mut device_layers = Vec::new();
+    let mut host_layers = Vec::new();
+    for index in 0..plans.len() {
+        match (
+            prefill_device[index],
+            prefill_host[index],
+            decode_device[index],
+            decode_host[index],
+        ) {
+            (false, false, false, false)
+            | (true, false, true, false)
+            | (false, true, false, true) => {}
+            (false, false, true, false) | (false, true, true, false) => {
+                device_layers.push(plans[index].layer);
+            }
+            (false, false, false, true) => host_layers.push(plans[index].layer),
+            _ => return Err("decode promotion targets are not monotone tier promotions".into()),
+        }
+    }
+    device_layers.sort_unstable();
+    host_layers.sort_unstable();
+    Ok(serde_json::json!({
+        "mode": if explicit { "explicit" } else { "default_budgeted" },
+        "device_layers": device_layers,
+        "host_layers": host_layers,
+    }))
+}
+
+fn validate_decode_promotion_prefixes(
+    plans: &[FixedLayerPlan],
+    prefill_device: &[bool],
+    prefill_host: &[bool],
+    decode_device: &[bool],
+    decode_host: &[bool],
+    decode_device_budget_bytes: usize,
+    decode_host_budget_bytes: usize,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    normalized_decode_promotion_targets(
+        plans,
+        prefill_device,
+        prefill_host,
+        decode_device,
+        decode_host,
+        true,
+    )?;
+    let (mut device_bytes, mut host_bytes) =
+        fixed_resident_bytes(plans, prefill_device, prefill_host)?;
+    if device_bytes > decode_device_budget_bytes || host_bytes > decode_host_budget_bytes {
+        return Err(
+            "decode promotion initial placement exceeds its decode retention budget".into(),
+        );
+    }
+    for index in 0..plans.len() {
+        match (
+            prefill_device[index],
+            prefill_host[index],
+            decode_device[index],
+            decode_host[index],
+        ) {
+            (false, false, true, false) => {
+                (device_bytes, host_bytes) = decode_device_promotion_residency(
+                    device_bytes,
+                    host_bytes,
+                    plans[index].raw_device_bytes,
+                    None,
+                    decode_device_budget_bytes,
+                )?;
+            }
+            (false, true, true, false) => {
+                (device_bytes, host_bytes) = decode_device_promotion_residency(
+                    device_bytes,
+                    host_bytes,
+                    plans[index].raw_device_bytes,
+                    Some(plans[index].raw_host_bytes),
+                    decode_device_budget_bytes,
+                )?;
+            }
+            (false, false, false, true) => {
+                host_bytes = decode_host_promotion_residency(
+                    host_bytes,
+                    plans[index].raw_host_bytes,
+                    decode_host_budget_bytes,
+                )?;
+            }
+            _ => {}
+        }
+        if device_bytes > decode_device_budget_bytes || host_bytes > decode_host_budget_bytes {
+            return Err("decode promotion prefix exceeds its decode retention budget".into());
+        }
+    }
+    if (device_bytes, host_bytes) != fixed_resident_bytes(plans, decode_device, decode_host)? {
+        return Err("decode promotion prefix accounting did not reach its target".into());
+    }
+    Ok((device_bytes, host_bytes))
+}
+
+fn parse_decode_promotion_plan(
+    value: Option<&std::ffi::OsStr>,
+    plans: &[FixedLayerPlan],
+    device_selected: &[bool],
+    host_selected: &[bool],
+    device_budget_bytes: usize,
+    host_budget_bytes: usize,
+    decode_device_budget_bytes: usize,
+    decode_host_budget_bytes: usize,
+) -> Result<Option<(Vec<bool>, Vec<bool>)>, Box<dyn Error>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{DECODE_PROMOTION_PLAN_ENV} must be valid UTF-8"))?;
+    if value.is_empty()
+        || plans.len() != device_selected.len()
+        || plans.len() != host_selected.len()
+        || plans
+            .iter()
+            .map(|plan| plan.layer)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != plans.len()
+    {
+        return Err(format!(
+            "{DECODE_PROMOTION_PLAN_ENV} requires a non-empty plan over unique candidate layers"
+        )
+        .into());
+    }
+    let (prefill_device_bytes, prefill_host_bytes) =
+        fixed_resident_bytes(plans, device_selected, host_selected)?;
+    if prefill_device_bytes > device_budget_bytes || prefill_host_bytes > host_budget_bytes {
+        return Err("decode promotion prefill placement exceeds its retention budget".into());
+    }
+
+    let mut decode_device_selected = device_selected.to_vec();
+    let mut decode_host_selected = host_selected.to_vec();
+    let mut promoted = BTreeSet::new();
+    for promotion in value.split(',') {
+        let Some((layer, target)) = promotion.split_once(':') else {
+            return Err(format!(
+                "{DECODE_PROMOTION_PLAN_ENV} must be comma-separated layer:D or layer:H promotions"
+            )
+            .into());
+        };
+        if layer.is_empty() || !layer.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!(
+                "{DECODE_PROMOTION_PLAN_ENV} layers must be base-10 unsigned integers"
+            )
+            .into());
+        }
+        let layer = layer
+            .parse::<usize>()
+            .map_err(|_| format!("{DECODE_PROMOTION_PLAN_ENV} layer is outside usize"))?;
+        if !promoted.insert(layer) {
+            return Err(
+                format!("{DECODE_PROMOTION_PLAN_ENV} contains duplicate layer {layer}").into(),
+            );
+        }
+        let index = plans
+            .iter()
+            .position(|plan| plan.layer == layer)
+            .ok_or_else(|| {
+                format!("{DECODE_PROMOTION_PLAN_ENV} layer {layer} is not a retention candidate")
+            })?;
+        match (device_selected[index], host_selected[index], target) {
+            (false, false, "D") => decode_device_selected[index] = true,
+            (false, false, "H") => decode_host_selected[index] = true,
+            (false, true, "D") => {
+                decode_device_selected[index] = true;
+                decode_host_selected[index] = false;
+            }
+            _ => {
+                return Err(format!(
+                    "{DECODE_PROMOTION_PLAN_ENV} layer {layer}:{target} is not S->H, S->D, or H->D"
+                )
+                .into());
+            }
+        }
+    }
+    validate_decode_promotion_prefixes(
+        plans,
+        device_selected,
+        host_selected,
+        &decode_device_selected,
+        &decode_host_selected,
+        decode_device_budget_bytes,
+        decode_host_budget_bytes,
+    )?;
+    Ok(Some((decode_device_selected, decode_host_selected)))
+}
+
+fn fixed_saved_bytes_for_target(
+    baseline_source_bytes: usize,
+    baseline_h2d_bytes: usize,
+    target_device: bool,
+    target_host: bool,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    match (target_device, target_host) {
+        (true, false) => Ok((baseline_source_bytes, baseline_h2d_bytes)),
+        (false, true) => Ok((baseline_source_bytes, 0)),
+        (false, false) => Ok((0, 0)),
+        (true, true) => Err("fixed saved-byte target selected two tiers".into()),
+    }
 }
 
 fn select_fixed_cache_layers(
@@ -12859,6 +16101,19 @@ fn select_fixed_cache_layers(
     selected
 }
 
+fn stationary_raw_prefill_selection(
+    plans: &[FixedLayerPlan],
+    device_budget_bytes: usize,
+    host_budget_bytes: usize,
+) -> (Vec<bool>, Vec<bool>) {
+    let none_selected = vec![false; plans.len()];
+    let device_selected =
+        select_fixed_cache_layers(plans, device_budget_bytes, &none_selected, true, true);
+    let host_selected =
+        select_fixed_cache_layers(plans, host_budget_bytes, &device_selected, false, true);
+    (device_selected, host_selected)
+}
+
 fn preflight_cache_budget(
     requested: usize,
     available: usize,
@@ -12897,8 +16152,19 @@ fn device_available_bytes() -> Result<usize, Box<dyn Error>> {
 
 const PHASE1_HCA_PAYLOAD_BYTES: usize = 391_959_576;
 const PHASE1_CSA_PAYLOAD_BYTES: usize = 427_239_448;
-const PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES: usize =
-    PHASE1_CSA_PAYLOAD_BYTES + RAW_FIXED_SCRATCH_BYTES;
+const PINNED_FIXED_PIPELINE_WORKER_SLOTS: usize = 2;
+// A prepared worker slot owns both its reusable wo_a decode scratch and the
+// decoded fixed runtime held by PinnedFixedPrepared::lease until finish()
+// restores it.  Two prepare replies may be outstanding simultaneously.
+const PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES: usize =
+    PINNED_FIXED_PIPELINE_WORKER_SLOTS * PHASE1_CSA_PAYLOAD_BYTES;
+const PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES: usize =
+    PINNED_FIXED_PIPELINE_WORKER_SLOTS * RAW_FIXED_SCRATCH_BYTES;
+const PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES: usize =
+    PINNED_FIXED_PIPELINE_WORKER_PREPARED_DEVICE_BYTES
+        + PINNED_FIXED_PIPELINE_WORKER_SCRATCH_DEVICE_BYTES;
+const PINNED_FIXED_PIPELINE_WORKER_PINNED_HOST_BYTES: usize =
+    PINNED_FIXED_PIPELINE_WORKER_SLOTS * PHASE1_CSA_PAYLOAD_BYTES;
 const PHASE1_P6_HCA_TRANSFERS: u64 = 23;
 const PHASE1_P6_CSA_TRANSFERS: u64 = 29;
 const PHASE1_P6_FIXED_PREPARE_NS: u64 = 11_466_446_202;
@@ -13628,6 +16894,8 @@ impl FixedLayerCache {
         layers: &[usize],
         device_reserve_bytes: usize,
         host_reserve_bytes: usize,
+        decode_device_release_bytes: usize,
+        decode_host_release_bytes: usize,
         stream: &CudaStream,
     ) -> Result<Self, Box<dyn Error>> {
         let requested_device = parse_gib_budget("COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB")?;
@@ -13635,7 +16903,7 @@ impl FixedLayerCache {
         let pinned_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
         let effective_requested_device = if pinned_pipeline {
             requested_device
-                .checked_sub(PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES)
+                .checked_sub(PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES)
                 .ok_or("pinned fixed pipeline device budget cannot hold its next layer and second decode scratch")?
         } else {
             requested_device
@@ -13643,11 +16911,11 @@ impl FixedLayerCache {
         let device_budget_bytes = preflight_cache_budget(
             effective_requested_device,
             device_available_bytes()?,
-            device_reserve_bytes
-                .saturating_add(RAW_FIXED_SCRATCH_BYTES)
-                .saturating_add(
-                    usize::from(pinned_pipeline) * PINNED_FIXED_PIPELINE_EXTRA_DEVICE_BYTES,
-                ),
+            device_reserve_bytes.saturating_add(if pinned_pipeline {
+                PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES
+            } else {
+                RAW_FIXED_SCRATCH_BYTES
+            }),
             "stationary_raw_device",
         );
         let host_budget_bytes = preflight_cache_budget(
@@ -13662,10 +16930,63 @@ impl FixedLayerCache {
             stationary_raw_layer_plans(model_dir, layers)?
         };
         let none_selected = vec![false; plan.len()];
-        let device_selected =
-            select_fixed_cache_layers(&plan, device_budget_bytes, &none_selected, true, true);
-        let host_selected =
-            select_fixed_cache_layers(&plan, host_budget_bytes, &device_selected, false, true);
+        let (device_selected, host_selected) =
+            stationary_raw_prefill_selection(&plan, device_budget_bytes, host_budget_bytes);
+        let decode_device_budget_bytes = device_budget_bytes
+            .checked_add(decode_device_release_bytes)
+            .ok_or("stationary raw decode overlay device budget overflow")?;
+        let decode_host_budget_bytes = host_budget_bytes
+            .checked_add(decode_host_release_bytes)
+            .ok_or("stationary raw decode overlay host budget overflow")?;
+        let explicit_decode_plan = std::env::var_os(DECODE_PROMOTION_PLAN_ENV);
+        let (decode_device_selected, decode_host_selected) = match parse_decode_promotion_plan(
+            explicit_decode_plan.as_deref(),
+            &plan,
+            &device_selected,
+            &host_selected,
+            device_budget_bytes,
+            host_budget_bytes,
+            decode_device_budget_bytes,
+            decode_host_budget_bytes,
+        )? {
+            Some(targets) => targets,
+            None => {
+                let device = select_fixed_cache_layers(
+                    &plan,
+                    decode_device_budget_bytes,
+                    &none_selected,
+                    true,
+                    true,
+                );
+                let host = select_fixed_cache_layers(
+                    &plan,
+                    decode_host_budget_bytes,
+                    &device,
+                    false,
+                    true,
+                );
+                (device, host)
+            }
+        };
+        if device_selected
+            .iter()
+            .zip(&decode_device_selected)
+            .any(|(&prefill, &decode)| prefill && !decode)
+            || host_selected
+                .iter()
+                .zip(&decode_device_selected)
+                .zip(&decode_host_selected)
+                .any(|((&prefill, &device), &host)| prefill && !device && !host)
+            || decode_host_selected
+                .iter()
+                .zip(&host_selected)
+                .zip(&device_selected)
+                .any(|((&decode, &prefill_host), &prefill_device)| {
+                    decode && !prefill_host && prefill_device
+                })
+        {
+            return Err("stationary raw decode overlay requires monotone tier promotions".into());
+        }
         let raw_scratch = (device_selected.iter().any(|&selected| selected)
             || host_selected.iter().any(|&selected| selected))
         .then(|| {
@@ -13679,6 +17000,8 @@ impl FixedLayerCache {
             plan,
             device_selected,
             host_selected,
+            decode_device_selected,
+            decode_host_selected,
             device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_device: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             raw_host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
@@ -13690,8 +17013,12 @@ impl FixedLayerCache {
             host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             device_budget_bytes,
             host_budget_bytes,
+            decode_device_budget_bytes,
+            decode_host_budget_bytes,
             device_resident_bytes: 0,
             host_resident_bytes: 0,
+            decode_device_promotions: Vec::new(),
+            decode_host_promotions: Vec::new(),
             device_hits: 0,
             host_hits: 0,
             misses: 0,
@@ -13758,10 +17085,16 @@ impl FixedLayerCache {
                 plan: Vec::new(),
                 device_selected: Vec::new(),
                 host_selected: Vec::new(),
+                decode_device_selected: Vec::new(),
+                decode_host_selected: Vec::new(),
                 device_budget_bytes,
                 host_budget_bytes,
+                decode_device_budget_bytes: device_budget_bytes,
+                decode_host_budget_bytes: host_budget_bytes,
                 device_resident_bytes: 0,
                 host_resident_bytes: 0,
+                decode_device_promotions: Vec::new(),
+                decode_host_promotions: Vec::new(),
                 device_hits: 0,
                 host_hits: 0,
                 misses: 0,
@@ -13819,12 +17152,18 @@ impl FixedLayerCache {
             raw_mode,
             host: (0..v4_state::V4_LAYER_COUNT).map(|_| None).collect(),
             plan,
+            decode_device_selected: device_selected.clone(),
+            decode_host_selected: host_selected.clone(),
             device_selected,
             host_selected,
             device_budget_bytes,
             host_budget_bytes,
+            decode_device_budget_bytes: device_budget_bytes,
+            decode_host_budget_bytes: host_budget_bytes,
             device_resident_bytes: 0,
             host_resident_bytes: 0,
+            decode_device_promotions: Vec::new(),
+            decode_host_promotions: Vec::new(),
             device_hits: 0,
             host_hits: 0,
             misses: 0,
@@ -13848,6 +17187,31 @@ impl FixedLayerCache {
             self.host_selected[index],
             &self.plan[index],
         )
+    }
+
+    fn record_stationary_saved_bytes(
+        &mut self,
+        layer: usize,
+        target_device: bool,
+        target_host: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let (source_bytes, h2d_bytes) = fixed_saved_bytes_for_target(
+            self.stationary_source_bytes[layer],
+            self.stationary_h2d_bytes[layer],
+            target_device,
+            target_host,
+        )?;
+        let source_bytes_saved = self
+            .stationary_source_bytes_saved
+            .checked_add(source_bytes)
+            .ok_or("stationary source-saved byte overflow")?;
+        let h2d_bytes_saved = self
+            .stationary_h2d_bytes_saved
+            .checked_add(h2d_bytes)
+            .ok_or("stationary H2D-saved byte overflow")?;
+        self.stationary_source_bytes_saved = source_bytes_saved;
+        self.stationary_h2d_bytes_saved = h2d_bytes_saved;
+        Ok(())
     }
 
     fn capture_stationary_raw(
@@ -13882,6 +17246,8 @@ impl FixedLayerCache {
         if runtime.weights.wo_a.len() != host_raw_len || wo_a_raw.len() != host_raw_len {
             return Err(format!("layer {layer} stationary raw wo_a shape mismatch").into());
         }
+        self.stationary_source_bytes[layer] = telemetry.fixed_source_bytes;
+        self.stationary_h2d_bytes[layer] = telemetry.fixed_h2d_bytes;
         if device_selected {
             let decoded_wo_a =
                 std::mem::replace(&mut runtime.weights.wo_a, DeviceBuffer::zeroed(stream, 0)?);
@@ -13904,8 +17270,6 @@ impl FixedLayerCache {
                 .into());
             }
             self.device_resident_bytes += resident_bytes;
-            self.stationary_source_bytes[layer] = telemetry.fixed_source_bytes;
-            self.stationary_h2d_bytes[layer] = telemetry.fixed_h2d_bytes;
             self.raw_device[layer] = Some(RawLoadedLayerRuntime {
                 runtime,
                 wo_a_raw,
@@ -13935,8 +17299,6 @@ impl FixedLayerCache {
                 .into());
             }
             self.host_resident_bytes += resident_bytes;
-            self.stationary_source_bytes[layer] = telemetry.fixed_source_bytes;
-            self.stationary_h2d_bytes[layer] = telemetry.fixed_h2d_bytes;
             self.raw_host[layer] = Some(RawDecodedLayerHost {
                 host,
                 wo_a_raw: raw,
@@ -13962,25 +17324,26 @@ impl FixedLayerCache {
             .ok_or("pinned fixed slot generation overflow")?;
         let generation = slot.generation;
         let candidate = self.plan.iter().position(|plan| plan.layer == layer);
-        let (device_selected, host_selected, expected_bytes) = candidate
+        let (
+            device_selected,
+            host_selected,
+            decode_device_selected,
+            decode_host_selected,
+            expected_bytes,
+        ) = candidate
             .map(|index| {
                 (
                     self.device_selected[index],
                     self.host_selected[index],
+                    self.decode_device_selected[index],
+                    self.decode_host_selected[index],
                     self.plan[index].raw_device_bytes,
                 )
             })
             .ok_or("pinned fixed layer is outside the retention plan")?;
         if device_selected && self.raw_device[layer].is_some() {
             self.device_hits += 1;
-            self.stationary_source_bytes_saved = self
-                .stationary_source_bytes_saved
-                .checked_add(self.stationary_source_bytes[layer])
-                .ok_or("pinned fixed source-saved byte overflow")?;
-            self.stationary_h2d_bytes_saved = self
-                .stationary_h2d_bytes_saved
-                .checked_add(self.stationary_h2d_bytes[layer])
-                .ok_or("pinned fixed H2D-saved byte overflow")?;
+            self.record_stationary_saved_bytes(layer, true, false)?;
             let cached = self.raw_device[layer]
                 .take()
                 .ok_or("pinned fixed device cache entry disappeared")?;
@@ -14027,12 +17390,11 @@ impl FixedLayerCache {
         let runtime;
         let raw_wo_a;
         let copied;
+        let mut overlay_raw_host = None;
+        let mut overlay_host_generation = None;
         if host_selected && self.raw_host[layer].is_some() {
             self.host_hits += 1;
-            self.stationary_source_bytes_saved = self
-                .stationary_source_bytes_saved
-                .checked_add(self.stationary_source_bytes[layer])
-                .ok_or("pinned fixed host source-saved byte overflow")?;
+            self.record_stationary_saved_bytes(layer, false, true)?;
             let mut cached = self.raw_host[layer]
                 .take()
                 .ok_or("pinned fixed host cache entry disappeared")?;
@@ -14063,18 +17425,48 @@ impl FixedLayerCache {
             {
                 return Err("pinned fixed host restore rejected an ABA replacement".into());
             }
-            let _ = self.raw_host[layer].insert(cached);
+            if decode_device_selected && !device_selected {
+                overlay_host_generation = Some(host_generation);
+                overlay_raw_host = Some(cached);
+            } else {
+                let _ = self.raw_host[layer].insert(cached);
+            }
             telemetry = FixedLoadTelemetry {
                 cache_status: "stationary_pinned_host_hit",
                 ..FixedLoadTelemetry::default()
             };
         } else {
             self.misses += 1;
-            let (host, loaded) = load_layer_host_raw_wo_a(model_dir, layer, &[token_id])?;
+            let (mut host, loaded) = load_layer_host_raw_wo_a(model_dir, layer, &[token_id])?;
             telemetry = loaded;
             (runtime, raw_wo_a, copied) = upload_pinned_layer_runtime_raw(
                 model_dir, layer, &host, module, transfer, &mut slot,
             )?;
+            if decode_host_selected && !host_selected {
+                drop_request_hash_ids_before_fixed_retention(&mut host.state.router, 1)?;
+                let raw = host
+                    .tail
+                    .wo_a_raw
+                    .take()
+                    .ok_or("decode overlay host promotion lost its existing raw wo_a")?;
+                let resident_bytes = host
+                    .num_bytes()
+                    .checked_add(raw.len())
+                    .ok_or("decode overlay host resident byte overflow")?;
+                let expected =
+                    self.plan[candidate.expect("retention candidate disappeared")].raw_host_bytes;
+                if resident_bytes != expected {
+                    return Err(format!(
+                        "layer {layer} decode overlay host bytes {resident_bytes} != plan {expected}"
+                    )
+                    .into());
+                }
+                overlay_raw_host = Some(RawDecodedLayerHost {
+                    host,
+                    wo_a_raw: raw,
+                    resident_bytes,
+                });
+            }
             telemetry.cache_status = "stationary_pinned_miss";
         }
         if copied != expected_bytes || copied > PHASE1_CSA_PAYLOAD_BYTES {
@@ -14092,13 +17484,13 @@ impl FixedLayerCache {
             lease: StationaryRawLease {
                 layer,
                 device_generation: None,
-                host_generation: None,
+                host_generation: overlay_host_generation,
                 scratch_generation: None,
                 runtime: Some(runtime),
                 // Keep the async upload source alive until runtime_done closes
                 // the transfer-stream happens-before chain.
                 raw_device: Some(raw_wo_a),
-                raw_host: None,
+                raw_host: overlay_raw_host,
                 scratch: None,
                 resident_bytes: 0,
                 decoded_wo_a_in_scratch: false,
@@ -14125,14 +17517,7 @@ impl FixedLayerCache {
             .unwrap_or((false, false));
         if device_selected && self.raw_device[layer].is_some() {
             self.device_hits += 1;
-            self.stationary_source_bytes_saved = self
-                .stationary_source_bytes_saved
-                .checked_add(self.stationary_source_bytes[layer])
-                .ok_or("stationary source-saved byte overflow")?;
-            self.stationary_h2d_bytes_saved = self
-                .stationary_h2d_bytes_saved
-                .checked_add(self.stationary_h2d_bytes[layer])
-                .ok_or("stationary H2D-saved byte overflow")?;
+            self.record_stationary_saved_bytes(layer, true, false)?;
             let cached = self.raw_device[layer]
                 .take()
                 .ok_or("stationary raw device cache entry disappeared")?;
@@ -14181,10 +17566,7 @@ impl FixedLayerCache {
         }
         if host_selected && self.raw_host[layer].is_some() {
             self.host_hits += 1;
-            self.stationary_source_bytes_saved = self
-                .stationary_source_bytes_saved
-                .checked_add(self.stationary_source_bytes[layer])
-                .ok_or("stationary source-saved byte overflow")?;
+            self.record_stationary_saved_bytes(layer, false, true)?;
             let cached = self.raw_host[layer]
                 .take()
                 .ok_or("stationary raw host cache entry disappeared")?;
@@ -14703,11 +18085,10 @@ fn upload_pinned_layer_runtime_raw(
         })
         .transpose()?;
     let attn_sink = copy!(tail.attn_sink.as_slice());
-    let raw_wo_a = copy!(
-        tail.wo_a_raw
-            .as_deref()
-            .ok_or("pinned fixed upload requires raw wo_a")?
-    );
+    let raw_wo_a = copy!(tail
+        .wo_a_raw
+        .as_deref()
+        .ok_or("pinned fixed upload requires raw wo_a")?);
     let wo_b = fp8!(&tail.wo_b);
     let hc_ffn_fn = copy!(tail.hc_ffn_fn.as_slice());
     let hc_ffn_base = copy!(tail.hc_ffn_base.as_slice());
@@ -14993,6 +18374,7 @@ fn run_b2_layer(
             None,
             false,
             None,
+            None,
         )?;
         let main = state.compressor();
         let indexer = state.indexer();
@@ -15053,6 +18435,7 @@ fn prepare_b2_prefix(
                     false,
                     None,
                     false,
+                    None,
                     None,
                 )?
                 .output,
@@ -15128,6 +18511,7 @@ fn prepare_two_token_prefix(
                         false,
                         None,
                         false,
+                        None,
                         None,
                     )?
                     .output,
@@ -17117,16 +20501,17 @@ fn run_compressor_device_into(
     ratio: usize,
     start_pos: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if input.is_empty()
-        || !input.len().is_multiple_of(v4_state::HIDDEN)
-        || outputs == 0
-        || wkv.len() != outputs * v4_state::HIDDEN
-        || wgate.len() != outputs * v4_state::HIDDEN
-        || ape.len() != ratio * outputs
-        || kv.len() != input.len() / v4_state::HIDDEN * outputs
-        || score.len() != kv.len()
-        || score_plus_ape.len() != kv.len()
-    {
+    if !compressor_workspace_contract_matches(
+        input.len(),
+        wkv.len(),
+        wgate.len(),
+        ape.len(),
+        kv.len(),
+        score.len(),
+        score_plus_ape.len(),
+        outputs,
+        ratio,
+    ) {
         return Err("device Compressor workspace contract mismatch".into());
     }
     // SAFETY: the explicit layer geometry and output rows are disjoint.
@@ -17148,6 +20533,236 @@ fn run_compressor_device_into(
         )?;
     }
     Ok(())
+}
+
+fn compressor_workspace_contract_matches(
+    input_elements: usize,
+    wkv_elements: usize,
+    wgate_elements: usize,
+    ape_elements: usize,
+    kv_elements: usize,
+    score_elements: usize,
+    score_plus_ape_elements: usize,
+    outputs: usize,
+    ratio: usize,
+) -> bool {
+    input_elements != 0
+        && input_elements.is_multiple_of(v4_state::HIDDEN)
+        && outputs != 0
+        && wkv_elements == outputs * v4_state::HIDDEN
+        && wgate_elements == outputs * v4_state::HIDDEN
+        && ape_elements == ratio * outputs
+        && kv_elements == input_elements / v4_state::HIDDEN * outputs
+        && score_elements == kv_elements
+        && score_plus_ape_elements == kv_elements
+}
+
+fn run_generic_main_compressor_device(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    scratch: &mut DeviceRequestScratch,
+    weights: &LayerDeviceWeights,
+    path: GenericStationaryPath,
+    position: usize,
+) -> Result<(), Box<dyn Error>> {
+    if scratch.exact_compressor.is_some() {
+        let DeviceRequestScratch {
+            attn_input,
+            compressor_kv,
+            compressor_score,
+            compressor_score_plus_ape,
+            hca_compressor_kv,
+            hca_compressor_score,
+            hca_compressor_score_plus_ape,
+            exact_compressor,
+            ..
+        } = scratch;
+        let strict = exact_compressor
+            .as_mut()
+            .ok_or("strict generic Compressor workspace disappeared")?;
+        return match path {
+            GenericStationaryPath::Csa4 => {
+                let refresh_weights = strict.begin_main_refresh(path, weights.layer);
+                let result = run_exact_compressor_buffers_device_into(
+                    module,
+                    stream,
+                    attn_input,
+                    &weights.compressor_wkv,
+                    &weights.compressor_wgate,
+                    &weights.compressor_ape,
+                    compressor_kv,
+                    compressor_score,
+                    compressor_score_plus_ape,
+                    &strict.cublas,
+                    &strict.workspace,
+                    &mut strict.input,
+                    &mut strict.csa_wkv,
+                    &mut strict.csa_wgate,
+                    path.ratio(),
+                    position,
+                    refresh_weights,
+                );
+                if result.is_ok() && refresh_weights {
+                    strict.finish_main_refresh(path, weights.layer, refresh_weights);
+                } else if result.is_err() {
+                    strict.invalidate();
+                }
+                result
+            }
+            GenericStationaryPath::Hca128 => {
+                let refresh_weights = strict.begin_main_refresh(path, weights.layer);
+                let result = run_exact_compressor_buffers_device_into(
+                    module,
+                    stream,
+                    attn_input,
+                    &weights.compressor_wkv,
+                    &weights.compressor_wgate,
+                    &weights.compressor_ape,
+                    hca_compressor_kv,
+                    hca_compressor_score,
+                    hca_compressor_score_plus_ape,
+                    &strict.cublas,
+                    &strict.workspace,
+                    &mut strict.input,
+                    &mut strict.hca_wkv,
+                    &mut strict.hca_wgate,
+                    path.ratio(),
+                    position,
+                    refresh_weights,
+                );
+                if result.is_ok() && refresh_weights {
+                    strict.finish_main_refresh(path, weights.layer, refresh_weights);
+                } else if result.is_err() {
+                    strict.invalidate();
+                }
+                result
+            }
+        };
+    }
+    match path {
+        GenericStationaryPath::Csa4 => run_compressor_device_into(
+            module,
+            stream,
+            &scratch.attn_input,
+            &weights.compressor_wkv,
+            &weights.compressor_wgate,
+            &weights.compressor_ape,
+            &mut scratch.compressor_kv,
+            &mut scratch.compressor_score,
+            &mut scratch.compressor_score_plus_ape,
+            path.compressor_width(),
+            path.ratio(),
+            position,
+        ),
+        GenericStationaryPath::Hca128 => run_compressor_device_into(
+            module,
+            stream,
+            &scratch.attn_input,
+            &weights.compressor_wkv,
+            &weights.compressor_wgate,
+            &weights.compressor_ape,
+            &mut scratch.hca_compressor_kv,
+            &mut scratch.hca_compressor_score,
+            &mut scratch.hca_compressor_score_plus_ape,
+            path.compressor_width(),
+            path.ratio(),
+            position,
+        ),
+    }
+}
+
+fn run_generic_compressor_pool_device(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    scratch: &mut DeviceRequestScratch,
+    path: GenericStationaryPath,
+) -> Result<(), Box<dyn Error>> {
+    match path {
+        GenericStationaryPath::Csa4 => run_compressor_pool_ratio4_device_into(
+            module,
+            stream,
+            &scratch.candidate_tail_kv,
+            &scratch.candidate_tail_score,
+            &mut scratch.compressed_pool,
+            v4_state::Q_HEAD_DIM,
+        ),
+        GenericStationaryPath::Hca128 => run_compressor_pool_ratio128_device_into(
+            module,
+            stream,
+            &scratch.candidate_hca_tail_kv,
+            &scratch.candidate_hca_tail_score,
+            &mut scratch.compressed_pool,
+        ),
+    }
+}
+
+fn run_generic_indexer_compressor_device(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    scratch: &mut DeviceRequestScratch,
+    layer: usize,
+    indexer: &DeviceLayerIndexer,
+    position: usize,
+) -> Result<(), Box<dyn Error>> {
+    let DeviceRequestScratch {
+        attn_input,
+        indexer_compressor_kv,
+        indexer_compressor_score,
+        indexer_compressor_score_plus_ape,
+        exact_compressor,
+        ..
+    } = scratch;
+    let kv = indexer_compressor_kv
+        .as_mut()
+        .ok_or("generic CSA indexer scratch disappeared")?;
+    let score = indexer_compressor_score
+        .as_mut()
+        .ok_or("generic CSA indexer scratch disappeared")?;
+    let score_plus_ape = indexer_compressor_score_plus_ape
+        .as_mut()
+        .ok_or("generic CSA indexer scratch disappeared")?;
+    if let Some(strict) = exact_compressor.as_mut() {
+        let refresh_weights = strict.begin_indexer_refresh(layer);
+        let result = run_exact_compressor_buffers_device_into(
+            module,
+            stream,
+            attn_input,
+            &indexer.compressor_wkv,
+            &indexer.compressor_wgate,
+            &indexer.compressor_ape,
+            kv,
+            score,
+            score_plus_ape,
+            &strict.cublas,
+            &strict.workspace,
+            &mut strict.input,
+            &mut strict.csa_indexer_wkv,
+            &mut strict.csa_indexer_wgate,
+            4,
+            position,
+            refresh_weights,
+        );
+        if result.is_ok() && refresh_weights {
+            strict.finish_indexer_refresh(layer, refresh_weights);
+        } else if result.is_err() {
+            strict.invalidate();
+        }
+        return result;
+    }
+    run_compressor_device_into(
+        module,
+        stream,
+        attn_input,
+        &indexer.compressor_wkv,
+        &indexer.compressor_wgate,
+        &indexer.compressor_ape,
+        kv,
+        score,
+        score_plus_ape,
+        256,
+        4,
+        position,
+    )
 }
 
 fn l0_pos0_compressor_probe_enabled(layer: usize, start_pos: usize) -> bool {
@@ -17495,7 +21110,7 @@ fn run_sparse_attention_device_into(
         || !q.len().is_multiple_of(row_width)
         || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
         || topk_per_row == 0
-        || topk.len() != q.len() / row_width * topk_per_row
+        || topk.len() < q.len() / row_width * topk_per_row
         || output.len() != q.len()
     {
         return Err("device sparse attention workspace contract mismatch".into());
@@ -17573,7 +21188,7 @@ fn run_sparse_attention_reference_state_device_into(
         || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
         || attn_sink.len() != v4_state::Q_HEADS
         || topk_per_row == 0
-        || topk.len() != rows * topk_per_row
+        || topk.len() < rows * topk_per_row
         || scratch.scores.len() < score_len
         || scratch.probabilities.len() < score_len
         || scratch.denominators.len() != head_len
@@ -17622,17 +21237,18 @@ fn run_sparse_attention_score_reuse_device_into(
     let head_len = rows
         .checked_mul(v4_state::Q_HEADS)
         .ok_or("sparse attention probability launch length overflow")?;
-    if q.is_empty()
-        || q.len() != rows * row_width
-        || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
-        || topk_per_row == 0
-        || topk.len() != rows * topk_per_row
-        || output.len() != q.len()
-        || scratch.scores.len() < score_len
-        || scratch.probabilities.len() < score_len
-        || scratch.denominators.len() != head_len
-        || scratch.valid_counts.len() != head_len
-    {
+    if !sparse_attention_score_reuse_workspace_matches(
+        q.len(),
+        kv.len(),
+        attn_sink.len(),
+        topk.len(),
+        output.len(),
+        scratch.scores.len(),
+        scratch.probabilities.len(),
+        scratch.denominators.len(),
+        scratch.valid_counts.len(),
+        topk_per_row,
+    ) {
         return Err("score-reuse sparse attention workspace contract mismatch".into());
     }
     // SAFETY: each phase has a disjoint output; the next phase consumes the
@@ -17673,6 +21289,46 @@ fn run_sparse_attention_score_reuse_device_into(
         )?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sparse_attention_score_reuse_workspace_matches(
+    q_elements: usize,
+    kv_elements: usize,
+    attn_sink_elements: usize,
+    topk_capacity: usize,
+    output_elements: usize,
+    score_capacity: usize,
+    probability_capacity: usize,
+    denominator_elements: usize,
+    valid_count_elements: usize,
+    active_topk_per_row: usize,
+) -> bool {
+    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let rows = q_elements / row_width;
+    let Some(active_topk) = rows.checked_mul(active_topk_per_row) else {
+        return false;
+    };
+    let Some(active_scores) = rows
+        .checked_mul(v4_state::Q_HEADS)
+        .and_then(|value| value.checked_mul(active_topk_per_row))
+    else {
+        return false;
+    };
+    let Some(head_elements) = rows.checked_mul(v4_state::Q_HEADS) else {
+        return false;
+    };
+    q_elements != 0
+        && q_elements == rows * row_width
+        && kv_elements.is_multiple_of(v4_state::Q_HEAD_DIM)
+        && attn_sink_elements == v4_state::Q_HEADS
+        && active_topk_per_row != 0
+        && topk_capacity >= active_topk
+        && output_elements == q_elements
+        && score_capacity >= active_scores
+        && probability_capacity >= active_scores
+        && denominator_elements == head_elements
+        && valid_count_elements == head_elements
 }
 
 fn run_l0_wo_a_device_into(
@@ -18703,6 +22359,7 @@ fn timeline_elapsed_ns(origin: std::time::Instant) -> u64 {
     u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[derive(Clone)]
 struct RealAttentionRun {
     output: Vec<u16>,
     topk: Option<Vec<i32>>,
@@ -18715,7 +22372,7 @@ struct RealAttentionRun {
     device_transfer: Option<DeviceAttentionTransfer>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DeviceAttentionTransfer {
     h2d_count: usize,
     h2d_bytes: usize,
@@ -18733,6 +22390,512 @@ struct DeviceCompressorRows {
     score_plus_ape: DeviceBuffer<f32>,
     persistent_kv: DeviceBuffer<f32>,
     persistent_score: DeviceBuffer<f32>,
+}
+
+/// Per-layer state for the generic stationary path.  It intentionally owns
+/// only data that survives from row p to p+1; all projections and attention
+/// intermediates live in the one `DeviceRequestScratch` below.
+struct DeviceLayerPersistentState {
+    layer: usize,
+    committed_rows: usize,
+    compressor_width: usize,
+    raw_kv_ring: DeviceBuffer<u16>,
+    compressor_tail_kv: DeviceBuffer<f32>,
+    compressor_tail_score: DeviceBuffer<f32>,
+    compressed_kv: DeviceBuffer<u16>,
+    indexer_tail_kv: Option<DeviceBuffer<f32>>,
+    indexer_tail_score: Option<DeviceBuffer<f32>>,
+    indexer_kv: Option<DeviceBuffer<u16>>,
+}
+
+/// Exactly one request-local GPU workspace.  This is deliberately separate
+/// from `DeviceTokenState`, which remains the frozen short/audit fixture.
+struct DeviceRequestScratch {
+    hc_hidden: DeviceBuffer<u16>,
+    freqs: DeviceBuffer<f32>,
+    inverse_freqs: DeviceBuffer<f32>,
+    compressed_freqs: DeviceBuffer<f32>,
+    mixes: DeviceBuffer<f32>,
+    pre: DeviceBuffer<f32>,
+    post: DeviceBuffer<f32>,
+    comb: DeviceBuffer<f32>,
+    trace: DeviceBuffer<f32>,
+    collapsed: DeviceBuffer<u16>,
+    attn_input: DeviceBuffer<u16>,
+    fp8_7168: DeviceBuffer<u8>,
+    fp8_7168_scales: DeviceBuffer<u8>,
+    fp8_1536: DeviceBuffer<u8>,
+    fp8_1536_scales: DeviceBuffer<u8>,
+    fp8_16384: DeviceBuffer<u8>,
+    fp8_16384_scales: DeviceBuffer<u8>,
+    empty_u8: DeviceBuffer<u8>,
+    empty_u16: DeviceBuffer<u16>,
+    q_lora_f32: DeviceBuffer<f32>,
+    q_lora_raw: DeviceBuffer<u16>,
+    q_lora: DeviceBuffer<u16>,
+    q_f32: DeviceBuffer<f32>,
+    q_raw: DeviceBuffer<u16>,
+    q_norm: DeviceBuffer<u16>,
+    q_rope: DeviceBuffer<u16>,
+    kv_f32: DeviceBuffer<f32>,
+    kv_raw: DeviceBuffer<u16>,
+    kv_norm: DeviceBuffer<u16>,
+    kv_rope: DeviceBuffer<u16>,
+    kv_ready: DeviceBuffer<u16>,
+    kv_scales: DeviceBuffer<u8>,
+    candidate_tail_kv: DeviceBuffer<f32>,
+    candidate_tail_score: DeviceBuffer<f32>,
+    candidate_hca_tail_kv: DeviceBuffer<f32>,
+    candidate_hca_tail_score: DeviceBuffer<f32>,
+    compressor_kv: DeviceBuffer<f32>,
+    compressor_score: DeviceBuffer<f32>,
+    compressor_score_plus_ape: DeviceBuffer<f32>,
+    hca_compressor_kv: DeviceBuffer<f32>,
+    hca_compressor_score: DeviceBuffer<f32>,
+    hca_compressor_score_plus_ape: DeviceBuffer<f32>,
+    exact_compressor: Option<GenericExactCompressorScratch>,
+    indexer_compressor_kv: Option<DeviceBuffer<f32>>,
+    indexer_compressor_score: Option<DeviceBuffer<f32>>,
+    indexer_compressor_score_plus_ape: Option<DeviceBuffer<f32>>,
+    candidate_indexer_tail_kv: Option<DeviceBuffer<f32>>,
+    candidate_indexer_tail_score: Option<DeviceBuffer<f32>>,
+    compressed_pool: DeviceBuffer<f32>,
+    compressed_bf16: DeviceBuffer<u16>,
+    compressed_norm: DeviceBuffer<u16>,
+    compressed_rope: DeviceBuffer<u16>,
+    compressed_ready: DeviceBuffer<u16>,
+    compressed_scales: DeviceBuffer<u8>,
+    indexer_pool: DeviceBuffer<f32>,
+    indexer_bf16: DeviceBuffer<u16>,
+    indexer_norm: DeviceBuffer<u16>,
+    indexer_rope: DeviceBuffer<u16>,
+    indexer_ready: DeviceBuffer<u16>,
+    candidate_indexer_cache: DeviceBuffer<u16>,
+    indexer_query_raw: DeviceBuffer<u16>,
+    indexer_query_rope: DeviceBuffer<u16>,
+    indexer_query_fp4: DeviceBuffer<u16>,
+    indexer_query_f32: DeviceBuffer<f32>,
+    indexer_weights_f32: DeviceBuffer<f32>,
+    indexer_kv_f32: DeviceBuffer<f32>,
+    indexer_scores: DeviceBuffer<f32>,
+    indexer_valid: DeviceBuffer<u32>,
+    indexer_selected: DeviceBuffer<i32>,
+    topk: DeviceBuffer<i32>,
+    attention_cache: DeviceBuffer<u16>,
+    sparse: DeviceBuffer<u16>,
+    sparse_scratch: SparseAttentionScoreReuseScratch,
+    sparse_inverse: DeviceBuffer<u16>,
+    wo_a: DeviceBuffer<u16>,
+    attention_f32: DeviceBuffer<f32>,
+    attention: DeviceBuffer<u16>,
+    after_attention: DeviceBuffer<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericStationaryPath {
+    Hca128,
+    Csa4,
+}
+
+impl GenericStationaryPath {
+    const fn from_ratio(ratio: v4_state::CompressionRatio) -> Self {
+        match ratio {
+            v4_state::CompressionRatio::Hca128 => Self::Hca128,
+            v4_state::CompressionRatio::Csa4 => Self::Csa4,
+        }
+    }
+
+    const fn is_csa(self) -> bool {
+        matches!(self, Self::Csa4)
+    }
+
+    const fn ratio(self) -> usize {
+        match self {
+            Self::Hca128 => 128,
+            Self::Csa4 => 4,
+        }
+    }
+
+    const fn compressor_width(self) -> usize {
+        match self {
+            Self::Hca128 => v4_state::Q_HEAD_DIM,
+            Self::Csa4 => 1_024,
+        }
+    }
+
+    const fn tail_rows(self) -> usize {
+        match self {
+            Self::Hca128 => v4_state::KV_WINDOW,
+            Self::Csa4 => 8,
+        }
+    }
+
+    const fn tail_elements(self) -> usize {
+        self.tail_rows() * self.compressor_width()
+    }
+
+    const fn compressor_slot(self, position: usize) -> usize {
+        match self {
+            Self::Hca128 => position % v4_state::KV_WINDOW,
+            Self::Csa4 => 4 + position % 4,
+        }
+    }
+
+    const fn topk_rows(self, compressed_rows: usize) -> usize {
+        v4_state::KV_WINDOW
+            + match self {
+                Self::Hca128 => compressed_rows,
+                Self::Csa4 if compressed_rows < v4_state::INDEX_TOPK => compressed_rows,
+                Self::Csa4 => v4_state::INDEX_TOPK,
+            }
+    }
+
+    /// Scratch capacity, not the number of causal keys.  Before the raw ring
+    /// fills, `window_topk_cpu` encodes uncommitted slots as `-1`.
+    const fn composite_capacity_rows(self, position: usize) -> usize {
+        self.topk_rows((position + 1) / self.ratio())
+    }
+
+    const fn max_topk_rows(self, plan: v4_state::LayerStationaryRequestPlan) -> usize {
+        self.topk_rows(self.compressed_rows(plan))
+    }
+
+    const fn compressed_rows(self, plan: v4_state::LayerStationaryRequestPlan) -> usize {
+        match self {
+            Self::Hca128 => plan.hca_compressed_rows,
+            Self::Csa4 => plan.csa_compressed_rows,
+        }
+    }
+}
+
+/// Element counts for the one request-shared generic stationary workspace.
+/// The HCA and CSA rows/tails coexist, but every request path selects exactly
+/// one row and one candidate tail from this table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenericStationaryScratchGeometry {
+    hca_main_elements: usize,
+    csa_main_elements: usize,
+    csa_indexer_elements: usize,
+    hca_tail_elements: usize,
+    csa_tail_elements: usize,
+}
+
+impl GenericStationaryScratchGeometry {
+    const fn max() -> Self {
+        Self {
+            hca_main_elements: v4_state::Q_HEAD_DIM,
+            csa_main_elements: 1_024,
+            csa_indexer_elements: 256,
+            hca_tail_elements: GenericStationaryPath::Hca128.tail_elements(),
+            csa_tail_elements: GenericStationaryPath::Csa4.tail_elements(),
+        }
+    }
+
+    const fn main_elements(self, path: GenericStationaryPath) -> usize {
+        match path {
+            GenericStationaryPath::Hca128 => self.hca_main_elements,
+            GenericStationaryPath::Csa4 => self.csa_main_elements,
+        }
+    }
+
+    const fn tail_elements(self, path: GenericStationaryPath) -> usize {
+        match path {
+            GenericStationaryPath::Hca128 => self.hca_tail_elements,
+            GenericStationaryPath::Csa4 => self.csa_tail_elements,
+        }
+    }
+}
+
+/// The one source of truth for the request-shared generic scratch.  Both the
+/// pre-cache reservation and `DeviceRequestScratch::new` consume this exact
+/// geometry, so a Full61 strict run cannot silently diverge from its ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceRequestScratchGeometry {
+    generic: GenericStationaryScratchGeometry,
+    csa_compressed_rows: usize,
+    topk_rows: usize,
+    strict: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceRequestScratchByteBreakdown {
+    core_mhc: usize,
+    projections: usize,
+    compressor: usize,
+    exact_compressor: usize,
+    indexer: usize,
+    topk_composite: usize,
+    sparse: usize,
+    score_reuse: usize,
+    attention_output: usize,
+}
+
+impl DeviceRequestScratchByteBreakdown {
+    fn total(self) -> Result<usize, Box<dyn Error>> {
+        [
+            self.core_mhc,
+            self.projections,
+            self.compressor,
+            self.exact_compressor,
+            self.indexer,
+            self.topk_composite,
+            self.sparse,
+            self.score_reuse,
+            self.attention_output,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or_else(|| -> Box<dyn Error> { "generic scratch breakdown overflow".into() })
+        })
+    }
+
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "core_mhc": self.core_mhc,
+            "projections": self.projections,
+            "compressor": self.compressor,
+            "exact_compressor": self.exact_compressor,
+            "indexer": self.indexer,
+            "topk_composite": self.topk_composite,
+            "sparse": self.sparse,
+            "score_reuse": self.score_reuse,
+            "attention_output": self.attention_output,
+        })
+    }
+}
+
+impl DeviceRequestScratchGeometry {
+    fn new(
+        plan: v4_state::LayerStationaryRequestPlan,
+        strict: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        let topk_rows = GenericStationaryPath::Hca128
+            .max_topk_rows(plan)
+            .max(GenericStationaryPath::Csa4.max_topk_rows(plan));
+        Ok(Self {
+            generic: GenericStationaryScratchGeometry::max(),
+            csa_compressed_rows: plan.csa_compressed_rows,
+            topk_rows,
+            strict,
+        })
+    }
+
+    const fn attention_f32_elements(self) -> usize {
+        v4_state::HIDDEN
+    }
+
+    fn byte_breakdown(self) -> Result<DeviceRequestScratchByteBreakdown, Box<dyn Error>> {
+        let bytes = |elements: usize, element_bytes: usize| {
+            elements
+                .checked_mul(element_bytes)
+                .ok_or("generic stationary scratch breakdown overflow")
+        };
+        let sum = |values: &[usize]| {
+            values.iter().try_fold(0usize, |total, &value| {
+                total
+                    .checked_add(value)
+                    .ok_or("generic stationary scratch breakdown overflow")
+            })
+        };
+        Ok(DeviceRequestScratchByteBreakdown {
+            core_mhc: sum(&[
+                bytes(v4_state::HC * v4_state::HIDDEN, 2)?,
+                bytes(2 * v4_state::HIDDEN, 2)?,
+                bytes(3 * v4_state::Q_ROPE_DIM, 4)?,
+                bytes(
+                    v4_state::MIX + 2 * v4_state::HC + v4_state::HC * v4_state::HC,
+                    4,
+                )?,
+                bytes(41 * v4_state::HC * v4_state::HC, 4)?,
+            ])?,
+            projections: sum(&[
+                bytes(
+                    v4_state::HIDDEN
+                        + v4_state::HIDDEN / v4_state::FP8_BLOCK
+                        + V4_Q_LORA_RANK
+                        + V4_Q_LORA_RANK / v4_state::FP8_BLOCK
+                        + v4_state::O_GROUPS * v4_state::O_LORA_RANK
+                        + v4_state::O_GROUPS * v4_state::O_LORA_RANK / v4_state::FP8_BLOCK,
+                    1,
+                )?,
+                bytes(
+                    2 * V4_Q_LORA_RANK
+                        + 3 * v4_state::Q_HEADS * v4_state::Q_HEAD_DIM
+                        + 4 * v4_state::Q_HEAD_DIM,
+                    2,
+                )?,
+                bytes(
+                    V4_Q_LORA_RANK
+                        + v4_state::Q_HEADS * v4_state::Q_HEAD_DIM
+                        + v4_state::Q_HEAD_DIM,
+                    4,
+                )?,
+            ])?,
+            compressor: sum(&[
+                bytes(4 * v4_state::Q_HEAD_DIM, 2)?,
+                bytes(14, 1)?,
+                bytes(
+                    2 * self.generic.csa_tail_elements
+                        + 2 * self.generic.hca_tail_elements
+                        + 3 * self.generic.csa_main_elements
+                        + 3 * self.generic.hca_main_elements
+                        + v4_state::Q_HEAD_DIM,
+                    4,
+                )?,
+            ])?,
+            exact_compressor: if self.strict {
+                sum(&[
+                    cublas_exact::WORKSPACE_BYTES,
+                    bytes(
+                        v4_state::HIDDEN
+                            + 2 * self.generic.hca_main_elements * v4_state::HIDDEN
+                            + 2 * self.generic.csa_main_elements * v4_state::HIDDEN
+                            + 2 * self.generic.csa_indexer_elements * v4_state::HIDDEN,
+                        4,
+                    )?,
+                ])?
+            } else {
+                0
+            },
+            indexer: sum(&[
+                bytes(4 * 128 + self.csa_compressed_rows * 128 + 3 * 64 * 128, 2)?,
+                bytes(
+                    3 * self.generic.csa_indexer_elements
+                        + 16 * self.generic.csa_indexer_elements
+                        + 128
+                        + 64 * 128
+                        + 64
+                        + self.csa_compressed_rows * 128
+                        + self.csa_compressed_rows,
+                    4,
+                )?,
+                bytes(self.csa_compressed_rows.min(v4_state::INDEX_TOPK), 4)?,
+                bytes(self.csa_compressed_rows, 4)?,
+            ])?,
+            topk_composite: sum(&[
+                bytes(self.topk_rows * v4_state::Q_HEAD_DIM, 2)?,
+                bytes(self.topk_rows, 4)?,
+            ])?,
+            sparse: bytes(2 * v4_state::Q_HEADS * v4_state::Q_HEAD_DIM, 2)?,
+            score_reuse: sum(&[
+                bytes(
+                    2 * self.topk_rows * v4_state::Q_HEADS + v4_state::Q_HEADS,
+                    4,
+                )?,
+                bytes(v4_state::Q_HEADS, 4)?,
+            ])?,
+            attention_output: sum(&[
+                bytes(
+                    v4_state::O_GROUPS * v4_state::O_LORA_RANK
+                        + v4_state::HIDDEN
+                        + v4_state::HC * v4_state::HIDDEN,
+                    2,
+                )?,
+                bytes(self.attention_f32_elements(), 4)?,
+            ])?,
+        })
+    }
+
+    fn num_bytes(self) -> Result<usize, Box<dyn Error>> {
+        let add = |total: usize, elements: usize, element_bytes: usize| {
+            elements
+                .checked_mul(element_bytes)
+                .and_then(|value| total.checked_add(value))
+                .ok_or("generic stationary scratch reserve overflow")
+        };
+        let mut total = 0usize;
+        for elements in [
+            v4_state::HC * v4_state::HIDDEN,
+            v4_state::HIDDEN,
+            v4_state::HIDDEN,
+            V4_Q_LORA_RANK,
+            V4_Q_LORA_RANK,
+            3 * v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+            4 * v4_state::Q_HEAD_DIM,
+            4 * v4_state::Q_HEAD_DIM,
+            4 * 128,
+            self.csa_compressed_rows * 128,
+            3 * 64 * 128,
+            self.topk_rows * v4_state::Q_HEAD_DIM,
+            2 * v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+            v4_state::O_GROUPS * v4_state::O_LORA_RANK,
+            v4_state::HIDDEN,
+            v4_state::HC * v4_state::HIDDEN,
+        ] {
+            total = add(total, elements, 2)?;
+        }
+        for elements in [
+            v4_state::HIDDEN,
+            v4_state::HIDDEN / v4_state::FP8_BLOCK,
+            V4_Q_LORA_RANK,
+            V4_Q_LORA_RANK / v4_state::FP8_BLOCK,
+            v4_state::O_GROUPS * v4_state::O_LORA_RANK,
+            v4_state::O_GROUPS * v4_state::O_LORA_RANK / v4_state::FP8_BLOCK,
+            14,
+        ] {
+            total = add(total, elements, 1)?;
+        }
+        for elements in [
+            3 * v4_state::Q_ROPE_DIM,
+            v4_state::MIX + 2 * v4_state::HC + v4_state::HC * v4_state::HC,
+            41 * v4_state::HC * v4_state::HC,
+            V4_Q_LORA_RANK,
+            v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+            v4_state::Q_HEAD_DIM,
+            2 * self.generic.csa_tail_elements + 2 * self.generic.hca_tail_elements,
+            3 * self.generic.csa_main_elements + 3 * self.generic.hca_main_elements,
+            3 * self.generic.csa_indexer_elements + 16 * self.generic.csa_indexer_elements,
+            v4_state::Q_HEAD_DIM + 128 + 64 * 128 + 64,
+            self.csa_compressed_rows * 128 + self.csa_compressed_rows,
+            // Score/probability rows and denominator are f32 per head; the
+            // attention projection retains its independent hidden-wide f32 row.
+            2 * self.topk_rows * v4_state::Q_HEADS
+                + v4_state::Q_HEADS
+                + self.attention_f32_elements(),
+        ] {
+            total = add(total, elements, 4)?;
+        }
+        total = add(
+            total,
+            self.csa_compressed_rows.min(v4_state::INDEX_TOPK) + self.topk_rows,
+            4,
+        )?;
+        // `SparseAttentionScoreReuseScratch::valid_counts` is one u32/head.
+        total = add(total, self.csa_compressed_rows + v4_state::Q_HEADS, 4)?;
+        if self.strict {
+            total = add(total, cublas_exact::WORKSPACE_BYTES, 1)?;
+            total = add(
+                total,
+                v4_state::HIDDEN
+                    + 2 * self.generic.hca_main_elements * v4_state::HIDDEN
+                    + 2 * self.generic.csa_main_elements * v4_state::HIDDEN
+                    + 2 * self.generic.csa_indexer_elements * v4_state::HIDDEN,
+                4,
+            )?;
+        }
+        if total != self.byte_breakdown()?.total()? {
+            return Err("generic stationary scratch total differs from its grouped ledger".into());
+        }
+        Ok(total)
+    }
+}
+
+#[cfg(test)]
+fn generic_stationary_range_fits(
+    source_len: usize,
+    source_offset: usize,
+    destination_len: usize,
+    destination_offset: usize,
+    count: usize,
+) -> bool {
+    source_offset
+        .checked_add(count)
+        .is_some_and(|end| end <= source_len)
+        && destination_offset
+            .checked_add(count)
+            .is_some_and(|end| end <= destination_len)
 }
 
 struct DeviceExactCompressorScratch {
@@ -18836,6 +22999,62 @@ struct DeviceTokenState {
     attention_f32: DeviceBuffer<f32>,
     attention: DeviceBuffer<u16>,
     after_attention: DeviceBuffer<u16>,
+}
+
+/// Persistent state owned solely by the MTP draft.  Unlike `DeviceTokenState`,
+/// this ratio-0 layout has exactly one BF16 sliding KV allocation and no
+/// compressor/indexer state, so a rejected candidate cannot mutate the teacher.
+struct MtpDraftState {
+    position: usize,
+    kv_cache: DeviceBuffer<u16>,
+}
+
+impl MtpDraftState {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        let plan =
+            v4_state::mtp1_swa::mtp1_swa_attention_state_plan(v4_state::mtp1_swa::MTP1_SWA_LAYER)?;
+        let kv_cache = DeviceBuffer::zeroed(stream, plan.kv_elements())?;
+        if kv_cache.num_bytes() != plan.capacity_contribution_bytes()
+            || kv_cache.num_bytes() != 131_072
+        {
+            return Err("MTP draft BF16 sliding-KV allocation drifted from its plan".into());
+        }
+        Ok(Self {
+            position: 0,
+            kv_cache,
+        })
+    }
+
+    fn persistent_bytes(&self) -> usize {
+        self.kv_cache.num_bytes()
+    }
+
+    fn digest(&self, stream: &CudaStream) -> Result<u64, Box<dyn Error>> {
+        Ok(fnv1a_u16(&self.kv_cache.to_host_vec(stream)?))
+    }
+
+    fn commit_kv_row(
+        &mut self,
+        stream: &CudaStream,
+        kv_ready: &DeviceBuffer<u16>,
+    ) -> Result<(), Box<dyn Error>> {
+        if kv_ready.len() != v4_state::Q_HEAD_DIM
+            || self.kv_cache.len() != v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM
+        {
+            return Err("MTP draft sliding-KV commit contract mismatch".into());
+        }
+        let slot =
+            v4_state::mtp1_swa::mtp1_swa_attention_state_plan(v4_state::mtp1_swa::MTP1_SWA_LAYER)?
+                .slot_for_position(self.position)?;
+        // SAFETY: the validated plan maps one complete 512-wide row into the
+        // unique in-range ring slot owned by this MTP state.
+        unsafe { copy_device_row(stream, &self.kv_cache, slot, kv_ready)? };
+        self.position = self
+            .position
+            .checked_add(1)
+            .ok_or("MTP draft KV position overflow")?;
+        Ok(())
+    }
 }
 
 struct DeviceRequestRopeLut {
@@ -18958,6 +23177,1343 @@ impl DeviceCompressorRows {
     }
 }
 
+impl DeviceLayerPersistentState {
+    fn new(
+        stream: &CudaStream,
+        weights: &LayerDeviceWeights,
+        plan: v4_state::LayerStationaryRequestPlan,
+    ) -> Result<Self, Box<dyn Error>> {
+        let path = GenericStationaryPath::from_ratio(weights.compression_ratio);
+        let csa = path.is_csa();
+        let compressor_width = path.compressor_width();
+        let compressed_rows = path.compressed_rows(plan);
+        let tail_elements = path.tail_elements();
+        let compressed_elements = compressed_rows
+            .checked_mul(v4_state::Q_HEAD_DIM)
+            .ok_or("generic stationary compressed KV capacity overflow")?;
+        let indexer_elements = plan
+            .csa_compressed_rows
+            .checked_mul(128)
+            .ok_or("generic stationary indexer KV capacity overflow")?;
+        let state = Self {
+            layer: weights.layer,
+            committed_rows: 0,
+            compressor_width,
+            raw_kv_ring: DeviceBuffer::zeroed(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?,
+            compressor_tail_kv: DeviceBuffer::zeroed(stream, tail_elements)?,
+            compressor_tail_score: DeviceBuffer::from_host(
+                stream,
+                &vec![f32::NEG_INFINITY; tail_elements],
+            )?,
+            compressed_kv: DeviceBuffer::zeroed(stream, compressed_elements)?,
+            indexer_tail_kv: csa
+                .then(|| DeviceBuffer::zeroed(stream, 8 * 256))
+                .transpose()?,
+            indexer_tail_score: csa
+                .then(|| DeviceBuffer::from_host(stream, &vec![f32::NEG_INFINITY; 8 * 256]))
+                .transpose()?,
+            indexer_kv: csa
+                .then(|| DeviceBuffer::zeroed(stream, indexer_elements))
+                .transpose()?,
+        };
+        if state.raw_kv_ring.len() != v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM
+            || state.compressor_tail_kv.len() != tail_elements
+            || state.compressor_tail_score.len() != tail_elements
+            || state.compressed_kv.len() != compressed_elements
+        {
+            return Err("generic stationary persistent layout drifted from request plan".into());
+        }
+        Ok(state)
+    }
+
+    fn raw_slot(&self, position: usize) -> Result<usize, Box<dyn Error>> {
+        if position != self.committed_rows {
+            return Err("generic stationary raw-ring commit is not contiguous".into());
+        }
+        Ok(position % v4_state::KV_WINDOW)
+    }
+
+    fn compressed_rows(&self, ratio: v4_state::CompressionRatio) -> usize {
+        self.committed_rows / ratio.get()
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.raw_kv_ring.num_bytes()
+            + self.compressor_tail_kv.num_bytes()
+            + self.compressor_tail_score.num_bytes()
+            + self.compressed_kv.num_bytes()
+            + self
+                .indexer_tail_kv
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .indexer_tail_score
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self.indexer_kv.as_ref().map_or(0, DeviceBuffer::num_bytes)
+    }
+}
+
+impl DeviceRequestScratch {
+    fn new(
+        stream: &CudaStream,
+        weights: &LayerDeviceWeights,
+        plan: v4_state::LayerStationaryRequestPlan,
+    ) -> Result<Self, Box<dyn Error>> {
+        if weights.wq_a.out_features != V4_Q_LORA_RANK
+            || weights.wq_b.out_features != v4_state::Q_HEADS * v4_state::Q_HEAD_DIM
+            || weights.wkv.out_features != v4_state::Q_HEAD_DIM
+        {
+            return Err(
+                "generic stationary scratch projection shapes differ from its geometry".into(),
+            );
+        }
+        Self::new_with_strict(stream, plan, strict_compressor_enabled())
+    }
+
+    fn new_with_strict(
+        stream: &CudaStream,
+        plan: v4_state::LayerStationaryRequestPlan,
+        target_strict_compressor: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        let scratch_geometry = DeviceRequestScratchGeometry::new(plan, target_strict_compressor)?;
+        let geometry = scratch_geometry.generic;
+        let topk_rows = scratch_geometry.topk_rows;
+        let scratch = Self {
+            hc_hidden: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HIDDEN)?,
+            freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            inverse_freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            compressed_freqs: DeviceBuffer::zeroed(stream, v4_state::Q_ROPE_DIM)?,
+            mixes: DeviceBuffer::zeroed(stream, v4_state::MIX)?,
+            pre: DeviceBuffer::zeroed(stream, v4_state::HC)?,
+            post: DeviceBuffer::zeroed(stream, v4_state::HC)?,
+            comb: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HC)?,
+            trace: DeviceBuffer::zeroed(stream, 41 * v4_state::HC * v4_state::HC)?,
+            collapsed: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            attn_input: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            fp8_7168: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            fp8_7168_scales: DeviceBuffer::zeroed(stream, v4_state::HIDDEN / v4_state::FP8_BLOCK)?,
+            fp8_1536: DeviceBuffer::zeroed(stream, V4_Q_LORA_RANK)?,
+            fp8_1536_scales: DeviceBuffer::zeroed(stream, V4_Q_LORA_RANK / v4_state::FP8_BLOCK)?,
+            fp8_16384: DeviceBuffer::zeroed(stream, v4_state::O_GROUPS * v4_state::O_LORA_RANK)?,
+            fp8_16384_scales: DeviceBuffer::zeroed(
+                stream,
+                v4_state::O_GROUPS * v4_state::O_LORA_RANK / v4_state::FP8_BLOCK,
+            )?,
+            empty_u8: DeviceBuffer::zeroed(stream, 0)?,
+            empty_u16: DeviceBuffer::zeroed(stream, 0)?,
+            q_lora_f32: DeviceBuffer::zeroed(stream, V4_Q_LORA_RANK)?,
+            q_lora_raw: DeviceBuffer::zeroed(stream, V4_Q_LORA_RANK)?,
+            q_lora: DeviceBuffer::zeroed(stream, V4_Q_LORA_RANK)?,
+            q_f32: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            q_raw: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            q_norm: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            q_rope: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            kv_f32: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            kv_raw: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            kv_norm: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            kv_rope: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            kv_ready: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            kv_scales: DeviceBuffer::zeroed(stream, 7)?,
+            candidate_tail_kv: DeviceBuffer::zeroed(
+                stream,
+                geometry.tail_elements(GenericStationaryPath::Csa4),
+            )?,
+            candidate_tail_score: DeviceBuffer::zeroed(
+                stream,
+                geometry.tail_elements(GenericStationaryPath::Csa4),
+            )?,
+            candidate_hca_tail_kv: DeviceBuffer::zeroed(
+                stream,
+                geometry.tail_elements(GenericStationaryPath::Hca128),
+            )?,
+            candidate_hca_tail_score: DeviceBuffer::zeroed(
+                stream,
+                geometry.tail_elements(GenericStationaryPath::Hca128),
+            )?,
+            compressor_kv: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Csa4),
+            )?,
+            compressor_score: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Csa4),
+            )?,
+            compressor_score_plus_ape: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Csa4),
+            )?,
+            hca_compressor_kv: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Hca128),
+            )?,
+            hca_compressor_score: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Hca128),
+            )?,
+            hca_compressor_score_plus_ape: DeviceBuffer::zeroed(
+                stream,
+                geometry.main_elements(GenericStationaryPath::Hca128),
+            )?,
+            exact_compressor: scratch_geometry
+                .strict
+                .then(|| GenericExactCompressorScratch::new_for_geometry(stream, scratch_geometry))
+                .transpose()?,
+            indexer_compressor_kv: Some(DeviceBuffer::zeroed(
+                stream,
+                geometry.csa_indexer_elements,
+            )?),
+            indexer_compressor_score: Some(DeviceBuffer::zeroed(
+                stream,
+                geometry.csa_indexer_elements,
+            )?),
+            indexer_compressor_score_plus_ape: Some(DeviceBuffer::zeroed(
+                stream,
+                geometry.csa_indexer_elements,
+            )?),
+            candidate_indexer_tail_kv: Some(DeviceBuffer::zeroed(
+                stream,
+                8 * geometry.csa_indexer_elements,
+            )?),
+            candidate_indexer_tail_score: Some(DeviceBuffer::zeroed(
+                stream,
+                8 * geometry.csa_indexer_elements,
+            )?),
+            compressed_pool: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_bf16: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_norm: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_rope: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_ready: DeviceBuffer::zeroed(stream, v4_state::Q_HEAD_DIM)?,
+            compressed_scales: DeviceBuffer::zeroed(stream, 7)?,
+            indexer_pool: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_bf16: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_norm: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_rope: DeviceBuffer::zeroed(stream, 128)?,
+            indexer_ready: DeviceBuffer::zeroed(stream, 128)?,
+            candidate_indexer_cache: DeviceBuffer::zeroed(
+                stream,
+                scratch_geometry
+                    .csa_compressed_rows
+                    .checked_mul(128)
+                    .ok_or("generic stationary candidate indexer cache capacity overflow")?,
+            )?,
+            indexer_query_raw: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_rope: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_fp4: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_query_f32: DeviceBuffer::zeroed(stream, 64 * 128)?,
+            indexer_weights_f32: DeviceBuffer::zeroed(stream, 64)?,
+            indexer_kv_f32: DeviceBuffer::zeroed(
+                stream,
+                scratch_geometry
+                    .csa_compressed_rows
+                    .checked_mul(128)
+                    .ok_or("generic stationary indexer scratch capacity overflow")?,
+            )?,
+            indexer_scores: DeviceBuffer::zeroed(stream, scratch_geometry.csa_compressed_rows)?,
+            indexer_valid: DeviceBuffer::from_host(
+                stream,
+                &vec![1_u32; scratch_geometry.csa_compressed_rows],
+            )?,
+            indexer_selected: DeviceBuffer::zeroed(
+                stream,
+                scratch_geometry
+                    .csa_compressed_rows
+                    .min(v4_state::INDEX_TOPK),
+            )?,
+            topk: DeviceBuffer::zeroed(stream, topk_rows)?,
+            attention_cache: DeviceBuffer::zeroed(stream, topk_rows * v4_state::Q_HEAD_DIM)?,
+            sparse: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            sparse_scratch: SparseAttentionScoreReuseScratch::new(stream, 1, topk_rows)?,
+            sparse_inverse: DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?,
+            wo_a: DeviceBuffer::zeroed(stream, v4_state::O_GROUPS * v4_state::O_LORA_RANK)?,
+            attention_f32: DeviceBuffer::zeroed(stream, scratch_geometry.attention_f32_elements())?,
+            attention: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            after_attention: DeviceBuffer::zeroed(stream, v4_state::HC * v4_state::HIDDEN)?,
+        };
+        let expected_bytes = scratch_geometry.num_bytes()?;
+        let actual_bytes = scratch.num_bytes();
+        if actual_bytes != expected_bytes {
+            return Err(format!(
+                "generic stationary scratch allocation diverged from its geometry contract: {}",
+                serde_json::json!({
+                    "plan": {"prompt_rows": plan.prompt_rows, "max_new_tokens": plan.max_new_tokens, "context_rows": plan.context_rows, "csa_rows": scratch_geometry.csa_compressed_rows, "hca_rows": plan.hca_compressed_rows, "topk_rows": scratch_geometry.topk_rows},
+                    "target_strict_compressor": scratch_geometry.strict,
+                    "runtime_strict_compressor": strict_compressor_enabled(),
+                    "expected_bytes": expected_bytes,
+                    "actual_bytes": actual_bytes,
+                    "expected_breakdown": scratch_geometry.byte_breakdown()?.json(),
+                    "actual_breakdown": scratch.byte_breakdown().json(),
+                })
+            )
+            .into());
+        }
+        Ok(scratch)
+    }
+
+    fn main_compressor(
+        &self,
+        path: GenericStationaryPath,
+    ) -> (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<f32>) {
+        match path {
+            GenericStationaryPath::Csa4 => (
+                &self.compressor_kv,
+                &self.compressor_score,
+                &self.compressor_score_plus_ape,
+            ),
+            GenericStationaryPath::Hca128 => (
+                &self.hca_compressor_kv,
+                &self.hca_compressor_score,
+                &self.hca_compressor_score_plus_ape,
+            ),
+        }
+    }
+
+    fn candidate_tails(
+        &self,
+        path: GenericStationaryPath,
+    ) -> (&DeviceBuffer<f32>, &DeviceBuffer<f32>) {
+        match path {
+            GenericStationaryPath::Csa4 => (&self.candidate_tail_kv, &self.candidate_tail_score),
+            GenericStationaryPath::Hca128 => {
+                (&self.candidate_hca_tail_kv, &self.candidate_hca_tail_score)
+            }
+        }
+    }
+
+    fn num_bytes(&self) -> usize {
+        [
+            self.hc_hidden.num_bytes(),
+            self.freqs.num_bytes(),
+            self.inverse_freqs.num_bytes(),
+            self.compressed_freqs.num_bytes(),
+            self.mixes.num_bytes(),
+            self.pre.num_bytes(),
+            self.post.num_bytes(),
+            self.comb.num_bytes(),
+            self.trace.num_bytes(),
+            self.collapsed.num_bytes(),
+            self.attn_input.num_bytes(),
+            self.fp8_7168.num_bytes(),
+            self.fp8_7168_scales.num_bytes(),
+            self.fp8_1536.num_bytes(),
+            self.fp8_1536_scales.num_bytes(),
+            self.fp8_16384.num_bytes(),
+            self.fp8_16384_scales.num_bytes(),
+            self.empty_u8.num_bytes(),
+            self.empty_u16.num_bytes(),
+            self.q_lora_f32.num_bytes(),
+            self.q_lora_raw.num_bytes(),
+            self.q_lora.num_bytes(),
+            self.q_f32.num_bytes(),
+            self.q_raw.num_bytes(),
+            self.q_norm.num_bytes(),
+            self.q_rope.num_bytes(),
+            self.kv_f32.num_bytes(),
+            self.kv_raw.num_bytes(),
+            self.kv_norm.num_bytes(),
+            self.kv_rope.num_bytes(),
+            self.kv_ready.num_bytes(),
+            self.kv_scales.num_bytes(),
+            self.candidate_tail_kv.num_bytes(),
+            self.candidate_tail_score.num_bytes(),
+            self.candidate_hca_tail_kv.num_bytes(),
+            self.candidate_hca_tail_score.num_bytes(),
+            self.compressor_kv.num_bytes(),
+            self.compressor_score.num_bytes(),
+            self.compressor_score_plus_ape.num_bytes(),
+            self.hca_compressor_kv.num_bytes(),
+            self.hca_compressor_score.num_bytes(),
+            self.hca_compressor_score_plus_ape.num_bytes(),
+            self.compressed_pool.num_bytes(),
+            self.compressed_bf16.num_bytes(),
+            self.compressed_norm.num_bytes(),
+            self.compressed_rope.num_bytes(),
+            self.compressed_ready.num_bytes(),
+            self.compressed_scales.num_bytes(),
+            self.indexer_pool.num_bytes(),
+            self.indexer_bf16.num_bytes(),
+            self.indexer_norm.num_bytes(),
+            self.indexer_rope.num_bytes(),
+            self.indexer_ready.num_bytes(),
+            self.candidate_indexer_cache.num_bytes(),
+            self.indexer_query_raw.num_bytes(),
+            self.indexer_query_rope.num_bytes(),
+            self.indexer_query_fp4.num_bytes(),
+            self.indexer_query_f32.num_bytes(),
+            self.indexer_weights_f32.num_bytes(),
+            self.indexer_kv_f32.num_bytes(),
+            self.indexer_scores.num_bytes(),
+            self.indexer_valid.num_bytes(),
+            self.indexer_selected.num_bytes(),
+            self.topk.num_bytes(),
+            self.attention_cache.num_bytes(),
+            self.sparse.num_bytes(),
+            self.sparse_scratch.num_bytes(),
+            self.sparse_inverse.num_bytes(),
+            self.wo_a.num_bytes(),
+            self.attention_f32.num_bytes(),
+            self.attention.num_bytes(),
+            self.after_attention.num_bytes(),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            + self
+                .exact_compressor
+                .as_ref()
+                .map_or(0, GenericExactCompressorScratch::num_bytes)
+            + self
+                .indexer_compressor_kv
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .indexer_compressor_score
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .indexer_compressor_score_plus_ape
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .candidate_indexer_tail_kv
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+            + self
+                .candidate_indexer_tail_score
+                .as_ref()
+                .map_or(0, DeviceBuffer::num_bytes)
+    }
+
+    fn byte_breakdown(&self) -> DeviceRequestScratchByteBreakdown {
+        let sum = |values: &[usize]| values.iter().sum::<usize>();
+        DeviceRequestScratchByteBreakdown {
+            core_mhc: sum(&[
+                self.hc_hidden.num_bytes(),
+                self.collapsed.num_bytes(),
+                self.attn_input.num_bytes(),
+                self.freqs.num_bytes(),
+                self.inverse_freqs.num_bytes(),
+                self.compressed_freqs.num_bytes(),
+                self.mixes.num_bytes(),
+                self.pre.num_bytes(),
+                self.post.num_bytes(),
+                self.comb.num_bytes(),
+                self.trace.num_bytes(),
+            ]),
+            projections: sum(&[
+                self.fp8_7168.num_bytes(),
+                self.fp8_7168_scales.num_bytes(),
+                self.fp8_1536.num_bytes(),
+                self.fp8_1536_scales.num_bytes(),
+                self.fp8_16384.num_bytes(),
+                self.fp8_16384_scales.num_bytes(),
+                self.q_lora_f32.num_bytes(),
+                self.q_lora_raw.num_bytes(),
+                self.q_lora.num_bytes(),
+                self.q_f32.num_bytes(),
+                self.q_raw.num_bytes(),
+                self.q_norm.num_bytes(),
+                self.q_rope.num_bytes(),
+                self.kv_f32.num_bytes(),
+                self.kv_raw.num_bytes(),
+                self.kv_norm.num_bytes(),
+                self.kv_rope.num_bytes(),
+                self.kv_ready.num_bytes(),
+            ]),
+            compressor: sum(&[
+                self.candidate_tail_kv.num_bytes(),
+                self.candidate_tail_score.num_bytes(),
+                self.candidate_hca_tail_kv.num_bytes(),
+                self.candidate_hca_tail_score.num_bytes(),
+                self.compressor_kv.num_bytes(),
+                self.compressor_score.num_bytes(),
+                self.compressor_score_plus_ape.num_bytes(),
+                self.hca_compressor_kv.num_bytes(),
+                self.hca_compressor_score.num_bytes(),
+                self.hca_compressor_score_plus_ape.num_bytes(),
+                self.compressed_pool.num_bytes(),
+                self.compressed_bf16.num_bytes(),
+                self.compressed_norm.num_bytes(),
+                self.compressed_rope.num_bytes(),
+                self.compressed_ready.num_bytes(),
+                self.compressed_scales.num_bytes(),
+                self.kv_scales.num_bytes(),
+            ]),
+            exact_compressor: self
+                .exact_compressor
+                .as_ref()
+                .map_or(0, GenericExactCompressorScratch::num_bytes),
+            indexer: sum(&[
+                self.indexer_compressor_kv
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::num_bytes),
+                self.indexer_compressor_score
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::num_bytes),
+                self.indexer_compressor_score_plus_ape
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::num_bytes),
+                self.candidate_indexer_tail_kv
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::num_bytes),
+                self.candidate_indexer_tail_score
+                    .as_ref()
+                    .map_or(0, DeviceBuffer::num_bytes),
+                self.indexer_pool.num_bytes(),
+                self.indexer_bf16.num_bytes(),
+                self.indexer_norm.num_bytes(),
+                self.indexer_rope.num_bytes(),
+                self.indexer_ready.num_bytes(),
+                self.candidate_indexer_cache.num_bytes(),
+                self.indexer_query_raw.num_bytes(),
+                self.indexer_query_rope.num_bytes(),
+                self.indexer_query_fp4.num_bytes(),
+                self.indexer_query_f32.num_bytes(),
+                self.indexer_weights_f32.num_bytes(),
+                self.indexer_kv_f32.num_bytes(),
+                self.indexer_scores.num_bytes(),
+                self.indexer_valid.num_bytes(),
+                self.indexer_selected.num_bytes(),
+            ]),
+            topk_composite: self.topk.num_bytes() + self.attention_cache.num_bytes(),
+            sparse: self.sparse.num_bytes() + self.sparse_inverse.num_bytes(),
+            score_reuse: self.sparse_scratch.num_bytes(),
+            attention_output: self.wo_a.num_bytes()
+                + self.attention_f32.num_bytes()
+                + self.attention.num_bytes()
+                + self.after_attention.num_bytes(),
+        }
+    }
+}
+
+/// Numerically identical to `DeviceRequestRopeLut` row construction, but
+/// avoids a request-length table.  Generic execution uploads exactly the row
+/// it needs into the reusable scratch buffer.
+fn upload_request_rope_row(
+    stream: &CudaStream,
+    position: usize,
+    inverse: bool,
+    destination: &DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
+    if destination.len() != v4_state::Q_ROPE_DIM {
+        return Err("generic stationary RoPE destination geometry mismatch".into());
+    }
+    let mut row = v4_state::compressed_rope_freqs(position);
+    if inverse {
+        for sine in row.iter_mut().skip(1).step_by(2) {
+            *sine = -*sine;
+        }
+    }
+    // SAFETY: the checked host row and preallocated device destination have
+    // exactly the same Q_ROPE_DIM element count.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            destination.cu_deviceptr(),
+            row.as_ptr(),
+            destination.num_bytes(),
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Run one generic stationary attention row against the request's real layer
+/// store.  Every persistent write is delayed until after the terminal hidden
+/// D2H succeeds, so an error leaves this layer's p counter and every other
+/// layer store untouched.
+struct GenericDeviceAttentionPrepared {
+    attention: RealAttentionRun,
+    position: usize,
+    boundary: bool,
+    compressed_before: usize,
+    path: GenericStationaryPath,
+}
+
+fn prepare_generic_device_attention_row(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceLayerPersistentState,
+    scratch: &mut DeviceRequestScratch,
+    hc_hidden: &[u16],
+    position: usize,
+    audit_expected_compressed_prefix: Option<&[u16]>,
+) -> Result<GenericDeviceAttentionPrepared, Box<dyn Error>> {
+    let weights = &runtime.weights;
+    let path = GenericStationaryPath::from_ratio(weights.compression_ratio);
+    let csa = path.is_csa();
+    let ratio = path.ratio();
+    if state.layer != weights.layer
+        || state.committed_rows != position
+        || hc_hidden.len() != v4_state::HC * v4_state::HIDDEN
+        || state.compressor_width != path.compressor_width()
+        || state.compressor_tail_kv.len() != path.tail_elements()
+        || state.compressor_tail_score.len() != path.tail_elements()
+        || scratch.candidate_tails(path).0.len() != path.tail_elements()
+        || scratch.candidate_tails(path).1.len() != path.tail_elements()
+    {
+        return Err("generic stationary device attention state contract mismatch".into());
+    }
+    let started = std::time::Instant::now();
+    // SAFETY: one fixed host hidden row matches the single reusable scratch.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            scratch.hc_hidden.cu_deviceptr(),
+            hc_hidden.as_ptr(),
+            scratch.hc_hidden.num_bytes(),
+            stream.cu_stream(),
+        )?;
+    }
+    upload_request_rope_row(stream, position, false, &scratch.freqs)?;
+    run_l0_mhc_pre_device_into(
+        module,
+        stream,
+        &scratch.hc_hidden,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+        &mut scratch.mixes,
+        &mut scratch.pre,
+        &mut scratch.post,
+        &mut scratch.comb,
+        &mut scratch.collapsed,
+        &mut scratch.trace,
+        None,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &scratch.collapsed,
+        &weights.attn_norm,
+        &mut scratch.attn_input,
+        v4_state::HIDDEN,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &scratch.attn_input,
+        &weights.wkv,
+        &mut scratch.fp8_7168,
+        &mut scratch.fp8_7168_scales,
+        &mut scratch.empty_u16,
+        &mut scratch.kv_f32,
+        &mut scratch.kv_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &scratch.kv_raw,
+        &weights.kv_norm,
+        &mut scratch.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &scratch.kv_norm,
+        &scratch.freqs,
+        &mut scratch.kv_rope,
+        1,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_kv_quantize_device_into(
+        module,
+        stream,
+        &scratch.kv_rope,
+        &mut scratch.empty_u8,
+        &mut scratch.kv_scales,
+        &mut scratch.kv_ready,
+    )?;
+    run_generic_main_compressor_device(module, stream, scratch, weights, path, position)?;
+    // Candidate tails are complete scratch copies.  Persistent tails are not
+    // touched until all subsequent attention work and terminal D2H succeed.
+    unsafe {
+        let (candidate_tail_kv, candidate_tail_score) = scratch.candidate_tails(path);
+        copy_device_range(
+            stream,
+            candidate_tail_kv,
+            0,
+            &state.compressor_tail_kv,
+            0,
+            state.compressor_tail_kv.len(),
+        )?;
+        copy_device_range(
+            stream,
+            candidate_tail_score,
+            0,
+            &state.compressor_tail_score,
+            0,
+            state.compressor_tail_score.len(),
+        )?;
+        let compressor_slot = path.compressor_slot(position);
+        let (compressor_kv, _, compressor_score_plus_ape) = scratch.main_compressor(path);
+        copy_device_row(stream, candidate_tail_kv, compressor_slot, compressor_kv)?;
+        copy_device_row(
+            stream,
+            candidate_tail_score,
+            compressor_slot,
+            compressor_score_plus_ape,
+        )?;
+    }
+    let boundary = (position + 1).is_multiple_of(ratio);
+    let compressed_before = state.compressed_rows(weights.compression_ratio);
+    let compressed_after = compressed_before + usize::from(boundary);
+    if compressed_after * v4_state::Q_HEAD_DIM > state.compressed_kv.len() {
+        return Err("generic stationary compressed KV capacity exhausted".into());
+    }
+    let composite_rows = path.composite_capacity_rows(position);
+    if composite_rows != path.topk_rows(compressed_after)
+        || scratch.topk.len() < composite_rows
+        || scratch.attention_cache.len()
+            < composite_rows
+                .checked_mul(v4_state::Q_HEAD_DIM)
+                .ok_or("generic stationary composite cache capacity overflow")?
+    {
+        return Err("generic stationary composite cache geometry mismatch".into());
+    }
+    if boundary {
+        run_generic_compressor_pool_device(module, stream, scratch, path)?;
+        run_f32_to_bf16_device_into(
+            module,
+            stream,
+            &scratch.compressed_pool,
+            &mut scratch.compressed_bf16,
+        )?;
+        upload_request_rope_row(
+            stream,
+            position + 1 - ratio,
+            false,
+            &scratch.compressed_freqs,
+        )?;
+        run_l0_rmsnorm_device_into(
+            module,
+            stream,
+            &scratch.compressed_bf16,
+            &weights.compressor_norm,
+            &mut scratch.compressed_norm,
+            v4_state::Q_HEAD_DIM,
+        )?;
+        run_rope_device_into(
+            module,
+            stream,
+            &scratch.compressed_norm,
+            &scratch.compressed_freqs,
+            &mut scratch.compressed_rope,
+            1,
+            v4_state::Q_HEAD_DIM,
+        )?;
+        run_l0_kv_quantize_device_into(
+            module,
+            stream,
+            &scratch.compressed_rope,
+            &mut scratch.empty_u8,
+            &mut scratch.compressed_scales,
+            &mut scratch.compressed_ready,
+        )?;
+        if let Some(expected_prefix) = audit_expected_compressed_prefix {
+            let expected_elements = (compressed_before + 1)
+                .checked_mul(v4_state::Q_HEAD_DIM)
+                .ok_or("generic prepared boundary audit prefix overflow")?;
+            if expected_prefix.len() != expected_elements {
+                return Err("generic prepared boundary audit host prefix is incomplete".into());
+            }
+            let expected_row =
+                &expected_prefix[compressed_before * v4_state::Q_HEAD_DIM..expected_elements];
+            let actual_row = scratch.compressed_ready.to_host_vec(stream)?;
+            check_compressed_boundary_bf16(
+                "prepared_compressed_row",
+                weights.layer,
+                position,
+                compressed_before,
+                v4_state::Q_HEAD_DIM,
+                expected_row,
+                &actual_row,
+            )?;
+        }
+        if csa {
+            // Preserve the official CSA overlap for the next four rows, still
+            // inside the candidate tail until the semantic commit below.
+            unsafe {
+                copy_device_range(
+                    stream,
+                    &scratch.candidate_tail_kv,
+                    0,
+                    &scratch.candidate_tail_kv,
+                    4 * 1_024,
+                    4 * 1_024,
+                )?;
+                copy_device_range(
+                    stream,
+                    &scratch.candidate_tail_score,
+                    0,
+                    &scratch.candidate_tail_score,
+                    4 * 1_024,
+                    4 * 1_024,
+                )?;
+            }
+        }
+    }
+    if csa {
+        let indexer = weights
+            .indexer
+            .as_ref()
+            .ok_or("generic CSA indexer weights disappeared")?;
+        run_generic_indexer_compressor_device(
+            module,
+            stream,
+            scratch,
+            weights.layer,
+            indexer,
+            position,
+        )?;
+        let (index_kv, _index_score, index_score_plus_ape, candidate_kv, candidate_score) = (
+            scratch
+                .indexer_compressor_kv
+                .as_mut()
+                .ok_or("generic CSA indexer scratch disappeared")?,
+            scratch
+                .indexer_compressor_score
+                .as_mut()
+                .ok_or("generic CSA indexer scratch disappeared")?,
+            scratch
+                .indexer_compressor_score_plus_ape
+                .as_mut()
+                .ok_or("generic CSA indexer scratch disappeared")?,
+            scratch
+                .candidate_indexer_tail_kv
+                .as_mut()
+                .ok_or("generic CSA candidate indexer tail disappeared")?,
+            scratch
+                .candidate_indexer_tail_score
+                .as_mut()
+                .ok_or("generic CSA candidate indexer tail disappeared")?,
+        );
+        let state_indexer_kv = state
+            .indexer_tail_kv
+            .as_ref()
+            .ok_or("generic CSA persistent indexer tail disappeared")?;
+        let state_indexer_score = state
+            .indexer_tail_score
+            .as_ref()
+            .ok_or("generic CSA persistent indexer tail disappeared")?;
+        unsafe {
+            copy_device_range(
+                stream,
+                candidate_kv,
+                0,
+                state_indexer_kv,
+                0,
+                state_indexer_kv.len(),
+            )?;
+            copy_device_range(
+                stream,
+                candidate_score,
+                0,
+                state_indexer_score,
+                0,
+                state_indexer_score.len(),
+            )?;
+            copy_device_row(stream, candidate_kv, 4 + position % 4, index_kv)?;
+            copy_device_row(
+                stream,
+                candidate_score,
+                4 + position % 4,
+                index_score_plus_ape,
+            )?;
+        }
+        if boundary {
+            run_compressor_pool_ratio4_device_into(
+                module,
+                stream,
+                candidate_kv,
+                candidate_score,
+                &mut scratch.indexer_pool,
+                128,
+            )?;
+            run_f32_to_bf16_device_into(
+                module,
+                stream,
+                &scratch.indexer_pool,
+                &mut scratch.indexer_bf16,
+            )?;
+            run_l0_rmsnorm_device_into(
+                module,
+                stream,
+                &scratch.indexer_bf16,
+                &indexer.compressor_norm,
+                &mut scratch.indexer_norm,
+                128,
+            )?;
+            run_rope_device_into(
+                module,
+                stream,
+                &scratch.indexer_norm,
+                &scratch.compressed_freqs,
+                &mut scratch.indexer_rope,
+                1,
+                128,
+            )?;
+            run_indexer_fp4_sim_device_into(
+                module,
+                stream,
+                &scratch.indexer_rope,
+                &mut scratch.indexer_ready,
+            )?;
+            unsafe {
+                copy_device_range(stream, candidate_kv, 0, candidate_kv, 4 * 256, 4 * 256)?;
+                copy_device_range(
+                    stream,
+                    candidate_score,
+                    0,
+                    candidate_score,
+                    4 * 256,
+                    4 * 256,
+                )?;
+            }
+        }
+    }
+    // Query projection and the composite raw/compressed cache are also scratch
+    // only.  The raw ring keeps physical p % 128 indices, matching top-k.
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &scratch.attn_input,
+        &weights.wq_a,
+        &mut scratch.fp8_7168,
+        &mut scratch.fp8_7168_scales,
+        &mut scratch.empty_u16,
+        &mut scratch.q_lora_f32,
+        &mut scratch.q_lora_raw,
+        false,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &scratch.q_lora_raw,
+        &weights.q_norm,
+        &mut scratch.q_lora,
+        weights.wq_a.out_features,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &scratch.q_lora,
+        &weights.wq_b,
+        &mut scratch.fp8_1536,
+        &mut scratch.fp8_1536_scales,
+        &mut scratch.empty_u16,
+        &mut scratch.q_f32,
+        &mut scratch.q_raw,
+        true,
+    )?;
+    run_l0_rmsnorm_device_into(
+        module,
+        stream,
+        &scratch.q_raw,
+        &scratch.empty_u16,
+        &mut scratch.q_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_rope_device_into(
+        module,
+        stream,
+        &scratch.q_norm,
+        &scratch.freqs,
+        &mut scratch.q_rope,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    unsafe {
+        copy_device_range(
+            stream,
+            &scratch.attention_cache,
+            0,
+            &state.raw_kv_ring,
+            0,
+            state.raw_kv_ring.len(),
+        )?;
+        copy_device_row(
+            stream,
+            &scratch.attention_cache,
+            state.raw_slot(position)?,
+            &scratch.kv_ready,
+        )?;
+        if compressed_before != 0 {
+            copy_device_range(
+                stream,
+                &scratch.attention_cache,
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                &state.compressed_kv,
+                0,
+                compressed_before * v4_state::Q_HEAD_DIM,
+            )?;
+        }
+        if boundary {
+            copy_device_range(
+                stream,
+                &scratch.attention_cache,
+                (v4_state::KV_WINDOW + compressed_before) * v4_state::Q_HEAD_DIM,
+                &scratch.compressed_ready,
+                0,
+                v4_state::Q_HEAD_DIM,
+            )?;
+        }
+    }
+    let (window, _) = v4_state::window_topk_cpu(1, position, v4_state::KV_WINDOW)?;
+    // SAFETY: the dynamic top-k buffer is at least 128 entries by construction.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            scratch.topk.cu_deviceptr(),
+            window.as_ptr(),
+            window.len() * std::mem::size_of::<i32>(),
+            stream.cu_stream(),
+        )?;
+    }
+    let raw_topk_per_row = window.len();
+    let topk_per_row = if csa && compressed_after != 0 {
+        let indexer = weights
+            .indexer
+            .as_ref()
+            .ok_or("generic CSA indexer weights disappeared")?;
+        run_l0_fp8_linear_device_into(
+            module,
+            stream,
+            &scratch.q_lora,
+            &indexer.wq_b,
+            &mut scratch.fp8_1536,
+            &mut scratch.fp8_1536_scales,
+            &mut scratch.empty_u16,
+            &mut scratch.indexer_query_f32,
+            &mut scratch.indexer_query_raw,
+            true,
+        )?;
+        run_rope_device_into(
+            module,
+            stream,
+            &scratch.indexer_query_raw,
+            &scratch.freqs,
+            &mut scratch.indexer_query_rope,
+            64,
+            128,
+        )?;
+        run_indexer_fp4_sim_device_into(
+            module,
+            stream,
+            &scratch.indexer_query_rope,
+            &mut scratch.indexer_query_fp4,
+        )?;
+        launch_v4_bf16_to_f32(
+            module,
+            stream,
+            &scratch.indexer_query_fp4,
+            &mut scratch.indexer_query_f32,
+        )?;
+        run_bf16_linear_f32_device_into(
+            module,
+            stream,
+            &scratch.attn_input,
+            &indexer.weights_proj,
+            &mut scratch.indexer_weights_f32,
+            v4_state::HIDDEN,
+            64,
+        )?;
+        run_scale_f32_device_in_place(
+            module,
+            stream,
+            &mut scratch.indexer_weights_f32,
+            1.0_f32 / (128.0_f32 * 64.0).sqrt(),
+        )?;
+        let state_indexer_kv = state
+            .indexer_kv
+            .as_ref()
+            .ok_or("generic CSA persistent indexer cache disappeared")?;
+        unsafe {
+            if compressed_before != 0 {
+                copy_device_range(
+                    stream,
+                    &scratch.candidate_indexer_cache,
+                    0,
+                    state_indexer_kv,
+                    0,
+                    compressed_before * 128,
+                )?;
+            }
+            if boundary {
+                copy_device_range(
+                    stream,
+                    &scratch.candidate_indexer_cache,
+                    compressed_before * 128,
+                    &scratch.indexer_ready,
+                    0,
+                    128,
+                )?;
+            }
+        }
+        launch_v4_bf16_to_f32(
+            module,
+            stream,
+            &scratch.candidate_indexer_cache,
+            &mut scratch.indexer_kv_f32,
+        )?;
+        let valid = u32::try_from(compressed_after)?;
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                scratch.indexer_valid.cu_deviceptr(),
+                &valid,
+                std::mem::size_of::<u32>(),
+                stream.cu_stream(),
+            )?;
+            module.indexer_scores_v4_f32(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(compressed_after)?),
+                &scratch.indexer_query_f32,
+                &scratch.indexer_kv_f32,
+                &scratch.indexer_weights_f32,
+                &mut scratch.indexer_scores,
+                1,
+                64,
+                128,
+                u32::try_from(compressed_after)?,
+            )?;
+        }
+        let selected = compressed_after.min(v4_state::INDEX_TOPK);
+        unsafe {
+            module.indexer_topk_v4_f32(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(selected)?),
+                &scratch.indexer_scores,
+                &scratch.indexer_valid,
+                &mut scratch.indexer_selected,
+                1,
+                u32::try_from(compressed_after)?,
+                u32::try_from(selected)?,
+                u32::try_from(v4_state::KV_WINDOW)?,
+            )?;
+            copy_device_range(
+                stream,
+                &scratch.topk,
+                v4_state::KV_WINDOW,
+                &scratch.indexer_selected,
+                0,
+                selected,
+            )?;
+        }
+        v4_state::KV_WINDOW + selected
+    } else if !csa && compressed_after != 0 {
+        let topk = v4_state::build_hca_sparse_topk(1, position, v4_state::KV_WINDOW, ratio)?;
+        // SAFETY: the HCA composite list fits the request-planned reusable top-k buffer.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                scratch.topk.cu_deviceptr(),
+                topk.indices.as_ptr(),
+                topk.indices.len() * std::mem::size_of::<i32>(),
+                stream.cu_stream(),
+            )?;
+        }
+        topk.per_row
+    } else {
+        raw_topk_per_row
+    };
+    if sparse_attention_arm_from_env()?.uses_score_reuse(topk_per_row) {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            &scratch.q_rope,
+            &scratch.attention_cache,
+            &weights.attn_sink,
+            &scratch.topk,
+            &mut scratch.sparse,
+            &mut scratch.sparse_scratch,
+            topk_per_row,
+        )?;
+    } else {
+        run_sparse_attention_device_into(
+            module,
+            stream,
+            &scratch.q_rope,
+            &scratch.attention_cache,
+            &weights.attn_sink,
+            &scratch.topk,
+            &mut scratch.sparse,
+            topk_per_row,
+        )?;
+    }
+    upload_request_rope_row(stream, position, true, &scratch.inverse_freqs)?;
+    run_rope_device_into(
+        module,
+        stream,
+        &scratch.sparse,
+        &scratch.inverse_freqs,
+        &mut scratch.sparse_inverse,
+        v4_state::Q_HEADS,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    run_l0_wo_a_device_into(
+        module,
+        stream,
+        &scratch.sparse_inverse,
+        &weights.wo_a,
+        &mut scratch.wo_a,
+    )?;
+    run_l0_fp8_linear_device_into(
+        module,
+        stream,
+        &scratch.wo_a,
+        &weights.wo_b,
+        &mut scratch.fp8_16384,
+        &mut scratch.fp8_16384_scales,
+        &mut scratch.empty_u16,
+        &mut scratch.attention_f32,
+        &mut scratch.attention,
+        false,
+    )?;
+    run_l0_hc_post_device_into(
+        module,
+        stream,
+        &scratch.attention,
+        &scratch.hc_hidden,
+        &scratch.post,
+        &scratch.comb,
+        &mut scratch.after_attention,
+    )?;
+    let output = scratch.after_attention.to_host_vec(stream)?;
+
+    Ok(GenericDeviceAttentionPrepared {
+        attention: RealAttentionRun {
+            output,
+            topk: None,
+            stage_digests: Vec::new(),
+            attention_topk_digest: 0,
+            attention_topk_per_row: topk_per_row,
+            indexer_topk_gpu_ns: 0,
+            attention_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            commit_ns: 0,
+            device_transfer: Some(DeviceAttentionTransfer {
+                h2d_count: 1,
+                h2d_bytes: scratch.hc_hidden.num_bytes(),
+                rope_lut_d2d_count: 0,
+                rope_lut_d2d_bytes: 0,
+                terminal_d2h_count: 1,
+                terminal_d2h_bytes: scratch.after_attention.num_bytes(),
+                intermediate_or_audit_d2h_count: 0,
+                intermediate_or_audit_d2h_bytes: 0,
+            }),
+        },
+        position,
+        boundary,
+        compressed_before,
+        path,
+    })
+}
+
+/// Commit the prepared delta only after the caller's complete FFN/mHC layer
+/// succeeds.  This is intentionally separate from attention preparation.
+fn commit_generic_device_attention_row(
+    state: &mut DeviceLayerPersistentState,
+    scratch: &DeviceRequestScratch,
+    prepared: GenericDeviceAttentionPrepared,
+    stream: &CudaStream,
+) -> Result<RealAttentionRun, Box<dyn Error>> {
+    if state.committed_rows != prepared.position {
+        return Err("generic stationary commit lost its causal layer boundary".into());
+    }
+    if state.compressor_tail_kv.len() != prepared.path.tail_elements()
+        || state.compressor_tail_score.len() != prepared.path.tail_elements()
+        || scratch.candidate_tails(prepared.path).0.len() != prepared.path.tail_elements()
+        || scratch.candidate_tails(prepared.path).1.len() != prepared.path.tail_elements()
+    {
+        return Err("generic stationary commit scratch geometry mismatch".into());
+    }
+    // Atomic semantic commit: all fallible layer work completed before this.
+    unsafe {
+        copy_device_row(
+            stream,
+            &state.raw_kv_ring,
+            state.raw_slot(prepared.position)?,
+            &scratch.kv_ready,
+        )?;
+        let (candidate_tail_kv, candidate_tail_score) = scratch.candidate_tails(prepared.path);
+        copy_device_range(
+            stream,
+            &state.compressor_tail_kv,
+            0,
+            candidate_tail_kv,
+            0,
+            state.compressor_tail_kv.len(),
+        )?;
+        copy_device_range(
+            stream,
+            &state.compressor_tail_score,
+            0,
+            candidate_tail_score,
+            0,
+            state.compressor_tail_score.len(),
+        )?;
+        if prepared.boundary {
+            copy_device_range(
+                stream,
+                &state.compressed_kv,
+                prepared.compressed_before * v4_state::Q_HEAD_DIM,
+                &scratch.compressed_ready,
+                0,
+                v4_state::Q_HEAD_DIM,
+            )?;
+        }
+        if prepared.path.is_csa() {
+            let persistent_kv = state
+                .indexer_tail_kv
+                .as_ref()
+                .ok_or("generic CSA persistent indexer tail disappeared")?;
+            let persistent_score = state
+                .indexer_tail_score
+                .as_ref()
+                .ok_or("generic CSA persistent indexer tail disappeared")?;
+            let candidate_kv = scratch
+                .candidate_indexer_tail_kv
+                .as_ref()
+                .ok_or("generic CSA candidate indexer tail disappeared")?;
+            let candidate_score = scratch
+                .candidate_indexer_tail_score
+                .as_ref()
+                .ok_or("generic CSA candidate indexer tail disappeared")?;
+            copy_device_range(
+                stream,
+                persistent_kv,
+                0,
+                candidate_kv,
+                0,
+                persistent_kv.len(),
+            )?;
+            copy_device_range(
+                stream,
+                persistent_score,
+                0,
+                candidate_score,
+                0,
+                persistent_score.len(),
+            )?;
+            if prepared.boundary {
+                copy_device_range(
+                    stream,
+                    state
+                        .indexer_kv
+                        .as_ref()
+                        .ok_or("generic CSA persistent indexer cache disappeared")?,
+                    prepared.compressed_before * 128,
+                    &scratch.indexer_ready,
+                    0,
+                    128,
+                )?;
+            }
+        }
+    }
+    state.committed_rows = state
+        .committed_rows
+        .checked_add(1)
+        .ok_or("generic stationary committed-row overflow")?;
+    Ok(prepared.attention)
+}
+
 fn zero_device_buffer<T>(
     stream: &CudaStream,
     buffer: &DeviceBuffer<T>,
@@ -18974,6 +24530,155 @@ fn zero_device_buffer<T>(
         }
     }
     Ok(())
+}
+
+/// Generic stationary shares one scratch across HCA and CSA layers.  Strict
+/// conversion buffers therefore retain one exact-sized allocation per fixed
+/// projection geometry; a layer-0 HCA allocation cannot stand in for CSA.
+struct GenericExactCompressorScratch {
+    cublas: cublas_exact::CublasExact,
+    workspace: DeviceBuffer<u8>,
+    input: DeviceBuffer<f32>,
+    hca_wkv: DeviceBuffer<f32>,
+    hca_wgate: DeviceBuffer<f32>,
+    csa_wkv: DeviceBuffer<f32>,
+    csa_wgate: DeviceBuffer<f32>,
+    csa_indexer_wkv: DeviceBuffer<f32>,
+    csa_indexer_wgate: DeviceBuffer<f32>,
+    // This scratch is request-local, so layer identity is sufficient: a
+    // request transition constructs fresh scratch.  Each buffer is a
+    // one-owner cache, never an all-61-layer cache.
+    hca_owner: Option<usize>,
+    csa_owner: Option<usize>,
+    csa_indexer_owner: Option<usize>,
+    active_layer: Option<usize>,
+    main_weight_conversions: u64,
+    indexer_weight_conversions: u64,
+}
+
+impl GenericExactCompressorScratch {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        Self::new_for_geometry(
+            stream,
+            DeviceRequestScratchGeometry::new(
+                v4_state::LayerStationaryRequestPlan::new(5, 3)?,
+                true,
+            )?,
+        )
+    }
+
+    fn new_for_geometry(
+        stream: &CudaStream,
+        geometry: DeviceRequestScratchGeometry,
+    ) -> Result<Self, Box<dyn Error>> {
+        if !geometry.strict {
+            return Err("strict generic Compressor scratch requires strict geometry".into());
+        }
+        let weights = |width: usize| {
+            width
+                .checked_mul(v4_state::HIDDEN)
+                .ok_or("strict generic Compressor weight size overflow")
+        };
+        Ok(Self {
+            cublas: cublas_exact::CublasExact::load()?,
+            workspace: DeviceBuffer::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?,
+            input: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            hca_wkv: DeviceBuffer::zeroed(stream, weights(geometry.generic.hca_main_elements)?)?,
+            hca_wgate: DeviceBuffer::zeroed(stream, weights(geometry.generic.hca_main_elements)?)?,
+            csa_wkv: DeviceBuffer::zeroed(stream, weights(geometry.generic.csa_main_elements)?)?,
+            csa_wgate: DeviceBuffer::zeroed(stream, weights(geometry.generic.csa_main_elements)?)?,
+            csa_indexer_wkv: DeviceBuffer::zeroed(
+                stream,
+                weights(geometry.generic.csa_indexer_elements)?,
+            )?,
+            csa_indexer_wgate: DeviceBuffer::zeroed(
+                stream,
+                weights(geometry.generic.csa_indexer_elements)?,
+            )?,
+            hca_owner: None,
+            csa_owner: None,
+            csa_indexer_owner: None,
+            active_layer: None,
+            main_weight_conversions: 0,
+            indexer_weight_conversions: 0,
+        })
+    }
+
+    fn audit_telemetry(&self) -> serde_json::Value {
+        serde_json::json!({
+            "main_weight_conversions": self.main_weight_conversions,
+            "indexer_weight_conversions": self.indexer_weight_conversions,
+            "hca_owner": self.hca_owner,
+            "csa_owner": self.csa_owner,
+            "csa_indexer_owner": self.csa_indexer_owner,
+            "active_layer": self.active_layer,
+        })
+    }
+
+    fn begin_main_refresh(&mut self, path: GenericStationaryPath, layer: usize) -> bool {
+        self.begin_layer(layer);
+        let owner = match path {
+            GenericStationaryPath::Hca128 => &mut self.hca_owner,
+            GenericStationaryPath::Csa4 => &mut self.csa_owner,
+        };
+        let refresh = *owner != Some(layer);
+        if refresh {
+            *owner = None;
+        }
+        refresh
+    }
+
+    fn finish_main_refresh(&mut self, path: GenericStationaryPath, layer: usize, refresh: bool) {
+        self.active_layer = Some(layer);
+        if refresh {
+            match path {
+                GenericStationaryPath::Hca128 => self.hca_owner = Some(layer),
+                GenericStationaryPath::Csa4 => self.csa_owner = Some(layer),
+            }
+            self.main_weight_conversions = self.main_weight_conversions.saturating_add(1);
+        }
+    }
+
+    fn begin_indexer_refresh(&mut self, layer: usize) -> bool {
+        self.begin_layer(layer);
+        let refresh = self.csa_indexer_owner != Some(layer);
+        if refresh {
+            self.csa_indexer_owner = None;
+        }
+        refresh
+    }
+
+    fn finish_indexer_refresh(&mut self, layer: usize, refresh: bool) {
+        self.active_layer = Some(layer);
+        if refresh {
+            self.csa_indexer_owner = Some(layer);
+            self.indexer_weight_conversions = self.indexer_weight_conversions.saturating_add(1);
+        }
+    }
+
+    fn begin_layer(&mut self, layer: usize) {
+        if self.active_layer != Some(layer) {
+            self.invalidate();
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.hca_owner = None;
+        self.csa_owner = None;
+        self.csa_indexer_owner = None;
+        self.active_layer = None;
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.workspace.num_bytes()
+            + self.input.num_bytes()
+            + self.hca_wkv.num_bytes()
+            + self.hca_wgate.num_bytes()
+            + self.csa_wkv.num_bytes()
+            + self.csa_wgate.num_bytes()
+            + self.csa_indexer_wkv.num_bytes()
+            + self.csa_indexer_wgate.num_bytes()
+    }
 }
 
 impl DeviceExactCompressorScratch {
@@ -19372,6 +25077,34 @@ fn run_compressor_pool_ratio4_device_into(
     Ok(())
 }
 
+fn run_compressor_pool_ratio128_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    persistent_kv: &DeviceBuffer<f32>,
+    persistent_score: &DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<(), Box<dyn Error>> {
+    if output.len() != v4_state::Q_HEAD_DIM
+        || persistent_kv.len() != v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM
+        || persistent_score.len() != v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM
+    {
+        return Err("device ratio-128 compressor pool workspace contract mismatch".into());
+    }
+    // SAFETY: each launch thread owns one 512-wide output dimension and scans
+    // the bounded 128-slot HCA state in canonical order.
+    unsafe {
+        module.compressor_pool_ratio128_v4_f32(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(v4_state::Q_HEAD_DIM)?),
+            persistent_kv,
+            persistent_score,
+            output,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_f32_to_bf16_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -19483,13 +25216,57 @@ fn run_exact_compressor_device_into(
     ratio: usize,
     start_pos: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let outputs = compressor.kv.len();
+    run_exact_compressor_buffers_device_into(
+        module,
+        stream,
+        input,
+        wkv,
+        wgate,
+        ape,
+        &mut compressor.kv,
+        &mut compressor.score,
+        &mut compressor.score_plus_ape,
+        cublas,
+        workspace,
+        input_f32,
+        wkv_f32,
+        wgate_f32,
+        ratio,
+        start_pos,
+        start_pos == 0,
+    )
+}
+
+/// Strict projection shared by the short device fixture and generic stationary
+/// path.  Both persist the same three FP32 row buffers, so the pinned cuBLAS
+/// reduction must be selected before either path writes its rolling tail.
+#[allow(clippy::too_many_arguments)]
+fn run_exact_compressor_buffers_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    wkv: &DeviceBuffer<u16>,
+    wgate: &DeviceBuffer<u16>,
+    ape: &DeviceBuffer<f32>,
+    kv: &mut DeviceBuffer<f32>,
+    score: &mut DeviceBuffer<f32>,
+    score_plus_ape: &mut DeviceBuffer<f32>,
+    cublas: &cublas_exact::CublasExact,
+    workspace: &DeviceBuffer<u8>,
+    input_f32: &mut DeviceBuffer<f32>,
+    wkv_f32: &mut DeviceBuffer<f32>,
+    wgate_f32: &mut DeviceBuffer<f32>,
+    ratio: usize,
+    start_pos: usize,
+    refresh_weights: bool,
+) -> Result<(), Box<dyn Error>> {
+    let outputs = kv.len();
     if input.len() != v4_state::HIDDEN
         || wkv.len() != outputs * v4_state::HIDDEN
         || wgate.len() != wkv.len()
         || ape.len() != ratio * outputs
-        || compressor.score.len() != outputs
-        || compressor.score_plus_ape.len() != outputs
+        || score.len() != outputs
+        || score_plus_ape.len() != outputs
         || input_f32.len() != input.len()
         || wkv_f32.len() != wkv.len()
         || wgate_f32.len() != wgate.len()
@@ -19497,7 +25274,7 @@ fn run_exact_compressor_device_into(
         return Err("strict device Compressor launch geometry mismatch".into());
     }
     launch_v4_bf16_to_f32(module, stream, input, input_f32)?;
-    if start_pos == 0 {
+    if refresh_weights {
         launch_v4_bf16_to_f32(module, stream, wkv, wkv_f32)?;
         launch_v4_bf16_to_f32(module, stream, wgate, wgate_f32)?;
     }
@@ -19509,7 +25286,7 @@ fn run_exact_compressor_device_into(
         workspace.num_bytes(),
         device_const(wkv_f32.cu_deviceptr()),
         device_const(input_f32.cu_deviceptr()),
-        device_mut(compressor.kv.cu_deviceptr()),
+        device_mut(kv.cu_deviceptr()),
         outputs,
         v4_state::HIDDEN,
     )?;
@@ -19519,7 +25296,7 @@ fn run_exact_compressor_device_into(
         workspace.num_bytes(),
         device_const(wgate_f32.cu_deviceptr()),
         device_const(input_f32.cu_deviceptr()),
-        device_mut(compressor.score.cu_deviceptr()),
+        device_mut(score.cu_deviceptr()),
         outputs,
         v4_state::HIDDEN,
     )?;
@@ -19527,19 +25304,12 @@ fn run_exact_compressor_device_into(
         .checked_mul(outputs)
         .ok_or("strict device Compressor APE offset overflow")?;
     unsafe {
-        copy_device_range(
-            stream,
-            &compressor.score_plus_ape,
-            0,
-            ape,
-            ape_offset,
-            outputs,
-        )?;
+        copy_device_range(stream, score_plus_ape, 0, ape, ape_offset, outputs)?;
         module.add_in_place(
             stream,
             LaunchConfig::for_num_elems(u32::try_from(outputs)?),
-            &mut compressor.score_plus_ape,
-            &compressor.score,
+            score_plus_ape,
+            score,
         )?;
     }
     Ok(())
@@ -20126,55 +25896,23 @@ fn run_device_attention_after_commit(
     } else {
         raw_topk
     };
-    let sparse_arm = sparse_attention_arm_from_env()?;
-    if !sparse_arm.uses_score_reuse(topk.len()) {
-        run_sparse_attention_device_into(
-            module,
-            stream,
-            &state.q_rope,
-            &state.attention_cache,
-            &weights.attn_sink,
-            topk,
-            &mut state.sparse,
-            topk.len(),
-        )?;
-    } else if csa_boundary {
-        run_sparse_attention_score_reuse_device_into(
-            module,
-            stream,
-            &state.q_rope,
-            &state.attention_cache,
-            &weights.attn_sink,
-            topk,
-            &mut state.sparse,
-            &mut state.sparse_csa,
-            topk.len(),
-        )?;
+    let sparse_scratch = if csa_boundary {
+        &mut state.sparse_csa
     } else if position == 0 {
-        run_sparse_attention_score_reuse_device_into(
-            module,
-            stream,
-            &state.q_rope,
-            &state.attention_cache,
-            &weights.attn_sink,
-            topk,
-            &mut state.sparse,
-            &mut state.sparse_pos0,
-            topk.len(),
-        )?;
+        &mut state.sparse_pos0
     } else {
-        run_sparse_attention_score_reuse_device_into(
-            module,
-            stream,
-            &state.q_rope,
-            &state.attention_cache,
-            &weights.attn_sink,
-            topk,
-            &mut state.sparse,
-            &mut state.sparse_pos1,
-            topk.len(),
-        )?;
-    }
+        &mut state.sparse_pos1
+    };
+    run_device_raw_window_attention(
+        module,
+        stream,
+        &state.q_rope,
+        &state.attention_cache,
+        &weights.attn_sink,
+        topk,
+        &mut state.sparse,
+        sparse_scratch,
+    )?;
     rope_lut.copy_inverse_row(stream, position, &state.inverse_freqs)?;
     run_rope_device_into(
         module,
@@ -20217,6 +25955,45 @@ fn run_device_attention_after_commit(
         state.after_attention.to_host_vec(stream)?,
         observe_topk.then(|| topk.to_host_vec(stream)).transpose()?,
     ))
+}
+
+/// Shared raw-window sparse-attention launch.  HCA/CSA still choose and fill
+/// their own cache/top-k state above; MTP supplies its isolated ratio-0 cache.
+fn run_device_raw_window_attention(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    q_rope: &DeviceBuffer<u16>,
+    attention_cache: &DeviceBuffer<u16>,
+    attn_sink: &DeviceBuffer<f32>,
+    topk: &DeviceBuffer<i32>,
+    sparse: &mut DeviceBuffer<u16>,
+    sparse_scratch: &mut SparseAttentionScoreReuseScratch,
+) -> Result<(), Box<dyn Error>> {
+    let sparse_arm = sparse_attention_arm_from_env()?;
+    if sparse_arm.uses_score_reuse(topk.len()) {
+        run_sparse_attention_score_reuse_device_into(
+            module,
+            stream,
+            q_rope,
+            attention_cache,
+            attn_sink,
+            topk,
+            sparse,
+            sparse_scratch,
+            topk.len(),
+        )
+    } else {
+        run_sparse_attention_device_into(
+            module,
+            stream,
+            q_rope,
+            attention_cache,
+            attn_sink,
+            topk,
+            sparse,
+            topk.len(),
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20630,11 +26407,245 @@ fn device_persistent_state_audit_d2h_transfer(state: &DeviceTokenState) -> (usiz
     (count, bytes)
 }
 
+/// Audit-only D2H snapshot of the generic layout.  It mirrors the host
+/// persistent representation exactly: physical raw ring, compressor tails,
+/// compressed cache, and optional CSA indexer state.
+fn generic_device_persistent_state_audit(
+    stream: &CudaStream,
+    state: &DeviceLayerPersistentState,
+) -> Result<PersistentStateAudit, Box<dyn Error>> {
+    Ok(PersistentStateAudit {
+        kv: state.raw_kv_ring.to_host_vec(stream)?,
+        compressed_kv: state.compressed_kv.to_host_vec(stream)?,
+        indexer_kv: state
+            .indexer_kv
+            .as_ref()
+            .map(|value| value.to_host_vec(stream))
+            .transpose()?
+            .unwrap_or_default(),
+        main_kv: state.compressor_tail_kv.to_host_vec(stream)?,
+        main_score: state.compressor_tail_score.to_host_vec(stream)?,
+        indexer_main_kv: state
+            .indexer_tail_kv
+            .as_ref()
+            .map(|value| value.to_host_vec(stream))
+            .transpose()?,
+        indexer_main_score: state
+            .indexer_tail_score
+            .as_ref()
+            .map(|value| value.to_host_vec(stream))
+            .transpose()?,
+    })
+}
+
+fn generic_device_persistent_state_audit_d2h_transfer(
+    state: &DeviceLayerPersistentState,
+) -> (usize, usize) {
+    let mut count = 4;
+    let mut bytes = state.raw_kv_ring.num_bytes()
+        + state.compressor_tail_kv.num_bytes()
+        + state.compressor_tail_score.num_bytes()
+        + state.compressed_kv.num_bytes();
+    if let (Some(indexer_kv), Some(indexer_tail_kv), Some(indexer_tail_score)) = (
+        state.indexer_kv.as_ref(),
+        state.indexer_tail_kv.as_ref(),
+        state.indexer_tail_score.as_ref(),
+    ) {
+        count += 3;
+        bytes +=
+            indexer_kv.num_bytes() + indexer_tail_kv.num_bytes() + indexer_tail_score.num_bytes();
+    }
+    (count, bytes)
+}
+
+/// Runs the host recurrence used only to observe generic device state.  The
+/// authoritative row is immutable here, and this helper receives no device
+/// state, request scratch, expert slots, or router state.
+fn run_generic_device_state_audit_mirror(
+    enabled: bool,
+    persistent: Option<&mut v4_state::V4SerialPersistentState>,
+    layer: usize,
+    hc_hidden: &[u16],
+    run: impl FnOnce(&mut v4_state::V4LayerPersistentState, &[u16]) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    if enabled {
+        persistent
+            .ok_or("generic device state audit host mirror disappeared")?
+            .transaction(layer, |host_state| run(host_state, hc_hidden))?;
+    }
+    Ok(())
+}
+
+/// Runs only after a generic head boundary has drained its worker leases. The
+/// host mirror is an independent recurrence; audit copies never enter the
+/// production transfer ledger or per-layer telemetry.
+fn generic_device_state_audit_head(
+    stream: &CudaStream,
+    states: &[Option<DeviceLayerPersistentState>],
+    host: &v4_state::V4SerialPersistentState,
+    lifecycle: &GenericStationaryLifecycle,
+    scratch: &DeviceRequestScratch,
+    position: usize,
+) -> Result<(serde_json::Value, Vec<(usize, PersistentStateAudit)>), Box<dyn Error>> {
+    lifecycle.assert_drained()?;
+    if states.len() != v4_state::V4_LAYER_COUNT {
+        return Err("generic device state audit lost a layer store".into());
+    }
+    let started = std::time::Instant::now();
+    let mut d2h_count = 0_usize;
+    let mut d2h_bytes = 0_usize;
+    let mut layers = Vec::with_capacity(v4_state::V4_LAYER_COUNT);
+    let mut snapshots = Vec::with_capacity(v4_state::V4_LAYER_COUNT);
+    for (layer, state) in states.iter().enumerate() {
+        let state = state
+            .as_ref()
+            .ok_or("generic device state audit found an empty layer store")?;
+        if state.layer != layer || state.committed_rows != position + 1 {
+            return Err("generic device state audit found a noncontiguous store".into());
+        }
+        let expected = host_persistent_state_audit(
+            host.layer(layer)
+                .ok_or("generic device state audit host mirror lost a layer")?,
+        );
+        let actual = generic_device_persistent_state_audit(stream, state)?;
+        check_persistent_state_audit(layer, position, &expected, &actual)?;
+        let (count, bytes) = generic_device_persistent_state_audit_d2h_transfer(state);
+        d2h_count = d2h_count.saturating_add(count);
+        d2h_bytes = d2h_bytes.saturating_add(bytes);
+        layers.push(serde_json::json!({
+            "layer": layer,
+            "committed_rows": state.committed_rows,
+            "exact": true,
+            "host": persistent_state_audit_json(&expected),
+            "device": persistent_state_audit_json(&actual),
+        }));
+        snapshots.push((state.committed_rows, actual));
+    }
+    Ok((
+        serde_json::json!({
+            "position": position,
+            "layers": layers,
+            "exact": true,
+            "d2h_count": d2h_count,
+            "d2h_bytes": d2h_bytes,
+            "strict_compressor_conversion_audit": scratch.exact_compressor.as_ref().map(GenericExactCompressorScratch::audit_telemetry),
+            "audit_wall_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "excluded_from_production_timing": true,
+        }),
+        snapshots,
+    ))
+}
+
+fn check_post_mtp_persistent_state(
+    layer: usize,
+    position: usize,
+    expected_committed_rows: usize,
+    expected: &PersistentStateAudit,
+    actual_committed_rows: usize,
+    actual: &PersistentStateAudit,
+) -> Result<(), Box<dyn Error>> {
+    if actual_committed_rows != expected_committed_rows {
+        return Err(format!(
+            "post-MTP teacher-state clobber: layer {layer} position {position} committed_rows expected {expected_committed_rows} actual {actual_committed_rows}"
+        )
+        .into());
+    }
+    check_persistent_state_audit(layer, position, expected, actual)
+        .map_err(|error| format!("post-MTP teacher-state clobber: {error}").into())
+}
+
+fn check_generic_device_state_unchanged(
+    stream: &CudaStream,
+    states: &[Option<DeviceLayerPersistentState>],
+    expected: &[(usize, PersistentStateAudit)],
+    position: usize,
+) -> Result<u64, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    if states.len() != v4_state::V4_LAYER_COUNT || expected.len() != v4_state::V4_LAYER_COUNT {
+        return Err("post-MTP teacher-state clobber: lost a layer store".into());
+    }
+    for (layer, (state, (expected_committed_rows, expected))) in
+        states.iter().zip(expected).enumerate()
+    {
+        let state = state
+            .as_ref()
+            .ok_or("post-MTP teacher-state clobber: found an empty layer store")?;
+        if state.layer != layer {
+            return Err("post-MTP teacher-state clobber: found a misordered layer store".into());
+        }
+        let actual = generic_device_persistent_state_audit(stream, state)?;
+        check_post_mtp_persistent_state(
+            layer,
+            position,
+            *expected_committed_rows,
+            expected,
+            state.committed_rows,
+            &actual,
+        )?;
+    }
+    Ok(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
 fn first_f32_bits_mismatch(left: &[f32], right: &[f32]) -> Option<usize> {
     left.iter()
         .zip(right)
         .position(|(left, right)| left.to_bits() != right.to_bits())
         .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+/// Diagnostic only: persistent Compressor state remains a strict FP32-bit
+/// gate.  When it fails, record enough numerics to distinguish a slot/layout
+/// fault from a bounded reduction-order difference before changing policy.
+fn f32_state_mismatch_diagnostic(expected: &[f32], actual: &[f32], index: usize) -> String {
+    let expected_value = expected.get(index).copied();
+    let actual_value = actual.get(index).copied();
+    let (mut max_abs, mut max_rel, mut max_ulp) = (0.0_f32, 0.0_f32, 0_u32);
+    let mut bf16_first = None;
+    for (element, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+        if expected.is_finite() && actual.is_finite() {
+            let abs = (expected - actual).abs();
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(abs / expected.abs().max(f32::MIN_POSITIVE));
+            max_ulp = max_ulp.max(f32_ulp_distance(expected, actual));
+        } else if expected.to_bits() != actual.to_bits() {
+            max_abs = f32::INFINITY;
+            max_rel = f32::INFINITY;
+            max_ulp = u32::MAX;
+        }
+        if bf16_first.is_none()
+            && v4_router::f32_to_bf16_rne(expected) != v4_router::f32_to_bf16_rne(actual)
+        {
+            bf16_first = Some(element);
+        }
+    }
+    let render = |value: Option<f32>| match value {
+        Some(value) => format!("value={value:e} bits=0x{:08x}", value.to_bits()),
+        None => "missing".to_owned(),
+    };
+    let first_abs = match (expected_value, actual_value) {
+        (Some(expected), Some(actual)) => (expected - actual).abs(),
+        _ => f32::INFINITY,
+    };
+    let first_rel = match (expected_value, actual_value) {
+        (Some(expected), Some(_actual)) => first_abs / expected.abs().max(f32::MIN_POSITIVE),
+        _ => f32::INFINITY,
+    };
+    let first_ulp = match (expected_value, actual_value) {
+        (Some(expected), Some(actual)) if expected.is_finite() && actual.is_finite() => {
+            f32_ulp_distance(expected, actual)
+        }
+        (Some(expected), Some(actual)) if expected.to_bits() == actual.to_bits() => 0,
+        _ => u32::MAX,
+    };
+    format!(
+        "expected_{} actual_{} first_abs={first_abs:e} first_rel={first_rel:e} first_ulp={first_ulp} max_abs={max_abs:e} max_rel={max_rel:e} max_ulp={max_ulp} bf16_rne_all_equal={} bf16_rne_first_mismatch={:?} expected_len={} actual_len={}",
+        render(expected_value),
+        render(actual_value),
+        bf16_first.is_none() && expected.len() == actual.len(),
+        bf16_first,
+        expected.len(),
+        actual.len(),
+    )
 }
 
 fn check_persistent_state_audit(
@@ -20745,19 +26756,18 @@ fn check_persistent_state_audit_with_compressor_state(
     if !require_compressor_state {
         return Ok(());
     }
-    for (name, mismatch) in [
-        (
-            "main_compressor_kv",
-            first_f32_bits_mismatch(&expected.main_kv, &actual.main_kv),
-        ),
+    for (name, expected, actual) in [
+        ("main_compressor_kv", &expected.main_kv, &actual.main_kv),
         (
             "main_compressor_score",
-            first_f32_bits_mismatch(&expected.main_score, &actual.main_score),
+            &expected.main_score,
+            &actual.main_score,
         ),
     ] {
-        if let Some(index) = mismatch {
+        if let Some(index) = first_f32_bits_mismatch(expected, actual) {
             return Err(format!(
-                "device token-state layer {layer} position {position} {name} first mismatch at {index}"
+                "device token-state layer {layer} position {position} {name} first mismatch at {index} ({})",
+                f32_state_mismatch_diagnostic(expected, actual, index),
             )
             .into());
         }
@@ -20778,7 +26788,8 @@ fn check_persistent_state_audit_with_compressor_state(
             (Some(expected), Some(actual)) => {
                 if let Some(index) = first_f32_bits_mismatch(expected, actual) {
                     return Err(format!(
-                        "device token-state layer {layer} position {position} {name} first mismatch at {index}"
+                        "device token-state layer {layer} position {position} {name} first mismatch at {index} ({})",
+                        f32_state_mismatch_diagnostic(expected, actual, index),
                     )
                     .into());
                 }
@@ -21005,6 +27016,34 @@ fn first_mismatch<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
         .zip(right)
         .position(|(left, right)| left != right)
         .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+}
+
+fn check_compressed_boundary_bf16(
+    stage: &str,
+    layer: usize,
+    position: usize,
+    first_row: usize,
+    row_width: usize,
+    expected: &[u16],
+    actual: &[u16],
+) -> Result<(), Box<dyn Error>> {
+    if row_width == 0 {
+        return Err("compressed boundary audit row width is zero".into());
+    }
+    if let Some(flat_index) = first_mismatch(expected, actual) {
+        let row = first_row + flat_index / row_width;
+        let index = flat_index % row_width;
+        let render = |value: Option<&u16>| {
+            value.map_or_else(|| "missing".to_owned(), |value| format!("0x{value:04x}"))
+        };
+        return Err(format!(
+            "stage={stage} layer={layer} position={position} row={row} index={index} old={} new={}",
+            render(expected.get(flat_index)),
+            render(actual.get(flat_index)),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn targeted_stage_u16(name: &str, expected: &[u16], actual: &[u16]) -> serde_json::Value {
@@ -21986,7 +28025,8 @@ fn run_pinned_fixed_worker_boundary_gate(
     let model_dir = v4_model_dir()?;
     let before_bytes = device_available_bytes()?;
     let transfer = context.new_stream()?;
-    let mut cache = FixedLayerCache::stationary_raw_from_env(&model_dir, &LAYERS, 0, 0, stream)?;
+    let mut cache =
+        FixedLayerCache::stationary_raw_from_env(&model_dir, &LAYERS, 0, 0, 0, 0, stream)?;
     let l2_index = cache
         .plan
         .iter()
@@ -22396,7 +28436,8 @@ fn run_device_attention_preflight_gate(
     let pinned_fixed_pipeline = optional_one_flag("COLIBRI_V4_PINNED_FIXED_PIPELINE")?;
     let pinned_fixed_diagnostic = if pinned_fixed_pipeline {
         let transfer = context.new_stream()?;
-        let mut cache = FixedLayerCache::stationary_raw_from_env(&model_dir, &[0], 0, 0, stream)?;
+        let mut cache =
+            FixedLayerCache::stationary_raw_from_env(&model_dir, &[0], 0, 0, 0, 0, stream)?;
         let scratch = cache
             .raw_scratch
             .take()
@@ -23048,6 +29089,7 @@ fn prepare_qd4_stationary_gate_inputs(
                         None,
                         false,
                         None,
+                        None,
                     )?
                     .output,
                 );
@@ -23130,6 +29172,7 @@ fn run_qd4_stationary_gate_arm(
                 false,
                 None,
                 true,
+                None,
                 None,
             )?;
             let audit = run
@@ -24320,6 +30363,11 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     device_observe_topk: bool,
     critical_path_origin: Option<std::time::Instant>,
     capture_routed_contributions: bool,
+    generic_device: Option<(
+        &mut DeviceLayerPersistentState,
+        &mut DeviceRequestScratch,
+        Option<&[u16]>,
+    )>,
     strict_scratch: Option<&mut StrictCompressorScratch>,
 ) -> Result<RealLayerRun, Box<dyn Error>> {
     let weights = &runtime.weights;
@@ -24330,6 +30378,7 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         || hc_hidden.len() != rows * row_width
         || token_ids.len() != rows
         || device_state.is_none()
+            && generic_device.is_none()
             && state.as_ref().is_none_or(|state| {
                 state.layer() != weights.layer || state.committed_kv_rows() != start_pos
             })
@@ -24343,12 +30392,31 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     if capture_routed_contributions && rows != 1 {
         return Err("routed contribution audit requires exactly one row".into());
     }
+    if device_state.is_some() && generic_device.is_some() {
+        return Err("real layer runner cannot mix frozen and generic device state".into());
+    }
     let mut stage = LayerStageTelemetry::default();
     let mut critical_path_timeline = critical_path_origin.map(CriticalPathTimeline::new);
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.attention_start_ns = timeline.now();
     }
-    let attention = if let Some(device_state) = device_state {
+    let mut generic_prepared = None;
+    let attention = if let Some((state, scratch, audit_expected_compressed_prefix)) = generic_device
+    {
+        let prepared = prepare_generic_device_attention_row(
+            module,
+            stream,
+            runtime,
+            state,
+            scratch,
+            hc_hidden,
+            start_pos,
+            audit_expected_compressed_prefix,
+        )?;
+        let attention = prepared.attention.clone();
+        generic_prepared = Some((state, scratch, prepared, audit_expected_compressed_prefix));
+        attention
+    } else if let Some(device_state) = device_state {
         run_device_attention_row(
             module,
             stream,
@@ -24630,7 +30698,32 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         &ffn_hc.comb,
     )?;
     maybe_write_v4_audit_u16(weights.layer, "hidden", &output)?;
-    stage.routed_ns = u64::try_from(routed_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if let Some((state, scratch, prepared, audit_expected_compressed_prefix)) = generic_prepared {
+        stage.routed_ns = u64::try_from(routed_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let commit_started = std::time::Instant::now();
+        let committed = commit_generic_device_attention_row(state, scratch, prepared, stream)?;
+        if let Some(expected_prefix) = audit_expected_compressed_prefix {
+            let actual = state.compressed_kv.to_host_vec(stream)?;
+            let actual_prefix = actual
+                .get(..expected_prefix.len())
+                .ok_or("generic post-commit boundary audit device prefix is incomplete")?;
+            check_compressed_boundary_bf16(
+                "post_commit_compressed_prefix",
+                weights.layer,
+                start_pos,
+                0,
+                v4_state::Q_HEAD_DIM,
+                expected_prefix,
+                actual_prefix,
+            )?;
+        }
+        stage.commit_ns = u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if committed.output != after_attention {
+            return Err("generic stationary attention commit output drifted".into());
+        }
+    } else {
+        stage.routed_ns = u64::try_from(routed_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.hc_post_end_ns = timeline.now();
         timeline.output_ready_ns = timeline.now();
@@ -24655,6 +30748,638 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         critical_path_timeline,
         routed_audit,
     })
+}
+
+struct MtpDraftRun {
+    candidate: i64,
+    routes: v4_router::RouterSelection,
+    source_bytes: usize,
+    routed_source_bytes: usize,
+    source_read_ns: u64,
+    h2d_ns: u64,
+    h2d_bytes: usize,
+    routed_h2d_bytes: usize,
+    kernel_ns: u64,
+    head_read_ns: u64,
+    head_h2d_ns: u64,
+    head_kernel_ns: u64,
+    head_d2h_ns: u64,
+    head_wall_ns: u64,
+    total_ns: u64,
+    persistent_bytes: usize,
+    transient_expert_peak_bytes: usize,
+    device_peak_bytes: usize,
+    borrowed_qd4_lane: bool,
+    kv_position: usize,
+    kv_digest: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Mtp1Qd4LoanTelemetry {
+    normal_lanes_before: usize,
+    normal_lanes_after: usize,
+    loan_depth_before: usize,
+    loan_depth_peak: usize,
+    loan_depth_final: usize,
+    event_drained: bool,
+}
+
+struct Mtp1Qd4Attempt<T> {
+    result: Result<T, Box<dyn Error>>,
+    loan: Mtp1Qd4LoanTelemetry,
+}
+
+fn mtp1_qd4_telemetry_fields(
+    route_ids: Option<&[i32]>,
+    routed_source_bytes: Option<usize>,
+    routed_h2d_bytes: Option<usize>,
+    loan: Mtp1Qd4LoanTelemetry,
+) -> Result<serde_json::Map<String, serde_json::Value>, Box<dyn Error>> {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "qd4_normal_lanes_before".into(),
+        serde_json::json!(loan.normal_lanes_before),
+    );
+    fields.insert(
+        "qd4_normal_lanes_after".into(),
+        serde_json::json!(loan.normal_lanes_after),
+    );
+    fields.insert(
+        "qd4_loan_depth_before".into(),
+        serde_json::json!(loan.loan_depth_before),
+    );
+    fields.insert(
+        "qd4_loan_depth_peak".into(),
+        serde_json::json!(loan.loan_depth_peak),
+    );
+    fields.insert(
+        "qd4_loan_depth_final".into(),
+        serde_json::json!(loan.loan_depth_final),
+    );
+    fields.insert(
+        "qd4_loan_event_drained".into(),
+        serde_json::json!(loan.event_drained),
+    );
+    if let Some(route_ids) = route_ids {
+        let source_bytes =
+            routed_source_bytes.ok_or("MTP routed source byte telemetry disappeared")?;
+        let h2d_bytes = routed_h2d_bytes.ok_or("MTP routed H2D byte telemetry disappeared")?;
+        if source_bytes % v4_expert::V4_ROUTED_EXPERT_BYTES != 0 {
+            return Err("MTP routed source bytes do not contain whole expert loads".into());
+        }
+        if source_bytes != h2d_bytes {
+            return Err("MTP routed source and H2D bytes diverged".into());
+        }
+        fields.insert("route_ids".into(), serde_json::json!(route_ids));
+        fields.insert(
+            "routed_expert_loads".into(),
+            serde_json::json!(source_bytes / v4_expert::V4_ROUTED_EXPERT_BYTES),
+        );
+        fields.insert(
+            "routed_source_bytes".into(),
+            serde_json::json!(source_bytes),
+        );
+        fields.insert("routed_h2d_bytes".into(), serde_json::json!(h2d_bytes));
+    } else if routed_source_bytes.is_some() || routed_h2d_bytes.is_some() {
+        return Err("MTP routed bytes require route IDs".into());
+    }
+    Ok(fields)
+}
+
+fn append_mtp1_qd4_telemetry(
+    record: &mut serde_json::Value,
+    route_ids: Option<&[i32]>,
+    routed_source_bytes: Option<usize>,
+    routed_h2d_bytes: Option<usize>,
+    loan: Mtp1Qd4LoanTelemetry,
+) -> Result<(), Box<dyn Error>> {
+    record
+        .as_object_mut()
+        .ok_or("MTP telemetry record must be a JSON object")?
+        .extend(mtp1_qd4_telemetry_fields(
+            route_ids,
+            routed_source_bytes,
+            routed_h2d_bytes,
+            loan,
+        )?);
+    Ok(())
+}
+
+struct MtpDraftPrefixRun {
+    persistent_bytes: usize,
+    kv_position: usize,
+    kv_digest: u64,
+}
+
+enum MtpDraftStep {
+    Prefix(Result<MtpDraftPrefixRun, Box<dyn Error>>),
+    Candidate(Result<MtpDraftRun, Box<dyn Error>>),
+}
+
+fn mtp1_requires_full_candidate(prompt_len: usize, token_position: usize) -> bool {
+    token_position + 1 >= prompt_len
+}
+
+/// One official MTP-1 row consumes the teacher's final hidden row and token at
+/// `candidate_pos`, appends its KV at that same position, then predicts the
+/// teacher's token at `candidate_pos + 1`.  Keep this separate from the P0
+/// score cap: stationary acceptance never changes which rows are causal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Mtp1Alignment {
+    input_pos: usize,
+    teacher_hidden_pos: usize,
+    kv_write_pos: usize,
+    candidate_pos: usize,
+    teacher_target_pos: usize,
+    prompt_forced: bool,
+}
+
+fn mtp1_alignment(
+    prompt_len: usize,
+    candidate_pos: usize,
+) -> Result<Mtp1Alignment, Box<dyn Error>> {
+    if prompt_len == 0 {
+        return Err("MTP1 alignment needs a nonempty prompt".into());
+    }
+    let teacher_target_pos = candidate_pos
+        .checked_add(1)
+        .ok_or("MTP1 candidate position overflow")?;
+    Ok(Mtp1Alignment {
+        input_pos: candidate_pos,
+        teacher_hidden_pos: candidate_pos,
+        kv_write_pos: candidate_pos,
+        candidate_pos,
+        teacher_target_pos,
+        prompt_forced: teacher_target_pos < prompt_len,
+    })
+}
+
+fn stationary_mtp1_enabled(generic_stationary: bool, flag: bool) -> Result<bool, Box<dyn Error>> {
+    if flag && !generic_stationary {
+        return Err("COLIBRI_V4_STATIONARY_MTP1_DRAFT requires generic device stationary".into());
+    }
+    Ok(flag)
+}
+
+fn mtp1_can_borrow_qd4_lane(worker_drained: bool, qd4_lanes: usize) -> bool {
+    worker_drained && qd4_lanes == V4_QD4_LANES
+}
+
+fn run_with_mtp1_qd4_loan<T>(
+    mut qd4_lanes: Option<&mut [ExpertSlot<'_>]>,
+    worker_drained: bool,
+    run: impl FnOnce(Option<&mut ExpertSlot<'_>>) -> Result<T, Box<dyn Error>>,
+) -> Mtp1Qd4Attempt<T> {
+    let normal_lanes_before = qd4_lanes.as_deref().map_or(0, <[ExpertSlot]>::len);
+    let lanes_present = qd4_lanes.is_some();
+    let borrowed = lanes_present && mtp1_can_borrow_qd4_lane(worker_drained, normal_lanes_before);
+    let mut event_drained = !lanes_present;
+    let result = if lanes_present && !borrowed {
+        Err("stationary MTP candidate requires a drained normal four-lane QD4 set".into())
+    } else if let Some(lanes) = qd4_lanes.as_deref_mut() {
+        let lane = &mut lanes[0];
+        let result = run(Some(lane));
+        let drain = lane.finish_qd4_loan();
+        event_drained = drain.is_ok();
+        match (result, drain) {
+            (Ok(value), Ok(true)) => Ok(value),
+            (Ok(_), Ok(false)) => Err("stationary MTP QD4 loan event did not drain".into()),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(_)) => Err(error),
+            (Err(error), Err(drain)) => {
+                Err(format!("{error}; stationary MTP QD4 loan drain also failed: {drain}").into())
+            }
+        }
+    } else {
+        run(None)
+    };
+    let normal_lanes_after = qd4_lanes.as_deref().map_or(0, <[ExpertSlot]>::len);
+    Mtp1Qd4Attempt {
+        result,
+        loan: Mtp1Qd4LoanTelemetry {
+            normal_lanes_before,
+            normal_lanes_after,
+            loan_depth_before: 0,
+            loan_depth_peak: usize::from(borrowed),
+            loan_depth_final: 0,
+            event_drained,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_mtp1_draft_state(
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    teacher_hc_hidden: &[u16],
+    input_id: i64,
+    start_pos: usize,
+    state: &mut MtpDraftState,
+) -> Result<MtpDraftPrefixRun, Box<dyn Error>> {
+    if state.position != start_pos || teacher_hc_hidden.len() != v4_state::HC * v4_state::HIDDEN {
+        return Err("MTP1 draft state position or teacher hidden-row contract mismatch".into());
+    }
+    let host = v4_state::load_mtp_draft_prefix_weights(model_dir)?;
+    let weights = upload_mtp_draft_prefix_weights(stream, &host)?;
+    let embedding = load_mtp_embedding_row(model_dir, input_id)?;
+    let enorm = DeviceBuffer::from_host(stream, &host.enorm)?;
+    let hnorm = DeviceBuffer::from_host(stream, &host.hnorm)?;
+    let e_input = run_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
+    let e_projection = host.e_proj.load(&host.shard)?;
+    let e_projection = DeviceFp8Matrix::new(stream, &e_projection)?;
+    let e = run_l0_fp8_linear(module, stream, &e_input, &e_projection, false)?.1;
+    let h_input = run_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
+    let h_projection = host.h_proj.load(&host.shard)?;
+    let h_projection = DeviceFp8Matrix::new(stream, &h_projection)?;
+    let h = run_l0_fp8_linear(module, stream, &h_input, &h_projection, false)?.1;
+    let mut residual = Vec::with_capacity(teacher_hc_hidden.len());
+    for h_row in h.chunks_exact(v4_state::HIDDEN) {
+        residual.extend(h_row.iter().zip(&e).map(|(&h, &e)| {
+            v4_router::f32_to_bf16_rne(v4_router::bf16_to_f32(h) + v4_router::bf16_to_f32(e))
+        }));
+    }
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &residual,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+    )?;
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &weights.attn_norm,
+        v4_state::HIDDEN,
+    )?;
+    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = run_l0_rmsnorm(
+        module,
+        stream,
+        &kv_raw,
+        &weights.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    let freqs = v4_state::compressed_rope_freqs(start_pos);
+    let kv_rope = run_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
+    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let kv_ready = DeviceBuffer::from_host(stream, &kv)?;
+    state.commit_kv_row(stream, &kv_ready)?;
+    Ok(MtpDraftPrefixRun {
+        persistent_bytes: state.persistent_bytes(),
+        kv_position: state.position,
+        kv_digest: state.digest(stream)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mtp1_draft_candidate(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    model_dir: &std::path::Path,
+    final_head: &v4_state::FinalHeadWeights,
+    mut borrowed_qd4_lane: Option<&mut ExpertSlot<'_>>,
+    capacity_limit: Option<usize>,
+    teacher_hc_hidden: &[u16],
+    input_id: i64,
+    start_pos: usize,
+    state: &mut MtpDraftState,
+) -> Result<MtpDraftRun, Box<dyn Error>> {
+    if state.position != start_pos || teacher_hc_hidden.len() != v4_state::HC * v4_state::HIDDEN {
+        return Err("MTP1 draft state position or teacher hidden-row contract mismatch".into());
+    }
+    let started = std::time::Instant::now();
+    let source_started = std::time::Instant::now();
+    let host = v4_state::load_mtp_draft_weights(model_dir)?;
+    let mut source_read_ns = u64::try_from(source_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let mut h2d_ns = 0_u64;
+    let mut h2d_bytes = 0_usize;
+    let embedding_started = std::time::Instant::now();
+    let embedding = load_mtp_embedding_row(model_dir, input_id)?;
+    source_read_ns = source_read_ns
+        .saturating_add(u64::try_from(embedding_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    let enorm = DeviceBuffer::from_host(stream, &host.enorm)?;
+    let hnorm = DeviceBuffer::from_host(stream, &host.hnorm)?;
+    let e_input = run_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
+    let (e, e_projection_bytes) = {
+        let projection_read_started = std::time::Instant::now();
+        let projection = host.e_proj.load(&host.shard)?;
+        source_read_ns = source_read_ns.saturating_add(
+            u64::try_from(projection_read_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let projection_h2d_started = std::time::Instant::now();
+        let projection = DeviceFp8Matrix::new(stream, &projection)?;
+        stream.synchronize()?;
+        h2d_ns = h2d_ns.saturating_add(
+            u64::try_from(projection_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let bytes = projection.num_bytes();
+        h2d_bytes = h2d_bytes.saturating_add(bytes);
+        (
+            run_l0_fp8_linear(module, stream, &e_input, &projection, false)?.1,
+            bytes,
+        )
+    };
+    let h_input = run_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
+    let (h, h_projection_bytes) = {
+        let projection_read_started = std::time::Instant::now();
+        let projection = host.h_proj.load(&host.shard)?;
+        source_read_ns = source_read_ns.saturating_add(
+            u64::try_from(projection_read_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let projection_h2d_started = std::time::Instant::now();
+        let projection = DeviceFp8Matrix::new(stream, &projection)?;
+        stream.synchronize()?;
+        h2d_ns = h2d_ns.saturating_add(
+            u64::try_from(projection_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let bytes = projection.num_bytes();
+        h2d_bytes = h2d_bytes.saturating_add(bytes);
+        (
+            run_l0_fp8_linear(module, stream, &h_input, &projection, false)?.1,
+            bytes,
+        )
+    };
+    // e/h projections have drained before the full MTP block is resident.
+    let fixed_h2d_started = std::time::Instant::now();
+    let weights = upload_mtp_draft_weights(module, stream, &host)?;
+    stream.synchronize()?;
+    let fixed_h2d_ns = u64::try_from(fixed_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    h2d_ns = h2d_ns.saturating_add(fixed_h2d_ns);
+    h2d_bytes = h2d_bytes.saturating_add(weights.num_bytes());
+    let peak_bytes = mtp1_draft_peak_bytes(
+        state.persistent_bytes(),
+        weights.num_bytes(),
+        e_projection_bytes,
+        h_projection_bytes,
+        usize::from(borrowed_qd4_lane.is_none()) * MTP1_DRAFT_TRANSIENT_EXPERT_SLOT_BYTES,
+        CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES,
+    )?;
+    if capacity_limit.is_some_and(|limit| peak_bytes > limit) {
+        return Err(format!(
+            "MTP1 draft peak {peak_bytes} exceeds capacity {}",
+            capacity_limit.expect("checked above")
+        )
+        .into());
+    }
+    let mut residual = Vec::with_capacity(teacher_hc_hidden.len());
+    for h_row in h.chunks_exact(v4_state::HIDDEN) {
+        residual.extend(h_row.iter().zip(&e).map(|(&h, &e)| {
+            v4_router::f32_to_bf16_rne(v4_router::bf16_to_f32(h) + v4_router::bf16_to_f32(e))
+        }));
+    }
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &residual,
+        &weights.hc_attn_fn,
+        &weights.hc_attn_scale,
+        &weights.hc_attn_base,
+    )?;
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &weights.attn_norm,
+        v4_state::HIDDEN,
+    )?;
+    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let q_lora = run_l0_rmsnorm(
+        module,
+        stream,
+        &q_lora_raw,
+        &weights.q_norm,
+        weights.wq_a.out_features,
+    )?;
+    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let empty_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &empty_norm, v4_state::Q_HEAD_DIM)?;
+    let freqs = v4_state::compressed_rope_freqs(start_pos);
+    let q = run_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
+    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = run_l0_rmsnorm(
+        module,
+        stream,
+        &kv_raw,
+        &weights.kv_norm,
+        v4_state::Q_HEAD_DIM,
+    )?;
+    let kv_rope = run_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
+    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let kv_ready = DeviceBuffer::from_host(stream, &kv)?;
+    let q = DeviceBuffer::from_host(stream, &q)?;
+    let cache = DeviceBuffer::zeroed(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?;
+    unsafe {
+        copy_device_range(
+            stream,
+            &cache,
+            0,
+            &state.kv_cache,
+            0,
+            v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+        )?;
+        copy_device_row(
+            stream,
+            &cache,
+            v4_state::mtp1_swa::mtp1_swa_attention_state_plan(v4_state::mtp1_swa::MTP1_SWA_LAYER)?
+                .slot_for_position(start_pos)?,
+            &kv_ready,
+        )?;
+    }
+    let (topk, _) = v4_state::window_topk_cpu(1, start_pos, v4_state::KV_WINDOW)?;
+    let topk = DeviceBuffer::from_host(stream, &topk)?;
+    let mut sparse = DeviceBuffer::zeroed(stream, v4_state::Q_HEADS * v4_state::Q_HEAD_DIM)?;
+    let mut sparse_scratch = SparseAttentionScoreReuseScratch::new(stream, 1, topk.len())?;
+    run_device_raw_window_attention(
+        module,
+        stream,
+        &q,
+        &cache,
+        &weights.attn_sink,
+        &topk,
+        &mut sparse,
+        &mut sparse_scratch,
+    )?;
+    let sparse = sparse.to_host_vec(stream)?;
+    let sparse = run_l0_rope(module, stream, &sparse, &freqs, v4_state::Q_HEADS, true)?;
+    let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
+    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let after_attention = run_l0_hc_post(
+        module,
+        stream,
+        &attention,
+        &residual,
+        &attn_hc.post,
+        &attn_hc.comb,
+    )?;
+    let ffn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        &after_attention,
+        &weights.hc_ffn_fn,
+        &weights.hc_ffn_scale,
+        &weights.hc_ffn_base,
+    )?;
+    let router = run_layer_router(module, stream, &ffn_hc.collapsed, &weights, &[])?;
+    let shared = run_layer_shared_expert(module, stream, &router.input, &weights)?;
+    let mut contributions = Vec::with_capacity(v4_router::V4_TOPK);
+    let mut expert_bytes = 0_usize;
+    let mut expert_ids = router
+        .routes
+        .ids
+        .iter()
+        .map(|&route| u16::try_from(route))
+        .collect::<Result<Vec<_>, _>>()?;
+    expert_ids.sort_unstable();
+    expert_ids.dedup();
+    for expert_id in expert_ids {
+        if let Some(slot) = borrowed_qd4_lane.as_deref_mut() {
+            let plan = v4_expert::RoutedExpertRangePlan::new_mtp(&host.shard, expert_id)?;
+            for (&route, &weight) in router.routes.ids.iter().zip(&router.routes.weights) {
+                if u16::try_from(route)? == expert_id {
+                    let mut output = vec![0.0_f32; v4_expert::V4_HIDDEN];
+                    let lane = slot.load_range_execute_into(
+                        &host.shard,
+                        &plan,
+                        &router.input,
+                        weight,
+                        &mut output,
+                        None,
+                        None,
+                    )?;
+                    source_read_ns = source_read_ns.saturating_add(lane.read_ns);
+                    h2d_ns = h2d_ns.saturating_add(lane.h2d_ns);
+                    expert_bytes = expert_bytes.saturating_add(v4_expert::V4_ROUTED_EXPERT_BYTES);
+                    h2d_bytes = h2d_bytes.saturating_add(v4_expert::V4_ROUTED_EXPERT_BYTES);
+                    contributions.push((expert_id, output));
+                }
+            }
+        } else {
+            let expert = v4_expert::RoutedExpert::load_mtp(&host.shard, expert_id)?;
+            source_read_ns = source_read_ns.saturating_add((expert.read_ms * 1_000_000.0) as u64);
+            expert_bytes = expert_bytes.saturating_add(expert.h2d_bytes());
+            let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
+            h2d_ns = h2d_ns.saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
+            h2d_bytes = h2d_bytes.saturating_add(expert.h2d_bytes());
+            for (&route, &weight) in router.routes.ids.iter().zip(&router.routes.weights) {
+                if u16::try_from(route)? == expert_id {
+                    contributions.push((expert_id, slot.execute(&router.input, weight)?.0));
+                }
+            }
+        }
+    }
+    contributions.sort_unstable_by_key(|(expert, _)| *expert);
+    let routed = contributions
+        .iter()
+        .map(|(expert, output)| (*expert, output.as_slice()))
+        .collect::<Vec<_>>();
+    let moe = v4_expert::reduce_moe_canonical(&routed, &shared)?;
+    let output = run_l0_hc_post(
+        module,
+        stream,
+        &moe,
+        &after_attention,
+        &ffn_hc.post,
+        &ffn_hc.comb,
+    )?;
+    let pre = v4_state::final_hc_gate_cpu(
+        &output,
+        1,
+        v4_state::HC,
+        v4_state::HIDDEN,
+        &host.hc_head_fn,
+        host.hc_head_scale,
+        &host.hc_head_base,
+    )?;
+    let normalized = v4_state::final_hc_head_cpu(
+        &output,
+        1,
+        v4_state::HC,
+        v4_state::HIDDEN,
+        &pre,
+        &host
+            .norm
+            .iter()
+            .map(|&bits| v4_router::bf16_to_f32(bits))
+            .collect::<Vec<_>>(),
+        &vec![0.0; v4_state::HIDDEN],
+        1,
+    )?
+    .normalized_bf16;
+    // The full MTP block and routed slot are no longer needed by the streamed
+    // LM head, so the head has no fixed-weight overlap.
+    drop(weights);
+    let head =
+        run_streamed_lm_head_gpu_normalized(context, module, stream, final_head, &normalized)?;
+    let head_read_ns = head.read_ns;
+    source_read_ns = source_read_ns.saturating_add(head.read_ns);
+    h2d_ns = h2d_ns.saturating_add(head.h2d_ns);
+    h2d_bytes = h2d_bytes.saturating_add(
+        v4_state::HIDDEN * std::mem::size_of::<u16>()
+            + v4_state::VOCAB * v4_state::HIDDEN * std::mem::size_of::<u16>(),
+    );
+    state.commit_kv_row(stream, &kv_ready)?;
+    let total_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(MtpDraftRun {
+        candidate: i64::try_from(head.candidate)?,
+        routes: router.routes,
+        source_bytes: host
+            .fixed_source_bytes
+            .saturating_add(host.e_proj.source_bytes())
+            .saturating_add(host.h_proj.source_bytes())
+            .saturating_add(expert_bytes)
+            .saturating_add(v4_state::HIDDEN * std::mem::size_of::<u16>())
+            .saturating_add(v4_state::VOCAB * v4_state::HIDDEN * std::mem::size_of::<u16>()),
+        routed_source_bytes: expert_bytes,
+        source_read_ns,
+        h2d_ns,
+        h2d_bytes,
+        routed_h2d_bytes: expert_bytes,
+        kernel_ns: total_ns
+            .saturating_sub(source_read_ns)
+            .saturating_sub(h2d_ns)
+            .saturating_sub(head.d2h_ns),
+        head_read_ns,
+        head_h2d_ns: head.h2d_ns,
+        head_kernel_ns: head.kernel_ns,
+        head_d2h_ns: head.d2h_ns,
+        head_wall_ns: head.wall_ns,
+        total_ns,
+        persistent_bytes: state.persistent_bytes(),
+        transient_expert_peak_bytes: usize::from(borrowed_qd4_lane.is_none())
+            * MTP1_DRAFT_TRANSIENT_EXPERT_SLOT_BYTES,
+        device_peak_bytes: peak_bytes,
+        borrowed_qd4_lane: borrowed_qd4_lane.is_some(),
+        kv_position: state.position,
+        kv_digest: state.digest(stream)?,
+    })
+}
+
+fn load_mtp_embedding_row(
+    model_dir: &std::path::Path,
+    input_id: i64,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    v4_state::validate_ids(&[input_id])?;
+    let shard = safetensors::ShardFile::open(model_dir.join("model-00001-of-00064.safetensors"))?;
+    let tensor = shard.tensor("embed.weight")?;
+    if tensor.dtype != safetensors::TensorDtype::Bf16
+        || tensor.shape != [v4_state::VOCAB as u64, v4_state::HIDDEN as u64]
+    {
+        return Err("MTP shared embedding tensor contract mismatch".into());
+    }
+    let mut embedding = vec![0_u16; v4_state::HIDDEN];
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(embedding.as_mut_ptr().cast(), embedding.len() * 2)
+    };
+    shard.read_at(
+        "embed.weight",
+        u64::try_from(usize::try_from(input_id)? * v4_state::HIDDEN * 2)?,
+        bytes,
+    )?;
+    Ok(embedding)
 }
 
 #[derive(Clone)]
@@ -26060,6 +32785,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn post_mtp_guard_covers_committed_rows_and_every_persistent_field() {
+        let baseline = PersistentStateAudit {
+            kv: vec![1],
+            compressed_kv: vec![2],
+            indexer_kv: vec![3],
+            main_kv: vec![4.0],
+            main_score: vec![5.0],
+            indexer_main_kv: Some(vec![6.0]),
+            indexer_main_score: Some(vec![7.0]),
+        };
+        assert!(check_post_mtp_persistent_state(0, 30, 31, &baseline, 31, &baseline).is_ok());
+        assert!(
+            check_post_mtp_persistent_state(0, 30, 31, &baseline, 32, &baseline)
+                .unwrap_err()
+                .to_string()
+                .contains("committed_rows")
+        );
+        let assert_clobber = |actual: PersistentStateAudit| {
+            assert!(
+                check_post_mtp_persistent_state(0, 30, 31, &baseline, 31, &actual)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("post-MTP teacher-state clobber:")
+            );
+        };
+
+        let mut actual = baseline.clone();
+        actual.kv[0] = 8;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.compressed_kv[0] = 8;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.indexer_kv[0] = 8;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.main_kv[0] = 8.0;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.main_score[0] = 8.0;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.indexer_main_kv.as_mut().unwrap()[0] = 8.0;
+        assert_clobber(actual);
+        let mut actual = baseline.clone();
+        actual.indexer_main_score.as_mut().unwrap()[0] = 8.0;
+        assert_clobber(actual);
+    }
+
+    #[test]
+    fn stationary_mtp1_preflight_plan_contract() {
+        let default = stationary_mtp1_preflight_plan(None, None).unwrap();
+        assert_eq!((default.prompt_rows, default.max_new_tokens), (5, 3));
+
+        let p58_n1 = stationary_mtp1_preflight_plan(
+            Some(std::ffi::OsStr::new("58")),
+            Some(std::ffi::OsStr::new("1")),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                p58_n1.prompt_rows,
+                p58_n1.max_new_tokens,
+                p58_n1.context_rows,
+                p58_n1.csa_compressed_rows,
+                p58_n1.hca_compressed_rows,
+            ),
+            (58, 1, 58, 14, 0)
+        );
+
+        assert!(stationary_mtp1_preflight_plan(Some(std::ffi::OsStr::new("58")), None).is_err());
+        assert!(stationary_mtp1_preflight_plan(None, Some(std::ffi::OsStr::new("1"))).is_err());
+        assert!(stationary_mtp1_preflight_plan(
+            Some(std::ffi::OsStr::new("0")),
+            Some(std::ffi::OsStr::new("1")),
+        )
+        .is_err());
+        assert!(stationary_mtp1_preflight_plan(
+            Some(std::ffi::OsStr::new("invalid")),
+            Some(std::ffi::OsStr::new("1")),
+        )
+        .is_err());
+
+        let overflow = usize::MAX.to_string();
+        assert!(stationary_mtp1_preflight_plan(
+            Some(std::ffi::OsStr::new(&overflow)),
+            Some(std::ffi::OsStr::new("2")),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stationary_mtp1_strict_scratch_geometry_is_single_sourced_for_p5_n3_and_p58_n8() {
+        let pinned = std::path::Path::new("/pinned/libcublas.so.12");
+        let p5_n3 = v4_state::LayerStationaryRequestPlan::new(5, 3).unwrap();
+        let p5_geometry = DeviceRequestScratchGeometry::new(p5_n3, true).unwrap();
+        assert!(stationary_mtp1_target_strict_scratch_contract(p5_n3, true, None).is_err());
+        assert_eq!(
+            stationary_mtp1_target_strict_scratch_contract(p5_n3, true, Some(pinned)).unwrap(),
+            113_476_834
+        );
+        assert_eq!(p5_geometry.num_bytes().unwrap(), 113_476_834);
+        assert_eq!(p5_geometry.attention_f32_elements(), v4_state::HIDDEN);
+        assert_eq!(
+            p5_geometry.attention_f32_elements() * std::mem::size_of::<f32>(),
+            28_672
+        );
+        assert_eq!(
+            p5_geometry.byte_breakdown().unwrap().total().unwrap(),
+            p5_geometry.num_bytes().unwrap()
+        );
+
+        let p58_n8 = v4_state::LayerStationaryRequestPlan::new(58, 8).unwrap();
+        assert_eq!(
+            stationary_mtp1_target_strict_scratch_contract(p58_n8, true, Some(pinned)).unwrap(),
+            113_519_314
+        );
+        assert_eq!(
+            DeviceRequestScratchGeometry::new(p58_n8, true)
+                .unwrap()
+                .num_bytes()
+                .unwrap(),
+            113_519_314
+        );
+    }
+
+    #[test]
     fn qd4_stationary_gate_schedule_and_f32_audit_are_strict() {
         let schedule = (0..4)
             .flat_map(|pair| {
@@ -26073,6 +32925,45 @@ mod tests {
         assert_eq!(schedule, "ABBABAAB");
         assert!(qd4_gate_f32_bits_equal(&[0.0, f32::NAN], &[0.0, f32::NAN]));
         assert!(!qd4_gate_f32_bits_equal(&[0.0], &[-0.0]));
+    }
+
+    #[test]
+    fn id_only_final_records_expose_monotonic_request_elapsed_deltas() {
+        let decision = IdOnlyFinalHeadDecision {
+            token: 42,
+            certificate: None,
+            cpu: None,
+            certificate_error: None,
+        };
+        let elapsed = [10_u64, 25, 41];
+        let observed = elapsed
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| {
+                id_only_final_record(
+                    4 + offset,
+                    42,
+                    if offset == 0 { "prompt" } else { "generated" },
+                    "DeviceLayerPersistentState",
+                    &decision,
+                    None,
+                    *value,
+                )
+                .unwrap()["request_elapsed_to_final_ns"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(observed, elapsed);
+        assert!(observed.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            observed
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
+            [15, 16]
+        );
     }
 
     #[test]
@@ -26119,6 +33010,796 @@ mod tests {
         assert!(chat_input_conflict(true, true, false));
         assert!(chat_input_conflict(true, false, true));
         assert!(!chat_input_conflict(true, false, false));
+    }
+
+    #[test]
+    fn mtp_prompt_forced_positions_advance_kv_without_full_candidates() {
+        assert!(!mtp1_requires_full_candidate(5, 0));
+        assert!(!mtp1_requires_full_candidate(5, 3));
+        assert!(mtp1_requires_full_candidate(5, 4));
+        assert!(mtp1_requires_full_candidate(5, 5));
+    }
+
+    #[test]
+    fn mtp1_stationary_alignment_scores_each_teacher_transition_once() {
+        let prompt = 5;
+        let forced = mtp1_alignment(prompt, 3).unwrap();
+        assert_eq!(
+            (
+                forced.input_pos,
+                forced.teacher_hidden_pos,
+                forced.kv_write_pos,
+                forced.candidate_pos,
+                forced.teacher_target_pos,
+                forced.prompt_forced
+            ),
+            (3, 3, 3, 3, 4, true),
+        );
+        let first = mtp1_alignment(prompt, 4).unwrap();
+        assert_eq!(
+            (
+                first.input_pos,
+                first.teacher_hidden_pos,
+                first.kv_write_pos,
+                first.candidate_pos,
+                first.teacher_target_pos,
+                first.prompt_forced
+            ),
+            (4, 4, 4, 4, 5, false),
+        );
+        let greedy = mtp1_alignment(prompt, 5).unwrap();
+        assert_eq!(
+            (
+                greedy.input_pos,
+                greedy.teacher_hidden_pos,
+                greedy.kv_write_pos,
+                greedy.candidate_pos,
+                greedy.teacher_target_pos,
+                greedy.prompt_forced
+            ),
+            (5, 5, 5, 5, 6, false),
+        );
+        assert!(mtp1_alignment(0, 0).is_err());
+        assert!(mtp1_alignment(1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn mtp1_stationary_peak_reservation_keeps_qd4_lane_out_of_extra_peak() {
+        let without_borrow = mtp1_draft_peak_bytes(10, 20, 30, 40, 50, 60).unwrap();
+        let with_borrow = mtp1_draft_peak_bytes(10, 20, 30, 40, 0, 60).unwrap();
+        assert_eq!(without_borrow, MTP1_DRAFT_CANDIDATE_LOCAL_BYTES + 80);
+        assert_eq!(with_borrow, MTP1_DRAFT_CANDIDATE_LOCAL_BYTES + 70);
+        assert!(mtp1_draft_peak_bytes(usize::MAX, 1, 0, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn stationary_mtp_capacity_liveness_uses_a_sequential_max() {
+        let fixed = mtp1_draft_fixed_device_bytes_from_geometry().unwrap();
+        assert_eq!(fixed, 511_234_072);
+        let projection =
+            v4_state::HIDDEN * v4_state::HIDDEN + (v4_state::HIDDEN / v4_state::FP8_BLOCK).pow(2);
+        let peak = mtp1_draft_peak_bytes(
+            MTP1_DRAFT_PERSISTENT_BYTES,
+            fixed,
+            projection,
+            projection,
+            0,
+            CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            peak,
+            fixed + MTP1_DRAFT_PERSISTENT_BYTES + MTP1_DRAFT_CANDIDATE_LOCAL_BYTES
+        );
+        assert!(peak > projection + MTP1_DRAFT_PERSISTENT_BYTES + MTP1_DRAFT_CANDIDATE_LOCAL_BYTES);
+        assert!(
+            peak > CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES
+                + MTP1_DRAFT_PERSISTENT_BYTES
+                + MTP1_DRAFT_CANDIDATE_LOCAL_BYTES
+        );
+    }
+
+    #[test]
+    fn stationary_mtp_capacity_preflight_schema_is_isolated_and_versioned() {
+        assert_eq!(
+            STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA,
+            "colibri-v4-stationary-mtp1-capacity-v2"
+        );
+        assert!(STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA.contains("capacity"));
+    }
+
+    #[test]
+    fn mtp1_qd4_lane_borrow_requires_drain_and_restores_teacher_ownership() {
+        assert!(!mtp1_can_borrow_qd4_lane(false, V4_QD4_LANES));
+        assert!(!mtp1_can_borrow_qd4_lane(true, V4_QD4_LANES - 1));
+        assert!(mtp1_can_borrow_qd4_lane(true, V4_QD4_LANES));
+        // The borrow calls `load_range_execute_into` synchronously and never
+        // touches QD4 accounting; the next teacher dispatch still owns 4 lanes.
+        assert_eq!(qd4_lane_count(true), V4_QD4_LANES);
+    }
+
+    #[test]
+    fn mtp1_qd4_telemetry_serializes_closed_loan_and_derived_loads() {
+        let loan = Mtp1Qd4LoanTelemetry {
+            normal_lanes_before: V4_QD4_LANES,
+            normal_lanes_after: V4_QD4_LANES,
+            loan_depth_before: 0,
+            loan_depth_peak: 1,
+            loan_depth_final: 0,
+            event_drained: true,
+        };
+        let bytes = 6 * v4_expert::V4_ROUTED_EXPERT_BYTES;
+        let fields =
+            mtp1_qd4_telemetry_fields(Some(&[1, 2, 3, 4, 5, 6]), Some(bytes), Some(bytes), loan)
+                .unwrap();
+        assert_eq!(fields["routed_expert_loads"], 6);
+        assert_eq!(fields["routed_source_bytes"], bytes);
+        assert_eq!(fields["routed_h2d_bytes"], bytes);
+        assert_eq!(fields["qd4_normal_lanes_before"], V4_QD4_LANES);
+        assert_eq!(fields["qd4_normal_lanes_after"], V4_QD4_LANES);
+        assert_eq!(fields["qd4_loan_depth_before"], 0);
+        assert_eq!(fields["qd4_loan_depth_peak"], 1);
+        assert_eq!(fields["qd4_loan_depth_final"], 0);
+        assert_eq!(fields["qd4_loan_event_drained"], true);
+
+        let failed = mtp1_qd4_telemetry_fields(None, None, None, loan).unwrap();
+        assert_eq!(failed["qd4_loan_depth_final"], 0);
+        assert_eq!(failed["qd4_loan_event_drained"], true);
+        assert!(mtp1_qd4_telemetry_fields(
+            Some(&[1]),
+            Some(v4_expert::V4_ROUTED_EXPERT_BYTES + 1),
+            Some(v4_expert::V4_ROUTED_EXPERT_BYTES + 1),
+            loan,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mtp1_failure_disables_state_and_env_off_preserves_generic_branch() {
+        let error = "synthetic MTP failure".to_string();
+        let (state, disabled) = (None::<usize>, Some(error.clone()));
+        assert!(state.is_none());
+        assert_eq!(disabled.as_deref(), Some(error.as_str()));
+        assert!(!stationary_mtp1_enabled(true, false).unwrap());
+        assert!(stationary_mtp1_enabled(false, false).is_ok());
+        assert!(stationary_mtp1_enabled(false, true).is_err());
+    }
+
+    #[test]
+    fn mtp_peak_ledger_uses_lifetimes_not_a_sum_of_all_stages() {
+        assert_eq!(
+            mtp1_draft_peak_bytes(10, 20, 30, 40, 50, 60).unwrap(),
+            MTP1_DRAFT_CANDIDATE_LOCAL_BYTES + 80
+        );
+        assert!(
+            mtp1_draft_peak_bytes(
+                MTP1_DRAFT_PERSISTENT_BYTES,
+                20_000_000,
+                5_000_000,
+                6_000_000,
+                MTP1_DRAFT_TRANSIENT_EXPERT_SLOT_BYTES,
+                CERTIFIED_ARGMAX_DEVICE_TEMP_BYTES,
+            )
+            .unwrap()
+                > MTP1_DRAFT_EXTRA_CAPACITY_BYTES
+        );
+        assert!(mtp1_draft_peak_bytes(usize::MAX, 1, 0, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn generic_stationary_lifecycle_commits_only_the_current_layer_and_poison_is_fail_closed() {
+        let mut lifecycle = GenericStationaryLifecycle::new(v4_state::V4_LAYER_COUNT).unwrap();
+        lifecycle.begin_layer(0, 0).unwrap();
+        lifecycle.commit_layer(0, 0).unwrap();
+        assert_eq!(lifecycle.committed_rows[0], 1);
+        assert!(lifecycle.committed_rows[1..].iter().all(|&rows| rows == 0));
+
+        // A failure after preparation but before commit does not advance layer
+        // 1 and cannot change any other layer's causal position.
+        let before = lifecycle.committed_rows.clone();
+        lifecycle.begin_layer(1, 0).unwrap();
+        lifecycle.poison();
+        assert_eq!(lifecycle.committed_rows, before);
+        assert!(lifecycle.begin_layer(1, 0).is_err());
+        assert!(lifecycle.commit_layer(1, 0).is_err());
+    }
+
+    #[test]
+    fn generic_device_state_audit_mirror_is_observational_for_a_synthetic_full_row() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct SyntheticFullRow {
+            output: Vec<u16>,
+            routes: Vec<i32>,
+            state: Vec<u16>,
+        }
+
+        fn run_synthetic_full_row(hidden: &[u16], state: &mut Vec<u16>) -> SyntheticFullRow {
+            let output = hidden
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value.wrapping_add(index as u16 + 1))
+                .collect::<Vec<_>>();
+            state.extend_from_slice(&output);
+            SyntheticFullRow {
+                routes: output.iter().map(|value| i32::from(*value % 7)).collect(),
+                output,
+                state: state.clone(),
+            }
+        }
+
+        let hidden = vec![3_u16, 5, 8, 13];
+        let mut audit_off_state = Vec::new();
+        let audit_off = run_synthetic_full_row(&hidden, &mut audit_off_state);
+
+        let mut host_mirror = v4_state::V4SerialPersistentState::new(1).unwrap();
+        let mut mirror_state = Vec::new();
+        let mut mirror_row = None;
+        run_generic_device_state_audit_mirror(
+            true,
+            Some(&mut host_mirror),
+            0,
+            &hidden,
+            |_host_state, mirror_hidden| {
+                mirror_row = Some(run_synthetic_full_row(mirror_hidden, &mut mirror_state));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let mut audit_on_state = Vec::new();
+        let audit_on = run_synthetic_full_row(&hidden, &mut audit_on_state);
+        assert_eq!(
+            audit_on, audit_off,
+            "audit changed authoritative full-row output/routes/state"
+        );
+        assert_eq!(
+            mirror_row.unwrap(),
+            audit_on,
+            "mirror did not receive an immutable row clone"
+        );
+
+        let mut invoked = false;
+        run_generic_device_state_audit_mirror(false, None, 0, &hidden, |_state, _row| {
+            invoked = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!invoked, "disabled audit invoked its mirror closure");
+    }
+
+    #[test]
+    fn compressed_boundary_stage_comparator_attributes_prepared_and_old_prefix_failures() {
+        let expected_row = [0x3f80_u16, 0x4000, 0x4040, 0x4080];
+        let mut prepared_row = expected_row;
+        prepared_row[2] = 0x40a0;
+        assert_eq!(
+            check_compressed_boundary_bf16(
+                "prepared_compressed_row",
+                9,
+                27,
+                6,
+                4,
+                &expected_row,
+                &prepared_row,
+            )
+            .unwrap_err()
+            .to_string(),
+            "stage=prepared_compressed_row layer=9 position=27 row=6 index=2 old=0x4040 new=0x40a0"
+        );
+
+        let expected_prefix = [1_u16, 2, 3, 4, 5, 6, 7, 8];
+        let mut committed_prefix = expected_prefix;
+        committed_prefix[1] = 20;
+        assert_eq!(
+            check_compressed_boundary_bf16(
+                "post_commit_compressed_prefix",
+                9,
+                27,
+                0,
+                4,
+                &expected_prefix,
+                &committed_prefix,
+            )
+            .unwrap_err()
+            .to_string(),
+            "stage=post_commit_compressed_prefix layer=9 position=27 row=0 index=1 old=0x0002 new=0x0014"
+        );
+    }
+
+    #[test]
+    fn generic_stationary_digest_dispatch_never_dereferences_host_mirror() {
+        assert_eq!(
+            persistent_state_digest_source(true, false, false),
+            PersistentStateDigestSource::ObservedDevice
+        );
+        assert_eq!(
+            persistent_state_digest_source(false, false, true),
+            PersistentStateDigestSource::HostPersistent
+        );
+        assert_eq!(
+            persistent_state_digest_source(false, true, true),
+            PersistentStateDigestSource::Unobserved,
+            "generic telemetry must not read the audit-only host mirror"
+        );
+        assert_eq!(
+            persistent_state_digest_source(false, true, false),
+            PersistentStateDigestSource::Unobserved
+        );
+    }
+
+    #[test]
+    fn generic_stationary_option_stores_survive_p5_decode_and_failure() {
+        #[derive(Debug)]
+        struct MockStore {
+            path: GenericStationaryPath,
+            committed_rows: usize,
+            commits: usize,
+        }
+
+        let mut stores = vec![
+            Some(MockStore {
+                path: GenericStationaryPath::Hca128,
+                committed_rows: 0,
+                commits: 0,
+            }),
+            Some(MockStore {
+                path: GenericStationaryPath::Csa4,
+                committed_rows: 0,
+                commits: 0,
+            }),
+        ];
+        let mut scratch = Some(0_usize);
+        let mut lifecycle = GenericStationaryLifecycle::new(v4_state::V4_LAYER_COUNT).unwrap();
+        macro_rules! run_row {
+            ($layer:expr, $position:expr, $fail:expr) => {{
+                (|| -> Result<(), Box<dyn Error>> {
+                    lifecycle.begin_layer($layer, $position)?;
+                    let state = stores
+                        .get_mut($layer)
+                        .and_then(Option::as_mut)
+                        .ok_or("generic stationary test store disappeared")?;
+                    let scratch = scratch
+                        .as_mut()
+                        .ok_or("generic stationary test scratch disappeared")?;
+                    // This is the production runner's borrowed Option tuple
+                    // shape; neither member is taken from its request store.
+                    let generic_device = Some((state, scratch, None::<&[u16]>));
+                    let (state, scratch, _audit_expected_compressed_prefix) =
+                        generic_device.ok_or("generic stationary test tuple disappeared")?;
+                    if $fail {
+                        return Err("generic stationary test injected precommit failure".into());
+                    }
+                    if state.committed_rows != $position {
+                        return Err("generic stationary test state lost causal continuity".into());
+                    }
+                    state.committed_rows += 1;
+                    state.commits += 1;
+                    *scratch += 1;
+                    lifecycle.commit_layer($layer, $position)
+                })()
+            }};
+        }
+
+        for position in 0..5 {
+            run_row!(0, position, false).unwrap();
+            run_row!(1, position, false).unwrap();
+        }
+        assert_eq!(stores[0].as_ref().unwrap().committed_rows, 5);
+        assert_eq!(stores[1].as_ref().unwrap().committed_rows, 5);
+
+        run_row!(0, 5, false).unwrap();
+        run_row!(1, 5, false).unwrap();
+        assert_eq!(stores[0].as_ref().unwrap().committed_rows, 6);
+        assert_eq!(stores[1].as_ref().unwrap().committed_rows, 6);
+        assert_eq!(lifecycle.telemetry.layer_commits, 12);
+        assert_eq!(scratch, Some(12));
+        assert_eq!(
+            stores[0].as_ref().unwrap().path,
+            GenericStationaryPath::Hca128
+        );
+        assert_eq!(
+            stores[1].as_ref().unwrap().path,
+            GenericStationaryPath::Csa4
+        );
+
+        assert!(run_row!(0, 6, true).is_err());
+        let state = stores[0].as_ref().unwrap();
+        assert_eq!(state.committed_rows, 6);
+        assert_eq!(state.commits, 6);
+        assert_eq!(lifecycle.committed_rows[0], 6);
+        assert!(stores.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn generic_stationary_lifecycle_tracks_peaks_and_rejects_live_lease_shutdown() {
+        let mut lifecycle = GenericStationaryLifecycle::new(v4_state::V4_LAYER_COUNT).unwrap();
+        lifecycle.observe_peaks(7, 11, 13);
+        lifecycle.observe_peaks(5, 17, 3);
+        lifecycle.acquire_lease();
+        assert!(lifecycle.assert_drained().is_err());
+        lifecycle.release_lease().unwrap();
+        lifecycle.assert_drained().unwrap();
+        assert_eq!(lifecycle.telemetry.device_peak_bytes, 7);
+        assert_eq!(lifecycle.telemetry.host_peak_bytes, 17);
+        assert_eq!(lifecycle.telemetry.pinned_peak_bytes, 13);
+        assert_eq!(lifecycle.telemetry.live_lease_peak, 1);
+    }
+
+    #[test]
+    fn generic_stationary_shared_scratch_table_covers_hca_csa_and_copy_ranges() {
+        let scratch = GenericStationaryScratchGeometry::max();
+        let plan = v4_state::LayerStationaryRequestPlan::new(129, 17).unwrap();
+        let shared_topk_rows = GenericStationaryPath::Hca128
+            .max_topk_rows(plan)
+            .max(GenericStationaryPath::Csa4.max_topk_rows(plan));
+        let shared_attention_elements = shared_topk_rows * v4_state::Q_HEAD_DIM;
+
+        for (path, expected_width, expected_ratio, expected_tail_rows) in [
+            (GenericStationaryPath::Hca128, 512, 128, 128),
+            (GenericStationaryPath::Csa4, 1_024, 4, 8),
+        ] {
+            let main = scratch.main_elements(path);
+            let tail = scratch.tail_elements(path);
+            let compressed_rows = path.compressed_rows(plan);
+            let composite_rows = path.topk_rows(compressed_rows);
+            assert_eq!(path.compressor_width(), expected_width);
+            assert_eq!(path.ratio(), expected_ratio);
+            assert_eq!(path.tail_rows(), expected_tail_rows);
+            assert_eq!(main, expected_width);
+            assert_eq!(tail, expected_tail_rows * expected_width);
+            assert!(compressor_workspace_contract_matches(
+                v4_state::HIDDEN,
+                main * v4_state::HIDDEN,
+                main * v4_state::HIDDEN,
+                expected_ratio * main,
+                main,
+                main,
+                main,
+                main,
+                expected_ratio,
+            ));
+            assert!(generic_stationary_range_fits(tail, 0, tail, 0, tail));
+            assert!(generic_stationary_range_fits(
+                tail,
+                path.compressor_slot(expected_ratio - 1) * main,
+                main,
+                0,
+                main,
+            ));
+            assert!(generic_stationary_range_fits(
+                tail,
+                0,
+                v4_state::Q_HEAD_DIM,
+                0,
+                v4_state::Q_HEAD_DIM,
+            ));
+            assert!(generic_stationary_range_fits(
+                v4_state::Q_HEAD_DIM,
+                0,
+                compressed_rows * v4_state::Q_HEAD_DIM,
+                (compressed_rows - 1) * v4_state::Q_HEAD_DIM,
+                v4_state::Q_HEAD_DIM,
+            ));
+            assert!(generic_stationary_range_fits(
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                0,
+                shared_attention_elements,
+                0,
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+            ));
+            assert!(generic_stationary_range_fits(
+                compressed_rows * v4_state::Q_HEAD_DIM,
+                0,
+                shared_attention_elements,
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                compressed_rows * v4_state::Q_HEAD_DIM,
+            ));
+            assert!(generic_stationary_range_fits(
+                v4_state::Q_HEAD_DIM,
+                0,
+                shared_attention_elements,
+                (v4_state::KV_WINDOW + compressed_rows - 1) * v4_state::Q_HEAD_DIM,
+                v4_state::Q_HEAD_DIM,
+            ));
+            assert!(generic_stationary_range_fits(
+                composite_rows,
+                0,
+                shared_topk_rows,
+                0,
+                composite_rows,
+            ));
+            assert!(shared_topk_rows >= composite_rows);
+        }
+
+        assert!(
+            !generic_stationary_range_fits(
+                scratch.tail_elements(GenericStationaryPath::Hca128),
+                0,
+                scratch.tail_elements(GenericStationaryPath::Csa4),
+                0,
+                scratch.tail_elements(GenericStationaryPath::Hca128),
+            ),
+            "v2's HCA persistent-tail to CSA-candidate-tail copy must be rejected"
+        );
+
+        let indexer = scratch.csa_indexer_elements;
+        let indexer_tail = 8 * indexer;
+        let indexer_cache = plan.csa_compressed_rows * 128;
+        assert_eq!(indexer, 256);
+        assert!(generic_stationary_range_fits(
+            indexer_tail,
+            0,
+            indexer_tail,
+            0,
+            indexer_tail,
+        ));
+        assert!(generic_stationary_range_fits(
+            indexer_cache,
+            0,
+            indexer_cache,
+            0,
+            indexer_cache,
+        ));
+        assert!(generic_stationary_range_fits(
+            indexer_tail,
+            4 * indexer,
+            indexer,
+            0,
+            indexer,
+        ));
+        assert!(compressor_workspace_contract_matches(
+            v4_state::HIDDEN,
+            indexer * v4_state::HIDDEN,
+            indexer * v4_state::HIDDEN,
+            4 * indexer,
+            indexer,
+            indexer,
+            indexer,
+            indexer,
+            4,
+        ));
+        assert!(generic_stationary_range_fits(indexer_tail, 0, 128, 0, 128,));
+        assert!(generic_stationary_range_fits(
+            64 * 128,
+            0,
+            64 * 128,
+            0,
+            64 * 128,
+        ));
+        assert_eq!(
+            v4_state::HC * v4_state::HIDDEN,
+            4 * v4_state::HIDDEN,
+            "the only generic terminal D2H row remains geometry-invariant"
+        );
+
+        for (path, position, expected_active_topk) in [
+            (GenericStationaryPath::Hca128, 0, 128),
+            (GenericStationaryPath::Hca128, 3, 128),
+            (GenericStationaryPath::Hca128, 127, 129),
+            (GenericStationaryPath::Hca128, 128, 129),
+            (GenericStationaryPath::Csa4, 0, 128),
+            (GenericStationaryPath::Csa4, 3, 129),
+            (GenericStationaryPath::Csa4, 127, 160),
+            (GenericStationaryPath::Csa4, 128, 160),
+        ] {
+            let active_topk = path.composite_capacity_rows(position);
+            let compressed_rows = (position + 1) / path.ratio();
+            assert_eq!(active_topk, expected_active_topk);
+            assert!(generic_stationary_range_fits(
+                active_topk,
+                0,
+                shared_topk_rows,
+                0,
+                active_topk,
+            ));
+            assert!(generic_stationary_range_fits(
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                0,
+                shared_attention_elements,
+                0,
+                v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+            ));
+            if compressed_rows != 0 {
+                assert!(generic_stationary_range_fits(
+                    compressed_rows * v4_state::Q_HEAD_DIM,
+                    0,
+                    shared_attention_elements,
+                    v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM,
+                    compressed_rows * v4_state::Q_HEAD_DIM,
+                ));
+            }
+            assert!(sparse_attention_score_reuse_workspace_matches(
+                v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+                shared_attention_elements,
+                v4_state::Q_HEADS,
+                shared_topk_rows,
+                v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+                v4_state::Q_HEADS * shared_topk_rows,
+                v4_state::Q_HEADS * shared_topk_rows,
+                v4_state::Q_HEADS,
+                v4_state::Q_HEADS,
+                active_topk,
+            ));
+            assert!(
+                !sparse_attention_score_reuse_workspace_matches(
+                    v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+                    shared_attention_elements,
+                    v4_state::Q_HEADS,
+                    active_topk - 1,
+                    v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+                    v4_state::Q_HEADS * shared_topk_rows,
+                    v4_state::Q_HEADS * shared_topk_rows,
+                    v4_state::Q_HEADS,
+                    v4_state::Q_HEADS,
+                    active_topk,
+                ),
+                "physical top-k capacity must cover the active geometry"
+            );
+        }
+
+        let v3_physical_topk = 129;
+        assert!(sparse_attention_score_reuse_workspace_matches(
+            v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+            v3_physical_topk * v4_state::Q_HEAD_DIM,
+            v4_state::Q_HEADS,
+            v3_physical_topk,
+            v4_state::Q_HEADS * v4_state::Q_HEAD_DIM,
+            v4_state::Q_HEADS * v3_physical_topk,
+            v4_state::Q_HEADS * v3_physical_topk,
+            v4_state::Q_HEADS,
+            v4_state::Q_HEADS,
+            128,
+        ));
+    }
+
+    #[test]
+    fn generic_stationary_causal_attention_geometry_matches_serial_topk() {
+        for (path, position, raw_width, raw_valid, compressed, selected, capacity) in [
+            (GenericStationaryPath::Hca128, 0, 1, 1, 0, 0, 128),
+            (GenericStationaryPath::Hca128, 3, 128, 4, 0, 0, 128),
+            (GenericStationaryPath::Hca128, 4, 128, 5, 0, 0, 128),
+            (GenericStationaryPath::Hca128, 127, 128, 128, 1, 1, 129),
+            (GenericStationaryPath::Hca128, 128, 128, 128, 1, 1, 129),
+            (GenericStationaryPath::Hca128, 256, 128, 128, 2, 2, 130),
+            (GenericStationaryPath::Csa4, 0, 1, 1, 0, 0, 128),
+            (GenericStationaryPath::Csa4, 3, 128, 4, 1, 1, 129),
+            (GenericStationaryPath::Csa4, 4, 128, 5, 1, 1, 129),
+            (GenericStationaryPath::Csa4, 127, 128, 128, 32, 32, 160),
+            (GenericStationaryPath::Csa4, 128, 128, 128, 32, 32, 160),
+            (GenericStationaryPath::Csa4, 256, 128, 128, 64, 64, 192),
+        ] {
+            let (raw, observed_raw_width) =
+                v4_state::window_topk_cpu(1, position, v4_state::KV_WINDOW).unwrap();
+            let raw_indices = raw
+                .iter()
+                .copied()
+                .filter(|&index| index >= 0)
+                .collect::<Vec<_>>();
+            let expected_raw = (position + 1 - raw_valid..=position)
+                .map(|index| (index % v4_state::KV_WINDOW) as i32)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                observed_raw_width, raw_width,
+                "{path:?} p{position} raw width"
+            );
+            assert_eq!(
+                raw_indices, expected_raw,
+                "{path:?} p{position} raw ring order"
+            );
+            assert_eq!(compressed, (position + 1) / path.ratio());
+            assert_eq!(
+                selected,
+                match path {
+                    GenericStationaryPath::Hca128 => compressed,
+                    GenericStationaryPath::Csa4 => compressed.min(v4_state::INDEX_TOPK),
+                }
+            );
+            assert_eq!(path.composite_capacity_rows(position), capacity);
+
+            let topk = match path {
+                GenericStationaryPath::Hca128 => {
+                    v4_state::build_hca_sparse_topk(1, position, v4_state::KV_WINDOW, path.ratio())
+                        .unwrap()
+                }
+                GenericStationaryPath::Csa4 if compressed == 0 => v4_state::SparseTopk {
+                    indices: raw.clone(),
+                    rows: 1,
+                    per_row: raw_width,
+                    window_per_row: raw_width,
+                    compressed_per_row: 0,
+                },
+                GenericStationaryPath::Csa4 => v4_state::build_csa_sparse_topk(
+                    &(0..compressed)
+                        .map(|index| index as f32)
+                        .collect::<Vec<_>>(),
+                    1,
+                    compressed,
+                    &[compressed],
+                    position,
+                    v4_state::KV_WINDOW,
+                    v4_state::INDEX_TOPK,
+                )
+                .unwrap(),
+            };
+            assert_eq!(
+                topk.per_row,
+                raw_width + selected,
+                "{path:?} p{position} top-k width"
+            );
+            assert_eq!(&topk.indices[..raw_width], raw.as_slice());
+            assert!(topk.indices[raw_width..]
+                .iter()
+                .all(|&index| index >= v4_state::KV_WINDOW as i32));
+        }
+    }
+
+    #[test]
+    fn sparse_attention_p0_ignores_physical_topk_and_kv_suffix_at_logical_width_one() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let one = v4_router::f32_to_bf16_rne(1.0);
+        let two = v4_router::f32_to_bf16_rne(2.0);
+        let q =
+            DeviceBuffer::from_host(&stream, &vec![0; v4_state::Q_HEADS * v4_state::Q_HEAD_DIM])
+                .expect("upload query");
+        let kv_a = vec![one; v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM];
+        let mut kv_b = kv_a.clone();
+        kv_b[v4_state::Q_HEAD_DIM..].fill(two);
+        let kv_a = DeviceBuffer::from_host(&stream, &kv_a).expect("upload zero suffix KV");
+        let kv_b = DeviceBuffer::from_host(&stream, &kv_b).expect("upload changed suffix KV");
+        let sink = DeviceBuffer::from_host(&stream, &vec![0.0_f32; v4_state::Q_HEADS])
+            .expect("upload attention sink");
+        let zero_suffix = vec![0_i32; v4_state::KV_WINDOW];
+        let mut valid_suffix = zero_suffix.clone();
+        let mut invalid_suffix = zero_suffix.clone();
+        valid_suffix[1..].fill(1);
+        invalid_suffix[1..].fill(-1);
+        let zero_suffix =
+            DeviceBuffer::from_host(&stream, &zero_suffix).expect("upload zero suffix top-k");
+        let valid_suffix =
+            DeviceBuffer::from_host(&stream, &valid_suffix).expect("upload valid suffix top-k");
+        let invalid_suffix =
+            DeviceBuffer::from_host(&stream, &invalid_suffix).expect("upload invalid suffix top-k");
+        let run = |kv: &DeviceBuffer<u16>, topk: &DeviceBuffer<i32>, topk_per_row| {
+            let mut output =
+                DeviceBuffer::<u16>::zeroed(&stream, q.len()).expect("allocate output");
+            let mut scratch =
+                SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW)
+                    .expect("allocate score-reuse scratch");
+            run_sparse_attention_score_reuse_device_into(
+                &module,
+                &stream,
+                &q,
+                kv,
+                &sink,
+                topk,
+                &mut output,
+                &mut scratch,
+                topk_per_row,
+            )
+            .expect("run sparse attention canary");
+            output.to_host_vec(&stream).expect("download output")
+        };
+
+        let logical_zero = run(&kv_a, &zero_suffix, 1);
+        let logical_valid = run(&kv_b, &valid_suffix, 1);
+        let logical_invalid = run(&kv_b, &invalid_suffix, 1);
+        assert_eq!(
+            logical_zero, logical_valid,
+            "logical p0 observed a physical suffix"
+        );
+        assert_eq!(
+            logical_zero, logical_invalid,
+            "logical p0 observed an invalid suffix"
+        );
+
+        let legacy_zero = run(&kv_a, &zero_suffix, v4_state::KV_WINDOW);
+        let legacy_invalid = run(&kv_a, &invalid_suffix, v4_state::KV_WINDOW);
+        assert_ne!(
+            legacy_zero, legacy_invalid,
+            "legacy p0 capacity width must expose the bug"
+        );
     }
 
     #[test]
@@ -26193,6 +33874,10 @@ mod tests {
             validate_qd4_lane_reserve(V4_QD4_PINNED_HOST_BYTES, V4_QD4_DEVICE_BYTES - 1).is_err()
         );
         assert_eq!(qd4_expected_routed_loads(61, 5).unwrap(), 1_830);
+        assert_eq!(
+            qd4_expected_routed_loads(61, greedy_forward_tokens(5, 3).unwrap()).unwrap(),
+            2_562
+        );
     }
 
     #[test]
@@ -26208,6 +33893,50 @@ mod tests {
         assert!(
             V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES > V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES
         );
+    }
+
+    #[test]
+    fn qd4_immutable_cache_five_row_plan_is_request_scoped_and_canonical() {
+        let routes = [
+            [0_u16, 1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11],
+            [12, 13, 14, 15, 16, 17],
+            [18, 19, 20, 21, 22, 23],
+            [24, 25, 26, 27, 28, 29],
+        ];
+        let revision = v4_state::REVISION;
+        let layer = 3_usize;
+        let plan = routes
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&expert| (revision, layer, expert))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let union = plan.iter().flatten().copied().collect::<BTreeSet<_>>();
+
+        assert_eq!(union.len(), 5 * v4_router::V4_TOPK);
+        assert!(union.len() <= V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS);
+        assert_eq!(
+            plan.iter()
+                .map(|row| row.iter().map(|key| key.2).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            routes.iter().map(|row| row.to_vec()).collect::<Vec<_>>()
+        );
+        assert_ne!(plan[0][0], (revision, layer + 1, routes[0][0]));
+        assert_ne!(plan[0][0], ("other-revision", layer, routes[0][0]));
+    }
+
+    #[test]
+    fn generic_qd4_immutable_cache_accounting_mixes_prefill_hits_and_decode_loads() {
+        let prefill_route_executions = qd4_expected_routed_loads(61, 5).unwrap();
+        let cached_prefill_source_loads = 61 * v4_router::V4_TOPK;
+        let cached_prefill_hits = prefill_route_executions - cached_prefill_source_loads;
+        let decode_source_loads = 122 * v4_router::V4_TOPK;
+
+        assert_eq!(cached_prefill_source_loads + cached_prefill_hits, 1_830);
+        assert_eq!(cached_prefill_source_loads + decode_source_loads, 1_098);
     }
 
     #[test]
@@ -26234,13 +33963,11 @@ mod tests {
         assert!(validate_phase_profile_mode(true, true).is_ok());
         assert!(validate_phase_profile_mode(false, true).is_err());
         assert!(validate_phase_profile_mode(true, false).is_err());
-        assert!(
-            parse_optional_one_flag(
-                "COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH",
-                Some(std::ffi::OsStr::new("yes"))
-            )
-            .is_err()
-        );
+        assert!(parse_optional_one_flag(
+            "COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH",
+            Some(std::ffi::OsStr::new("yes"))
+        )
+        .is_err());
         assert!(
             validate_fixed_prefetch_requirements(true, true, true, 4 * 1024 * 1024 * 1024).is_ok()
         );
@@ -26248,6 +33975,32 @@ mod tests {
         assert!(validate_fixed_prefetch_requirements(true, false, true, usize::MAX).is_err());
         assert!(validate_fixed_prefetch_requirements(true, true, false, usize::MAX).is_err());
         assert!(validate_fixed_prefetch_requirements(true, true, true, 1).is_err());
+    }
+
+    #[test]
+    fn decode_retention_overlay_env_is_default_on_and_strict() {
+        let name = "COLIBRI_V4_DECODE_RETENTION_OVERLAY";
+        assert!(parse_default_true_zero_one_flag(name, None).unwrap());
+        assert!(!parse_default_true_zero_one_flag(name, Some(std::ffi::OsStr::new("0"))).unwrap());
+        assert!(parse_default_true_zero_one_flag(name, Some(std::ffi::OsStr::new("yes"))).is_err());
+        let prefill_target = ([true, false], [false, true]);
+        let decode_target = ([true, true], [false, false]);
+        let closure_target = |records, device_promotions, host_promotions| {
+            decode_overlay_uses_decode_target(
+                records,
+                prefill_target.0.len(),
+                device_promotions,
+                host_promotions,
+            )
+            .map(|decode| if decode { decode_target } else { prefill_target })
+        };
+        assert_eq!(closure_target(0, 0, 0).unwrap(), prefill_target);
+        assert!(closure_target(0, 1, 0).is_err());
+        assert_eq!(
+            closure_target(prefill_target.0.len(), 1, 0).unwrap(),
+            decode_target,
+        );
+        assert!(closure_target(1, 0, 0).is_err());
     }
 
     #[test]
@@ -26392,7 +34145,7 @@ mod tests {
     }
 
     #[test]
-    fn one_token_phase_profile_closure_uses_only_exclusive_outer_scopes() {
+    fn generic_decode_phase_profile_closure_uses_only_exclusive_outer_scopes() {
         let (prefill_outer, decode_outer, profiled_outer, request_gap) =
             stationary_one_token_phase_profile_outer_accounting(300, 100, 220, 80, 800).unwrap();
         assert_eq!(
@@ -26400,13 +34153,15 @@ mod tests {
             (400, 300, 700, 100)
         );
         assert_eq!(prefill_outer + decode_outer + request_gap, 800);
+        assert_eq!((5 + 2) * v4_state::V4_LAYER_COUNT, 427);
+        assert_eq!(1 + 2, 3);
         assert!(
             stationary_one_token_phase_profile_outer_accounting(300, 100, 220, 81, 700).is_err()
         );
     }
 
     #[test]
-    fn stationary_parallel_profile_keeps_lane_work_out_of_wall_bounds() {
+    fn stationary_parallel_profile_uses_disjoint_commit_and_routed_scopes() {
         let parallel = LayerStageTelemetry {
             attention_ns: 40,
             commit_ns: 5,
@@ -26428,10 +34183,12 @@ mod tests {
             ..LayerStageTelemetry::default()
         };
         let (profile, attributed, outer) =
-            stationary_layer_phase_profile_json(100, 400, None, &parallel, 4, true).unwrap();
-        assert_eq!(outer, 300);
+            stationary_layer_phase_profile_json(100, 315, None, &parallel, 4, true).unwrap();
+        assert_eq!(outer, 215);
         assert_eq!(attributed, 215);
-        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v4");
+        assert_eq!(profile["unattributed_gap_ns"], 0);
+        assert!(profile["closure"]["exact"].as_bool().unwrap());
+        assert_eq!(profile["schema"], "colibri-v4-stationary-phase-profile-v5");
         let lanes = &profile["top_level"]["routed"]["parallel_lanes"];
         assert_eq!(lanes["lane_count"], V4_QD4_LANES);
         assert_eq!(lanes["route_job_count"], v4_router::V4_TOPK);
@@ -26439,32 +34196,36 @@ mod tests {
         assert_eq!(lanes["read_completion_horizon_ns"], 80);
         assert_eq!(lanes["h2d_event_work_sum_ns"], 160);
         assert_eq!(lanes["kernel_event_work_sum_ns"], 140);
-        assert!(
-            profile["top_level"]["routed"]["diagnostics"]
-                .get("h2d_ns")
-                .is_none()
-        );
+        assert!(profile["top_level"]["routed"]["diagnostics"]
+            .get("h2d_ns")
+            .is_none());
 
         let serial_with_parallel_work = LayerStageTelemetry {
             routed_h2d_ns: 101,
             ..parallel
         };
-        assert!(
-            stationary_layer_phase_profile_json(
-                100,
-                400,
-                None,
-                &serial_with_parallel_work,
-                4,
-                false,
-            )
-            .is_err()
-        );
-        let bad_outer = LayerStageTelemetry {
-            routed_ns: 101,
+        assert!(stationary_layer_phase_profile_json(
+            100,
+            400,
+            None,
+            &serial_with_parallel_work,
+            4,
+            false,
+        )
+        .is_err());
+        let commit_overlapped_routed = LayerStageTelemetry {
+            routed_ns: 105,
             ..parallel
         };
-        assert!(stationary_layer_phase_profile_json(100, 300, None, &bad_outer, 4, true).is_err());
+        assert!(stationary_layer_phase_profile_json(
+            100,
+            315,
+            None,
+            &commit_overlapped_routed,
+            4,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
@@ -26645,6 +34406,262 @@ mod tests {
     }
 
     #[test]
+    fn generic_decode_overlay_capacity_targets() {
+        const WO_A_SOURCE_BYTES: usize = 67_108_864;
+        const GIB: usize = 1024 * 1024 * 1024;
+        let plans = (0..v4_state::V4_LAYER_COUNT)
+            .map(|layer| {
+                let raw_device_bytes = if layer < 2 || layer % 2 == 1 {
+                    PHASE1_HCA_PAYLOAD_BYTES
+                } else {
+                    PHASE1_CSA_PAYLOAD_BYTES
+                };
+                let device_bytes = raw_device_bytes + WO_A_SOURCE_BYTES;
+                let host_bytes = fixed_layer_decoded_host_bytes(layer, device_bytes).unwrap();
+                FixedLayerPlan {
+                    layer,
+                    tensors: Vec::new(),
+                    device_bytes,
+                    raw_device_bytes,
+                    host_bytes,
+                    raw_host_bytes: host_bytes - WO_A_SOURCE_BYTES,
+                    device_saved_ns: 1,
+                    host_saved_ns: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let none = vec![false; plans.len()];
+        let prefill_device_budget = 4 * GIB - PINNED_FIXED_PIPELINE_WORKER_DEVICE_BYTES;
+        let prefill_host_budget = 13 * GIB;
+        let prefill_device =
+            select_fixed_cache_layers(&plans, prefill_device_budget, &none, true, true);
+        let prefill_host =
+            select_fixed_cache_layers(&plans, prefill_host_budget, &prefill_device, false, true);
+        let decode_device = select_fixed_cache_layers(
+            &plans,
+            prefill_device_budget + V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES,
+            &none,
+            true,
+            true,
+        );
+        let decode_host = select_fixed_cache_layers(
+            &plans,
+            prefill_host_budget + V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES,
+            &decode_device,
+            false,
+            true,
+        );
+        let promoted = |decode: &[bool], prefill: &[bool]| {
+            plans
+                .iter()
+                .zip(decode)
+                .zip(prefill)
+                .filter_map(|((plan, &decode), &prefill)| {
+                    (decode && !prefill).then_some(plan.layer)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(promoted(&decode_device, &prefill_device), [15, 17]);
+        assert_eq!(promoted(&decode_host, &prefill_host), [24, 26, 28, 30]);
+        assert_eq!(
+            (
+                decode_device.iter().filter(|&&selected| selected).count(),
+                decode_host.iter().filter(|&&selected| selected).count(),
+                plans.len()
+                    - decode_device.iter().filter(|&&selected| selected).count()
+                    - decode_host.iter().filter(|&&selected| selected).count(),
+            ),
+            (10, 36, 15),
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .zip(&decode_host)
+                .zip(&prefill_host)
+                .filter_map(|((plan, &decode), &prefill)| {
+                    (decode && !prefill).then_some(plan.raw_device_bytes + 4_096)
+                })
+                .sum::<usize>(),
+            1_708_974_176,
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .zip(&decode_device)
+                .zip(&prefill_device)
+                .filter_map(|((plan, &decode), &prefill)| {
+                    (decode && !prefill).then_some(plan.raw_device_bytes)
+                })
+                .sum::<usize>(),
+            783_919_152,
+        );
+    }
+
+    #[test]
+    fn explicit_decode_promotion_plan_is_strict_and_model_neutral() {
+        let plans = [(7, 10, 11), (11, 20, 21), (19, 30, 31), (23, 40, 41)]
+            .into_iter()
+            .map(|(layer, raw_device_bytes, raw_host_bytes)| FixedLayerPlan {
+                layer,
+                tensors: Vec::new(),
+                device_bytes: raw_device_bytes,
+                raw_device_bytes,
+                host_bytes: raw_host_bytes,
+                raw_host_bytes,
+                device_saved_ns: 1,
+                host_saved_ns: 1,
+            })
+            .collect::<Vec<_>>();
+        let prefill_device = [true, false, false, false];
+        let prefill_host = [false, true, false, false];
+        let parse = |value: Option<&str>, device_budget, host_budget| {
+            parse_decode_promotion_plan(
+                value.map(std::ffi::OsStr::new),
+                &plans,
+                &prefill_device,
+                &prefill_host,
+                10,
+                21,
+                device_budget,
+                host_budget,
+            )
+        };
+        assert!(parse(None, 60, 41).unwrap().is_none());
+        assert_eq!(
+            parse(Some("11:D,19:D,23:H"), 60, 41).unwrap().unwrap(),
+            (
+                vec![true, true, true, false],
+                vec![false, false, false, true],
+            )
+        );
+        assert!(parse(Some("11:D,19:H"), 30, 31).is_ok());
+        for invalid in [
+            "",
+            "19:D,",
+            "19:d",
+            " 19:D",
+            "19:D,19:H",
+            "7:D",
+            "11:H",
+            "29:D",
+        ] {
+            assert!(parse(Some(invalid), 60, 41).is_err(), "{invalid}");
+        }
+        assert!(parse(Some("19:D"), 39, 41).is_err());
+        assert!(parse(Some("23:H"), 60, 40).is_err());
+        assert!(
+            parse_decode_promotion_plan(
+                Some(std::ffi::OsStr::new("11:H,19:D")),
+                &plans,
+                &prefill_device,
+                &[false, false, true, false],
+                10,
+                31,
+                40,
+                31,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_promotion_fingerprint_is_canonical_and_mode_sensitive() {
+        let plans = [(7, 10, 11), (11, 20, 21), (19, 30, 31), (23, 40, 41)]
+            .into_iter()
+            .map(|(layer, raw_device_bytes, raw_host_bytes)| FixedLayerPlan {
+                layer,
+                tensors: Vec::new(),
+                device_bytes: raw_device_bytes,
+                raw_device_bytes,
+                host_bytes: raw_host_bytes,
+                raw_host_bytes,
+                device_saved_ns: 1,
+                host_saved_ns: 1,
+            })
+            .collect::<Vec<_>>();
+        let prefill_device = [true, false, false, false];
+        let prefill_host = [false, true, false, false];
+        let parse = |value| {
+            parse_decode_promotion_plan(
+                Some(std::ffi::OsStr::new(value)),
+                &plans,
+                &prefill_device,
+                &prefill_host,
+                10,
+                21,
+                60,
+                41,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let ordered = parse("11:D,19:D,23:H");
+        let reordered = parse("23:H,19:D,11:D");
+        let explicit = normalized_decode_promotion_targets(
+            &plans,
+            &prefill_device,
+            &prefill_host,
+            &ordered.0,
+            &ordered.1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit,
+            normalized_decode_promotion_targets(
+                &plans,
+                &prefill_device,
+                &prefill_host,
+                &reordered.0,
+                &reordered.1,
+                true,
+            )
+            .unwrap()
+        );
+        let default_mode = normalized_decode_promotion_targets(
+            &plans,
+            &prefill_device,
+            &prefill_host,
+            &ordered.0,
+            &ordered.1,
+            false,
+        )
+        .unwrap();
+        let fingerprint = |overlay, targets| {
+            normalized_config_fingerprint(serde_json::json!({
+                "decode_retention_overlay": overlay,
+                "normalized_promotion_targets": targets,
+            }))
+            .unwrap()
+        };
+        assert_ne!(
+            fingerprint(true, explicit.clone())["digest"],
+            fingerprint(true, default_mode)["digest"],
+        );
+        assert_ne!(
+            fingerprint(true, explicit.clone())["digest"],
+            fingerprint(false, explicit)["digest"],
+        );
+    }
+
+    #[test]
+    fn source_to_device_saved_bytes_are_exact() {
+        assert_eq!(
+            fixed_saved_bytes_for_target(123_456_789, 98_765_432, true, false).unwrap(),
+            (123_456_789, 98_765_432),
+        );
+    }
+
+    #[test]
+    fn source_to_device_promotion_closes_residency_without_host_ownership() {
+        assert_eq!(
+            decode_device_promotion_residency(100, 300, 40, None, 140).unwrap(),
+            (140, 300),
+        );
+        assert!(decode_device_promotion_residency(100, 300, 40, None, 139).is_err());
+    }
+
+    #[test]
     fn bounded_readahead_cap_rounds_metadata_to_os_pages() {
         let ranges = [
             safetensors::FileRange { offset: 1, len: 7 },
@@ -26768,6 +34785,615 @@ mod tests {
             output.to_host_vec(&stream).expect("download BF16 output"),
             expected
         );
+    }
+
+    #[test]
+    fn canonical_compressor_pool_gpu_matches_host_bits_for_csa_main_indexer_and_hca() {
+        fn run_case(
+            module: &kernels::LoadedModule,
+            stream: &CudaStream,
+            label: &str,
+            ratio: usize,
+            width: usize,
+        ) -> Result<(Vec<f32>, Vec<u16>), Box<dyn Error>> {
+            const TINY_SCORE_GAP: f32 = f32::from_bits(0x3380_0000);
+            let overlap = ratio == 4;
+            let value_width = width * (1 + usize::from(overlap));
+            let slots = ratio * (1 + usize::from(overlap));
+            let mut fixture_kv = vec![0.0_f32; slots * value_width];
+            let mut fixture_score = vec![f32::NEG_INFINITY; slots * value_width];
+            let mut host = v4_state::V4CompressorState::new_decode(ratio, width)?;
+            let mut expected = None;
+            for position in 0..ratio {
+                let mut kv = vec![0.0_f32; value_width];
+                let mut score = vec![0.0_f32; value_width];
+                for element in 0..value_width {
+                    let dimension = element % width;
+                    kv[element] = ((position * 17 + element * 7) % 97) as f32 * 0.015_625 - 0.75;
+                    score[element] = if element / width == usize::from(overlap) && dimension == 0 {
+                        match position {
+                            0 => 0.0,
+                            1 => -TINY_SCORE_GAP,
+                            2 => -1.0,
+                            _ => f32::from_bits(0xc015_93f8),
+                        }
+                    } else {
+                        ((position * 11 + element * 3) % 61) as f32 * 0.031_25 - 0.5
+                    };
+                }
+                let slot = if overlap {
+                    ratio + position % ratio
+                } else {
+                    position % ratio
+                };
+                let start = slot * value_width;
+                fixture_kv[start..start + value_width].copy_from_slice(&kv);
+                fixture_score[start..start + value_width].copy_from_slice(&score);
+                let (next, pooled) = host.prepare_decode_row_and_pool(
+                    &v4_state::CompressorPrepared {
+                        kv_f32: kv,
+                        score_f32: score.clone(),
+                        score_plus_ape_f32: score,
+                    },
+                    position,
+                )?;
+                host = next;
+                if position + 1 == ratio {
+                    expected = pooled;
+                }
+            }
+            if overlap
+                && !fixture_score[..ratio * value_width]
+                    .iter()
+                    .all(|value| *value == f32::NEG_INFINITY)
+            {
+                return Err(format!("{label} fixture lost its unwritten -inf slots").into());
+            }
+            let expected = expected.ok_or_else(|| format!("{label} boundary did not pool"))?;
+            let kv = DeviceBuffer::from_host(stream, &fixture_kv)?;
+            let score = DeviceBuffer::from_host(stream, &fixture_score)?;
+            let mut actual = DeviceBuffer::<f32>::zeroed(stream, width)?;
+            if overlap {
+                run_compressor_pool_ratio4_device_into(
+                    module,
+                    stream,
+                    &kv,
+                    &score,
+                    &mut actual,
+                    width,
+                )?;
+            } else {
+                run_compressor_pool_ratio128_device_into(module, stream, &kv, &score, &mut actual)?;
+            }
+            let actual = actual.to_host_vec(stream)?;
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{label} canonical FP32 pool bits"
+            );
+            let expected_bf16 = expected
+                .iter()
+                .copied()
+                .map(v4_router::f32_to_bf16_rne)
+                .collect::<Vec<_>>();
+            let actual = DeviceBuffer::from_host(stream, &actual)?;
+            let mut actual_bf16 = DeviceBuffer::<u16>::zeroed(stream, width)?;
+            run_f32_to_bf16_device_into(module, stream, &actual, &mut actual_bf16)?;
+            assert_eq!(
+                actual_bf16.to_host_vec(stream)?,
+                expected_bf16,
+                "{label} prepared BF16 row bits"
+            );
+            Ok((expected, expected_bf16))
+        }
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let mut all_f32 = Vec::new();
+        let mut all_bf16 = Vec::new();
+        for (label, ratio, width) in [
+            ("CSA main", 4, v4_state::Q_HEAD_DIM),
+            ("CSA indexer", 4, 128),
+            ("HCA", 128, v4_state::Q_HEAD_DIM),
+        ] {
+            let (f32, bf16) =
+                run_case(&module, &stream, label, ratio, width).expect("canonical pool case");
+            all_f32.extend(f32);
+            all_bf16.extend(bf16);
+        }
+        assert_eq!(fnv1a_f32(&all_f32), 0x36e1_2dd9_0d23_eeb7);
+        assert_eq!(fnv1a_u16(&all_bf16), 0x9e01_5e04_a47c_4838);
+    }
+
+    #[test]
+    fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and_hca_p127() {
+        fn run_case(
+            module: &kernels::LoadedModule,
+            stream: &CudaStream,
+            ratio: usize,
+            width: usize,
+            boundary: usize,
+        ) -> Result<(), Box<dyn Error>> {
+            let weights = width
+                .checked_mul(v4_state::HIDDEN)
+                .ok_or("synthetic Compressor weight size overflow")?;
+            let synthetic_bf16 = |seed: usize, exponent_base: u16| {
+                let hash = (seed as u32)
+                    .wrapping_mul(0x9e37_79b9)
+                    .rotate_left(13)
+                    .wrapping_mul(0x85eb_ca6b);
+                let sign = ((hash >> 31) as u16) << 15;
+                let exponent = exponent_base + ((hash >> 17) as u16 & 0x0f);
+                sign | (exponent << 7) | (hash as u16 & 0x007f)
+            };
+            let input_for = |position: usize| {
+                (0..v4_state::HIDDEN)
+                    .map(|index| synthetic_bf16(index + position * 7_199, 118))
+                    .collect::<Vec<_>>()
+            };
+            let wkv_host = (0..weights)
+                .map(|index| synthetic_bf16(index + 0x1_0000, 114))
+                .collect::<Vec<_>>();
+            let wgate_host = (0..weights)
+                .map(|index| synthetic_bf16(index + 0x2_0000, 114))
+                .collect::<Vec<_>>();
+            let ape_host = (0..ratio * width)
+                .map(|index| ((index * 17 % 113) as f32 - 56.0) * 0.002_929_687_5)
+                .collect::<Vec<_>>();
+            let wkv = DeviceBuffer::from_host(stream, &wkv_host)?;
+            let wgate = DeviceBuffer::from_host(stream, &wgate_host)?;
+            let ape = DeviceBuffer::from_host(stream, &ape_host)?;
+            let mut input = DeviceBuffer::<u16>::zeroed(stream, v4_state::HIDDEN)?;
+            let mut kv = DeviceBuffer::<f32>::zeroed(stream, width)?;
+            let mut score = DeviceBuffer::<f32>::zeroed(stream, width)?;
+            let mut score_plus_ape = DeviceBuffer::<f32>::zeroed(stream, width)?;
+            let cublas = cublas_exact::CublasExact::load()?;
+            let workspace = DeviceBuffer::<u8>::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?;
+            let mut input_f32 = DeviceBuffer::<f32>::zeroed(stream, v4_state::HIDDEN)?;
+            let mut wkv_f32 = DeviceBuffer::<f32>::zeroed(stream, weights)?;
+            let mut wgate_f32 = DeviceBuffer::<f32>::zeroed(stream, weights)?;
+            let tail_kv =
+                DeviceBuffer::<f32>::zeroed(stream, ratio * (1 + usize::from(ratio == 4)) * width)?;
+            let tail_score = DeviceBuffer::from_host(
+                stream,
+                &vec![f32::NEG_INFINITY; ratio * (1 + usize::from(ratio == 4)) * width],
+            )?;
+            let mut pool = DeviceBuffer::<f32>::zeroed(stream, v4_state::Q_HEAD_DIM)?;
+            let mut pool_bf16 = DeviceBuffer::<u16>::zeroed(stream, v4_state::Q_HEAD_DIM)?;
+            let mut host = v4_state::V4CompressorState::new_decode(ratio, v4_state::Q_HEAD_DIM)?;
+            let mut host_oracle = StrictCompressorArena::new(stream, width, ratio)?;
+
+            for position in 0..=boundary {
+                let host_input = input_for(position);
+                input.copy_from_host(stream, &host_input)?;
+                let expected = host_oracle.run_from_device(
+                    &cublas,
+                    stream,
+                    &host_input,
+                    &wkv,
+                    &wgate,
+                    &ape,
+                    width,
+                    ratio,
+                    position,
+                )?;
+                run_exact_compressor_buffers_device_into(
+                    module,
+                    stream,
+                    &input,
+                    &wkv,
+                    &wgate,
+                    &ape,
+                    &mut kv,
+                    &mut score,
+                    &mut score_plus_ape,
+                    &cublas,
+                    &workspace,
+                    &mut input_f32,
+                    &mut wkv_f32,
+                    &mut wgate_f32,
+                    ratio,
+                    position,
+                    position == 0,
+                )?;
+                if position == 0 {
+                    let mut custom_kv = DeviceBuffer::<f32>::zeroed(stream, width)?;
+                    let mut custom_score = DeviceBuffer::<f32>::zeroed(stream, width)?;
+                    let mut custom_score_plus_ape = DeviceBuffer::<f32>::zeroed(stream, width)?;
+                    run_compressor_device_into(
+                        module,
+                        stream,
+                        &input,
+                        &wkv,
+                        &wgate,
+                        &ape,
+                        &mut custom_kv,
+                        &mut custom_score,
+                        &mut custom_score_plus_ape,
+                        width,
+                        ratio,
+                        position,
+                    )?;
+                    if first_f32_bits_mismatch(&custom_kv.to_host_vec(stream)?, &expected.kv_f32)
+                        .is_none()
+                        && first_f32_bits_mismatch(
+                            &custom_score_plus_ape.to_host_vec(stream)?,
+                            &expected.score_plus_ape_f32,
+                        )
+                        .is_none()
+                    {
+                        return Err(
+                            "synthetic Compressor fixture no longer distinguishes custom and pinned cuBLAS reductions".into(),
+                        );
+                    }
+                }
+                let (next, expected_pool) =
+                    host.prepare_decode_row_and_pool(&expected, position)?;
+                host = next;
+                let slot = if ratio == 4 {
+                    4 + position % 4
+                } else {
+                    position % ratio
+                };
+                // This is the generic persistent-tail update: projection row
+                // followed by the shared physical slot mapping.
+                unsafe {
+                    copy_device_row(stream, &tail_kv, slot, &kv)?;
+                    copy_device_row(stream, &tail_score, slot, &score_plus_ape)?;
+                }
+                if let Some(expected_pool) = expected_pool {
+                    if ratio == 4 {
+                        run_compressor_pool_ratio4_device_into(
+                            module,
+                            stream,
+                            &tail_kv,
+                            &tail_score,
+                            &mut pool,
+                            v4_state::Q_HEAD_DIM,
+                        )?;
+                        // Match the generic CSA post-boundary overlap copy
+                        // after the pool has consumed slots 0..3 and 4..7.
+                        unsafe {
+                            copy_device_range(stream, &tail_kv, 0, &tail_kv, 4 * width, 4 * width)?;
+                            copy_device_range(
+                                stream,
+                                &tail_score,
+                                0,
+                                &tail_score,
+                                4 * width,
+                                4 * width,
+                            )?;
+                        }
+                    } else {
+                        run_compressor_pool_ratio128_device_into(
+                            module,
+                            stream,
+                            &tail_kv,
+                            &tail_score,
+                            &mut pool,
+                        )?;
+                    }
+                    let actual_pool = pool.to_host_vec(stream)?;
+                    let (mismatches, max_abs, max_rel, max_ulp) =
+                        final_head_comparison(&actual_pool, &expected_pool);
+                    if mismatches != 0 {
+                        return Err(format!(
+                            "strict generic ratio-{ratio} boundary p{position} pool drift: max_abs={max_abs:e} max_rel={max_rel:e} max_ulp={max_ulp}"
+                        )
+                        .into());
+                    }
+                    run_f32_to_bf16_device_into(module, stream, &pool, &mut pool_bf16)?;
+                    let expected_bf16 = expected_pool
+                        .iter()
+                        .copied()
+                        .map(v4_router::f32_to_bf16_rne)
+                        .collect::<Vec<_>>();
+                    if pool_bf16.to_host_vec(stream)? != expected_bf16 {
+                        return Err(format!(
+                            "strict generic ratio-{ratio} boundary p{position} BF16 compressed state drifted"
+                        )
+                        .into());
+                    }
+                }
+            }
+            if first_f32_bits_mismatch(&host.kv(), &tail_kv.to_host_vec(stream)?).is_some()
+                || first_f32_bits_mismatch(&host.score(), &tail_score.to_host_vec(stream)?)
+                    .is_some()
+            {
+                return Err(format!(
+                    "strict generic ratio-{ratio} persistent Compressor tail differs from the pinned cuBLAS host oracle"
+                )
+                .into());
+            }
+            Ok(())
+        }
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let generic_exact =
+            GenericExactCompressorScratch::new(&stream).expect("allocate shared strict scratch");
+        assert_eq!(
+            generic_exact.hca_wkv.len(),
+            v4_state::Q_HEAD_DIM * v4_state::HIDDEN
+        );
+        assert_eq!(generic_exact.csa_wkv.len(), 1_024 * v4_state::HIDDEN);
+        assert_eq!(generic_exact.csa_indexer_wkv.len(), 256 * v4_state::HIDDEN);
+        run_case(&module, &stream, 4, 1_024, 3).expect("CSA p3 strict generic Compressor");
+        run_case(&module, &stream, 128, v4_state::Q_HEAD_DIM, 127)
+            .expect("HCA p127 strict generic Compressor");
+    }
+
+    #[test]
+    fn generic_strict_compressor_owner_refreshes_across_hca_csa_and_indexer_layers() {
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let mut strict =
+            GenericExactCompressorScratch::new(&stream).expect("allocate generic strict scratch");
+        let bits = |seed: usize| {
+            let hash = (seed as u32)
+                .wrapping_mul(0x9e37_79b9)
+                .rotate_left(13)
+                .wrapping_mul(0x85eb_ca6b);
+            (((hash >> 31) as u16) << 15)
+                | ((114 + ((hash >> 17) as u16 & 0x0f)) << 7)
+                | (hash as u16 & 0x007f)
+        };
+        let input_for = |position: usize| {
+            (0..v4_state::HIDDEN)
+                .map(|index| bits(index + position * 7_199 + 0x30000))
+                .collect::<Vec<_>>()
+        };
+        let make_weights = |width: usize, ratio: usize, seed: usize| {
+            let elements = width * v4_state::HIDDEN;
+            let wkv = (0..elements)
+                .map(|index| bits(index + seed))
+                .collect::<Vec<_>>();
+            let wgate = (0..elements)
+                .map(|index| bits(index + seed + 0x10000))
+                .collect::<Vec<_>>();
+            let ape = (0..ratio * width)
+                .map(|index| ((index * 17 + seed) % 113) as f32 * 0.003_906_25 - 0.21875)
+                .collect::<Vec<_>>();
+            (wkv, wgate, ape)
+        };
+        let (a_wkv_host, a_wgate_host, a_ape_host) =
+            make_weights(v4_state::Q_HEAD_DIM, 128, 0x40000);
+        let (b_wkv_host, b_wgate_host, b_ape_host) = make_weights(1_024, 4, 0x50000);
+        let (i_wkv_host, i_wgate_host, i_ape_host) = make_weights(256, 4, 0x60000);
+        let a_wkv = DeviceBuffer::from_host(&stream, &a_wkv_host).expect("upload HCA wkv");
+        let a_wgate = DeviceBuffer::from_host(&stream, &a_wgate_host).expect("upload HCA gate");
+        let a_ape = DeviceBuffer::from_host(&stream, &a_ape_host).expect("upload HCA APE");
+        let b_wkv = DeviceBuffer::from_host(&stream, &b_wkv_host).expect("upload CSA wkv");
+        let b_wgate = DeviceBuffer::from_host(&stream, &b_wgate_host).expect("upload CSA gate");
+        let b_ape = DeviceBuffer::from_host(&stream, &b_ape_host).expect("upload CSA APE");
+        let i_wkv = DeviceBuffer::from_host(&stream, &i_wkv_host).expect("upload indexer wkv");
+        let i_wgate = DeviceBuffer::from_host(&stream, &i_wgate_host).expect("upload indexer gate");
+        let i_ape = DeviceBuffer::from_host(&stream, &i_ape_host).expect("upload indexer APE");
+        let mut input = DeviceBuffer::<u16>::zeroed(&stream, v4_state::HIDDEN).expect("input");
+        let mut hca_kv =
+            DeviceBuffer::<f32>::zeroed(&stream, v4_state::Q_HEAD_DIM).expect("HCA KV");
+        let mut hca_score =
+            DeviceBuffer::<f32>::zeroed(&stream, v4_state::Q_HEAD_DIM).expect("HCA score");
+        let mut hca_ape =
+            DeviceBuffer::<f32>::zeroed(&stream, v4_state::Q_HEAD_DIM).expect("HCA score APE");
+        let mut csa_kv = DeviceBuffer::<f32>::zeroed(&stream, 1_024).expect("CSA KV");
+        let mut csa_score = DeviceBuffer::<f32>::zeroed(&stream, 1_024).expect("CSA score");
+        let mut csa_ape = DeviceBuffer::<f32>::zeroed(&stream, 1_024).expect("CSA score APE");
+        let mut index_kv = DeviceBuffer::<f32>::zeroed(&stream, 256).expect("indexer KV");
+        let mut index_score = DeviceBuffer::<f32>::zeroed(&stream, 256).expect("indexer score");
+        let mut index_ape = DeviceBuffer::<f32>::zeroed(&stream, 256).expect("indexer score APE");
+
+        macro_rules! run_main {
+            ($path:expr, $layer:expr, $position:expr, $width:expr, $ratio:expr, $wkv_host:expr, $wgate_host:expr, $ape_host:expr, $wkv:expr, $wgate:expr, $ape:expr, $kv:expr, $score:expr, $score_ape:expr, $converted_wkv:ident, $converted_wgate:ident) => {{
+                let host_input = input_for($position);
+                let expected = run_compressor_official_cublas_host(
+                    &strict.cublas,
+                    &stream,
+                    &host_input,
+                    $wkv_host,
+                    $wgate_host,
+                    $ape_host,
+                    $width,
+                    $ratio,
+                    $position,
+                )
+                .expect("fresh pinned cuBLAS reference");
+                input
+                    .copy_from_host(&stream, &host_input)
+                    .expect("upload input");
+                let refresh = strict.begin_main_refresh($path, $layer);
+                run_exact_compressor_buffers_device_into(
+                    &module,
+                    &stream,
+                    &input,
+                    $wkv,
+                    $wgate,
+                    $ape,
+                    $kv,
+                    $score,
+                    $score_ape,
+                    &strict.cublas,
+                    &strict.workspace,
+                    &mut strict.input,
+                    &mut strict.$converted_wkv,
+                    &mut strict.$converted_wgate,
+                    $ratio,
+                    $position,
+                    refresh,
+                )
+                .expect("generic strict projection");
+                strict.finish_main_refresh($path, $layer, refresh);
+                assert!(first_f32_bits_mismatch(
+                    &$kv.to_host_vec(&stream).expect("download KV"),
+                    &expected.kv_f32
+                )
+                .is_none());
+                assert!(first_f32_bits_mismatch(
+                    &$score_ape.to_host_vec(&stream).expect("download score APE"),
+                    &expected.score_plus_ape_f32
+                )
+                .is_none());
+                refresh
+            }};
+        }
+
+        assert!(run_main!(
+            GenericStationaryPath::Hca128,
+            10,
+            0,
+            v4_state::Q_HEAD_DIM,
+            128,
+            &a_wkv_host,
+            &a_wgate_host,
+            &a_ape_host,
+            &a_wkv,
+            &a_wgate,
+            &a_ape,
+            &mut hca_kv,
+            &mut hca_score,
+            &mut hca_ape,
+            hca_wkv,
+            hca_wgate
+        ));
+        assert!(!run_main!(
+            GenericStationaryPath::Hca128,
+            10,
+            1,
+            v4_state::Q_HEAD_DIM,
+            128,
+            &a_wkv_host,
+            &a_wgate_host,
+            &a_ape_host,
+            &a_wkv,
+            &a_wgate,
+            &a_ape,
+            &mut hca_kv,
+            &mut hca_score,
+            &mut hca_ape,
+            hca_wkv,
+            hca_wgate
+        ));
+        assert!(run_main!(
+            GenericStationaryPath::Csa4,
+            11,
+            2,
+            1_024,
+            4,
+            &b_wkv_host,
+            &b_wgate_host,
+            &b_ape_host,
+            &b_wkv,
+            &b_wgate,
+            &b_ape,
+            &mut csa_kv,
+            &mut csa_score,
+            &mut csa_ape,
+            csa_wkv,
+            csa_wgate
+        ));
+        assert!(!run_main!(
+            GenericStationaryPath::Csa4,
+            11,
+            3,
+            1_024,
+            4,
+            &b_wkv_host,
+            &b_wgate_host,
+            &b_ape_host,
+            &b_wkv,
+            &b_wgate,
+            &b_ape,
+            &mut csa_kv,
+            &mut csa_score,
+            &mut csa_ape,
+            csa_wkv,
+            csa_wgate
+        ));
+
+        for position in [2, 3] {
+            let host_input = input_for(position);
+            let expected = run_compressor_official_cublas_host(
+                &strict.cublas,
+                &stream,
+                &host_input,
+                &i_wkv_host,
+                &i_wgate_host,
+                &i_ape_host,
+                256,
+                4,
+                position,
+            )
+            .expect("fresh pinned indexer reference");
+            input
+                .copy_from_host(&stream, &host_input)
+                .expect("upload indexer input");
+            let refresh = strict.begin_indexer_refresh(11);
+            run_exact_compressor_buffers_device_into(
+                &module,
+                &stream,
+                &input,
+                &i_wkv,
+                &i_wgate,
+                &i_ape,
+                &mut index_kv,
+                &mut index_score,
+                &mut index_ape,
+                &strict.cublas,
+                &strict.workspace,
+                &mut strict.input,
+                &mut strict.csa_indexer_wkv,
+                &mut strict.csa_indexer_wgate,
+                4,
+                position,
+                refresh,
+            )
+            .expect("generic strict indexer projection");
+            strict.finish_indexer_refresh(11, refresh);
+            assert_eq!(refresh, position == 2);
+            assert!(first_f32_bits_mismatch(
+                &index_kv.to_host_vec(&stream).expect("download indexer KV"),
+                &expected.kv_f32
+            )
+            .is_none());
+        }
+
+        let refresh_a_p5 = run_main!(
+            GenericStationaryPath::Hca128,
+            10,
+            5,
+            v4_state::Q_HEAD_DIM,
+            128,
+            &a_wkv_host,
+            &a_wgate_host,
+            &a_ape_host,
+            &a_wkv,
+            &a_wgate,
+            &a_ape,
+            &mut hca_kv,
+            &mut hca_score,
+            &mut hca_ape,
+            hca_wkv,
+            hca_wgate
+        );
+        assert!(refresh_a_p5, "A p5 must refresh after B's layer transition");
+        assert_ne!(
+            5, 0,
+            "the old start_pos gate would have skipped this required refresh"
+        );
+        assert_eq!(strict.main_weight_conversions, 3);
+        assert_eq!(strict.indexer_weight_conversions, 1);
+        assert_eq!(strict.hca_owner, Some(10));
+        assert_eq!(strict.csa_owner, None);
+        assert_eq!(strict.csa_indexer_owner, None);
     }
 
     #[test]
@@ -27561,16 +36187,20 @@ mod tests_continued {
 
     #[test]
     fn csa_indexer_scores_match_cpu_oracle_and_select_causal_topk() {
-        let (rows, heads, head_dim, keys) = (2_usize, 3_usize, 4_usize, 5_usize);
+        let (rows, heads, head_dim, keys, key_capacity) =
+            (2_usize, 3_usize, 4_usize, 5_usize, 7_usize);
         let q = (0..rows * heads * head_dim)
             .map(|index| (index as f32 - 7.0) / 8.0)
             .collect::<Vec<_>>();
-        let kv = (0..keys * head_dim)
+        let mut kv = (0..keys * head_dim)
             .map(|index| ((index * 3 % 17) as f32 - 8.0) / 7.0)
             .collect::<Vec<_>>();
+        let active_kv = kv.clone();
+        kv.resize(key_capacity * head_dim, 1234.0);
         let weights = vec![0.5, -0.25, 1.0, -0.75, 0.625, 0.375];
-        let expected = v4_state::indexer_scores_cpu(&q, &kv, &weights, rows, heads, head_dim, keys)
-            .expect("CPU CSA indexer score oracle");
+        let expected =
+            v4_state::indexer_scores_cpu(&q, &active_kv, &weights, rows, heads, head_dim, keys)
+                .expect("CPU CSA indexer score oracle");
 
         let context = CudaContext::new(0).expect("create CUDA context");
         let stream = context.default_stream();
@@ -27578,8 +36208,9 @@ mod tests_continued {
         let q_device = DeviceBuffer::from_host(&stream, &q).expect("upload q");
         let kv_device = DeviceBuffer::from_host(&stream, &kv).expect("upload kv");
         let weights_device = DeviceBuffer::from_host(&stream, &weights).expect("upload weights");
-        let mut scores =
-            DeviceBuffer::from_host(&stream, &vec![0.0_f32; rows * keys]).expect("allocate scores");
+        let untouched = -12345.0_f32;
+        let mut scores = DeviceBuffer::from_host(&stream, &vec![untouched; rows * key_capacity])
+            .expect("allocate scores");
         unsafe {
             module
                 .indexer_scores_v4_f32(
@@ -27597,10 +36228,42 @@ mod tests_continued {
                 .expect("launch CSA indexer scores");
         }
         let actual = scores.to_host_vec(&stream).expect("download scores");
-        assert_close("CSA indexer scores", &actual, &expected);
+        assert_close("CSA indexer scores", &actual[..rows * keys], &expected);
+        assert!(actual[rows * keys..]
+            .iter()
+            .all(|&value| value == untouched));
+
+        let undersized_kv =
+            DeviceBuffer::from_host(&stream, &active_kv[..active_kv.len() - 1]).unwrap();
+        let mut fail_closed =
+            DeviceBuffer::from_host(&stream, &vec![untouched; rows * key_capacity]).unwrap();
+        unsafe {
+            module
+                .indexer_scores_v4_f32(
+                    &stream,
+                    LaunchConfig::for_num_elems(u32::try_from(rows * keys).unwrap()),
+                    &q_device,
+                    &undersized_kv,
+                    &weights_device,
+                    &mut fail_closed,
+                    rows as u32,
+                    heads as u32,
+                    head_dim as u32,
+                    keys as u32,
+                )
+                .expect("launch undersized CSA indexer scores");
+        }
+        assert!(fail_closed
+            .to_host_vec(&stream)
+            .unwrap()
+            .iter()
+            .all(|&value| value == untouched));
+
         let expected_topk =
             v4_state::indexer_topk_cpu(&expected, rows, keys, 2, &[3, 5], 128).unwrap();
-        let actual_topk = v4_state::indexer_topk_cpu(&actual, rows, keys, 2, &[3, 5], 128).unwrap();
+        let actual_topk =
+            v4_state::indexer_topk_cpu(&actual[..rows * keys], rows, keys, 2, &[3, 5], 128)
+                .unwrap();
         assert_eq!(actual_topk, expected_topk);
         let valid = DeviceBuffer::from_host(&stream, &[3_u32, 5_u32]).unwrap();
         let mut gpu_topk = DeviceBuffer::<i32>::zeroed(&stream, rows * 2).unwrap();

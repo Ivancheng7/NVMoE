@@ -32,6 +32,269 @@ pub const COMPRESS_RATIO: usize = 128;
 pub const COMPRESS_STATE_ELEMENTS: usize = COMPRESS_RATIO * Q_HEAD_DIM;
 pub const INDEX_TOPK: usize = 1_024;
 
+/// Checked request-local storage geometry for layer-stationary execution.
+/// `context_rows` is the number of causal rows the request can commit; the
+/// local KV payload itself remains a 128-row ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerStationaryRequestPlan {
+    pub prompt_rows: usize,
+    pub max_new_tokens: usize,
+    pub context_rows: usize,
+    pub raw_kv_rows: usize,
+    pub csa_compressed_rows: usize,
+    pub hca_compressed_rows: usize,
+    pub token_scratch_bytes: usize,
+    pub host_csa_capacity_bytes: usize,
+    pub host_hca_capacity_bytes: usize,
+    pub device_csa_capacity_bytes: usize,
+    pub device_hca_capacity_bytes: usize,
+}
+
+impl LayerStationaryRequestPlan {
+    pub fn new(prompt_rows: usize, max_new_tokens: usize) -> Result<Self, Box<dyn Error>> {
+        let context_rows = prompt_rows
+            .checked_add(max_new_tokens.saturating_sub(1))
+            .ok_or("layer-stationary request context overflow")?;
+        Self::for_context(prompt_rows, max_new_tokens, context_rows)
+    }
+
+    pub fn actual_decision_positions(
+        self,
+        actual_generated_tokens: usize,
+    ) -> Result<std::ops::Range<usize>, Box<dyn Error>> {
+        if actual_generated_tokens > self.max_new_tokens {
+            return Err("layer-stationary generated token count exceeds its request plan".into());
+        }
+        let start = self
+            .prompt_rows
+            .checked_sub(1)
+            .ok_or("layer-stationary decision positions require a nonempty prompt")?;
+        let end = start
+            .checked_add(actual_generated_tokens)
+            .ok_or("layer-stationary decision position overflow")?;
+        Ok(start..end)
+    }
+
+    fn for_context(
+        prompt_rows: usize,
+        max_new_tokens: usize,
+        context_rows: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        if context_rows == 0 || context_rows > 1_048_576 {
+            return Err("layer-stationary context must be within 1..=1048576".into());
+        }
+        let bytes = |rows: usize, width: usize| {
+            rows.checked_mul(width)
+                .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
+                .ok_or("layer-stationary capacity overflow")
+        };
+        // The device layout is always a 128-row ring.  A short request still
+        // owns the full ring so the p % 128 address and its capacity ledger do
+        // not change at the prefill/decode boundary.
+        let raw_kv_rows = KV_WINDOW;
+        let raw_kv_bytes = bytes(raw_kv_rows, Q_HEAD_DIM)?;
+        let csa_main_bytes = bytes(context_rows / 4, Q_HEAD_DIM)?;
+        let csa_indexer_bytes = bytes(context_rows / 4, 128)?;
+        let hca_main_bytes = bytes(context_rows / 128, Q_HEAD_DIM)?;
+        let token_scratch_bytes = bytes(1, Q_HEAD_DIM)?;
+        let host_csa_capacity_bytes = raw_kv_bytes
+            .checked_add(csa_main_bytes)
+            .and_then(|value| value.checked_add(csa_indexer_bytes))
+            .ok_or("layer-stationary CSA host capacity overflow")?;
+        let host_hca_capacity_bytes = raw_kv_bytes
+            .checked_add(hca_main_bytes)
+            .ok_or("layer-stationary HCA host capacity overflow")?;
+        let device_csa_capacity_bytes = host_csa_capacity_bytes
+            .checked_add(token_scratch_bytes)
+            .ok_or("layer-stationary CSA device capacity overflow")?;
+        let device_hca_capacity_bytes = host_hca_capacity_bytes
+            .checked_add(token_scratch_bytes)
+            .ok_or("layer-stationary HCA device capacity overflow")?;
+        Ok(Self {
+            prompt_rows,
+            max_new_tokens,
+            context_rows,
+            raw_kv_rows,
+            csa_compressed_rows: context_rows / 4,
+            hca_compressed_rows: context_rows / 128,
+            token_scratch_bytes,
+            host_csa_capacity_bytes,
+            host_hca_capacity_bytes,
+            device_csa_capacity_bytes,
+            device_hca_capacity_bytes,
+        })
+    }
+
+    fn for_existing_context(context_rows: usize) -> Result<Self, Box<dyn Error>> {
+        Self::for_context(context_rows, 1, context_rows)
+    }
+
+    fn compressed_rows(self, ratio: CompressionRatio) -> usize {
+        match ratio {
+            CompressionRatio::Csa4 => self.csa_compressed_rows,
+            CompressionRatio::Hca128 => self.hca_compressed_rows,
+        }
+    }
+}
+
+/// One request-local staging row. GPU production will use a bounded prepared
+/// delta; this CPU object only keeps the semantic oracle's staging boundary
+/// explicit.
+pub struct LayerStationaryTokenScratch {
+    kv_row: Vec<u16>,
+}
+
+impl LayerStationaryTokenScratch {
+    fn new() -> Self {
+        Self {
+            kv_row: vec![0; Q_HEAD_DIM],
+        }
+    }
+
+    pub fn prepare_kv_row(&mut self, row_bf16: &[u16]) -> Result<(), Box<dyn Error>> {
+        if row_bf16.len() != Q_HEAD_DIM
+            || row_bf16.iter().any(|&bits| !bf16_to_f32(bits).is_finite())
+        {
+            return Err("layer-stationary token scratch KV contract mismatch".into());
+        }
+        self.kv_row.copy_from_slice(row_bf16);
+        Ok(())
+    }
+
+    pub fn kv_row(&self) -> &[u16] {
+        &self.kv_row
+    }
+}
+
+/// The first MTP layer is the only planned ratio-0 attention layer.  It is
+/// deliberately separate from `compression_ratio_for_layer`, which remains
+/// the 0..61 V4-Pro model-layer contract.
+pub mod mtp1_swa {
+    use super::*;
+
+    pub const MTP1_SWA_LAYER: usize = V4_LAYER_COUNT;
+    pub const MTP1_SWA_WINDOW_ROWS: usize = KV_WINDOW;
+    pub const MTP1_SWA_FLATTENED_KV_WIDTH: usize = Q_HEAD_DIM;
+    pub const MTP1_SWA_KV_LANES: usize = 1;
+    pub const MTP1_SWA_DTYPE_BYTES: usize = std::mem::size_of::<u16>();
+
+    /// Metadata-derived persistent storage for a window-only attention layer.
+    /// `flattened_kv_width` already includes the model's K/V representation.  The
+    /// V4 MTP1 contract is one BF16 latent row of width 512, rather than separate
+    /// K and V buffers or an extra multiplier for the four mHC lanes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct SlidingKvPersistentStatePlan {
+        window_rows: usize,
+        flattened_kv_width: usize,
+        kv_lanes: usize,
+        dtype_bytes: usize,
+        kv_elements: usize,
+        kv_bytes: usize,
+    }
+
+    impl SlidingKvPersistentStatePlan {
+        pub fn new(
+            window_rows: usize,
+            flattened_kv_width: usize,
+            kv_lanes: usize,
+            dtype_bytes: usize,
+        ) -> Result<Self, Box<dyn Error>> {
+            if window_rows == 0 || flattened_kv_width == 0 || kv_lanes == 0 || dtype_bytes == 0 {
+                return Err("sliding KV metadata must be non-zero".into());
+            }
+            let kv_elements = window_rows
+                .checked_mul(flattened_kv_width)
+                .and_then(|elements| elements.checked_mul(kv_lanes))
+                .ok_or("sliding KV element count overflow")?;
+            let kv_bytes = kv_elements
+                .checked_mul(dtype_bytes)
+                .ok_or("sliding KV byte count overflow")?;
+            Ok(Self {
+                window_rows,
+                flattened_kv_width,
+                kv_lanes,
+                dtype_bytes,
+                kv_elements,
+                kv_bytes,
+            })
+        }
+
+        pub const fn window_rows(self) -> usize {
+            self.window_rows
+        }
+
+        pub const fn flattened_kv_width(self) -> usize {
+            self.flattened_kv_width
+        }
+
+        pub const fn kv_lanes(self) -> usize {
+            self.kv_lanes
+        }
+
+        pub const fn dtype_bytes(self) -> usize {
+            self.dtype_bytes
+        }
+
+        pub const fn kv_elements(self) -> usize {
+            self.kv_elements
+        }
+
+        pub const fn persistent_bytes(self) -> usize {
+            self.kv_bytes
+        }
+
+        pub const fn compressor_bytes(self) -> usize {
+            0
+        }
+
+        pub const fn indexer_bytes(self) -> usize {
+            0
+        }
+
+        pub const fn capacity_contribution_bytes(self) -> usize {
+            self.kv_bytes
+        }
+
+        pub fn slot_for_position(self, position: usize) -> Result<usize, Box<dyn Error>> {
+            if self.window_rows == 0 {
+                return Err("sliding KV window has no rows".into());
+            }
+            Ok(position % self.window_rows)
+        }
+    }
+
+    /// The named MTP1 planner is the sole exception to the V4-Pro layer range.
+    /// It captures only the official ratio-0 sliding-KV persistent state; RoPE and
+    /// all temporary attention buffers remain owned by the caller's scratch scope.
+    pub fn mtp1_swa_attention_state_plan(
+        layer: usize,
+    ) -> Result<SlidingKvPersistentStatePlan, Box<dyn Error>> {
+        if layer != MTP1_SWA_LAYER {
+            return Err(format!(
+                "MTP1 ratio-0 planner accepts only layer {MTP1_SWA_LAYER}, got {layer}"
+            )
+            .into());
+        }
+        let plan = SlidingKvPersistentStatePlan::new(
+            MTP1_SWA_WINDOW_ROWS,
+            MTP1_SWA_FLATTENED_KV_WIDTH,
+            MTP1_SWA_KV_LANES,
+            MTP1_SWA_DTYPE_BYTES,
+        )?;
+        if plan.window_rows != KV_WINDOW
+            || plan.flattened_kv_width != Q_HEAD_DIM
+            || plan.kv_lanes != 1
+            || plan.dtype_bytes != std::mem::size_of::<u16>()
+            || plan.kv_bytes != KV_WINDOW * Q_HEAD_DIM * std::mem::size_of::<u16>()
+        {
+            return Err(
+                "MTP1 ratio-0 sliding KV metadata drifted from the V4 BF16 contract".into(),
+            );
+        }
+        Ok(plan)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompressionRatio {
     Csa4,
@@ -731,6 +994,82 @@ pub struct L0TailWeights {
     pub wo_a_decode_ms: f64,
 }
 
+/// The one official MTP block has a separate namespace and no compressor or
+/// indexer.  Its two input projections deliberately remain locators: loading
+/// both 51 MiB FP8 matrices at once would create a second persistent draft
+/// allocation instead of the required load/compute/drop lifetime.
+pub struct MtpFp8ProjectionLocator {
+    weight: &'static str,
+    scale: &'static str,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl MtpFp8ProjectionLocator {
+    pub fn load(&self, shard: &ShardFile) -> Result<Fp8Matrix, Box<dyn Error>> {
+        read_matrix(
+            shard,
+            self.weight,
+            self.scale,
+            self.in_features,
+            self.out_features,
+        )
+    }
+
+    pub const fn source_bytes(&self) -> usize {
+        self.in_features * self.out_features
+            + self.out_features.div_ceil(FP8_BLOCK) * (self.in_features / FP8_BLOCK)
+    }
+}
+
+/// Host ownership for the MTP-only fixed tensors.  `e_proj` and `h_proj` are
+/// metadata-only locators; their FP8 payloads are read only by the draft
+/// execution scope, never retained here.
+pub struct MtpDraftWeights {
+    pub shard: ShardFile,
+    pub e_proj: MtpFp8ProjectionLocator,
+    pub h_proj: MtpFp8ProjectionLocator,
+    pub enorm: Vec<u16>,
+    pub hnorm: Vec<u16>,
+    pub norm: Vec<u16>,
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+    pub hc_attn_fn: Vec<f32>,
+    pub hc_attn_base: Vec<f32>,
+    pub hc_attn_scale: Vec<f32>,
+    pub attn_norm: Vec<u16>,
+    pub wq_a: Fp8Projection,
+    pub wq_b: Fp8Matrix,
+    pub wkv: Fp8Projection,
+    pub attn_sink: Vec<f32>,
+    pub wo_a: Fp8Matrix,
+    pub wo_b: Fp8Matrix,
+    pub hc_ffn_fn: Vec<f32>,
+    pub hc_ffn_base: Vec<f32>,
+    pub hc_ffn_scale: Vec<f32>,
+    pub ffn_norm: Vec<u16>,
+    pub gate: Vec<u16>,
+    pub router_bias: Vec<f32>,
+    pub shared: L0SharedExpert,
+    pub fixed_source_bytes: usize,
+}
+
+/// The exact MTP prefix needed to append one sliding-KV row.  Prompt-forced
+/// transitions do not need a routed FFN or vocabulary head candidate.
+pub struct MtpDraftPrefixWeights {
+    pub shard: ShardFile,
+    pub e_proj: MtpFp8ProjectionLocator,
+    pub h_proj: MtpFp8ProjectionLocator,
+    pub enorm: Vec<u16>,
+    pub hnorm: Vec<u16>,
+    pub hc_attn_fn: Vec<f32>,
+    pub hc_attn_base: Vec<f32>,
+    pub hc_attn_scale: Vec<f32>,
+    pub attn_norm: Vec<u16>,
+    pub wkv: Fp8Projection,
+}
+
 pub struct QuantizedFp8Activation {
     pub values: Vec<u8>,
     pub scales: Vec<u8>,
@@ -1147,7 +1486,11 @@ pub struct V4CompressorState {
 pub struct V4LayerPersistentState {
     layer: usize,
     max_context: usize,
+    raw_kv_rows: usize,
+    committed_kv_rows: usize,
     kv_bf16: Vec<u16>,
+    compressed_capacity_rows: usize,
+    indexer_capacity_rows: usize,
     compressed_kv_bf16: Vec<u16>,
     indexer_kv_bf16: Vec<u16>,
     compressor: V4CompressorState,
@@ -1156,18 +1499,26 @@ pub struct V4LayerPersistentState {
 
 pub struct V4SerialPersistentState {
     max_context: usize,
+    plan: LayerStationaryRequestPlan,
+    token_scratch: LayerStationaryTokenScratch,
     layers: Vec<Option<V4LayerPersistentState>>,
 }
 
 impl V4LayerPersistentState {
-    fn new(layer: usize, max_context: usize) -> Result<Self, Box<dyn Error>> {
-        let ratio = compression_ratio_for_layer(layer)?.get();
+    fn new(layer: usize, plan: LayerStationaryRequestPlan) -> Result<Self, Box<dyn Error>> {
+        let compression_ratio = compression_ratio_for_layer(layer)?;
+        let ratio = compression_ratio.get();
+        let compressed_capacity_rows = plan.compressed_rows(compression_ratio);
         Ok(Self {
             layer,
-            max_context,
-            kv_bf16: Vec::new(),
-            compressed_kv_bf16: Vec::new(),
-            indexer_kv_bf16: Vec::new(),
+            max_context: plan.context_rows,
+            raw_kv_rows: plan.raw_kv_rows,
+            committed_kv_rows: 0,
+            kv_bf16: vec![0; plan.raw_kv_rows * Q_HEAD_DIM],
+            compressed_capacity_rows,
+            indexer_capacity_rows: usize::from(ratio == 4) * compressed_capacity_rows,
+            compressed_kv_bf16: Vec::with_capacity(compressed_capacity_rows * Q_HEAD_DIM),
+            indexer_kv_bf16: Vec::with_capacity(compressed_capacity_rows * 128),
             compressor: V4CompressorState::new_decode(ratio, Q_HEAD_DIM)?,
             indexer: (ratio == 4)
                 .then(|| V4CompressorState::new_decode(4, 128))
@@ -1180,7 +1531,7 @@ impl V4LayerPersistentState {
     }
 
     pub fn committed_kv_rows(&self) -> usize {
-        self.kv_bf16.len() / Q_HEAD_DIM
+        self.committed_kv_rows
     }
 
     pub fn kv_bf16(&self) -> &[u16] {
@@ -1199,7 +1550,7 @@ impl V4LayerPersistentState {
         let mut cache = vec![0_u16; KV_WINDOW * Q_HEAD_DIM];
         let rows = self.committed_kv_rows();
         for absolute in rows.saturating_sub(KV_WINDOW)..rows {
-            let source = absolute * Q_HEAD_DIM;
+            let source = (absolute % self.raw_kv_rows) * Q_HEAD_DIM;
             let destination = (absolute % KV_WINDOW) * Q_HEAD_DIM;
             cache[destination..destination + Q_HEAD_DIM]
                 .copy_from_slice(&self.kv_bf16[source..source + Q_HEAD_DIM]);
@@ -1221,14 +1572,20 @@ impl V4LayerPersistentState {
         start_pos: usize,
         row_bf16: &[u16],
     ) -> Result<(), Box<dyn Error>> {
-        if start_pos != self.committed_kv_rows()
+        if start_pos != self.committed_kv_rows
             || start_pos >= self.max_context
+            || self.raw_kv_rows == 0
             || row_bf16.len() != Q_HEAD_DIM
             || row_bf16.iter().any(|&bits| !bf16_to_f32(bits).is_finite())
         {
             return Err("V4 per-layer KV append contract mismatch".into());
         }
-        self.kv_bf16.extend_from_slice(row_bf16);
+        let slot = (start_pos % self.raw_kv_rows) * Q_HEAD_DIM;
+        self.kv_bf16[slot..slot + Q_HEAD_DIM].copy_from_slice(row_bf16);
+        self.committed_kv_rows = self
+            .committed_kv_rows
+            .checked_add(1)
+            .ok_or("V4 per-layer KV row count overflow")?;
         Ok(())
     }
 
@@ -1288,6 +1645,7 @@ impl V4LayerPersistentState {
         append_compressed_row(
             &mut self.compressed_kv_bf16,
             compressed_index,
+            self.compressed_capacity_rows,
             Q_HEAD_DIM,
             row_bf16,
             "main",
@@ -1305,6 +1663,7 @@ impl V4LayerPersistentState {
         append_compressed_row(
             &mut self.indexer_kv_bf16,
             compressed_index,
+            self.indexer_capacity_rows,
             128,
             row_bf16,
             "indexer",
@@ -1314,7 +1673,11 @@ impl V4LayerPersistentState {
     pub fn bits_equal(&self, other: &Self) -> bool {
         self.layer == other.layer
             && self.max_context == other.max_context
+            && self.raw_kv_rows == other.raw_kv_rows
+            && self.committed_kv_rows == other.committed_kv_rows
             && self.kv_bf16 == other.kv_bf16
+            && self.compressed_capacity_rows == other.compressed_capacity_rows
+            && self.indexer_capacity_rows == other.indexer_capacity_rows
             && self.compressed_kv_bf16 == other.compressed_kv_bf16
             && self.indexer_kv_bf16 == other.indexer_kv_bf16
             && self.compressor.bits_equal(&other.compressor)
@@ -1329,11 +1692,13 @@ impl V4LayerPersistentState {
 fn append_compressed_row(
     cache: &mut Vec<u16>,
     compressed_index: usize,
+    capacity_rows: usize,
     width: usize,
     row_bf16: &[u16],
     operation: &str,
 ) -> Result<(), Box<dyn Error>> {
-    if compressed_index.checked_mul(width) != Some(cache.len())
+    if compressed_index >= capacity_rows
+        || compressed_index.checked_mul(width) != Some(cache.len())
         || row_bf16.len() != width
         || row_bf16.iter().any(|&bits| !bf16_to_f32(bits).is_finite())
     {
@@ -1345,11 +1710,26 @@ fn append_compressed_row(
 
 impl V4SerialPersistentState {
     pub fn new(max_context: usize) -> Result<Self, Box<dyn Error>> {
-        if max_context == 0 || max_context > 1_048_576 {
-            return Err("V4 max context must be within 1..=1048576".into());
-        }
-        Ok(Self {
+        Self::with_plan(LayerStationaryRequestPlan::for_existing_context(
             max_context,
+        )?)
+    }
+
+    pub fn new_for_request(
+        prompt_rows: usize,
+        max_new_tokens: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::with_plan(LayerStationaryRequestPlan::new(
+            prompt_rows,
+            max_new_tokens,
+        )?)
+    }
+
+    fn with_plan(plan: LayerStationaryRequestPlan) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            max_context: plan.context_rows,
+            plan,
+            token_scratch: LayerStationaryTokenScratch::new(),
             layers: (0..V4_LAYER_COUNT).map(|_| None).collect(),
         })
     }
@@ -1360,6 +1740,14 @@ impl V4SerialPersistentState {
 
     pub fn allocated_layers(&self) -> usize {
         self.layers.iter().filter(|state| state.is_some()).count()
+    }
+
+    pub fn request_plan(&self) -> LayerStationaryRequestPlan {
+        self.plan
+    }
+
+    pub fn token_scratch(&mut self) -> &mut LayerStationaryTokenScratch {
+        &mut self.token_scratch
     }
 
     pub fn layer(&self, layer: usize) -> Option<&V4LayerPersistentState> {
@@ -1375,9 +1763,11 @@ impl V4SerialPersistentState {
             .layers
             .get(layer)
             .ok_or_else(|| format!("V4 layer {layer} is outside 0..{V4_LAYER_COUNT}"))?;
+        // ponytail: CPU oracle clone/swap proves atomic semantic failure; GPU
+        // production must instead commit a bounded prepared delta.
         let mut scratch = match slot {
             Some(state) => state.clone(),
-            None => V4LayerPersistentState::new(layer, self.max_context)?,
+            None => V4LayerPersistentState::new(layer, self.plan)?,
         };
         apply(&mut scratch)?;
         self.layers[layer] = Some(scratch);
@@ -2390,6 +2780,272 @@ fn load_layer_tail_inner(
     })
 }
 
+/// Loads the fixed MTP tensors from their official `mtp.0` namespace.  The
+/// routed experts and the two 51 MiB e/h projections remain stream-owned by
+/// the caller, so this function cannot accidentally make them persistent.
+pub fn load_mtp_draft_weights(model_dir: &Path) -> Result<MtpDraftWeights, Box<dyn Error>> {
+    const MTP_SHARD: &str = "model-00064-of-00064.safetensors";
+    const MTP_PREFIX: &str = "mtp.0";
+    validate_model_dir(model_dir)?;
+    let index = indexed_model(model_dir)?;
+    for name in ["embed.weight", "head.weight"] {
+        let location = index.resolve_tensor(name)?;
+        let expected = if name == "embed.weight" {
+            "model-00001-of-00064.safetensors"
+        } else {
+            "model-00063-of-00064.safetensors"
+        };
+        if location.shard != expected {
+            return Err(format!(
+                "MTP shared {name} is in {}, expected {expected}",
+                location.shard
+            )
+            .into());
+        }
+    }
+    let names = [
+        "e_proj.weight",
+        "e_proj.scale",
+        "h_proj.weight",
+        "h_proj.scale",
+        "enorm.weight",
+        "hnorm.weight",
+        "norm.weight",
+        "hc_head_fn",
+        "hc_head_base",
+        "hc_head_scale",
+        "hc_attn_fn",
+        "hc_attn_base",
+        "hc_attn_scale",
+        "attn_norm.weight",
+        "attn.wq_a.weight",
+        "attn.wq_a.scale",
+        "attn.q_norm.weight",
+        "attn.wq_b.weight",
+        "attn.wq_b.scale",
+        "attn.wkv.weight",
+        "attn.wkv.scale",
+        "attn.kv_norm.weight",
+        "attn.attn_sink",
+        "attn.wo_a.weight",
+        "attn.wo_a.scale",
+        "attn.wo_b.weight",
+        "attn.wo_b.scale",
+        "hc_ffn_fn",
+        "hc_ffn_base",
+        "hc_ffn_scale",
+        "ffn_norm.weight",
+        "ffn.gate.weight",
+        "ffn.gate.bias",
+        "ffn.shared_experts.w1.weight",
+        "ffn.shared_experts.w1.scale",
+        "ffn.shared_experts.w2.weight",
+        "ffn.shared_experts.w2.scale",
+        "ffn.shared_experts.w3.weight",
+        "ffn.shared_experts.w3.scale",
+    ];
+    for suffix in names {
+        let name = format!("{MTP_PREFIX}.{suffix}");
+        let location = index.resolve_tensor(&name)?;
+        if location.shard != MTP_SHARD {
+            return Err(format!("{name} is in {}, expected {MTP_SHARD}", location.shard).into());
+        }
+    }
+    let shard = ShardFile::open(model_dir.join(MTP_SHARD))?;
+    let e_proj = mtp_fp8_projection_locator(&shard, "mtp.0.e_proj.weight", "mtp.0.e_proj.scale")?;
+    let h_proj = mtp_fp8_projection_locator(&shard, "mtp.0.h_proj.weight", "mtp.0.h_proj.scale")?;
+    let wq_a = read_projection(
+        &shard,
+        "mtp.0.attn.wq_a.weight",
+        "mtp.0.attn.wq_a.scale",
+        "mtp.0.attn.q_norm.weight",
+        1_536,
+    )?;
+    let wq_b = read_matrix(
+        &shard,
+        "mtp.0.attn.wq_b.weight",
+        "mtp.0.attn.wq_b.scale",
+        1_536,
+        65_536,
+    )?;
+    let wkv = read_projection(
+        &shard,
+        "mtp.0.attn.wkv.weight",
+        "mtp.0.attn.wkv.scale",
+        "mtp.0.attn.kv_norm.weight",
+        Q_HEAD_DIM,
+    )?;
+    let wo_a = read_matrix(
+        &shard,
+        "mtp.0.attn.wo_a.weight",
+        "mtp.0.attn.wo_a.scale",
+        Q_HEADS * Q_HEAD_DIM / O_GROUPS,
+        O_GROUPS * O_LORA_RANK,
+    )?;
+    let wo_b = read_matrix(
+        &shard,
+        "mtp.0.attn.wo_b.weight",
+        "mtp.0.attn.wo_b.scale",
+        O_GROUPS * O_LORA_RANK,
+        HIDDEN,
+    )?;
+    let shared = L0SharedExpert {
+        w1: read_matrix(
+            &shard,
+            "mtp.0.ffn.shared_experts.w1.weight",
+            "mtp.0.ffn.shared_experts.w1.scale",
+            HIDDEN,
+            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
+        )?,
+        w2: read_matrix(
+            &shard,
+            "mtp.0.ffn.shared_experts.w2.weight",
+            "mtp.0.ffn.shared_experts.w2.scale",
+            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
+            HIDDEN,
+        )?,
+        w3: read_matrix(
+            &shard,
+            "mtp.0.ffn.shared_experts.w3.weight",
+            "mtp.0.ffn.shared_experts.w3.scale",
+            HIDDEN,
+            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
+        )?,
+    };
+    let mut weights = MtpDraftWeights {
+        enorm: read_bf16(&shard, "mtp.0.enorm.weight", &[HIDDEN])?,
+        hnorm: read_bf16(&shard, "mtp.0.hnorm.weight", &[HIDDEN])?,
+        norm: read_bf16(&shard, "mtp.0.norm.weight", &[HIDDEN])?,
+        hc_head_fn: read_f32(&shard, "mtp.0.hc_head_fn", &[HC, HC * HIDDEN])?,
+        hc_head_base: read_f32(&shard, "mtp.0.hc_head_base", &[HC])?,
+        hc_head_scale: read_f32(&shard, "mtp.0.hc_head_scale", &[1])?[0],
+        hc_attn_fn: read_f32(&shard, "mtp.0.hc_attn_fn", &[MIX, HC * HIDDEN])?,
+        hc_attn_base: read_f32(&shard, "mtp.0.hc_attn_base", &[MIX])?,
+        hc_attn_scale: read_f32(&shard, "mtp.0.hc_attn_scale", &[3])?,
+        attn_norm: read_bf16(&shard, "mtp.0.attn_norm.weight", &[HIDDEN])?,
+        wq_a,
+        wq_b,
+        wkv,
+        attn_sink: read_f32(&shard, "mtp.0.attn.attn_sink", &[Q_HEADS])?,
+        wo_a,
+        wo_b,
+        hc_ffn_fn: read_f32(&shard, "mtp.0.hc_ffn_fn", &[MIX, HC * HIDDEN])?,
+        hc_ffn_base: read_f32(&shard, "mtp.0.hc_ffn_base", &[MIX])?,
+        hc_ffn_scale: read_f32(&shard, "mtp.0.hc_ffn_scale", &[3])?,
+        ffn_norm: read_bf16(&shard, "mtp.0.ffn_norm.weight", &[HIDDEN])?,
+        gate: read_bf16(
+            &shard,
+            "mtp.0.ffn.gate.weight",
+            &[crate::v4_router::V4_ROUTED_EXPERTS, HIDDEN],
+        )?,
+        router_bias: read_f32(
+            &shard,
+            "mtp.0.ffn.gate.bias",
+            &[crate::v4_router::V4_ROUTED_EXPERTS],
+        )?,
+        shared,
+        shard,
+        e_proj,
+        h_proj,
+        fixed_source_bytes: 0,
+    };
+    weights.fixed_source_bytes = mtp_fixed_source_bytes(&weights)?;
+    Ok(weights)
+}
+
+pub fn load_mtp_draft_prefix_weights(
+    model_dir: &Path,
+) -> Result<MtpDraftPrefixWeights, Box<dyn Error>> {
+    const MTP_SHARD: &str = "model-00064-of-00064.safetensors";
+    validate_model_dir(model_dir)?;
+    let shard = ShardFile::open(model_dir.join(MTP_SHARD))?;
+    Ok(MtpDraftPrefixWeights {
+        e_proj: mtp_fp8_projection_locator(&shard, "mtp.0.e_proj.weight", "mtp.0.e_proj.scale")?,
+        h_proj: mtp_fp8_projection_locator(&shard, "mtp.0.h_proj.weight", "mtp.0.h_proj.scale")?,
+        enorm: read_bf16(&shard, "mtp.0.enorm.weight", &[HIDDEN])?,
+        hnorm: read_bf16(&shard, "mtp.0.hnorm.weight", &[HIDDEN])?,
+        hc_attn_fn: read_f32(&shard, "mtp.0.hc_attn_fn", &[MIX, HC * HIDDEN])?,
+        hc_attn_base: read_f32(&shard, "mtp.0.hc_attn_base", &[MIX])?,
+        hc_attn_scale: read_f32(&shard, "mtp.0.hc_attn_scale", &[3])?,
+        attn_norm: read_bf16(&shard, "mtp.0.attn_norm.weight", &[HIDDEN])?,
+        wkv: read_projection(
+            &shard,
+            "mtp.0.attn.wkv.weight",
+            "mtp.0.attn.wkv.scale",
+            "mtp.0.attn.kv_norm.weight",
+            Q_HEAD_DIM,
+        )?,
+        shard,
+    })
+}
+
+fn mtp_fp8_projection_locator(
+    shard: &ShardFile,
+    weight: &'static str,
+    scale: &'static str,
+) -> Result<MtpFp8ProjectionLocator, Box<dyn Error>> {
+    checked(shard, weight, TensorDtype::F8E4M3, &[HIDDEN, HIDDEN])?;
+    checked(
+        shard,
+        scale,
+        TensorDtype::F8E8M0,
+        &[HIDDEN / FP8_BLOCK, HIDDEN / FP8_BLOCK],
+    )?;
+    Ok(MtpFp8ProjectionLocator {
+        weight,
+        scale,
+        in_features: HIDDEN,
+        out_features: HIDDEN,
+    })
+}
+
+fn mtp_fixed_source_bytes(weights: &MtpDraftWeights) -> Result<usize, Box<dyn Error>> {
+    let matrices = [
+        &weights.wq_a.matrix,
+        &weights.wq_b,
+        &weights.wkv.matrix,
+        &weights.wo_a,
+        &weights.wo_b,
+        &weights.shared.w1,
+        &weights.shared.w2,
+        &weights.shared.w3,
+    ];
+    let matrix_bytes = matrices.into_iter().try_fold(0_usize, |total, matrix| {
+        total
+            .checked_add(matrix.weight.len())
+            .and_then(|bytes| bytes.checked_add(matrix.scale.len()))
+            .ok_or("MTP fixed matrix byte count overflow")
+    })?;
+    [
+        matrix_bytes,
+        weights.enorm.len() * 2,
+        weights.hnorm.len() * 2,
+        weights.norm.len() * 2,
+        weights.hc_head_fn.len() * 4,
+        weights.hc_head_base.len() * 4,
+        std::mem::size_of::<f32>(),
+        weights.hc_attn_fn.len() * 4,
+        weights.hc_attn_base.len() * 4,
+        weights.hc_attn_scale.len() * 4,
+        weights.attn_norm.len() * 2,
+        weights.wq_a.norm.len() * 2,
+        weights.wkv.norm.len() * 2,
+        weights.attn_sink.len() * 4,
+        weights.hc_ffn_fn.len() * 4,
+        weights.hc_ffn_base.len() * 4,
+        weights.hc_ffn_scale.len() * 4,
+        weights.ffn_norm.len() * 2,
+        weights.gate.len() * 2,
+        weights.router_bias.len() * 4,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or("MTP fixed source byte count overflow".into())
+    })
+}
+
 pub fn load_compressor_weights(model_dir: &Path) -> Result<CompressorWeights, Box<dyn Error>> {
     validate_model_dir(model_dir)?;
     let shard = ShardFile::open(model_dir.join("model-00002-of-00064.safetensors"))?;
@@ -2910,17 +3566,17 @@ impl V4CompressorState {
                 let mut numerator = 0.0_f32;
                 for slot in 0..self.compress_ratio {
                     let index = slot * value_width + dimension;
-                    let weight = (scratch.score[index] - maximum).exp();
+                    let weight = pytorch_sleef_expf(scratch.score[index] - maximum);
                     denominator += weight;
-                    numerator += scratch.kv[index] * weight;
+                    numerator = scratch.kv[index].mul_add(weight, numerator);
                 }
                 if self.overlap {
                     for slot in 0..self.compress_ratio {
                         let index =
                             (self.compress_ratio + slot) * value_width + self.head_dim + dimension;
-                        let weight = (scratch.score[index] - maximum).exp();
+                        let weight = pytorch_sleef_expf(scratch.score[index] - maximum);
                         denominator += weight;
-                        numerator += scratch.kv[index] * weight;
+                        numerator = scratch.kv[index].mul_add(weight, numerator);
                     }
                 }
                 output[dimension] = numerator / denominator;
@@ -3492,19 +4148,20 @@ fn sigmoid(x: f32) -> f32 {
 // unless such copies or derivative works are solely in the form of
 // machine-executable object code generated by a source language processor.
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-fn pytorch_sleef_expf(value: f32) -> f32 {
-    let exponent = (value * 1.442_695_040_888_963_4_f32).round_ties_even() as i32;
+#[inline(always)]
+pub(crate) fn pytorch_sleef_expf(value: f32) -> f32 {
+    let exponent = libm::roundevenf(value * 1.442_695_040_888_963_4_f32) as i32;
     let exponent_f32 = exponent as f32;
-    let mut reduced = exponent_f32.mul_add(-0.693_145_751_953_125_f32, value);
-    reduced = exponent_f32.mul_add(-1.428_606_765_330_187_e-6_f32, reduced);
+    let mut reduced = libm::fmaf(exponent_f32, -0.693_145_751_953_125_f32, value);
+    reduced = libm::fmaf(exponent_f32, -1.428_606_765_330_187_e-6_f32, reduced);
 
     let mut polynomial = 0.000_198_527_617_612_853_65_f32;
-    polynomial = polynomial.mul_add(reduced, 0.001_393_043_552_525_341_5_f32);
-    polynomial = polynomial.mul_add(reduced, 0.008_333_360_776_305_199_f32);
-    polynomial = polynomial.mul_add(reduced, 0.041_666_485_369_205_475_f32);
-    polynomial = polynomial.mul_add(reduced, 0.166_666_671_633_720_4_f32);
-    polynomial = polynomial.mul_add(reduced, 0.5);
-    let mut result = (reduced * reduced).mul_add(polynomial, reduced) + 1.0;
+    polynomial = libm::fmaf(polynomial, reduced, 0.001_393_043_552_525_341_5_f32);
+    polynomial = libm::fmaf(polynomial, reduced, 0.008_333_360_776_305_199_f32);
+    polynomial = libm::fmaf(polynomial, reduced, 0.041_666_485_369_205_475_f32);
+    polynomial = libm::fmaf(polynomial, reduced, 0.166_666_671_633_720_4_f32);
+    polynomial = libm::fmaf(polynomial, reduced, 0.5);
+    let mut result = libm::fmaf(reduced * reduced, polynomial, reduced) + 1.0;
     let high = exponent >> 1;
     result *= f32::from_bits(((high + 127) as u32) << 23);
     result *= f32::from_bits(((exponent - high + 127) as u32) << 23);
@@ -3582,6 +4239,34 @@ mod tests {
     const FP8_JSON: &str = include_str!("../fixtures/v4_fp8_projection_pytorch_oracle.json");
     const FP8_BIN: &[u8] = include_bytes!("../fixtures/v4_fp8_projection_pytorch_oracle.bin");
     const MINI_SERIAL_JSON: &str = include_str!("../fixtures/v4_mini_serial_oracle_v1.json");
+
+    #[test]
+    fn mtp1_ratio_zero_sliding_kv_plan_is_exact() {
+        let plan = mtp1_swa::mtp1_swa_attention_state_plan(mtp1_swa::MTP1_SWA_LAYER).unwrap();
+        assert_eq!(plan.window_rows(), 128);
+        assert_eq!(plan.flattened_kv_width(), 512);
+        assert_eq!(plan.kv_lanes(), 1);
+        assert_eq!(plan.dtype_bytes(), 2);
+        assert_eq!(plan.kv_elements(), 128 * 512);
+        assert_eq!(plan.persistent_bytes(), 131_072);
+        assert_eq!(plan.capacity_contribution_bytes(), 131_072);
+        assert_eq!(plan.compressor_bytes(), 0);
+        assert_eq!(plan.indexer_bytes(), 0);
+
+        assert_eq!(plan.slot_for_position(0).unwrap(), 0);
+        assert_eq!(plan.slot_for_position(127).unwrap(), 127);
+        assert_eq!(plan.slot_for_position(128).unwrap(), 0);
+    }
+
+    #[test]
+    fn mtp1_ratio_zero_metadata_is_strict_and_checked() {
+        assert!(mtp1_swa::mtp1_swa_attention_state_plan(0).is_err());
+        assert!(mtp1_swa::SlidingKvPersistentStatePlan::new(0, 512, 1, 2).is_err());
+        assert!(mtp1_swa::SlidingKvPersistentStatePlan::new(128, 0, 1, 2).is_err());
+        assert!(mtp1_swa::SlidingKvPersistentStatePlan::new(128, 512, 0, 2).is_err());
+        assert!(mtp1_swa::SlidingKvPersistentStatePlan::new(128, 512, 1, 0).is_err());
+        assert!(mtp1_swa::SlidingKvPersistentStatePlan::new(usize::MAX, 2, 1, 2).is_err());
+    }
 
     #[test]
     fn token_id_validation_is_not_limited_to_fixture_batch_width() {
@@ -4212,6 +4897,98 @@ mod tests {
                 .is_err()
         );
         assert_eq!(serial.layer(2).unwrap().compressed_kv_bf16(), before);
+    }
+
+    #[test]
+    fn layer_stationary_request_plan_checks_exact_short_and_long_contexts() {
+        let short = LayerStationaryRequestPlan::new(5, 3).unwrap();
+        assert_eq!(short.context_rows, 7);
+        assert_eq!(
+            short
+                .actual_decision_positions(3)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [4, 5, 6]
+        );
+        assert_eq!(
+            short
+                .actual_decision_positions(1)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        assert!(short.actual_decision_positions(4).is_err());
+        assert_eq!(short.raw_kv_rows, KV_WINDOW);
+        assert_eq!(short.csa_compressed_rows, 1);
+        assert_eq!(short.hca_compressed_rows, 0);
+        assert_eq!(short.token_scratch_bytes, Q_HEAD_DIM * 2);
+        assert_eq!(short.host_csa_capacity_bytes, 132_352);
+        assert_eq!(short.device_csa_capacity_bytes, 133_376);
+
+        assert_eq!(
+            LayerStationaryRequestPlan::new(31, 1)
+                .unwrap()
+                .actual_decision_positions(1)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [30]
+        );
+        assert!(
+            LayerStationaryRequestPlan::new(5, 0)
+                .unwrap()
+                .actual_decision_positions(0)
+                .unwrap()
+                .is_empty()
+        );
+
+        let long = LayerStationaryRequestPlan::new(129, 17).unwrap();
+        assert_eq!(long.context_rows, 145);
+        assert_eq!(long.raw_kv_rows, KV_WINDOW);
+        assert_eq!(long.csa_compressed_rows, 36);
+        assert_eq!(long.hca_compressed_rows, 1);
+        assert!(long.device_csa_capacity_bytes > long.host_csa_capacity_bytes);
+        assert!(LayerStationaryRequestPlan::new(usize::MAX, 2).is_err());
+        assert!(LayerStationaryRequestPlan::new(0, 0).is_err());
+    }
+
+    #[test]
+    fn layer_stationary_ring_capacities_and_failed_transaction_are_exact() {
+        let mut csa = V4SerialPersistentState::new_for_request(4, 1).unwrap();
+        for position in 0..4 {
+            csa.transaction(2, |state| {
+                state.append_kv_row(
+                    position,
+                    &vec![f32_to_bf16_rne(position as f32); Q_HEAD_DIM],
+                )
+            })
+            .unwrap();
+        }
+        csa.transaction(2, |state| {
+            state.append_compressed_kv_row(0, &vec![f32_to_bf16_rne(1.0); Q_HEAD_DIM])
+        })
+        .unwrap();
+        let csa_before = csa.layer(2).unwrap().clone();
+        assert!(
+            csa.transaction(2, |state| {
+                state.append_compressed_kv_row(1, &vec![f32_to_bf16_rne(2.0); Q_HEAD_DIM])
+            })
+            .is_err()
+        );
+        assert!(csa.layer(2).unwrap().bits_equal(&csa_before));
+
+        let mut hca = V4SerialPersistentState::new_for_request(128, 1).unwrap();
+        for position in 0..128 {
+            hca.transaction(0, |state| {
+                state.append_kv_row(position, &vec![f32_to_bf16_rne(3.0); Q_HEAD_DIM])
+            })
+            .unwrap();
+        }
+        hca.transaction(0, |state| {
+            state.append_compressed_kv_row(0, &vec![f32_to_bf16_rne(4.0); Q_HEAD_DIM])
+        })
+        .unwrap();
+        assert_eq!(hca.layer(0).unwrap().committed_kv_rows(), 128);
+        assert_eq!(hca.layer(0).unwrap().compressed_kv_bf16().len(), Q_HEAD_DIM);
     }
 
     #[test]

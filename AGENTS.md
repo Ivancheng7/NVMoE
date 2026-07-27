@@ -77,6 +77,9 @@ The V4-Pro storage/compute separation contract is
 
 ## Mechanism experiment discipline
 
+- All experiment GPU before/after snapshots must invoke
+  `rust/colibri-cuda/tools/gpu_memory_telemetry.js`; callers must not assemble
+  their own `nvidia-smi` query or output columns.
 - Keep the critical path explicit. A hard blocker is limited to a change in
   routes/top-k, persistent state, the throughput estimand, or data integrity.
   Record other repairs and continue without expanding the active experiment.

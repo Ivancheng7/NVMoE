@@ -11,8 +11,6 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 OUT = Path(__file__).resolve().parent
-REPO = OUT.parents[2]
-DEFAULT_ARTIFACT_ROOT = Path("/mnt/colibri-native/.logs")
 W = 960
 
 # Okabe-Ito plus neutral grays. Every categorical use also has a non-color cue.
@@ -98,6 +96,22 @@ FULL_REQUEST = {
         "sha256": "52d7c04b1e15b6c5450fd49d2eda4c14cf06372fd5d80fbabc77149c4c311cb3",
         "source_identity_sha256": "5889c47ff142ce3805ed02708be0111916437be2fbd66c3000a2b8011ddb081d",
         "qd4": True,
+    },
+    "accepted": {
+        "e2e_seconds": [56.253016944, 54.856168365],
+        "ttft_seconds": [28.712002960, 26.591071426],
+        "hot_total_seconds": [27.363205350, 28.068096448],
+        "n_per_config": 2,
+        "host_retention_gib": 13.0,
+        "device_retention_gib": 4.0,
+        "source_identity_sha256": "2cead3753903ece8fdd47167a99869c182693590f6b803cf033443653871248e",
+        "manifest_sha256": "ec2aa924f12b9d356522efacf7de9980def18e685f196f87d30901d120c26904",
+        "exact_token": 115287,
+        "normalized_bf16_digests": [
+            "519e76cfedc01504",
+            "7017c61decbc4151",
+            "3bed9be0e5ebd27c",
+        ],
     },
 }
 
@@ -257,7 +271,7 @@ def read_artifacts(root: Path) -> tuple[dict[str, list[dict]], dict[str, dict]]:
         raw = path.read_bytes()
         digest = sha256_bytes(raw)
         if digest != expected_sha:
-            raise RuntimeError(f"artifact identity changed: {path}")
+            raise RuntimeError(f"artifact identity changed: {name}")
         if not raw.endswith(b"\n"):
             raise RuntimeError(f"artifact is not newline-terminated: {path}")
         parsed = [json.loads(item) for item in raw.decode("utf-8").splitlines()]
@@ -269,7 +283,8 @@ def read_artifacts(root: Path) -> tuple[dict[str, list[dict]], dict[str, dict]]:
             raise RuntimeError(f"unexpected trace schema: {path}")
         records[key] = parsed
         metadata[key] = {
-            "path": str(path),
+            "logical_id": key,
+            "artifact": name,
             "sha256": digest,
             "bytes": len(raw),
             "lines": len(parsed),
@@ -746,7 +761,7 @@ def hardware_ladder_figure(data: dict) -> str:
     body = text(48, 42, title_value, 25, weight="bold")
     body += text(48, 70, "Observed runs and future estimates use separate evidence labels; read each rate within its workload.", 14, C["muted"])
     cards = [
-        ("OBSERVED DEVELOPMENT", "V4-Pro P5/N3", "0.015 to 0.034 emitted tok/s", "V8 and V9, one full request per condition", C["blue"], ""),
+        ("OBSERVED", "V4-Pro P5/N3", "0.015 to 0.054 emitted tok/s", "baseline n=1; final candidate n=2", C["blue"], ""),
         ("PROJECTED, FLASH RUNS 0", "Flash cold H1, 12 GiB", "0.103 to 0.125 tok/s", "projection envelope", C["orange"], "8 5"),
         ("PROJECTED, FLASH RUNS 0", "Flash fixed-resident H1, 16 GiB", "0.313 to 0.658 tok/s", "residency is unimplemented", C["green"], "8 5"),
         ("PROJECTED, FLASH RUNS 0", "Flash fixed-resident H2, 24 GiB", "0.548 to 1.153 committed tok/s", "q=0.8; draft and rollback costs unmeasured", C["purple"], "8 5"),
@@ -764,26 +779,72 @@ def hardware_ladder_figure(data: dict) -> str:
 
 
 def full_request_speedup_figure() -> str:
-    height = 520
-    v8, v9 = FULL_REQUEST["v8"], FULL_REQUEST["v9"]
+    height = 540
+    baseline = FULL_REQUEST["v8"]
+    accepted = FULL_REQUEST["accepted"]
+    accepted_seconds = accepted["e2e_seconds"]
+    final_seconds = statistics.geometric_mean(accepted_seconds)
     maximum, x0, x1 = 220.0, 290.0, 780.0
     scale = lambda seconds: x0 + seconds / maximum * (x1 - x0)
-    ratio = v8["seconds"] / v9["seconds"]
-    body = text(48, 42, "Exact full request: P5/N3 runs 2.23x faster", 25, weight="bold")
-    body += text(48, 70, "P5/N3, 61 layers, same prompt IDs and greedy output, one development request per condition", 14, C["muted"])
-    for y, label_value, item, fill_value, pattern in (
-        (135, "Exact baseline", v8, C["blue"], "url(#hatch-sky)"),
-        (265, "Current exact engine", v9, C["vermillion"], C["vermillion"]),
-    ):
-        end = scale(item["seconds"])
+    speedup = baseline["seconds"] / final_seconds
+    reduction = 100 * (1 - final_seconds / baseline["seconds"])
+    body = text(48, 42, f"Full request latency fell {reduction:.1f}%", 25, weight="bold")
+    body += text(
+        48,
+        70,
+        "Exact P5/N3, 61 layers. Final bar is the geometric mean of two accepted candidate runs.",
+        14,
+        C["muted"],
+    )
+    rows = (
+        (135, "Exact baseline", baseline["seconds"], C["sky"], "url(#hatch-sky)"),
+        (265, "Accepted engine", final_seconds, C["vermillion"], "url(#cross-vermillion)"),
+    )
+    for y, label_value, seconds, fill_value, pattern in rows:
+        end = scale(seconds)
         body += text(x0 - 18, y + 31, label_value, 17, C["ink"], "end", "bold")
         body += rect(x0, y, end - x0, 54, pattern, fill_value, 2, 2)
-        body += text(end + 12, y + 34, f"{item['seconds']:.9f} s", 16, C["ink"], weight="bold")
+        body += text(end + 12, y + 34, f"{seconds:.3f} s", 16, C["ink"], weight="bold")
+    body += circle(scale(accepted_seconds[0]), 276, 6, C["paper"], C["ink"], 2)
+    body += square(scale(accepted_seconds[1]), 308, 6, C["paper"], C["ink"], 2)
+    body += text(
+        430,
+        340,
+        f"Point markers: B1 {accepted_seconds[0]:.3f} s  |  B2 {accepted_seconds[1]:.3f} s",
+        12,
+        C["muted"],
+        weight="bold",
+    )
     body += axis(x0, x1, 365, maximum, [0, 50, 100, 150, 200], "full request wall time, seconds")
-    body += text(48, 438, f"{ratio:.9f}x faster  |  latency down 55.125234%  |  0.015079334 to 0.033603148 emitted tok/s", 17, C["vermillion"], weight="bold")
-    body += text(48, 466, "PASS: 427 transactional commits and 183 exact layer-state audits. n=1 per condition; descriptive development evidence.", 13, C["muted"])
-    body += footer("EXACT BASELINE AND CURRENT ENGINE, FULL-REQUEST DEVELOPMENT COMPARISON", height)
-    return svg("Exact full-request speedup", "Exact baseline and current exact engine full-request wall times shown from zero with internal-state checks.", body, height)
+    body += text(
+        48,
+        438,
+        f"{speedup:.2f}x  |  {reduction:.1f}% less time  |  0.0151 to {3 / final_seconds:.4f} emitted tok/s",
+        18,
+        C["vermillion"],
+        weight="bold",
+    )
+    body += text(
+        48,
+        470,
+        "Final ABBA: n=2 per config. Every arm kept the same token and normalized BF16 digests.",
+        13,
+        C["ink"],
+        weight="bold",
+    )
+    body += text(
+        48,
+        497,
+        "The 3.58x baseline comparison is cross-lineage descriptive evidence. Bars start at zero.",
+        13,
+        C["muted"],
+    )
+    return svg(
+        "Exact full-request speedup",
+        "Baseline and accepted exact-engine P5/N3 full-request wall times shown from zero. Final points show both accepted candidate runs.",
+        body,
+        height,
+    )
 
 
 def flash_projection_envelope_figure() -> str:
@@ -896,13 +957,13 @@ def provenance(data: dict, metadata: dict[str, dict]) -> dict:
                 "rows": [
                     {
                         "model": "V4-Pro",
-                        "evidence_class": "Observed development",
+                        "evidence_class": "Observed",
                         "rate_tok_s": [
                             3 / FULL_REQUEST["v8"]["seconds"],
-                            3 / FULL_REQUEST["v9"]["seconds"],
+                            3 / statistics.geometric_mean(FULL_REQUEST["accepted"]["e2e_seconds"]),
                         ],
                         "formula": "emitted_rate = 3 / full_request_seconds",
-                        "scope": "P5/N3 full request, one V8 and one V9 development run",
+                        "scope": "P5/N3 full request, baseline n=1 and final accepted candidate n=2",
                     },
                     {
                         "model": "V4-Flash",
@@ -937,15 +998,18 @@ def provenance(data: dict, metadata: dict[str, dict]) -> dict:
                 ],
             },
             "19-full-request-speedup.svg": {
-                "evidence_class": "Measured development",
-                "n_per_condition": 1,
-                "workload": "same P5/N3 full request",
+                "evidence_class": "Measured, cross-lineage descriptive headline",
+                "baseline_n": 1,
+                "final_candidate_n": FULL_REQUEST["accepted"]["n_per_config"],
+                "workload": "P5/N3 full request",
                 "inputs": FULL_REQUEST,
                 "formulas": [
-                    "speedup = v8.seconds / v9.seconds",
-                    "latency_reduction_percent = 100 * (1 - v9.seconds / v8.seconds)",
-                    "emitted_rate = 3 / seconds",
+                    "final_seconds = geometric_mean(accepted.e2e_seconds)",
+                    "speedup = v8.seconds / final_seconds",
+                    "latency_reduction_percent = 100 * (1 - final_seconds / v8.seconds)",
+                    "emitted_rate = 3 / full_request_seconds",
                 ],
+                "claim_boundary": "Final candidate comes from an exact ABBA gate with n=2 per config. The baseline comparison crosses source lineages and is descriptive.",
             },
             "20-flash-projection-envelope.svg": {
                 "evidence_class": "Projected",
@@ -1024,8 +1088,8 @@ def main() -> None:
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=DEFAULT_ARTIFACT_ROOT,
-        help=f"directory containing frozen JSONL artifacts (default: {DEFAULT_ARTIFACT_ROOT})",
+        required=True,
+        help="directory containing frozen JSONL artifacts",
     )
     parser.add_argument(
         "--check",

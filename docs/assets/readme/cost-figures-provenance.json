@@ -1,63 +1,73 @@
 {
   "artifact_identity": {
     "cache_off_pair1": {
+      "artifact": "full61-qd4-cache-abba-b43-a1.jsonl",
       "bytes": 870361,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-a1.jsonl",
+      "logical_id": "cache_off_pair1",
       "sha256": "a6c7509e644366c162058822e6ba6a5e9cf3b5872156bc215e5deb749e938cf4"
     },
     "cache_off_pair2": {
+      "artifact": "full61-qd4-cache-abba-b43-a2.jsonl",
       "bytes": 870448,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-a2.jsonl",
+      "logical_id": "cache_off_pair2",
       "sha256": "61338061e833e85165f465b92b0ff8e00063b0a9ddffefe2187305fd67e0271c"
     },
     "cache_on_pair1": {
+      "artifact": "full61-qd4-cache-abba-b43-b1.jsonl",
       "bytes": 869848,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-b1.jsonl",
+      "logical_id": "cache_on_pair1",
       "sha256": "333c0ff7cd719198e5debbfd8c6b4d3b09f7ac7342b26b1b42d4eed6f549a078"
     },
     "cache_on_pair2": {
+      "artifact": "full61-qd4-cache-abba-b43-b2.jsonl",
       "bytes": 869873,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/full61-qd4-cache-abba-b43-b2.jsonl",
+      "logical_id": "cache_on_pair2",
       "sha256": "5af29cc0ee387f3eab7f4e383a023728f3f5f68f40e087f3e89ae4e92e7c16cb"
     },
     "cache_strict_audit": {
+      "artifact": "full61-qd4-immutable-cache-strict-audit-b43-20260725.jsonl",
       "bytes": 901793,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/full61-qd4-immutable-cache-strict-audit-b43-20260725.jsonl",
+      "logical_id": "cache_strict_audit",
       "sha256": "6d0972b01ee945bfb88c47f92acb5b306de2cd8e1eb3cd3c0696deeb90e920c1"
     },
     "host_bf16_pair1": {
+      "artifact": "qd4-raw-host-abba-4fedb133-20260725-host-b.jsonl",
       "bytes": 870566,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-host-b.jsonl",
+      "logical_id": "host_bf16_pair1",
       "sha256": "0ee931dd095243d8cda15a32c3a12649c6cc1cb4fce0c9576b564ea27c852a4e"
     },
     "host_bf16_pair2": {
+      "artifact": "qd4-raw-host-abba-4fedb133-20260725-host-b-2.jsonl",
       "bytes": 870212,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-host-b-2.jsonl",
+      "logical_id": "host_bf16_pair2",
       "sha256": "6f3a60246121be268674eb671521e9c0fe37fdbae0ccfc7200bbdc37f475af65"
     },
     "pos5_one_token": {
+      "artifact": "pos5-production-dag-0009-b15c-20260725.jsonl",
       "bytes": 1071477,
       "lines": 369,
-      "path": "/mnt/colibri-native/.logs/pos5-production-dag-0009-b15c-20260725.jsonl",
+      "logical_id": "pos5_one_token",
       "sha256": "ae807d39e1e087a5f93da75f1d5ceca71da0b6f88ffce436fbda83cb41f0bf94"
     },
     "raw_gpu_pair1": {
+      "artifact": "qd4-raw-host-abba-4fedb133-20260725-raw-a.jsonl",
       "bytes": 869703,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-raw-a.jsonl",
+      "logical_id": "raw_gpu_pair1",
       "sha256": "8a8690f2868e10ae0b7cb7bc0a3ad8c4055f1a7efe8b45fcaa1d13ca7178004f"
     },
     "raw_gpu_pair2": {
+      "artifact": "qd4-raw-host-abba-4fedb133-20260725-raw-a-2.jsonl",
       "bytes": 869892,
       "lines": 307,
-      "path": "/mnt/colibri-native/.logs/qd4-raw-host-abba-4fedb133-20260725-raw-a-2.jsonl",
+      "logical_id": "raw_gpu_pair2",
       "sha256": "49dd68b2673cf0ab2126f5b0e81a16107b6179918837068053ef45294372a8b6"
     }
   },
@@ -178,14 +188,14 @@
       "flash_runs": 0,
       "rows": [
         {
-          "evidence_class": "Observed development",
+          "evidence_class": "Observed",
           "formula": "emitted_rate = 3 / full_request_seconds",
           "model": "V4-Pro",
           "rate_tok_s": [
             0.015079333915859104,
-            0.033603148094961066
+            0.054005203927542975
           ],
-          "scope": "P5/N3 full request, one V8 and one V9 development run"
+          "scope": "P5/N3 full request, baseline n=1 and final accepted candidate n=2"
         },
         {
           "band_tok_s": [
@@ -241,13 +251,42 @@
       ]
     },
     "19-full-request-speedup.svg": {
-      "evidence_class": "Measured development",
+      "baseline_n": 1,
+      "claim_boundary": "Final candidate comes from an exact ABBA gate with n=2 per config. The baseline comparison crosses source lineages and is descriptive.",
+      "evidence_class": "Measured, cross-lineage descriptive headline",
+      "final_candidate_n": 2,
       "formulas": [
-        "speedup = v8.seconds / v9.seconds",
-        "latency_reduction_percent = 100 * (1 - v9.seconds / v8.seconds)",
-        "emitted_rate = 3 / seconds"
+        "final_seconds = geometric_mean(accepted.e2e_seconds)",
+        "speedup = v8.seconds / final_seconds",
+        "latency_reduction_percent = 100 * (1 - final_seconds / v8.seconds)",
+        "emitted_rate = 3 / full_request_seconds"
       ],
       "inputs": {
+        "accepted": {
+          "device_retention_gib": 4.0,
+          "e2e_seconds": [
+            56.253016944,
+            54.856168365
+          ],
+          "exact_token": 115287,
+          "host_retention_gib": 13.0,
+          "hot_total_seconds": [
+            27.36320535,
+            28.068096448
+          ],
+          "manifest_sha256": "ec2aa924f12b9d356522efacf7de9980def18e685f196f87d30901d120c26904",
+          "n_per_config": 2,
+          "normalized_bf16_digests": [
+            "519e76cfedc01504",
+            "7017c61decbc4151",
+            "3bed9be0e5ebd27c"
+          ],
+          "source_identity_sha256": "2cead3753903ece8fdd47167a99869c182693590f6b803cf033443653871248e",
+          "ttft_seconds": [
+            28.71200296,
+            26.591071426
+          ]
+        },
         "commits": 427,
         "generated": [
           115287,
@@ -277,8 +316,7 @@
           "source_identity_sha256": "5889c47ff142ce3805ed02708be0111916437be2fbd66c3000a2b8011ddb081d"
         }
       },
-      "n_per_condition": 1,
-      "workload": "same P5/N3 full request"
+      "workload": "P5/N3 full request"
     },
     "20-flash-projection-envelope.svg": {
       "assumptions_not_measured": [

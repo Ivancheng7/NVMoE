@@ -4,72 +4,83 @@
 
 Does Your Next LLM Infrastructure Really Need to Be an H100?
 
-| **1.6T parameters** | **12GB VRAM** | **2.228x faster** |
+| **1.6T parameters** | **12GB VRAM** | **3.58x faster** |
 | --- | --- | --- |
-| Full V4-Pro checkpoint stays local | Bounded GPU working set | Exact full-request development result |
+| Full 810GiB model directory | Exact bounded GPU working set | 198.948s to 55.550s |
 
 ![Exact full-request speedup](docs/assets/readme/19-full-request-speedup.svg)
 
-The goal is personal inference for models that normally imply datacenter hardware. A local SSD can hold the full checkpoint. Each token depends on routed expert weights moving through a small working set in the required order. localMoE preserves the model's arithmetic and optimizes that data flow.
+localMoE runs the complete DeepSeek-V4-Pro checkpoint from a WSL-native ext4 volume and keeps only a bounded working set in RAM and VRAM. On the measured laptop, the accepted P5/N3 candidate completed a full request in a geometric mean of `55.550s`, down from the recorded `198.948s` exact baseline. That is a descriptive `3.58x` cross-lineage speedup and a `72.1%` reduction in wall time.
 
-## The idea: preserve model arithmetic and optimize data flow
+The final candidate itself passed a sealed ABBA gate with `n=2` per configuration. Every arm emitted the same three token IDs and the same normalized BF16 digest sequence.
 
-An MoE activates a sparse subset of its parameters for each token. The complete expert set remains addressable throughout the request. V4-Pro makes this demanding: every generated token crosses 61 serial layers, each layer has fixed work, and its router determines which expert bytes must arrive next.
+## The 1.6T problem on a 12GB GPU
 
-localMoE treats that as a placement problem under a semantic contract. A request follows one bounded path:
+An MoE activates a sparse subset of experts for each token. V4-Pro still crosses 61 serial layers, and every layer combines fixed work with router-selected expert payloads. The full expert set must remain addressable even though only a small fraction can live on the GPU.
 
-`SSD -> RAM decode -> pinned host staging -> GPU lease -> canonical reduction -> transactional state commit`
+localMoE turns that constraint into a tiered execution path:
+
+`ext4 SSD -> CPU read and decode -> pinned RAM -> retained VRAM -> canonical GPU reduction -> transactional state commit`
 
 ![Bounded SSD, RAM, and VRAM execution path](docs/assets/readme/02-execution-path.svg)
 
-The runtime overlaps preparation of the next payload with GPU work on the current payload. Layer-stationary state keeps persistent state per model layer and one scratch space per request. Cache leases protect a slot while a worker owns it, and a layer commits persistent state only after successful completion. The engine reduces I/O, decode, H2D traffic, and idle time. Route choice, reduction order, and observable state follow the canonical contract.
+The runtime prepares future payloads while the GPU consumes the current layer. An immutable expert cache loads each prefill expert union once, host retention keeps more fixed payloads away from storage, and device retention removes another part of the H2D path. The route order and state transition remain canonical throughout the request.
 
 ![Checkpoint capacity versus laptop memory tiers](docs/assets/readme/01-capacity.svg)
 
-| Recorded V4-Pro pressure test | Value |
-| --- | ---: |
-| GPU | NVIDIA GeForce RTX 4080 Laptop, `12,282MiB` VRAM |
-| Host memory | `32GB` RAM |
-| Checkpoint | `864,721,029,744B` across 64 pinned shards |
-| Executed path | Complete 61-layer Rust canonical mechanism path |
+## What the sealed experiments support
 
-## Current evidence
+All three ABBA gates used P5/N3 full61 exact execution. Each configuration has two complete arms in the frozen `A1, B1, B2, A2` order, and every complete arm remains in its symmetric estimate.
 
-The README generator freezes two manually recorded `n=1` full-request timings for the same P5/N3 configuration. Their quotient is the displayed `2.228x` development comparison. The recorded metadata lists the same pinned V4-Pro weights, prompt IDs, greedy output, 61-layer schedule, and internal state-audit contract.
+| Sealed mechanism gate | Candidate change | Symmetric E2E ratio | Registered timing gate |
+| --- | --- | ---: | ---: |
+| Immutable expert cache | cache off to 32 slots | `0.7007` | TTFT `0.7901`, hot total `0.6328` |
+| Host retention | `12GiB` to `13GiB` | `0.8946` | TTFT `0.8862`, hot total `0.9039` |
+| Device retention | `3.5GiB` to `4.0GiB` | `0.9260` | TTFT `0.9268`, hot total `0.9248` |
 
-| Exact P5/N3 full request | Wall time | Emitted rate | Change |
-| --- | ---: | ---: | ---: |
-| Exact baseline | `198.95s` | `0.0151tok/s` | `1.00x` |
-| Current exact engine | `89.28s` | `0.0336tok/s` | **`2.228x`** |
+The cache gate cut physical expert loads from `2,562` to `1,576` and removed `34.603GB` from both routed storage reads and routed H2D traffic. Moving to `13GiB` host retention removed another `2.563GB` of fixed source reads. Moving to `4.0GiB` device retention removed `1.709GB` of fixed source reads and `1.568GB` of fixed H2D traffic.
 
-The frozen timing inputs give a `55.13%` reduction in complete-request latency. Each request emits three tokens. A separate full61 accounting audit reduced routed source reads and routed H2D from `64.223GB` to `29.620GB`, a `53.9%` reduction for its recorded workload.
+The sealed N6 device-retention overlay reduced the measured per-token interval from `17.8409426951s` to `16.5992631988s`, a change of `-1.2416794963s/token` (`6.96%`). Per token, it avoided `1,708,974,176 B` of source reads and `783,919,152 B` of H2D traffic while preserving the engine's declared exact semantics. This estimate has `n=2` per configuration. Paired drift bounds the supported claim to the recorded P5/N3 setup.
 
-The public artifact for this comparison is the frozen [README generator](docs/assets/readme/generate_cost_figures.py) and [benchmark ledger](docs/assets/readme/cost-figures-provenance.json) record. The two timing entries have different source identities, so the result remains descriptive development evidence. It validates the recorded Rust canonical route, reduction, and transactional state boundary. Sustained chat-service throughput requires a separate benchmark, and official PyTorch full61 parity has a separate acceptance gate.
+## Expected timing on the measured laptop
 
-## A route to home inference
+P5/N3 means a five-token prompt followed by three emitted tokens. The final accepted configuration uses `13GiB` host retention and `4.0GiB` device retention.
 
-V4-Pro is an intentionally severe storage-and-state pressure test. It exposes the cost of fixed payloads, sparse expert unions, persistent state traffic, and the output head across a small memory hierarchy. The same scheduling model can be evaluated on smaller MoEs where those terms are more favorable for home hardware.
+| P5/N3 measurement | Geometric center | Derived rate |
+| --- | ---: | ---: |
+| TTFT | `27.631s` | one first emitted token |
+| Two decode intervals | `27.713s` total | `0.0722tok/s` |
+| Complete request E2E | `55.550s` | `0.0540 emitted tok/s` |
 
-DeepSeek-V4-Flash is the first planned target. The following Flash intervals are illustrative projection inputs frozen in the README generator and benchmark ledger. This repository has zero Flash runs, and measured performance is still pending.
+The decode rate comes from two measured intervals. It is short-run evidence, and sustained generation needs a longer benchmark. The E2E number covers the whole recorded request, including TTFT and both decode intervals.
 
-![Projected Flash home-hardware envelope](docs/assets/readme/20-flash-projection-envelope.svg)
+The measured starting configuration is:
 
-| Future V4-Flash configuration | Projected committed rate |
-| --- | ---: |
-| Cold H1, 12GiB | `0.103 to 0.125tok/s` |
-| Fixed-resident H1, 16GiB | `0.313 to 0.658tok/s` |
-| Fixed-resident H2, 24GiB, `q=0.8` | `0.548 to 1.153tok/s` |
-| Fixed-resident H5, 32 to 48GiB, `q=0.8` | `0.500 to 1.052tok/s` |
+| Resource | Configuration |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 4080 Laptop GPU, `12,282MiB` VRAM |
+| Host | `32GB` RAM |
+| WSL2 | about `24GiB` visible memory |
+| Retention | `13GiB` host and `4.0GiB` device budgets |
+| Model storage | WSL-native ext4, at least `810GiB` for the model directory |
 
-These intervals are illustrative planning inputs. Future measurement must establish fixed residency, draft cost, rollback, actual expert unions, scheduler span, and the acceptance probability `q`. Each model family also needs its own metadata, routing semantics, KV layout, and acceptance gate.
+This measured configuration is the current reference point. General minimum requirements still need independent validation. Leave additional storage for builds and result artifacts.
+
+## What exact means here
+
+`exact` refers to the Rust engine's declared canonical contract. Across every accepted arm, p4, p5, and p6 emitted token `115287` with normalized BF16 digests `519e76cfedc01504`, `7017c61decbc4151`, and `3bed9be0e5ebd27c`. Route order, reductions, KV updates, lease release, and transactional state commits also passed their recorded gates.
+
+Official PyTorch full-model parity, long-context behavior, text quality across prompts, sampling, and sustained throughput remain separate acceptance targets. The headline `3.58x` compares different source lineages, so it is descriptive evidence. The three ABBA ratios above carry the paired mechanism claims.
 
 ## Why Rust
 
-Rust makes the runtime's constraints visible in the code. Move-only leases express cache ownership, typed FP4-FP8 layouts produce byte budgets, bounded workers and CUDA streams overlap I/O with GPU work, ordered reductions preserve canonical expert order, and transactional commits protect persistent state. GEMM speed still follows the kernel and hardware.
+Rust gives the runtime useful constraints at the language boundary. Move-only leases keep cache slots owned until GPU work releases them. RAII closes pinned-memory, CUDA-event, and device-buffer lifetimes on every exit path. Typed FP4 and FP8 layouts make byte budgets explicit. Bounded channels and CUDA streams overlap storage, CPU decode, H2D, and GPU execution without relaxing canonical reduction order.
+
+The result is a resource scheduler whose ownership rules are inspectable in code, while GEMM performance still comes from CUDA kernels and the GPU.
 
 ## Quickstart
 
-The current path targets WSL2/Linux, CUDA12.x, LLVM/NVPTX, libclang, and an Ada `sm_89` GPU. Store model weights on a WSL-native ext4 block device. The environment contract rejects `/mnt/c` and `/mnt/d` for model storage.
+The current path targets WSL2/Linux, CUDA 12.x, LLVM/NVPTX, libclang, and Ada `sm_89`. Store model weights on a WSL-native ext4 block device. The environment contract rejects `/mnt/c` and `/mnt/d` for model storage.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
@@ -80,8 +91,8 @@ cargo check --locked -p colibri-cuda
 ./run-identified.sh test --arch sm_89
 ```
 
-## License and inspiration
+Code is available under the [Apache License 2.0](LICENSE). Model weights follow their own release terms.
 
-Code is available under the [Apache License 2.0](LICENSE). Model weights and associated materials follow their release terms. Retained upstream code and assets keep their existing notices and license terms.
+## Inspiration
 
-localMoE is inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri). It explores how far exact streamed MoE execution can go on hardware people already own.
+localMoE was inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) and continues that line of work toward exact, full-weight MoE inference on home hardware.

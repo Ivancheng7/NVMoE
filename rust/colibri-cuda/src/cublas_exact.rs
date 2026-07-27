@@ -2,7 +2,7 @@ use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
-pub const LIBRARY_SHA256: &str = "031ce6c2cbfbb9468f040527cab5c599069ce5609e73e28f87503881063eac21";
+pub const LIBRARY_SHA256: &str = "4cc45526449a95d3985389785e985b7832460ea3db178bc9e9963be2111fbee8";
 pub const EXPECTED_VERSION: i32 = 120_405;
 pub const WORKSPACE_BYTES: usize = 8_519_680;
 

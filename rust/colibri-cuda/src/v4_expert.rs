@@ -91,6 +91,21 @@ pub struct RoutedRangeReadTelemetry {
 impl RoutedExpertRangePlan {
     pub fn new(shard: &ShardFile, layer: usize, expert_id: u16) -> Result<Self, Box<dyn Error>> {
         let prefix = routed_expert_prefix(layer, expert_id)?;
+        Self::new_with_prefix(shard, expert_id, &prefix)
+    }
+
+    /// MTP is the one official routed-expert namespace outside `layers.*`.
+    /// Keeping it explicit prevents the ordinary layer range from widening.
+    pub fn new_mtp(shard: &ShardFile, expert_id: u16) -> Result<Self, Box<dyn Error>> {
+        let prefix = mtp_routed_expert_prefix(expert_id)?;
+        Self::new_with_prefix(shard, expert_id, &prefix)
+    }
+
+    fn new_with_prefix(
+        shard: &ShardFile,
+        expert_id: u16,
+        prefix: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let names = [
             format!("{prefix}.w1.weight"),
             format!("{prefix}.w1.scale"),
@@ -246,6 +261,16 @@ impl RoutedExpert {
         expert_id: u16,
     ) -> Result<Self, Box<dyn Error>> {
         let prefix = routed_expert_prefix(layer, expert_id)?;
+        Self::load_with_prefix(shard, &prefix)
+    }
+
+    /// Loads one official MTP expert without extending the production layer ABI.
+    pub fn load_mtp(shard: &ShardFile, expert_id: u16) -> Result<Self, Box<dyn Error>> {
+        let prefix = mtp_routed_expert_prefix(expert_id)?;
+        Self::load_with_prefix(shard, &prefix)
+    }
+
+    fn load_with_prefix(shard: &ShardFile, prefix: &str) -> Result<Self, Box<dyn Error>> {
         let w1 = read_fp4(
             shard,
             &format!("{prefix}.w1"),
@@ -327,6 +352,15 @@ fn routed_expert_prefix(layer: usize, expert_id: u16) -> Result<String, ExpertEr
         )));
     }
     Ok(format!("layers.{layer}.ffn.experts.{expert_id}"))
+}
+
+fn mtp_routed_expert_prefix(expert_id: u16) -> Result<String, ExpertError> {
+    if expert_id as usize >= crate::v4_router::V4_ROUTED_EXPERTS {
+        return Err(ExpertError::Tensor(format!(
+            "invalid routed expert id {expert_id}"
+        )));
+    }
+    Ok(format!("mtp.0.ffn.experts.{expert_id}"))
 }
 
 struct ReadBuffer {

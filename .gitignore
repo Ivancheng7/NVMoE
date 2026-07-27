@@ -45,6 +45,8 @@ c/bench/
 stats*.txt
 *.log
 /docs/*.md
+/docs/research/
+/docs/assets/readme/data/
 
 # Local Rust builds and generated release-audit output. Keep Rust sources,
 # fixtures, and checked evidence versioned; only these reproducible byproducts
