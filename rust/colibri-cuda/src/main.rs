@@ -2,6 +2,7 @@
 //! `silu_mul`, and `pipe_rows_add` in `c/backend_cuda.cu`.
 
 #![recursion_limit = "256"]
+#![feature(core_float_math)]
 
 #[allow(dead_code)] // wired into model dispatch after the current CUDA smoke phase
 mod cublas_exact;
@@ -12,7 +13,10 @@ mod v4_expert;
 mod v4_federated;
 mod v4_fp4;
 mod v4_router;
+mod v4_serve;
+mod v4_spec;
 mod v4_state;
+mod v4_tilelang_ref;
 mod v4_tokenizer;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -20,7 +24,7 @@ use std::error::Error;
 use std::io::Write;
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig, PinnedHostBuffer, sys};
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, device, kernel, thread, warp};
 
 const CERTIFIED_HEAD_NONFINITE: u32 = 1;
 const CERTIFIED_HEAD_SUBNORMAL: u32 = 2;
@@ -37,9 +41,102 @@ const CERTIFIED_ARGMAX_HOST_TEMP_BYTES: usize = CERTIFIED_ARGMAX_CHUNK_ROWS * v4
     + v4_state::VOCAB * (std::mem::size_of::<f32>() * 3)
     + v4_state::HIDDEN * (std::mem::size_of::<f32>() * 2 + std::mem::size_of::<u16>() * 2);
 
+// TileLang's four-lane xor reduction is (0 + 2) + (1 + 3), not a left fold.
+macro_rules! tilelang_sum4 {
+    ($a:expr, $b:expr, $c:expr, $d:expr) => {{
+        let ac = $a + $c;
+        let bd = $b + $d;
+        let ac = unsafe { core::ptr::read_volatile(&ac) };
+        let bd = unsafe { core::ptr::read_volatile(&bd) };
+        ac + bd
+    }};
+}
+
+// DeepSeek-V4-Flash E2M1 nibbles converted exactly to raw E4M3 bytes.
+// Packed immediates keep this LUT in registers instead of thread-local memory.
+const V4_FP4_E2M1_TO_E4M3_POSITIVE: u64 = 0x4c48_4440_3c38_3000;
+const V4_FP4_E2M1_TO_E4M3_NEGATIVE: u64 = 0xccc8_c4c0_bcb8_b080;
+
+#[inline(always)]
+const fn v4_fp4_nibble_to_e4m3(nibble: u8) -> u8 {
+    let lut = if nibble & 8 == 0 {
+        V4_FP4_E2M1_TO_E4M3_POSITIVE
+    } else {
+        V4_FP4_E2M1_TO_E4M3_NEGATIVE
+    };
+    (lut >> ((nibble as u64 & 7) * 8)) as u8
+}
+
+#[inline(always)]
+const fn v4_fp4_pair_to_e4m3x2(packed: u8) -> u16 {
+    v4_fp4_nibble_to_e4m3(packed & 0x0f) as u16 | ((v4_fp4_nibble_to_e4m3(packed >> 4) as u16) << 8)
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
+
+    // Direct libdevice FFI: candidate-only parity probe, never a model output.
+    #[device]
+    unsafe extern "C" {
+        fn __nv_expf(value: f32) -> f32;
+        fn __nv_log1pf(value: f32) -> f32;
+        fn __nv_sqrtf(value: f32) -> f32;
+        fn __nv_rsqrtf(value: f32) -> f32;
+    }
+
+    #[inline(always)]
+    fn mhc_committed_rsqrt(value: f32) -> f32 {
+        // SAFETY: libdevice `__nv_rsqrtf` is defined for every finite input;
+        // the caller supplies RMSNorm's positive epsilon-shifted mean square.
+        unsafe { __nv_rsqrtf(value) }
+    }
+
+    #[inline(always)]
+    fn router_softplus(logit: f32, score_arm: u32) -> f32 {
+        if score_arm != 0 {
+            return if logit > 20.0 {
+                logit
+            } else {
+                // SAFETY: finite router logits are valid libdevice inputs.
+                unsafe { __nv_log1pf(__nv_expf(logit)) }
+            };
+        }
+        if logit > 20.0 {
+            logit
+        } else if logit > 0.0 {
+            logit + libm::log1pf(libm::expf(-logit))
+        } else {
+            libm::log1pf(libm::expf(logit))
+        }
+    }
+
+    #[inline(always)]
+    fn router_sqrtsoftplus(logit: f32, score_arm: u32) -> f32 {
+        let softplus = router_softplus(logit, score_arm);
+        if score_arm != 0 {
+            router_accurate_sqrt(softplus)
+        } else {
+            sqrt_newton(softplus)
+        }
+    }
+
+    /// Mirrors the positive-FP32 sqrt refinement emitted by the pinned
+    /// official Flash SASS: rsqrt, two FTZ multiplies, then two FTZ FMAs.
+    /// Softplus is mathematically positive; preserving zero/non-finite input
+    /// avoids creating a spurious `sqrt.approx` fallback in this score path.
+    #[inline(always)]
+    fn router_accurate_sqrt(softplus: f32) -> f32 {
+        if !(softplus > 0.0) || !softplus.is_finite() {
+            return softplus;
+        }
+        // SAFETY: the guard proves a finite positive libdevice rsqrt input.
+        let reciprocal = unsafe { __nv_rsqrtf(softplus) };
+        let y = cuda_device::float::mul_rn_ftz_f32(softplus, reciprocal);
+        let half = cuda_device::float::mul_rn_ftz_f32(reciprocal, 0.5);
+        let error = cuda_device::float::fma_rn_ftz_f32(-y, y, softplus);
+        cuda_device::float::fma_rn_ftz_f32(error, half, y)
+    }
 
     fn bf16_to_f32(bits: u16) -> f32 {
         f32::from_bits((bits as u32) << 16)
@@ -251,6 +348,234 @@ mod kernels {
         sum
     }
 
+    /// PyTorch 2.10+cu126's contiguous [1, 4096] RMSNorm square pass.  Keep
+    /// this materialized: the official sm86 cubin rounds the BF16->FP32 square
+    /// before its separate reduction kernel.
+    #[kernel]
+    pub fn rmsnorm_flash_square_bf16(input: &[u16], mut squares: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let index_raw = index.get() as usize;
+        if index_raw >= input.len() {
+            return;
+        }
+        let Some(square) = squares.get_mut(index) else {
+            return;
+        };
+        let value = bf16_to_f32(input[index_raw]);
+        *square = cuda_device::float::mul_rn_f32(value, value);
+    }
+
+    /// Fixed Flash mHC reduction for one contiguous [4, 4096] row.  The
+    /// square pass above is intentionally separate, matching the pinned
+    /// PyTorch 2.10 reduction kernel's globally materialized FP32 input.
+    #[kernel]
+    pub fn mhc_flash_reduce_rsqrt_16384(
+        squares: &[f32],
+        mut rsqrt: DisjointSlice<f32>,
+        mut debug: DisjointSlice<u32>,
+    ) {
+        const WIDTH: usize = 16_384;
+        const FIELDS: usize = 5;
+        static mut REDUCE: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let start = row * WIDTH;
+        if start + WIDTH > squares.len()
+            || row >= rsqrt.len()
+            || !(debug.is_empty() || debug.len() == rsqrt.len() * FIELDS)
+            || tid >= 512
+        {
+            return;
+        }
+
+        let base = start + tid * 4;
+        let mut a0 = squares[base];
+        let mut a1 = squares[base + 1];
+        let mut a2 = squares[base + 2];
+        let mut a3 = squares[base + 3];
+        for k in 1..8 {
+            let offset = 2_048 * k;
+            a0 = cuda_device::float::add_rn_f32(a0, squares[base + offset]);
+            a1 = cuda_device::float::add_rn_f32(a1, squares[base + offset + 1]);
+            a2 = cuda_device::float::add_rn_f32(a2, squares[base + offset + 2]);
+            a3 = cuda_device::float::add_rn_f32(a3, squares[base + offset + 3]);
+        }
+        let a01 = cuda_device::float::add_rn_f32(a0, a1);
+        let a012 = cuda_device::float::add_rn_f32(a01, a2);
+        unsafe { REDUCE[tid] = cuda_device::float::add_rn_f32(a012, a3) };
+        thread::sync_threads();
+        for offset in [256_usize, 128, 64, 32] {
+            if tid < offset {
+                unsafe {
+                    REDUCE[tid] = cuda_device::float::add_rn_f32(REDUCE[tid], REDUCE[tid + offset]);
+                }
+            }
+            thread::sync_threads();
+        }
+
+        if tid < 32 {
+            let mut sum = unsafe { REDUCE[tid] };
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 16));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 8));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 4));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 2));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 1));
+            if tid == 0 {
+                let mean = cuda_device::float::mul_rn_f32(sum, 1.0 / WIDTH as f32);
+                let mean_eps = cuda_device::float::add_rn_f32(mean, 1e-6);
+                let current_newton = 1.0 / sqrt_newton(mean_eps);
+                let libdevice_sqrt = 1.0 / core::f32::math::sqrt(mean_eps);
+                let inv = mhc_committed_rsqrt(mean_eps);
+                unsafe {
+                    *rsqrt.as_mut_ptr().add(row) = inv;
+                    if !debug.is_empty() {
+                        let base = row * FIELDS;
+                        *debug.as_mut_ptr().add(base) = sum.to_bits();
+                        *debug.as_mut_ptr().add(base + 1) = mean_eps.to_bits();
+                        *debug.as_mut_ptr().add(base + 2) = current_newton.to_bits();
+                        *debug.as_mut_ptr().add(base + 3) = libdevice_sqrt.to_bits();
+                        *debug.as_mut_ptr().add(base + 4) = inv.to_bits();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replay-only final HC head: the gate's four already-normalized raw dots
+    /// are transformed with the official affine/sigmoid+epsilon expression,
+    /// then collapsed in source order with explicit RN operations.  It is not
+    /// wired into Flash production dispatch.
+    #[kernel]
+    pub fn flash_final_head_sigmoid_collapse4(
+        input: &[u16],
+        raw_dot: &[f32],
+        rsqrt: &[f32],
+        hc_scale: &[f32],
+        hc_base: &[f32],
+        mut pre: DisjointSlice<f32>,
+        mut collapsed: DisjointSlice<u16>,
+    ) {
+        const HC: usize = 4;
+        const HIDDEN: usize = 4_096;
+        let column = thread::index_1d().get() as usize;
+        if column >= HIDDEN
+            || input.len() != HC * HIDDEN
+            || raw_dot.len() != HC
+            || rsqrt.len() != 1
+            || hc_scale.len() != 1
+            || hc_base.len() != HC
+            || pre.len() != HC
+            || collapsed.len() != HIDDEN
+        {
+            return;
+        }
+        let mut gate = [0.0_f32; HC];
+        for copy in 0..HC {
+            let scaled = cuda_device::float::mul_rn_f32(raw_dot[copy], rsqrt[0]);
+            let affine = cuda_device::float::add_rn_f32(
+                cuda_device::float::mul_rn_f32(scaled, hc_scale[0]),
+                hc_base[copy],
+            );
+            // SAFETY: finite replay inputs and locked weights make expf's
+            // domain valid; this is the pinned official sigmoid expression.
+            gate[copy] = 1.0 / (1.0 + unsafe { __nv_expf(-affine) }) + 1e-6;
+            if column < HC {
+                unsafe { *pre.as_mut_ptr().add(column) = gate[column] };
+            }
+        }
+        let product = |copy: usize| {
+            cuda_device::float::mul_rn_f32(gate[copy], bf16_to_f32(input[copy * HIDDEN + column]))
+        };
+        let p0 = product(0);
+        let p1 = product(1);
+        let p2 = product(2);
+        let p3 = product(3);
+        let p01 = cuda_device::float::add_rn_f32(p0, p1);
+        let p012 = cuda_device::float::add_rn_f32(p01, p2);
+        let value = cuda_device::float::add_rn_f32(p012, p3);
+        unsafe { *collapsed.as_mut_ptr().add(column) = f32_to_bf16_rne(value) };
+    }
+
+    /// Fixed Flash learned-router reduction recovered from the pinned PyTorch
+    /// 2.10+cu126 sm86 cubin.  One 512-thread block owns one contiguous row.
+    #[kernel]
+    pub fn rmsnorm_flash_learned_4096_bf16(
+        input: &[u16],
+        norm: &[u16],
+        squares: &[f32],
+        mut output: DisjointSlice<u16>,
+        mut trace: DisjointSlice<f32>,
+    ) {
+        const WIDTH: usize = 4_096;
+        static mut REDUCE: SharedArray<f32, 512> = SharedArray::UNINIT;
+
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let start = row * WIDTH;
+        if norm.len() != WIDTH
+            || start + WIDTH > input.len()
+            || start + WIDTH > squares.len()
+            || start + WIDTH > output.len()
+            || tid >= 512
+        {
+            return;
+        }
+
+        let base = start + tid * 4;
+        let upper = base + WIDTH / 2;
+        let a0 = cuda_device::float::add_rn_f32(squares[base], squares[upper]);
+        let a1 = cuda_device::float::add_rn_f32(squares[base + 1], squares[upper + 1]);
+        let a2 = cuda_device::float::add_rn_f32(squares[base + 2], squares[upper + 2]);
+        let a3 = cuda_device::float::add_rn_f32(squares[base + 3], squares[upper + 3]);
+        let p01 = cuda_device::float::add_rn_f32(a0, a1);
+        let p012 = cuda_device::float::add_rn_f32(p01, a2);
+        let partial = cuda_device::float::add_rn_f32(p012, a3);
+        unsafe { REDUCE[tid] = partial };
+        thread::sync_threads();
+        for offset in [256_usize, 128, 64, 32] {
+            if tid < offset {
+                unsafe {
+                    REDUCE[tid] = cuda_device::float::add_rn_f32(REDUCE[tid], REDUCE[tid + offset]);
+                }
+            }
+            thread::sync_threads();
+        }
+
+        if tid < 32 {
+            let mut sum = unsafe { REDUCE[tid] };
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 16));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 8));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 4));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 2));
+            sum = cuda_device::float::add_rn_f32(sum, warp::shuffle_down_f32(sum, 1));
+            if tid == 0 {
+                let mean = cuda_device::float::mul_rn_f32(sum, 1.0 / WIDTH as f32);
+                let inv = mhc_committed_rsqrt(cuda_device::float::add_rn_f32(mean, 1e-6));
+                unsafe { REDUCE[0] = inv };
+                if trace.len().is_multiple_of(3) && row < trace.len() / 3 {
+                    let rows = trace.len() / 3;
+                    unsafe {
+                        *trace.as_mut_ptr().add(row) = sum;
+                        *trace.as_mut_ptr().add(rows + row) = mean;
+                        *trace.as_mut_ptr().add(rows * 2 + row) = inv;
+                    }
+                }
+            }
+        }
+        thread::sync_threads();
+        let inv = unsafe { REDUCE[0] };
+        for column in (tid..WIDTH).step_by(512) {
+            let normalized = f32::from_bits((input[start + column] as u32) << 16) * inv;
+            let value = normalized * f32::from_bits((norm[column] as u32) << 16);
+            let bits = value.to_bits();
+            unsafe {
+                *output.as_mut_ptr().add(start + column) =
+                    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16;
+            }
+        }
+    }
+
     #[kernel]
     pub fn quantize_v4_activation(input: &[u16], mut output: DisjointSlice<f32>) {
         const BLOCK: usize = 128;
@@ -272,6 +597,38 @@ mod kernels {
         }
         let scale = pow2_ceil(if amax > 1e-4 { amax } else { 1e-4 } / 448.0);
         *destination = quantize_e4m3fn(bf16_to_f32(input[output_index]) / scale) * scale;
+    }
+
+    #[kernel]
+    pub fn quantize_v4_activation_raw(
+        input: &[u16],
+        mut output: DisjointSlice<u8>,
+        mut scales: DisjointSlice<u8>,
+    ) {
+        const BLOCK: usize = 128;
+        let group = thread::index_1d().get() as usize;
+        if input.is_empty()
+            || input.len() % BLOCK != 0
+            || output.len() != input.len()
+            || scales.len() != input.len() / BLOCK
+            || group >= scales.len()
+        {
+            return;
+        }
+        let start = group * BLOCK;
+        let mut amax = 0.0_f32;
+        for offset in 0..BLOCK {
+            amax = amax.max(bf16_to_f32(input[start + offset]).abs());
+        }
+        let scale = pow2_ceil(amax.max(1e-4) / 448.0);
+        // SAFETY: one thread owns a complete 128-value activation group.
+        unsafe {
+            *scales.as_mut_ptr().add(group) = encode_e8m0_power_of_two(scale);
+            for offset in 0..BLOCK {
+                *output.as_mut_ptr().add(start + offset) =
+                    quantize_e4m3fn_bits(bf16_to_f32(input[start + offset]) / scale);
+            }
+        }
     }
 
     #[kernel]
@@ -609,6 +966,108 @@ mod kernels {
                 *output_f32.as_mut_ptr().add(output_index + 1) = total[1];
                 *output_bf16.as_mut_ptr().add(output_index) = f32_to_bf16_rne(total[0]);
                 *output_bf16.as_mut_ptr().add(output_index + 1) = f32_to_bf16_rne(total[1]);
+            }
+        }
+    }
+
+    /// DeepSeek-V4-Flash FP8 x FP4 expert matvec on Ada FP8 tensor cores.
+    ///
+    /// One warp computes eight outputs. FP4 E2M1 nibbles are expanded in
+    /// registers to raw E4M3, then each K32 partial is scaled and accumulated
+    /// in the same strict order as the official 0731 kernel.
+    #[kernel]
+    pub fn matvec_v4_fp4_mma(
+        input: &[u8],
+        input_scales: &[u8],
+        packed: &[u8],
+        scales: &[u8],
+        mut output: DisjointSlice<u16>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        const ACTIVATION_BLOCK: usize = 128;
+        const WEIGHT_BLOCK: usize = 32;
+        const MMA_N: usize = 8;
+        let thread_index = thread::index_1d().get() as usize;
+        let warp_index = thread_index / 32;
+        let lane = warp::lane_id() as usize;
+        let group = lane / 4;
+        let thread_in_group = lane % 4;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if in_features == 0
+            || in_features % ACTIVATION_BLOCK != 0
+            || out_features == 0
+            || out_features % MMA_N != 0
+        {
+            return;
+        }
+        let rows = input.len() / in_features;
+        let output_tiles = out_features / MMA_N;
+        let activation_blocks = in_features / ACTIVATION_BLOCK;
+        let weight_blocks = in_features / WEIGHT_BLOCK;
+        if input.len() != rows * in_features
+            || input_scales.len() != rows * activation_blocks
+            || packed.len() != out_features * (in_features / 2)
+            || scales.len() != out_features * weight_blocks
+            || output.len() != rows * out_features
+            || warp_index >= rows * output_tiles
+        {
+            return;
+        }
+        let row = warp_index / output_tiles;
+        let output_start = (warp_index % output_tiles) * MMA_N;
+        let weight_row = output_start + group;
+        let packed_row = weight_row * (in_features / 2);
+        let mut total = [0.0_f32; 4];
+        for block in 0..weight_blocks {
+            let k_start = block * WEIGHT_BLOCK;
+            let a0_start = row * in_features + k_start + thread_in_group * 4;
+            let a1_start = a0_start + 16;
+            let a0 = (input[a0_start] as u32)
+                | ((input[a0_start + 1] as u32) << 8)
+                | ((input[a0_start + 2] as u32) << 16)
+                | ((input[a0_start + 3] as u32) << 24);
+            let a1 = (input[a1_start] as u32)
+                | ((input[a1_start + 1] as u32) << 8)
+                | ((input[a1_start + 2] as u32) << 16)
+                | ((input[a1_start + 3] as u32) << 24);
+            let b0_start = packed_row + k_start / 2 + thread_in_group * 2;
+            let b1_start = b0_start + 8;
+            let b0 = v4_fp4_pair_to_e4m3x2(packed[b0_start]) as u32
+                | ((v4_fp4_pair_to_e4m3x2(packed[b0_start + 1]) as u32) << 16);
+            let b1 = v4_fp4_pair_to_e4m3x2(packed[b1_start]) as u32
+                | ((v4_fp4_pair_to_e4m3x2(packed[b1_start + 1]) as u32) << 16);
+            // SAFETY: every active lane executes the same register-only
+            // m16n8k32 instruction with PTX-documented fragment layouts.
+            let fragment = unsafe {
+                cuda_device::wmma::mma_m16n8k32_fp8_f32_e4m3_e4m3(
+                    [0.0_f32; 4],
+                    [a0, a0, a1, a1],
+                    [b0, b1],
+                )
+            };
+            let activation_scale = decode_e8m0fnu(
+                input_scales[row * activation_blocks + block / (ACTIVATION_BLOCK / WEIGHT_BLOCK)],
+            );
+            let output_col = output_start + thread_in_group * 2;
+            let weight_scale0 = decode_e8m0fnu(scales[output_col * weight_blocks + block]);
+            let weight_scale1 = decode_e8m0fnu(scales[(output_col + 1) * weight_blocks + block]);
+            let scaled0 = fragment[0] * activation_scale;
+            let scaled1 = fragment[1] * activation_scale;
+            let scaled2 = fragment[2] * activation_scale;
+            let scaled3 = fragment[3] * activation_scale;
+            total[0] = cuda_device::float::fma_rn_f32(scaled0, weight_scale0, total[0]);
+            total[1] = cuda_device::float::fma_rn_f32(scaled1, weight_scale1, total[1]);
+            total[2] = cuda_device::float::fma_rn_f32(scaled2, weight_scale0, total[2]);
+            total[3] = cuda_device::float::fma_rn_f32(scaled3, weight_scale1, total[3]);
+        }
+        if group == 0 {
+            let output_index = row * out_features + output_start + thread_in_group * 2;
+            // SAFETY: lanes 0..3 uniquely own two outputs in this warp's tile.
+            unsafe {
+                *output.as_mut_ptr().add(output_index) = f32_to_bf16_rne(total[0]);
+                *output.as_mut_ptr().add(output_index + 1) = f32_to_bf16_rne(total[1]);
             }
         }
     }
@@ -1037,6 +1496,65 @@ mod kernels {
         }
     }
 
+    /// Exact-diagnostic Flash arm: each lane owns one K value in a 32-wide
+    /// block, reduces unscaled FP8×FP4 first, then lane 0 applies both scales.
+    #[kernel]
+    pub fn matvec_v4_fp4_block32(
+        input: &[u8],
+        input_scales: &[u8],
+        packed: &[u8],
+        scales: &[u8],
+        mut output: DisjointSlice<u16>,
+        in_features: u32,
+        out_features: u32,
+    ) {
+        const WEIGHT_BLOCK: usize = 32;
+        const ACTIVATION_BLOCK: usize = 128;
+        let thread_index = thread::index_1d().get() as usize;
+        let output_index = thread_index / 32;
+        let lane = warp::lane_id() as usize;
+        let in_features = in_features as usize;
+        let out_features = out_features as usize;
+        if output_index >= output.len()
+            || in_features == 0
+            || in_features % ACTIVATION_BLOCK != 0
+            || output_index >= input.len() / in_features * out_features
+            || input_scales.len() != input.len() / ACTIVATION_BLOCK
+            || packed.len() != out_features * in_features / 2
+            || scales.len() != out_features * in_features / WEIGHT_BLOCK
+        {
+            return;
+        }
+        let row = output_index / out_features;
+        let output_row = output_index % out_features;
+        let input_row = row * in_features;
+        let packed_row = output_row * (in_features / 2);
+        let scale_row = output_row * (in_features / WEIGHT_BLOCK);
+        let mut acc = 0.0_f32;
+        for block in 0..in_features / WEIGHT_BLOCK {
+            let input_index = input_row + block * WEIGHT_BLOCK + lane;
+            let packed_byte = packed[packed_row + block * (WEIGHT_BLOCK / 2) + lane / 2];
+            let mut partial = decode_e4m3fn(input[input_index]) * decode_fp4(packed_byte, lane % 2);
+            partial += warp::shuffle_xor_f32(partial, 16);
+            partial += warp::shuffle_xor_f32(partial, 8);
+            partial += warp::shuffle_xor_f32(partial, 4);
+            partial += warp::shuffle_xor_f32(partial, 2);
+            partial += warp::shuffle_xor_f32(partial, 1);
+            if lane == 0 {
+                let activation_scale = decode_e8m0fnu(
+                    input_scales[row * (in_features / ACTIVATION_BLOCK) + block / 4],
+                );
+                let weight_scale = decode_e8m0fnu(scales[scale_row + block]);
+                acc += partial * activation_scale * weight_scale;
+            }
+        }
+        if lane == 0 {
+            // ponytail: scalar warp arm is exact diagnosis only; assess MMA
+            // performance only after this L0 boundary passes parity.
+            unsafe { *output.as_mut_ptr().add(output_index) = f32_to_bf16_rne(acc) };
+        }
+    }
+
     #[kernel]
     pub fn swiglu_route_bf16(
         gate: &[u16],
@@ -1190,7 +1708,10 @@ mod kernels {
             let mean_eps = bf16_to_f32(f32_to_bf16_rne(mean + 1e-6));
             bf16_to_f32(f32_to_bf16_rne(1.0 / sqrt_newton(mean_eps)))
         } else {
-            1.0 / sqrt_newton(square_sum / hidden as f32 + 1e-6)
+            // The pinned RMSNorm evaluates rsqrt directly in FP32.  The
+            // Newton reciprocal-sqrt path is one ULP high on L1's exact FFN
+            // input and crosses three BF16 output boundaries.
+            mhc_committed_rsqrt(square_sum / hidden as f32 + 1e-6)
         };
         for column in 0..hidden {
             let normalized = f32::from_bits((input[start + column] as u32) << 16) * inv_rms;
@@ -1293,37 +1814,41 @@ mod kernels {
         topk: &[i32],
         mut output: DisjointSlice<u16>,
         topk_per_row: u32,
+        heads: u32,
+        dim: u32,
     ) {
-        const HEADS: usize = 128;
-        const DIM: usize = 512;
+        let heads = heads as usize;
+        let dim = dim as usize;
         const SCALE: f32 = 0.044_194_173;
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
-        if q.len() != output.len()
-            || q.len() % (HEADS * DIM) != 0
-            || kv.len() % DIM != 0
-            || attn_sink.len() != HEADS
+        if heads == 0
+            || dim == 0
+            || q.len() != output.len()
+            || q.len() % (heads * dim) != 0
+            || kv.len() % dim != 0
+            || attn_sink.len() != heads
             || topk_per_row == 0
-            || topk.len() < q.len() / (HEADS * DIM) * topk_per_row
+            || topk.len() < q.len() / (heads * dim) * topk_per_row
             || index >= output.len()
         {
             return;
         }
-        let row = index / (HEADS * DIM);
-        let head = index / DIM % HEADS;
-        let dimension = index % DIM;
-        let q_start = (row * HEADS + head) * DIM;
+        let row = index / (heads * dim);
+        let head = index / dim % heads;
+        let dimension = index % dim;
+        let q_start = (row * heads + head) * dim;
         let mut score_max = f32::NEG_INFINITY;
         let mut valid = 0;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / DIM {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let mut score = 0.0_f32;
-            for column in 0..DIM {
+            for column in 0..dim {
                 score +=
-                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * dim + column]);
             }
             score *= SCALE;
             score_max = score_max.max(score);
@@ -1337,17 +1862,17 @@ mod kernels {
         let mut denominator = 0.0_f32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / DIM {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let mut score = 0.0_f32;
-            for column in 0..DIM {
+            for column in 0..dim {
                 score +=
-                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * dim + column]);
             }
             let probability = libm::expf(score * SCALE - score_max);
             denominator += probability;
-            numerator += probability * bf16_to_f32(kv[key as usize * DIM + dimension]);
+            numerator += probability * bf16_to_f32(kv[key as usize * dim + dimension]);
         }
         denominator += libm::expf(attn_sink[head] - score_max);
         unsafe {
@@ -1369,40 +1894,44 @@ mod kernels {
         mut denominators: DisjointSlice<f32>,
         mut valid_counts: DisjointSlice<u32>,
         topk_per_row: u32,
+        heads: u32,
+        dim: u32,
     ) {
-        const HEADS: usize = 128;
-        const DIM: usize = 512;
+        let heads = heads as usize;
+        let dim = dim as usize;
         const SCALE: f32 = 0.044_194_173;
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
-        let rows = denominators.len() / HEADS;
-        if rows == 0
-            || q.len() != rows * HEADS * DIM
-            || kv.len() % DIM != 0
-            || attn_sink.len() != HEADS
+        let rows = denominators.len() / heads.max(1);
+        if heads == 0
+            || dim == 0
+            || rows == 0
+            || q.len() != rows * heads * dim
+            || kv.len() % dim != 0
+            || attn_sink.len() != heads
             || topk_per_row == 0
             || topk.len() < rows * topk_per_row
-            || scores.len() < rows * HEADS * topk_per_row
-            || probabilities.len() < rows * HEADS * topk_per_row
-            || valid_counts.len() != rows * HEADS
+            || scores.len() < rows * heads * topk_per_row
+            || probabilities.len() < rows * heads * topk_per_row
+            || valid_counts.len() != rows * heads
             || index >= denominators.len()
         {
             return;
         }
-        let row = index / HEADS;
-        let head = index % HEADS;
-        let q_start = (row * HEADS + head) * DIM;
+        let row = index / heads;
+        let head = index % heads;
+        let q_start = (row * heads + head) * dim;
         let mut score_max = f32::NEG_INFINITY;
         let mut valid = 0_u32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / DIM {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let mut score = 0.0_f32;
-            for column in 0..DIM {
+            for column in 0..dim {
                 score +=
-                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * dim + column]);
             }
             unsafe { *scores.as_mut_ptr().add(index * topk_per_row + slot) = score }
             score *= SCALE;
@@ -1419,13 +1948,13 @@ mod kernels {
         let mut denominator = 0.0_f32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / DIM {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let mut score = 0.0_f32;
-            for column in 0..DIM {
+            for column in 0..dim {
                 score +=
-                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * dim + column]);
             }
             let probability = libm::expf(score * SCALE - score_max);
             unsafe {
@@ -1447,34 +1976,39 @@ mod kernels {
         topk: &[i32],
         mut scores: DisjointSlice<f32>,
         topk_per_row: u32,
+        heads: u32,
+        dim: u32,
     ) {
-        const HEADS: usize = 128;
-        const DIM: usize = 512;
+        let heads = heads as usize;
+        let dim = dim as usize;
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
-        let score_width = HEADS * topk_per_row;
-        let score_len = q.len() / (HEADS * DIM) * score_width;
-        if q.len() % (HEADS * DIM) != 0
-            || kv.len() % DIM != 0
+        if heads == 0 || dim == 0 {
+            return;
+        }
+        let score_width = heads * topk_per_row;
+        let score_len = q.len() / (heads * dim) * score_width;
+        if q.len() % (heads * dim) != 0
+            || kv.len() % dim != 0
             || topk_per_row == 0
-            || topk.len() < q.len() / (HEADS * DIM) * topk_per_row
+            || topk.len() < q.len() / (heads * dim) * topk_per_row
             || scores.len() < score_len
             || index >= score_len
         {
             return;
         }
         let row = index / score_width;
-        let head = index / topk_per_row % HEADS;
+        let head = index / topk_per_row % heads;
         let slot = index % topk_per_row;
         let key = topk[row * topk_per_row + slot];
-        let score = if key < 0 || key as usize >= kv.len() / DIM {
+        let score = if key < 0 || key as usize >= kv.len() / dim {
             0.0_f32
         } else {
-            let q_start = (row * HEADS + head) * DIM;
+            let q_start = (row * heads + head) * dim;
             let mut score = 0.0_f32;
-            for column in 0..DIM {
+            for column in 0..dim {
                 score +=
-                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * DIM + column]);
+                    bf16_to_f32(q[q_start + column]) * bf16_to_f32(kv[key as usize * dim + column]);
             }
             score
         };
@@ -1491,31 +2025,36 @@ mod kernels {
         mut denominators: DisjointSlice<f32>,
         mut valid_counts: DisjointSlice<u32>,
         topk_per_row: u32,
+        heads: u32,
+        dim: u32,
     ) {
-        const HEADS: usize = 128;
+        let heads = heads as usize;
+        let dim = dim as usize;
         const SCALE: f32 = 0.044_194_173;
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
-        let rows = denominators.len() / HEADS;
-        if rows == 0
-            || denominators.len() != rows * HEADS
-            || valid_counts.len() != rows * HEADS
-            || attn_sink.len() != HEADS
-            || kv.len() % 512 != 0
+        let rows = denominators.len() / heads.max(1);
+        if heads == 0
+            || dim == 0
+            || rows == 0
+            || denominators.len() != rows * heads
+            || valid_counts.len() != rows * heads
+            || attn_sink.len() != heads
+            || kv.len() % dim != 0
             || topk_per_row == 0
             || topk.len() < rows * topk_per_row
-            || scores.len() < rows * HEADS * topk_per_row
-            || probabilities.len() < rows * HEADS * topk_per_row
+            || scores.len() < rows * heads * topk_per_row
+            || probabilities.len() < rows * heads * topk_per_row
             || index >= denominators.len()
         {
             return;
         }
-        let row = index / HEADS;
+        let row = index / heads;
         let mut score_max = f32::NEG_INFINITY;
         let mut valid = 0_u32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / 512 {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let score = scores[index * topk_per_row + slot] * SCALE;
@@ -1532,14 +2071,14 @@ mod kernels {
         let mut denominator = 0.0_f32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / 512 {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             let probability = libm::expf(scores[index * topk_per_row + slot] * SCALE - score_max);
             unsafe { *probabilities.as_mut_ptr().add(index * topk_per_row + slot) = probability }
             denominator += probability;
         }
-        denominator += libm::expf(attn_sink[index % HEADS] - score_max);
+        denominator += libm::expf(attn_sink[index % heads] - score_max);
         unsafe {
             *denominators.as_mut_ptr().add(index) = denominator;
             *valid_counts.as_mut_ptr().add(index) = valid;
@@ -1555,27 +2094,32 @@ mod kernels {
         valid_counts: &[u32],
         mut output: DisjointSlice<u16>,
         topk_per_row: u32,
+        heads: u32,
+        dim: u32,
     ) {
-        const HEADS: usize = 128;
-        const DIM: usize = 512;
+        let heads = heads as usize;
+        let dim = dim as usize;
         let index = thread::index_1d().get() as usize;
         let topk_per_row = topk_per_row as usize;
-        let rows = output.len() / (HEADS * DIM);
-        if output.len() != rows * HEADS * DIM
-            || kv.len() % DIM != 0
+        if heads == 0 || dim == 0 {
+            return;
+        }
+        let rows = output.len() / (heads * dim);
+        if output.len() != rows * heads * dim
+            || kv.len() % dim != 0
             || topk_per_row == 0
             || topk.len() < rows * topk_per_row
-            || probabilities.len() < rows * HEADS * topk_per_row
-            || denominators.len() != rows * HEADS
-            || valid_counts.len() != rows * HEADS
+            || probabilities.len() < rows * heads * topk_per_row
+            || denominators.len() != rows * heads
+            || valid_counts.len() != rows * heads
             || index >= output.len()
         {
             return;
         }
-        let row = index / (HEADS * DIM);
-        let head = index / DIM % HEADS;
-        let dimension = index % DIM;
-        let head_index = row * HEADS + head;
+        let row = index / (heads * dim);
+        let head = index / dim % heads;
+        let dimension = index % dim;
+        let head_index = row * heads + head;
         if valid_counts[head_index] == 0 {
             unsafe { *output.as_mut_ptr().add(index) = 0 }
             return;
@@ -1583,11 +2127,11 @@ mod kernels {
         let mut numerator = 0.0_f32;
         for slot in 0..topk_per_row {
             let key = topk[row * topk_per_row + slot];
-            if key < 0 || key as usize >= kv.len() / DIM {
+            if key < 0 || key as usize >= kv.len() / dim {
                 continue;
             }
             numerator += probabilities[head_index * topk_per_row + slot]
-                * bf16_to_f32(kv[key as usize * DIM + dimension]);
+                * bf16_to_f32(kv[key as usize * dim + dimension]);
         }
         unsafe {
             *output.as_mut_ptr().add(index) = f32_to_bf16_rne(numerator / denominators[head_index]);
@@ -1595,28 +2139,39 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn wo_a_v4_bf16(input: &[u16], weight: &[u16], mut output: DisjointSlice<u16>) {
-        const HEADS: usize = 128;
-        const HEAD_DIM: usize = 512;
-        const GROUPS: usize = 16;
-        const GROUP_INPUT: usize = HEADS * HEAD_DIM / GROUPS;
-        const GROUP_OUTPUT: usize = 1_024;
-        const OUTPUT: usize = GROUPS * GROUP_OUTPUT;
+    pub fn wo_a_v4_bf16(
+        input: &[u16],
+        weight: &[u16],
+        mut output: DisjointSlice<u16>,
+        heads: u32,
+        head_dim: u32,
+        groups: u32,
+        group_output: u32,
+    ) {
+        let heads = heads as usize;
+        let head_dim = head_dim as usize;
+        let groups = groups as usize;
+        let group_output = group_output as usize;
+        if heads == 0 || head_dim == 0 || groups == 0 || heads % groups != 0 {
+            return;
+        }
+        let group_input = heads * head_dim / groups;
+        let output_width = groups * group_output;
         let index = thread::index_1d().get() as usize;
-        if input.len() % (HEADS * HEAD_DIM) != 0
-            || weight.len() != OUTPUT * GROUP_INPUT
-            || output.len() != input.len() / (HEADS * HEAD_DIM) * OUTPUT
+        if input.len() % (heads * head_dim) != 0
+            || weight.len() != output_width * group_input
+            || output.len() != input.len() / (heads * head_dim) * output_width
             || index >= output.len()
         {
             return;
         }
-        let row = index / OUTPUT;
-        let output_row = index % OUTPUT;
-        let group = output_row / GROUP_OUTPUT;
-        let input_start = row * HEADS * HEAD_DIM + group * GROUP_INPUT;
-        let weight_start = output_row * GROUP_INPUT;
+        let row = index / output_width;
+        let output_row = index % output_width;
+        let group = output_row / group_output;
+        let input_start = row * heads * head_dim + group * group_input;
+        let weight_start = output_row * group_input;
         let mut accumulated = 0.0_f32;
-        for column in 0..GROUP_INPUT {
+        for column in 0..group_input {
             accumulated = cuda_device::float::fma_rn_f32(
                 bf16_to_f32(input[input_start + column]),
                 bf16_to_f32(weight[weight_start + column]),
@@ -1627,29 +2182,37 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn gate_logits_v4_bf16(input: &[u16], gate: &[u16], mut logits: DisjointSlice<f32>) {
-        const HIDDEN: usize = 7_168;
-        const EXPERTS: usize = 384;
+    pub fn gate_logits_v4_bf16(
+        input: &[u16],
+        gate: &[u16],
+        mut logits: DisjointSlice<f32>,
+        hidden: u32,
+        experts: u32,
+    ) {
+        let hidden = hidden as usize;
+        let experts = experts as usize;
         const K_BLOCK: usize = 192;
         let index = thread::index_1d().get() as usize;
-        if input.len() % HIDDEN != 0
-            || gate.len() != EXPERTS * HIDDEN
-            || logits.len() != input.len() / HIDDEN * EXPERTS
+        if hidden == 0
+            || experts == 0
+            || input.len() % hidden != 0
+            || gate.len() != experts * hidden
+            || logits.len() != input.len() / hidden * experts
             || index >= logits.len()
         {
             return;
         }
-        let row = index / EXPERTS;
-        let expert = index % EXPERTS;
+        let row = index / experts;
+        let expert = index % experts;
         let mut accumulated = 0.0_f32;
         let mut block = 0;
-        while block < HIDDEN {
+        while block < hidden {
             let mut partial = 0.0_f32;
-            let end = (block + K_BLOCK).min(HIDDEN);
+            let end = (block + K_BLOCK).min(hidden);
             for column in block..end {
                 partial = cuda_device::float::fma_rn_f32(
-                    bf16_to_f32(input[row * HIDDEN + column]),
-                    bf16_to_f32(gate[expert * HIDDEN + column]),
+                    bf16_to_f32(input[row * hidden + column]),
+                    bf16_to_f32(gate[expert * hidden + column]),
                     partial,
                 );
             }
@@ -1667,33 +2230,103 @@ mod kernels {
         comb: &[f32],
         mut output: DisjointSlice<u16>,
     ) {
-        const HIDDEN: usize = 7_168;
         const HC: usize = 4;
         let index = thread::index_1d().get() as usize;
-        if input.len() % HIDDEN != 0
-            || residual.len() != input.len() * HC
-            || post.len() != input.len() / HIDDEN * HC
-            || comb.len() != input.len() / HIDDEN * HC * HC
+        if post.len() % HC != 0 {
+            return;
+        }
+        let rows = post.len() / HC;
+        if rows == 0 || input.len() % rows != 0 {
+            return;
+        }
+        let hidden = input.len() / rows;
+        if residual.len() != input.len() * HC
+            || comb.len() != rows * HC * HC
             || output.len() != residual.len()
             || index >= output.len()
         {
             return;
         }
-        let row = index / (HC * HIDDEN);
-        let copy = index / HIDDEN % HC;
-        let column = index % HIDDEN;
-        let residual_start = row * HC * HIDDEN;
+        let row = index / (HC * hidden);
+        let copy = index / hidden % HC;
+        let column = index % hidden;
+        let residual_start = row * HC * hidden;
         let mut products = [0.0_f32; HC];
         for source in 0..HC {
             let product = comb[(row * HC + source) * HC + copy]
-                * bf16_to_f32(residual[residual_start + source * HIDDEN + column]);
+                * bf16_to_f32(residual[residual_start + source * hidden + column]);
             products[source] = unsafe { core::ptr::read_volatile(&product) };
         }
-        let residual_sum = (products[0] + products[2]) + (products[1] + products[3]);
-        let branch = post[row * HC + copy] * bf16_to_f32(input[row * HIDDEN + column]);
+        // The pinned four-lane `torch.sum(..., dim=source_lane)` kernel folds
+        // source lanes in order.  Each FP32 boundary is observable at BF16
+        // RNE, so spell out the three rounded adds.
+        let residual_sum01 = cuda_device::float::add_rn_f32(products[0], products[1]);
+        let residual_sum012 = cuda_device::float::add_rn_f32(residual_sum01, products[2]);
+        let residual_sum = cuda_device::float::add_rn_f32(residual_sum012, products[3]);
+        let branch = post[row * HC + copy] * bf16_to_f32(input[row * hidden + column]);
         let branch = unsafe { core::ptr::read_volatile(&branch) };
         unsafe {
             *output.as_mut_ptr().add(index) = f32_to_bf16_rne(branch + residual_sum);
+        }
+    }
+
+    /// Parity-only raw-word probe for one HC-post output.  It never feeds the
+    /// model result and is launched only by the Flash L0 dump path.
+    #[kernel]
+    pub fn hc_post_v4_bf16_trace(
+        input: &[u16],
+        residual: &[u16],
+        post: &[f32],
+        comb: &[f32],
+        audit_index: u32,
+        mut audit: DisjointSlice<u32>,
+    ) {
+        const HC: usize = 4;
+        const WORDS: usize = 21;
+        if thread::index_1d().get() != 0 || audit.len() != WORDS || post.len() % HC != 0 {
+            return;
+        }
+        let rows = post.len() / HC;
+        if rows == 0
+            || input.len() % rows != 0
+            || residual.len() != input.len() * HC
+            || comb.len() != rows * HC * HC
+            || audit_index as usize >= residual.len()
+        {
+            return;
+        }
+        let hidden = input.len() / rows;
+        let index = audit_index as usize;
+        let row = index / (HC * hidden);
+        let copy = index / hidden % HC;
+        let column = index % hidden;
+        let residual_start = row * HC * hidden;
+        let branch_input = input[row * hidden + column];
+        let branch = post[row * HC + copy] * bf16_to_f32(branch_input);
+        let branch = unsafe { core::ptr::read_volatile(&branch) };
+        let mut products = [0.0_f32; HC];
+        unsafe {
+            *audit.as_mut_ptr().add(0) = audit_index;
+            *audit.as_mut_ptr().add(1) = branch_input as u32;
+            *audit.as_mut_ptr().add(2) = post[row * HC + copy].to_bits();
+            *audit.as_mut_ptr().add(3) = branch.to_bits();
+            for source in 0..HC {
+                let residual_bits = residual[residual_start + source * hidden + column];
+                let coefficient = comb[(row * HC + source) * HC + copy];
+                let product = coefficient * bf16_to_f32(residual_bits);
+                products[source] = core::ptr::read_volatile(&product);
+                *audit.as_mut_ptr().add(4 + source) = residual_bits as u32;
+                *audit.as_mut_ptr().add(8 + source) = coefficient.to_bits();
+                *audit.as_mut_ptr().add(12 + source) = products[source].to_bits();
+            }
+            let sum01 = cuda_device::float::add_rn_f32(products[0], products[1]);
+            let sum012 = cuda_device::float::add_rn_f32(sum01, products[2]);
+            let residual_sum = cuda_device::float::add_rn_f32(sum012, products[3]);
+            *audit.as_mut_ptr().add(16) = sum01.to_bits();
+            *audit.as_mut_ptr().add(17) = sum012.to_bits();
+            *audit.as_mut_ptr().add(18) = residual_sum.to_bits();
+            *audit.as_mut_ptr().add(19) = (branch + residual_sum).to_bits();
+            *audit.as_mut_ptr().add(20) = f32_to_bf16_rne(branch + residual_sum) as u32;
         }
     }
 
@@ -1707,37 +2340,40 @@ mod kernels {
         mut post: DisjointSlice<f32>,
         mut comb: DisjointSlice<f32>,
     ) {
-        const H: usize = 7168;
         const HC: usize = 4;
         const MIX: usize = 24;
         const EPS: f32 = 1e-6;
         const K_BLOCK: usize = 192;
         let row = thread::index_1d().get() as usize;
-        if input.len() % (HC * H) != 0
-            || row >= input.len() / (HC * H)
-            || hc_fn.len() != MIX * HC * H
+        if hc_fn.len() % (MIX * HC) != 0 {
+            return;
+        }
+        let h = hc_fn.len() / (MIX * HC);
+        if h == 0
+            || input.len() % (HC * h) != 0
+            || row >= input.len() / (HC * h)
             || hc_scale.len() != 3
             || hc_base.len() != MIX
             || collapsed.len() != input.len() / HC
-            || post.len() != input.len() / H
-            || comb.len() != input.len() / (HC * H) * HC * HC
+            || post.len() != input.len() / h
+            || comb.len() != input.len() / (HC * h) * HC * HC
         {
             return;
         }
-        let start = row * HC * H;
-        let square = pytorch_square_sum_bf16(input, start, HC * H);
-        let inv = 1.0 / sqrt_newton(square / (HC * H) as f32 + EPS);
+        let start = row * HC * h;
+        let square = pytorch_square_sum_bf16(input, start, HC * h);
+        let inv = 1.0 / sqrt_newton(square / (HC * h) as f32 + EPS);
         let mut mixes = [0.0; MIX];
         for out in 0..MIX {
             let mut dot = 0.0;
             let mut block = 0;
-            while block < HC * H {
+            while block < HC * h {
                 let mut partial = 0.0;
-                let end = (block + K_BLOCK).min(HC * H);
+                let end = (block + K_BLOCK).min(HC * h);
                 for i in block..end {
                     partial = cuda_device::float::fma_rn_f32(
                         bf16_to_f32(input[start + i]),
-                        hc_fn[out * HC * H + i],
+                        hc_fn[out * HC * h + i],
                         partial,
                     );
                 }
@@ -1807,13 +2443,13 @@ mod kernels {
                 }
             }
         }
-        for col in 0..H {
+        for col in 0..h {
             let mut value = 0.0;
             for copy in 0..HC {
-                value += pre[copy] * bf16_to_f32(input[start + copy * H + col]);
+                value += pre[copy] * bf16_to_f32(input[start + copy * h + col]);
             }
             unsafe {
-                *collapsed.as_mut_ptr().add(row * H + col) = f32_to_bf16_rne(value);
+                *collapsed.as_mut_ptr().add(row * h + col) = f32_to_bf16_rne(value);
             }
         }
     }
@@ -1821,32 +2457,35 @@ mod kernels {
     /// mHC's normalized linear stage only: [rows, 4, H] -> [rows, 24].
     #[kernel]
     pub fn mhc_linear_v4_bf16_scalar(input: &[u16], hc_fn: &[f32], mut mixes: DisjointSlice<f32>) {
-        const H: usize = 7168;
         const HC: usize = 4;
         const MIX: usize = 24;
         const EPS: f32 = 1e-6;
         const K_BLOCK: usize = 192;
         let row = thread::index_1d().get() as usize;
-        if input.len() % (HC * H) != 0
-            || row >= input.len() / (HC * H)
-            || hc_fn.len() != MIX * HC * H
-            || mixes.len() != input.len() / (HC * H) * MIX
+        if hc_fn.len() % (MIX * HC) != 0 {
+            return;
+        }
+        let h = hc_fn.len() / (MIX * HC);
+        if h == 0
+            || input.len() % (HC * h) != 0
+            || row >= input.len() / (HC * h)
+            || mixes.len() != input.len() / (HC * h) * MIX
         {
             return;
         }
-        let start = row * HC * H;
-        let square = pytorch_square_sum_bf16(input, start, HC * H);
-        let inv = 1.0 / sqrt_newton(square / (HC * H) as f32 + EPS);
+        let start = row * HC * h;
+        let square = pytorch_square_sum_bf16(input, start, HC * h);
+        let inv = 1.0 / sqrt_newton(square / (HC * h) as f32 + EPS);
         for out in 0..MIX {
             let mut dot = 0.0;
             let mut block = 0;
-            while block < HC * H {
+            while block < HC * h {
                 let mut partial = 0.0;
-                let end = (block + K_BLOCK).min(HC * H);
+                let end = (block + K_BLOCK).min(HC * h);
                 for i in block..end {
                     partial = cuda_device::float::fma_rn_f32(
                         bf16_to_f32(input[start + i]),
-                        hc_fn[out * HC * H + i],
+                        hc_fn[out * HC * h + i],
                         partial,
                     );
                 }
@@ -1863,7 +2502,6 @@ mod kernels {
     /// original 192-wide FMA/block accumulation order.
     #[kernel]
     pub fn mhc_linear_v4_bf16(input: &[u16], hc_fn: &[f32], mut mixes: DisjointSlice<f32>) {
-        const H: usize = 7168;
         const HC: usize = 4;
         const MIX: usize = 24;
         const EPS: f32 = 1e-6;
@@ -1871,14 +2509,16 @@ mod kernels {
         let thread = thread::index_1d().get() as usize;
         let row = thread / 32;
         let lane = thread % 32;
-        let layout_valid = input.len() % (HC * H) == 0
-            && hc_fn.len() == MIX * HC * H
-            && mixes.len() == input.len() / (HC * H) * MIX;
-        let row_valid = layout_valid && row < input.len() / (HC * H);
+        let h = hc_fn.len() / (MIX * HC);
+        let layout_valid = h != 0
+            && hc_fn.len() % (MIX * HC) == 0
+            && input.len() % (HC * h) == 0
+            && mixes.len() == input.len() / (HC * h) * MIX;
+        let row_valid = layout_valid && row < input.len() / (HC * h);
         let lane_zero_inv = if row_valid && lane == 0 {
-            let start = row * HC * H;
-            let square = pytorch_square_sum_bf16(input, start, HC * H);
-            1.0 / sqrt_newton(square / (HC * H) as f32 + EPS)
+            let start = row * HC * h;
+            let square = pytorch_square_sum_bf16(input, start, HC * h);
+            1.0 / sqrt_newton(square / (HC * h) as f32 + EPS)
         } else {
             0.0
         };
@@ -1886,16 +2526,16 @@ mod kernels {
         if !row_valid || lane >= MIX {
             return;
         }
-        let start = row * HC * H;
+        let start = row * HC * h;
         let mut dot = 0.0;
         let mut block = 0;
-        while block < HC * H {
+        while block < HC * h {
             let mut partial = 0.0;
-            let end = (block + K_BLOCK).min(HC * H);
+            let end = (block + K_BLOCK).min(HC * h);
             for i in block..end {
                 partial = cuda_device::float::fma_rn_f32(
                     bf16_to_f32(input[start + i]),
-                    hc_fn[lane * HC * H + i],
+                    hc_fn[lane * HC * h + i],
                     partial,
                 );
             }
@@ -1904,6 +2544,67 @@ mod kernels {
         }
         // SAFETY: the layout check above proves this output row exists.
         unsafe { *mixes.as_mut_ptr().add(row * MIX + lane) = dot * inv }
+    }
+
+    /// Flash cuBLAS arm post-GEMM scale.  The fixed 16,384-wide reduction
+    /// above owns the reciprocal square root; this kernel only applies it to
+    /// the 24 already-computed raw dots.
+    #[kernel]
+    pub fn mhc_scale_raw_dot_by_rsqrt_v4(
+        raw_dot: &[f32],
+        rsqrt: &[f32],
+        mut mixes: DisjointSlice<f32>,
+    ) {
+        const MIX: usize = 24;
+        let row = thread::index_1d().get() as usize;
+        if raw_dot.len() % MIX != 0 {
+            return;
+        }
+        let rows = raw_dot.len() / MIX;
+        if rows == 0 || rsqrt.len() != rows || mixes.len() != raw_dot.len() || row >= rows {
+            return;
+        }
+        let inv = rsqrt[row];
+        unsafe {
+            for lane in 0..MIX {
+                *mixes.as_mut_ptr().add(row * MIX + lane) =
+                    cuda_device::float::mul_rn_f32(raw_dot[row * MIX + lane], inv);
+            }
+        }
+    }
+
+    /// Parity-only mHC normalization probe.  This runs after the committed
+    /// scale kernel and writes no tensor consumed by inference.
+    #[kernel]
+    pub fn mhc_rsqrt_debug_v4(input: &[u16], mut debug: DisjointSlice<u32>) {
+        const HC: usize = 4;
+        const EPS: f32 = 1e-6;
+        const FIELDS: usize = 5;
+        let row = thread::index_1d().get() as usize;
+        if input.len() % HC != 0 || debug.len() % FIELDS != 0 {
+            return;
+        }
+        let rows = debug.len() / FIELDS;
+        if rows == 0 || input.len() % (rows * HC) != 0 || row >= rows {
+            return;
+        }
+        let width = input.len() / rows;
+        let square = pytorch_square_sum_bf16(input, row * width, width);
+        let mean_eps = square / width as f32 + EPS;
+        let current_newton = 1.0 / sqrt_newton(mean_eps);
+        // cuda-oxide lowers `core::f32::math::sqrt` to libdevice
+        // `__nv_sqrtf`; the inherent `f32::sqrt` resolves through `std` here.
+        let libdevice_sqrt_value = core::f32::math::sqrt(mean_eps);
+        let libdevice_sqrt = 1.0 / libdevice_sqrt_value;
+        let libdevice_rsqrt = mhc_committed_rsqrt(mean_eps);
+        unsafe {
+            let base = row * FIELDS;
+            *debug.as_mut_ptr().add(base) = square.to_bits();
+            *debug.as_mut_ptr().add(base + 1) = mean_eps.to_bits();
+            *debug.as_mut_ptr().add(base + 2) = current_newton.to_bits();
+            *debug.as_mut_ptr().add(base + 3) = libdevice_sqrt.to_bits();
+            *debug.as_mut_ptr().add(base + 4) = libdevice_rsqrt.to_bits();
+        }
     }
 
     /// mHC's Sinkhorn/collapse stage. Trace order is logits, softmax, then
@@ -1920,25 +2621,30 @@ mod kernels {
         mut collapsed: DisjointSlice<u16>,
         mut trace: DisjointSlice<f32>,
     ) {
-        const H: usize = 7168;
         const HC: usize = 4;
         const MIX: usize = 24;
         const EPS: f32 = 1e-6;
         let row = thread::index_1d().get() as usize;
-        if input.len() % (HC * H) != 0
-            || row >= input.len() / (HC * H)
-            || mixes.len() != input.len() / (HC * H) * MIX
+        if mixes.len() % MIX != 0 {
+            return;
+        }
+        let rows = mixes.len() / MIX;
+        if rows == 0 || input.len() % (rows * HC) != 0 {
+            return;
+        }
+        let h = input.len() / (rows * HC);
+        if row >= rows
             || hc_scale.len() != 3
             || hc_base.len() != MIX
-            || pre.len() != input.len() / H
-            || post.len() != input.len() / H
-            || comb.len() != input.len() / (HC * H) * HC * HC
+            || pre.len() != input.len() / h
+            || post.len() != input.len() / h
+            || comb.len() != rows * HC * HC
             || collapsed.len() != input.len() / HC
-            || trace.len() != input.len() / (HC * H) * 41 * HC * HC
+            || trace.len() != rows * 41 * HC * HC
         {
             return;
         }
-        let start = row * HC * H;
+        let start = row * HC * h;
         let mix = row * MIX;
         let base = row * HC * HC;
         let trace_base = row * 41 * HC * HC;
@@ -1967,12 +2673,13 @@ mod kernels {
                         *comb.as_mut_ptr().add(base + i * HC + j)
                 }
             }
-            let mut sum = 0.0;
+            let mut values = [0.0; HC];
             for j in 0..HC {
                 let value = libm::expf(unsafe { *comb.as_mut_ptr().add(base + i * HC + j) } - max);
                 unsafe { *comb.as_mut_ptr().add(base + i * HC + j) = value }
-                sum += value;
+                values[j] = value;
             }
+            let sum = tilelang_sum4!(values[0], values[1], values[2], values[3]);
             for j in 0..HC {
                 unsafe {
                     let value = comb.as_mut_ptr().add(base + i * HC + j);
@@ -1983,10 +2690,11 @@ mod kernels {
         }
         for step in 0..20 {
             for j in 0..HC {
-                let mut sum = 0.0;
+                let mut values = [0.0; HC];
                 for i in 0..HC {
-                    unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                    values[i] = unsafe { *comb.as_mut_ptr().add(base + i * HC + j) };
                 }
+                let sum = tilelang_sum4!(values[0], values[1], values[2], values[3]);
                 for i in 0..HC {
                     unsafe {
                         let value = comb.as_mut_ptr().add(base + i * HC + j);
@@ -2006,10 +2714,11 @@ mod kernels {
             }
             if step != 19 {
                 for i in 0..HC {
-                    let mut sum = 0.0;
+                    let mut values = [0.0; HC];
                     for j in 0..HC {
-                        unsafe { sum += *comb.as_mut_ptr().add(base + i * HC + j) }
+                        values[j] = unsafe { *comb.as_mut_ptr().add(base + i * HC + j) };
                     }
+                    let sum = tilelang_sum4!(values[0], values[1], values[2], values[3]);
                     for j in 0..HC {
                         unsafe {
                             let value = comb.as_mut_ptr().add(base + i * HC + j);
@@ -2029,12 +2738,26 @@ mod kernels {
                 }
             }
         }
-        for col in 0..H {
-            let mut value = 0.0;
-            for copy in 0..HC {
-                value += local_pre[copy] * bf16_to_f32(input[start + copy * H + col]);
-            }
-            unsafe { *collapsed.as_mut_ptr().add(row * H + col) = f32_to_bf16_rne(value) }
+        for col in 0..h {
+            // PyTorch's `torch.sum(..., dim=2)` at the pinned four-lane
+            // boundary is a source-lane serial reduction.  Keep each product
+            // and add explicitly rounded so cuda-oxide cannot contract the
+            // cross-lane TileLang tree into FMAs.
+            let p0 = cuda_device::float::mul_rn_f32(local_pre[0], bf16_to_f32(input[start + col]));
+            let p1 =
+                cuda_device::float::mul_rn_f32(local_pre[1], bf16_to_f32(input[start + h + col]));
+            let p2 = cuda_device::float::mul_rn_f32(
+                local_pre[2],
+                bf16_to_f32(input[start + 2 * h + col]),
+            );
+            let p3 = cuda_device::float::mul_rn_f32(
+                local_pre[3],
+                bf16_to_f32(input[start + 3 * h + col]),
+            );
+            let p01 = cuda_device::float::add_rn_f32(p0, p1);
+            let p012 = cuda_device::float::add_rn_f32(p01, p2);
+            let value = cuda_device::float::add_rn_f32(p012, p3);
+            unsafe { *collapsed.as_mut_ptr().add(row * h + col) = f32_to_bf16_rne(value) }
         }
     }
 
@@ -2045,17 +2768,32 @@ mod kernels {
         hash_ids: &[i64],
         mut output_ids: DisjointSlice<i32>,
         mut output_weights: DisjointSlice<f32>,
+        mut trace_softplus: DisjointSlice<f32>,
+        mut trace_post_scores: DisjointSlice<f32>,
+        mut trace_selected_scores: DisjointSlice<f32>,
+        mut trace_denom_steps: DisjointSlice<f32>,
         hash_mode: u32,
+        experts: u32,
+        route_scale: f32,
+        score_arm: u32,
     ) {
-        const EXPERTS: usize = 384;
         const TOPK: usize = 6;
+        let experts = experts as usize;
         let row = thread::index_1d().get() as usize;
-        let start = row * EXPERTS;
+        let start = row * experts;
         let output_start = row * TOPK;
-        if start + EXPERTS > logits.len()
+        // All trace buffers are either all zero-length (normal execution) or
+        // complete row-major buffers.  The trace is written from this primary
+        // selection kernel so it cannot be confused with a parity recompute.
+        let trace = trace_softplus.len() == logits.len()
+            && trace_post_scores.len() == logits.len()
+            && trace_selected_scores.len() == output_weights.len()
+            && trace_denom_steps.len() == output_weights.len();
+        if experts == 0
+            || start + experts > logits.len()
             || output_start + TOPK > output_ids.len()
             || output_start + TOPK > output_weights.len()
-            || bias.len() != EXPERTS
+            || bias.len() != experts
             || (hash_mode != 0 && output_start + TOPK > hash_ids.len())
         {
             return;
@@ -2066,32 +2804,38 @@ mod kernels {
         if hash_mode != 0 {
             for slot in 0..TOPK {
                 let id = hash_ids[output_start + slot];
-                if id < 0 || id >= EXPERTS as i64 {
+                if id < 0 || id >= experts as i64 {
                     return;
                 }
                 ids[slot] = id as i32;
-                let logit = logits[start + id as usize];
-                let softplus = if logit > 20.0 {
-                    logit
-                } else if logit > 0.0 {
-                    logit + libm::log1pf(libm::expf(-logit))
+                let softplus = router_softplus(logits[start + id as usize], score_arm);
+                raw[slot] = if score_arm != 0 {
+                    router_accurate_sqrt(softplus)
                 } else {
-                    libm::log1pf(libm::expf(logit))
+                    sqrt_newton(softplus)
                 };
-                raw[slot] = sqrt_newton(softplus);
+                if trace {
+                    unsafe {
+                        *trace_softplus.as_mut_ptr().add(start + id as usize) = softplus;
+                        *trace_post_scores.as_mut_ptr().add(start + id as usize) = raw[slot];
+                    }
+                }
             }
         } else {
             let mut selected = [f32::NEG_INFINITY; TOPK];
-            for expert in 0..EXPERTS {
-                let logit = logits[start + expert];
-                let softplus = if logit > 20.0 {
-                    logit
-                } else if logit > 0.0 {
-                    logit + libm::log1pf(libm::expf(-logit))
+            for expert in 0..experts {
+                let softplus = router_softplus(logits[start + expert], score_arm);
+                let candidate_raw = if score_arm != 0 {
+                    router_accurate_sqrt(softplus)
                 } else {
-                    libm::log1pf(libm::expf(logit))
+                    sqrt_newton(softplus)
                 };
-                let candidate_raw = sqrt_newton(softplus);
+                if trace {
+                    unsafe {
+                        *trace_softplus.as_mut_ptr().add(start + expert) = softplus;
+                        *trace_post_scores.as_mut_ptr().add(start + expert) = candidate_raw;
+                    }
+                }
                 let candidate = candidate_raw + bias[expert];
                 let mut slot = 0;
                 while slot < TOPK && candidate <= selected[slot] {
@@ -2111,17 +2855,74 @@ mod kernels {
                 }
             }
         }
-        let mut sum = 0.0;
-        for value in raw {
-            sum += value;
+        // Pinned official route denominator tree, not a generic left fold.
+        let left_04 = raw[0] + raw[4];
+        let left = left_04 + raw[2];
+        let right_15 = raw[1] + raw[5];
+        let right = right_15 + raw[3];
+        let sum = left + right;
+        if trace {
+            let tree = [left_04, left, right_15, right, sum, sum];
+            for slot in 0..TOPK {
+                unsafe {
+                    *trace_selected_scores.as_mut_ptr().add(output_start + slot) = raw[slot];
+                    *trace_denom_steps.as_mut_ptr().add(output_start + slot) = tree[slot];
+                }
+            }
         }
         for slot in 0..TOPK {
             // SAFETY: the output bounds above prove both row-local indices.
             unsafe {
                 *output_ids.as_mut_ptr().add(output_start + slot) = ids[slot];
-                *output_weights.as_mut_ptr().add(output_start + slot) = raw[slot] / sum * 2.5;
+                *output_weights.as_mut_ptr().add(output_start + slot) =
+                    raw[slot] / sum * route_scale;
             }
         }
+    }
+
+    /// Parity-only router score dump.  This never feeds routing or model state.
+    #[kernel]
+    pub fn router_post_score_v4(logits: &[f32], mut scores: DisjointSlice<f32>, score_arm: u32) {
+        let index = thread::index_1d().get() as usize;
+        if index >= logits.len() || scores.len() != logits.len() {
+            return;
+        }
+        unsafe { *scores.as_mut_ptr().add(index) = router_sqrtsoftplus(logits[index], score_arm) }
+    }
+
+    /// Parity-only selected-score trace in the already committed route order.
+    #[kernel]
+    pub fn router_selected_score_denom_v4(
+        scores: &[f32],
+        ids: &[i32],
+        mut selected_scores: DisjointSlice<f32>,
+        mut denoms: DisjointSlice<f32>,
+        experts: u32,
+    ) {
+        const TOPK: usize = 6;
+        let experts = experts as usize;
+        let row = thread::index_1d().get() as usize;
+        let start = row * experts;
+        let output_start = row * TOPK;
+        if experts == 0
+            || start + experts > scores.len()
+            || output_start + TOPK > ids.len()
+            || output_start + TOPK > selected_scores.len()
+            || row >= denoms.len()
+        {
+            return;
+        }
+        let mut denom = 0.0_f32;
+        for slot in 0..TOPK {
+            let id = ids[output_start + slot];
+            if id < 0 || id as usize >= experts {
+                return;
+            }
+            let score = scores[start + id as usize];
+            denom += score;
+            unsafe { *selected_scores.as_mut_ptr().add(output_start + slot) = score }
+        }
+        unsafe { *denoms.as_mut_ptr().add(row) = denom }
     }
 }
 
@@ -2286,6 +3087,10 @@ fn run_v4_router_gpu_oracle(
         DeviceBuffer::from_host(stream, &vec![0_i32; rows as usize * v4_router::V4_TOPK])?;
     let mut weights =
         DeviceBuffer::from_host(stream, &vec![0_f32; rows as usize * v4_router::V4_TOPK])?;
+    let mut trace_softplus = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut trace_post_scores = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut trace_selected_scores = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut trace_denom_steps = DeviceBuffer::<f32>::zeroed(stream, 0)?;
     // SAFETY: validated fixed V4 dimensions prove every kernel slice length and
     // scalar conversion. Both launches stay on the stream; terminal copies below
     // are smoke-only parity boundaries.
@@ -2306,7 +3111,14 @@ fn run_v4_router_gpu_oracle(
             &hash_ids,
             &mut ids,
             &mut weights,
+            &mut trace_softplus,
+            &mut trace_post_scores,
+            &mut trace_selected_scores,
+            &mut trace_denom_steps,
             hash_mode as u32,
+            u32::try_from(v4_router::V4_ROUTED_EXPERTS)?,
+            v4_router::V4_ROUTE_SCALE,
+            FlashRouterScoreArm::Canonical.kernel_flag(),
         )?;
     }
     Ok((
@@ -2330,6 +3142,10 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32]) {
 }
 
 fn v4_model_dir() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    v4_model_dir_for(&v4_spec::PRO)
+}
+
+fn v4_model_dir_for(spec: &'static v4_spec::V4Spec) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let path = std::env::var_os("COLIBRI_DSV4_MODEL_DIR")
         .or_else(|| std::env::var_os("COLIBRI_DSV4_DIR"))
         .map(std::path::PathBuf::from)
@@ -2339,7 +3155,8 @@ fn v4_model_dir() -> Result<std::path::PathBuf, Box<dyn Error>> {
                 .and_then(|path| path.parent().map(std::path::Path::to_owned))
         })
         .ok_or("set COLIBRI_DSV4_MODEL_DIR to the pinned ext4 snapshot")?;
-    v4_state::validate_model_dir(&path)?;
+    v4_state::validate_model_dir_for(spec, &path)?;
+    let _ = v4_state::base_indexed_model(spec, &path)?;
     Ok(path)
 }
 
@@ -2614,6 +3431,1142 @@ impl Drop for PendingResultFile {
     }
 }
 
+const FLASH_FINAL_HEAD_CAPTURE_SCHEMA: &str = "colibri-flash-0731-final-head-capture-v1";
+const FLASH_FINAL_HEAD_RUST_SCHEMA: &str = "colibri-flash-0731-final-head-rust-v1";
+
+fn final_head_u16_bytes(values: &[u16]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn final_head_f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect()
+}
+
+fn final_head_u32_bytes(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn final_head_capture_config() -> serde_json::Value {
+    serde_json::json!({
+        "base": std::env::var("COLIBRI_V4_FLASH_BASE").ok(),
+        "prefetch": std::env::var("COLIBRI_V4_FLASH_PREFETCH").ok(),
+        "stream_read_mode": std::env::var("COLIBRI_V4_STREAM_READ_MODE").ok(),
+        "mhc_linear": std::env::var("COLIBRI_V4_FLASH_MHC_LINEAR_ARM").ok(),
+        "router_linear": std::env::var("COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM").ok(),
+        "router_score": std::env::var("COLIBRI_V4_FLASH_ROUTER_SCORE_ARM").ok(),
+        "fp4_accum": std::env::var("COLIBRI_V4_FLASH_FP4_ACCUM_ARM").ok(),
+    })
+}
+
+fn write_final_head_file(path: std::path::PathBuf, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut output = PendingResultFile::reserve(path)?;
+    output.file_mut().write_all(bytes)?;
+    output.commit()
+}
+
+fn final_head_dump_dir() -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    if std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return Ok(None);
+    }
+    match std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR") {
+        None => Ok(None),
+        Some(path) if path.is_empty() => {
+            Err("COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR must not be empty".into())
+        }
+        Some(path) => Ok(Some(path.into())),
+    }
+}
+
+fn write_final_head_input(
+    directory: &std::path::Path,
+    hidden: &[u16],
+) -> Result<(), Box<dyn Error>> {
+    if hidden.len() != v4_state::HC * v4_spec::FLASH_0731.hidden {
+        return Err("Flash final-head capture hidden shape mismatch".into());
+    }
+    let bytes = final_head_u16_bytes(hidden);
+    let hidden_path = directory.join("final_hidden_bf16.bin");
+    write_final_head_file(hidden_path.clone(), &bytes)?;
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let mut manifest = PendingResultFile::reserve(directory.join("manifest.json"))?;
+    serde_json::to_writer_pretty(
+        manifest.file_mut(),
+        &serde_json::json!({
+            "schema": FLASH_FINAL_HEAD_CAPTURE_SCHEMA,
+            "model_revision": v4_spec::FLASH_0731.revision,
+            "shape": [1, v4_state::HC, v4_spec::FLASH_0731.hidden],
+            "dtype": "BF16",
+            "byte_order": "little",
+            "hidden": {
+                "file": "final_hidden_bf16.bin", "bytes": bytes.len(),
+                "fnv1a64": format!("{:016x}", fnv1a_u16(hidden)),
+                "sha256": sha256_file(&hidden_path)?,
+            },
+            "binary": {"path": binary, "sha256": sha256_file(&std::env::current_exe()?)?},
+            "config": final_head_capture_config(),
+        }),
+    )?;
+    manifest.file_mut().write_all(b"\n")?;
+    manifest.commit()
+}
+
+fn write_final_head_output(
+    directory: &std::path::Path,
+    hidden: &[u16],
+    cpu: &v4_state::FinalHeadCpuRun,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    let root = directory.join("rust-head");
+    let collapsed = final_head_u16_bytes(&cpu.output.collapsed_bf16);
+    let normalized = final_head_u16_bytes(&cpu.output.normalized_bf16);
+    let logits = final_head_f32_bytes(&cpu.output.logits_f32);
+    let collapsed_path = root.join("collapsed_bf16.bin");
+    let normalized_path = root.join("normalized_bf16.bin");
+    let logits_path = root.join("logits_f32.bin");
+    write_final_head_file(collapsed_path.clone(), &collapsed)?;
+    write_final_head_file(normalized_path.clone(), &normalized)?;
+    write_final_head_file(logits_path.clone(), &logits)?;
+    let mut manifest = PendingResultFile::reserve(root.join("manifest.json"))?;
+    serde_json::to_writer_pretty(
+        manifest.file_mut(),
+        &serde_json::json!({
+            "schema": FLASH_FINAL_HEAD_RUST_SCHEMA, "mode": mode,
+            "model_revision": v4_spec::FLASH_0731.revision,
+            "input_hidden_fnv1a64": format!("{:016x}", fnv1a_u16(hidden)),
+            "collapsed_bf16": {"file":"collapsed_bf16.bin","shape":[1,v4_spec::FLASH_0731.hidden],"fnv1a64":format!("{:016x}",fnv1a_u16(&cpu.output.collapsed_bf16)),"sha256":sha256_file(&collapsed_path)?},
+            "normalized_bf16": {"file":"normalized_bf16.bin","shape":[1,v4_spec::FLASH_0731.hidden],"fnv1a64":format!("{:016x}",fnv1a_u16(&cpu.output.normalized_bf16)),"sha256":sha256_file(&normalized_path)?},
+            "logits_f32": {"file":"logits_f32.bin","shape":[1,v4_spec::FLASH_0731.vocab],"fnv1a64":format!("{:016x}",fnv1a_f32(&cpu.output.logits_f32)),"sha256":sha256_file(&logits_path)?},
+            "argmax": cpu.output.argmax[0],
+        }),
+    )?;
+    manifest.file_mut().write_all(b"\n")?;
+    manifest.commit()
+}
+
+fn final_head_trace_float(value: f32) -> serde_json::Value {
+    serde_json::json!({"bits": format!("0x{:08x}", value.to_bits()), "value": value})
+}
+
+/// A head-only diagnostic sidecar.  It deliberately does not alter the capture
+/// schema or the production final-head call: fields marked `scalar_replay` are
+/// recomputed from the locked input with the same scalar Rust formula solely to
+/// make a reduction boundary inspectable.
+fn write_final_head_replay_trace(
+    directory: &std::path::Path,
+    hidden: &[u16],
+    weights: &v4_state::FinalHeadWeights,
+    cpu: &v4_state::FinalHeadCpuRun,
+) -> Result<(), Box<dyn Error>> {
+    const COLLAPSE_COLUMN: usize = 3661;
+    let width = v4_state::HC * v4_spec::FLASH_0731.hidden;
+    if hidden.len() != width || COLLAPSE_COLUMN >= v4_spec::FLASH_0731.hidden {
+        return Err("Flash final-head replay trace shape mismatch".into());
+    }
+    // This invokes the production gate once and makes the resulting pre4 bits
+    // explicit.  The individual dot/partial fields below cannot be recovered
+    // from that API and are therefore labelled scalar_replay.
+    let pre_actual = v4_state::final_hc_gate_cpu(
+        hidden,
+        1,
+        v4_state::HC,
+        v4_spec::FLASH_0731.hidden,
+        &weights.hc_fn_f32,
+        weights.hc_scale_f32,
+        &weights.hc_base_f32,
+    )?;
+    let square_sum = hidden
+        .iter()
+        .map(|&bits| {
+            let value = v4_router::bf16_to_f32(bits);
+            value * value
+        })
+        .sum::<f32>();
+    let mean_plus_eps = square_sum / width as f32 + 1e-6_f32;
+    let rsqrt = 1.0_f32 / mean_plus_eps.sqrt();
+    let mut gates = Vec::with_capacity(v4_state::HC);
+    for copy in 0..v4_state::HC {
+        let mut dot = 0.0_f32;
+        for column in 0..width {
+            dot +=
+                v4_router::bf16_to_f32(hidden[column]) * weights.hc_fn_f32[copy * width + column];
+        }
+        let scaled = dot * rsqrt;
+        let affine = scaled * weights.hc_scale_f32 + weights.hc_base_f32[copy];
+        let pre_replay = 1.0_f32 / (1.0_f32 + (-affine).exp()) + 1e-6_f32;
+        gates.push(serde_json::json!({
+            "copy": copy,
+            "raw_dot_scalar_replay": final_head_trace_float(dot),
+            "scaled_scalar_replay": final_head_trace_float(scaled),
+            "affine_scalar_replay": final_head_trace_float(affine),
+            "pre_scalar_replay": final_head_trace_float(pre_replay),
+            "pre_actual": final_head_trace_float(pre_actual[copy]),
+        }));
+    }
+    let mut partial = 0.0_f32;
+    let mut collapse_terms = Vec::with_capacity(v4_state::HC);
+    for copy in 0..v4_state::HC {
+        let input_bits = hidden[copy * v4_spec::FLASH_0731.hidden + COLLAPSE_COLUMN];
+        let input = v4_router::bf16_to_f32(input_bits);
+        let product = pre_actual[copy] * input;
+        partial += product;
+        collapse_terms.push(serde_json::json!({
+            "copy": copy,
+            "input_bf16_bits": format!("0x{input_bits:04x}"),
+            "input_f32": final_head_trace_float(input),
+            "pre_actual": final_head_trace_float(pre_actual[copy]),
+            "product_scalar_replay": final_head_trace_float(product),
+            "partial_scalar_replay": final_head_trace_float(partial),
+        }));
+    }
+    let trace = serde_json::json!({
+        "schema": "colibri-flash-0731-final-head-replay-trace-v1",
+        "scope": "head_only",
+        "gate": {
+            "square_sum_scalar_replay": final_head_trace_float(square_sum),
+            "mean_plus_eps_scalar_replay": final_head_trace_float(mean_plus_eps),
+            "rsqrt_scalar_replay": final_head_trace_float(rsqrt),
+            "pre4_actual": pre_actual.iter().map(|&value| final_head_trace_float(value)).collect::<Vec<_>>(),
+            "copies": gates,
+        },
+        "collapse_index_3661": {
+            "terms": collapse_terms,
+            "collapsed_bf16_actual": format!("0x{:04x}", cpu.output.collapsed_bf16[COLLAPSE_COLUMN]),
+            "partials": "scalar_replay; production final_hc_head_cpu does not expose internal partials",
+        },
+    });
+    let mut output =
+        PendingResultFile::reserve(directory.join("rust-head").join("head-trace.json"))?;
+    serde_json::to_writer_pretty(output.file_mut(), &trace)?;
+    output.file_mut().write_all(b"\n")?;
+    output.commit()
+}
+
+fn flash_final_head_candidate_sm89() -> Result<String, Box<dyn Error>> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits"])
+        .output()?;
+    if !output.status.success() {
+        return Err("Flash final-head GPU candidate requires nvidia-smi compute_cap".into());
+    }
+    let capability = std::str::from_utf8(&output.stdout)?.trim();
+    if capability != "8.9" {
+        return Err(
+            format!("Flash final-head GPU candidate requires SM 8.9, got {capability}").into(),
+        );
+    }
+    Ok(capability.into())
+}
+
+fn validate_flash_final_head_candidate_config(
+    manifest: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let config = manifest["config"]
+        .as_object()
+        .ok_or("Flash final-head candidate input lacks config")?;
+    for (name, expected) in [
+        ("base", "1"),
+        ("prefetch", "1"),
+        ("stream_read_mode", "buffered"),
+        ("mhc_linear", "cublas"),
+        ("router_linear", "cublas"),
+        ("router_score", "libdevice"),
+        ("fp4_accum", "fp8_mma"),
+    ] {
+        if config.get(name).and_then(serde_json::Value::as_str) != Some(expected) {
+            return Err(
+                format!("Flash final-head candidate requires captured {name}={expected}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlashFinalHeadArm {
+    Cpu,
+    GpuExact,
+}
+
+fn flash_final_head_arm_for(
+    spec: &v4_spec::V4Spec,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<FlashFinalHeadArm, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 {
+        if value.is_some() {
+            return Err("COLIBRI_V4_FLASH_FINAL_HEAD_ARM is Flash-0731 base only".into());
+        }
+        return Ok(FlashFinalHeadArm::Cpu);
+    }
+    match value {
+        None => Ok(FlashFinalHeadArm::Cpu),
+        Some(value) if value == "cpu" => Ok(FlashFinalHeadArm::Cpu),
+        Some(value) if value == "gpu_exact" => Ok(FlashFinalHeadArm::GpuExact),
+        Some(_) => Err("COLIBRI_V4_FLASH_FINAL_HEAD_ARM must be cpu or gpu_exact".into()),
+    }
+}
+
+fn flash_final_head_arm(spec: &v4_spec::V4Spec) -> Result<FlashFinalHeadArm, Box<dyn Error>> {
+    flash_final_head_arm_for(
+        spec,
+        std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_ARM").as_deref(),
+    )
+}
+
+fn flash_final_head_gpu_production_dir() -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let result = std::env::var_os("COLIBRI_V4_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_RESULT_JSONL for Flash GPU exact final head")?;
+    let parent = result
+        .parent()
+        .ok_or("Flash GPU exact result path has no parent")?;
+    Ok(parent.join("flash-final-head-gpu-exact"))
+}
+
+const FLASH_FINAL_HEAD_CANDIDATE_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
+
+fn final_head_candidate_observe_device_free(minimum: &mut usize) -> Result<(), Box<dyn Error>> {
+    *minimum = (*minimum).min(device_available_bytes()?);
+    Ok(())
+}
+
+fn final_head_candidate_memory_gate(
+    stage: &str,
+    required_device_bytes: usize,
+    required_host_bytes: usize,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    let free_device = device_available_bytes()?;
+    let free_host = host_available_bytes()?;
+    let device_required = required_device_bytes
+        .checked_add(FLASH_FINAL_HEAD_CANDIDATE_HEADROOM_BYTES)
+        .ok_or("Flash final-head candidate device capacity overflow")?;
+    if free_device < device_required || free_host < required_host_bytes {
+        return Err(format!(
+            "Flash final-head candidate {stage} capacity requires device={device_required} (payload={required_device_bytes} headroom={FLASH_FINAL_HEAD_CANDIDATE_HEADROOM_BYTES}) and host={required_host_bytes}, available device={free_device} host={free_host}"
+        )
+        .into());
+    }
+    Ok((free_device, free_host))
+}
+
+fn final_head_candidate_official_tensor(
+    directory: &std::path::Path,
+    manifest: &serde_json::Value,
+    tensor: &str,
+    filename: &str,
+    dtype: &str,
+    expected_bytes: usize,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let entry = &manifest["tensors"][tensor];
+    if entry["file"] != filename || entry["dtype"] != dtype {
+        return Err(format!("Flash final-head official {tensor} manifest mismatch").into());
+    }
+    let bytes = std::fs::read(directory.join(filename))?;
+    if bytes.len() != expected_bytes
+        || sha256_bytes(&bytes)? != entry["sha256"].as_str().unwrap_or_default()
+    {
+        return Err(format!("Flash final-head official {tensor} bytes mismatch").into());
+    }
+    Ok(bytes)
+}
+
+fn final_head_candidate_require_exact(
+    stage: &str,
+    actual: &[u8],
+    expected: &[u8],
+    element_bytes: usize,
+) -> Result<(), Box<dyn Error>> {
+    if element_bytes == 0 || actual.len() != expected.len() || actual.len() % element_bytes != 0 {
+        return Err(format!("Flash final-head {stage} comparison shape mismatch").into());
+    }
+    if let Some(byte) = actual
+        .iter()
+        .zip(expected)
+        .position(|(left, right)| left != right)
+    {
+        let element = byte / element_bytes;
+        let start = element * element_bytes;
+        return Err(format!(
+            "Flash final-head {stage} first divergence element={element} byte={byte} actual={:02x?} expected={:02x?}",
+            &actual[start..start + element_bytes],
+            &expected[start..start + element_bytes],
+        )
+        .into());
+    }
+    Ok(())
+}
+
+struct FlashFinalHeadGpuExactRun {
+    output: v4_state::FinalHeadOutput,
+    source_bytes: usize,
+    timing: serde_json::Value,
+    memory: serde_json::Value,
+}
+
+fn run_flash_final_head_gpu_exact(
+    output_dir: &std::path::Path,
+    verification_manifest: Option<&serde_json::Value>,
+    hidden: &[u16],
+    weights: &v4_state::FinalHeadWeights,
+) -> Result<FlashFinalHeadGpuExactRun, Box<dyn Error>> {
+    if let Some(manifest) = verification_manifest {
+        validate_flash_final_head_candidate_config(manifest)?;
+    }
+    let sm = flash_final_head_candidate_sm89()?;
+    if hidden.len() != v4_state::HC * v4_spec::FLASH_0731.hidden
+        || weights.hc_fn_f32.len() != v4_state::HC * hidden.len()
+        || weights.hc_base_f32.len() != v4_state::HC
+    {
+        return Err("Flash final-head GPU candidate locked geometry mismatch".into());
+    }
+    let official = if verification_manifest.is_some() {
+        let directory = std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR")
+            .map(std::path::PathBuf::from)
+            .ok_or("set COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR for GPU exact comparison")?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+        if manifest["schema"] != "colibri-flash-0731-final-head-official-v1"
+            || manifest["model_revision"] != v4_spec::FLASH_0731.revision
+            || manifest["input_hidden_fnv1a64"] != format!("{:016x}", fnv1a_u16(hidden))
+        {
+            return Err("Flash final-head official comparison manifest mismatch".into());
+        }
+        Some((directory, manifest))
+    } else {
+        None
+    };
+    let hidden_bytes = hidden
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or("Flash final-head hidden byte count overflow")?;
+    let gate_weight_bytes = weights
+        .hc_fn_f32
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("Flash final-head gate byte count overflow")?;
+    let base_device_payload = hidden_bytes
+        .checked_add(gate_weight_bytes)
+        .and_then(|bytes| bytes.checked_add(hidden.len() * std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_add(hidden.len() * std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_add(cublas_exact::WORKSPACE_BYTES))
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or("Flash final-head base device capacity overflow")?;
+    let context = CudaContext::new(0)?;
+    let (device_free_before, host_free_before) =
+        final_head_candidate_memory_gate("gate", base_device_payload, 0)?;
+    let mut device_free_min = device_free_before;
+    let total_started = std::time::Instant::now();
+    let stream = context.default_stream();
+    let module = kernels::load(&context)?;
+    let gate_h2d_started = std::time::Instant::now();
+    let input = DeviceBuffer::from_host(&stream, hidden)?;
+    let hc_fn = DeviceBuffer::from_host(&stream, &weights.hc_fn_f32)?;
+    let hc_scale = DeviceBuffer::from_host(&stream, &[weights.hc_scale_f32])?;
+    let hc_base = DeviceBuffer::from_host(&stream, &weights.hc_base_f32)?;
+    let mut input_f32 = DeviceBuffer::<f32>::zeroed(&stream, hidden.len())?;
+    let mut squares = DeviceBuffer::<f32>::zeroed(&stream, hidden.len())?;
+    let raw_dot = DeviceBuffer::<f32>::zeroed(&stream, v4_state::HC)?;
+    let mut rsqrt = DeviceBuffer::<f32>::zeroed(&stream, 1)?;
+    let mut rms_debug = DeviceBuffer::<u32>::zeroed(&stream, FLASH_MHC_RSQRT_DEBUG_FIELDS)?;
+    let mut pre = DeviceBuffer::<f32>::zeroed(&stream, v4_state::HC)?;
+    let mut collapsed = DeviceBuffer::<u16>::zeroed(&stream, v4_spec::FLASH_0731.hidden)?;
+    let cublas = cublas_exact::CublasExact::load()?;
+    let workspace = DeviceBuffer::<u8>::zeroed(&stream, cublas_exact::WORKSPACE_BYTES)?;
+    stream.synchronize()?;
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let gate_h2d_ms = gate_h2d_started.elapsed().as_secs_f64() * 1_000.0;
+    let gate_kernel_started = std::time::Instant::now();
+    launch_v4_bf16_to_f32(&module, &stream, &input, &mut input_f32)?;
+    let device_const = |pointer: u64| pointer as usize as *const std::ffi::c_void;
+    let device_mut = |pointer: u64| pointer as usize as *mut std::ffi::c_void;
+    cublas.sgemm_mn1(
+        stream.cu_stream().cast::<std::ffi::c_void>(),
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(hc_fn.cu_deviceptr()),
+        device_const(input_f32.cu_deviceptr()),
+        device_mut(raw_dot.cu_deviceptr()),
+        v4_state::HC,
+        hidden.len(),
+    )?;
+    // SAFETY: fixed 16K gate geometry, locked BF16 input, and disjoint output
+    // lanes are established above.  This path is replay-only.
+    unsafe {
+        module.rmsnorm_flash_square_bf16(
+            &stream,
+            LaunchConfig::for_num_elems(u32::try_from(hidden.len())?),
+            &input,
+            &mut squares,
+        )?;
+        module.mhc_flash_reduce_rsqrt_16384(
+            &stream,
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (512, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &squares,
+            &mut rsqrt,
+            &mut rms_debug,
+        )?;
+        module.flash_final_head_sigmoid_collapse4(
+            &stream,
+            LaunchConfig::for_num_elems(u32::try_from(v4_spec::FLASH_0731.hidden)?),
+            &input,
+            &raw_dot,
+            &rsqrt,
+            &hc_scale,
+            &hc_base,
+            &mut pre,
+            &mut collapsed,
+        )?;
+    }
+    stream.synchronize()?;
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let gate_kernel_ms = gate_kernel_started.elapsed().as_secs_f64() * 1_000.0;
+    let gate_d2h_started = std::time::Instant::now();
+    let raw_dot = raw_dot.to_host_vec(&stream)?;
+    let rsqrt = rsqrt.to_host_vec(&stream)?;
+    let rms_debug = rms_debug.to_host_vec(&stream)?;
+    let pre = pre.to_host_vec(&stream)?;
+    let collapsed = collapsed.to_host_vec(&stream)?;
+    let gate_d2h_ms = gate_d2h_started.elapsed().as_secs_f64() * 1_000.0;
+    if rsqrt.len() != 1 || rms_debug.len() != FLASH_MHC_RSQRT_DEBUG_FIELDS {
+        return Err("Flash final-head GPU candidate trace shape mismatch".into());
+    }
+    let root = output_dir.join("gpu-exact-candidate");
+    let raw_dot_path = root.join("raw_dot_f32.bin");
+    let pre_path = root.join("pre_f32.bin");
+    let collapsed_path = root.join("collapsed_bf16.bin");
+    let rms_path = root.join("rms_debug_u32.bin");
+    write_final_head_file(raw_dot_path.clone(), &final_head_f32_bytes(&raw_dot))?;
+    write_final_head_file(pre_path.clone(), &final_head_f32_bytes(&pre))?;
+    write_final_head_file(collapsed_path.clone(), &final_head_u16_bytes(&collapsed))?;
+    write_final_head_file(rms_path.clone(), &final_head_u32_bytes(&rms_debug))?;
+    if let Some((directory, manifest)) = official.as_ref() {
+        let expected = final_head_candidate_official_tensor(
+            directory,
+            manifest,
+            "collapsed_bf16",
+            "collapsed_bf16.bin",
+            "BF16",
+            collapsed.len() * std::mem::size_of::<u16>(),
+        )?;
+        final_head_candidate_require_exact(
+            "collapsed_bf16",
+            &final_head_u16_bytes(&collapsed),
+            &expected,
+            std::mem::size_of::<u16>(),
+        )?;
+    }
+
+    let norm_h2d_started = std::time::Instant::now();
+    let norm_weight = DeviceBuffer::from_host(&stream, &weights.norm_bf16)?;
+    let collapsed_device = DeviceBuffer::from_host(&stream, &collapsed)?;
+    let mut normalized_device = DeviceBuffer::<u16>::zeroed(&stream, v4_spec::FLASH_0731.hidden)?;
+    let mut norm_trace = DeviceBuffer::<f32>::zeroed(&stream, 0)?;
+    stream.synchronize()?;
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let norm_h2d_ms = norm_h2d_started.elapsed().as_secs_f64() * 1_000.0;
+    let norm_kernel_started = std::time::Instant::now();
+    run_flash_learned_rmsnorm_4096_device_into(
+        &module,
+        &stream,
+        &collapsed_device,
+        &norm_weight,
+        &mut normalized_device,
+        &mut norm_trace,
+    )?;
+    stream.synchronize()?;
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let norm_kernel_ms = norm_kernel_started.elapsed().as_secs_f64() * 1_000.0;
+    let norm_d2h_started = std::time::Instant::now();
+    let normalized = normalized_device.to_host_vec(&stream)?;
+    let norm_d2h_ms = norm_d2h_started.elapsed().as_secs_f64() * 1_000.0;
+    let normalized_path = root.join("normalized_bf16.bin");
+    let normalized_bytes = final_head_u16_bytes(&normalized);
+    write_final_head_file(normalized_path.clone(), &normalized_bytes)?;
+    if let Some((directory, manifest)) = official.as_ref() {
+        let expected = final_head_candidate_official_tensor(
+            directory,
+            manifest,
+            "normalized_bf16",
+            "normalized_bf16.bin",
+            "BF16",
+            normalized_bytes.len(),
+        )?;
+        final_head_candidate_require_exact(
+            "normalized_bf16",
+            &normalized_bytes,
+            &expected,
+            std::mem::size_of::<u16>(),
+        )?;
+    }
+
+    let head_elements = v4_spec::FLASH_0731
+        .vocab
+        .checked_mul(v4_spec::FLASH_0731.hidden)
+        .ok_or("Flash final-head full head element count overflow")?;
+    let head_source_bytes = head_elements
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or("Flash final-head full head source byte count overflow")?;
+    let head_f32_bytes = head_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("Flash final-head full head FP32 byte count overflow")?;
+    let logits_bytes = v4_spec::FLASH_0731
+        .vocab
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("Flash final-head logits byte count overflow")?;
+    let full_device_payload = base_device_payload
+        .checked_add(head_source_bytes)
+        .and_then(|bytes| bytes.checked_add(head_f32_bytes))
+        .and_then(|bytes| bytes.checked_add(logits_bytes))
+        .ok_or("Flash final-head full head device capacity overflow")?;
+    final_head_candidate_memory_gate("full_head", full_device_payload, head_source_bytes)?;
+    let head_load_started = std::time::Instant::now();
+    let mut head_bf16 = vec![0_u16; head_elements];
+    // SAFETY: `u16` is two bytes and the vec owns exactly `head_source_bytes`
+    // contiguous bytes; the pinned checkpoint is little-endian BF16.
+    let head_bytes = unsafe {
+        std::slice::from_raw_parts_mut(head_bf16.as_mut_ptr().cast::<u8>(), head_source_bytes)
+    };
+    weights.read_head_weight_bytes(0, v4_spec::FLASH_0731.vocab, head_bytes)?;
+    let head_load_ms = head_load_started.elapsed().as_secs_f64() * 1_000.0;
+    let logits_h2d_started = std::time::Instant::now();
+    let head_bf16_device = DeviceBuffer::from_host(&stream, &head_bf16)?;
+    drop(head_bf16);
+    let mut head_device = DeviceBuffer::<f32>::zeroed(&stream, head_elements)?;
+    let logits_device = DeviceBuffer::<f32>::zeroed(&stream, v4_spec::FLASH_0731.vocab)?;
+    let mut normalized_f32 = DeviceBuffer::<f32>::zeroed(&stream, v4_spec::FLASH_0731.hidden)?;
+    launch_v4_bf16_to_f32(&module, &stream, &head_bf16_device, &mut head_device)?;
+    launch_v4_bf16_to_f32(&module, &stream, &normalized_device, &mut normalized_f32)?;
+    stream.synchronize()?;
+    drop(head_bf16_device);
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let logits_h2d_ms = logits_h2d_started.elapsed().as_secs_f64() * 1_000.0;
+    let logits_kernel_started = std::time::Instant::now();
+    cublas.sgemm_mn1(
+        stream.cu_stream().cast::<std::ffi::c_void>(),
+        device_mut(workspace.cu_deviceptr()),
+        workspace.num_bytes(),
+        device_const(head_device.cu_deviceptr()),
+        device_const(normalized_f32.cu_deviceptr()),
+        device_mut(logits_device.cu_deviceptr()),
+        v4_spec::FLASH_0731.vocab,
+        v4_spec::FLASH_0731.hidden,
+    )?;
+    stream.synchronize()?;
+    final_head_candidate_observe_device_free(&mut device_free_min)?;
+    let logits_kernel_ms = logits_kernel_started.elapsed().as_secs_f64() * 1_000.0;
+    let logits_d2h_started = std::time::Instant::now();
+    let logits = logits_device.to_host_vec(&stream)?;
+    let logits_d2h_ms = logits_d2h_started.elapsed().as_secs_f64() * 1_000.0;
+    let logits_path = root.join("logits_f32.bin");
+    let logits_bytes_raw = final_head_f32_bytes(&logits);
+    write_final_head_file(logits_path.clone(), &logits_bytes_raw)?;
+    if let Some((directory, manifest)) = official.as_ref() {
+        let expected = final_head_candidate_official_tensor(
+            directory,
+            manifest,
+            "logits_f32",
+            "logits_f32.bin",
+            "F32",
+            logits_bytes_raw.len(),
+        )?;
+        final_head_candidate_require_exact(
+            "logits_f32",
+            &logits_bytes_raw,
+            &expected,
+            std::mem::size_of::<f32>(),
+        )?;
+    }
+    let (&first_logit, tail) = logits
+        .split_first()
+        .ok_or("Flash final-head logits are empty")?;
+    let mut argmax = 0_usize;
+    let mut max_logit = first_logit;
+    for (offset, &logit) in tail.iter().enumerate() {
+        if logit > max_logit {
+            argmax = offset + 1;
+            max_logit = logit;
+        }
+    }
+    if let Some((_, manifest)) = official.as_ref() {
+        if manifest["argmax"].as_u64() != Some(u64::try_from(argmax)?) {
+            return Err(format!("Flash final-head argmax mismatch actual={argmax}").into());
+        }
+    }
+    let timing = serde_json::json!({"gate_h2d":gate_h2d_ms, "gate_kernel":gate_kernel_ms, "gate_d2h":gate_d2h_ms, "norm_h2d":norm_h2d_ms, "norm_kernel":norm_kernel_ms, "norm_d2h":norm_d2h_ms, "head_load_and_promote":head_load_ms, "logits_h2d":logits_h2d_ms, "logits_kernel":logits_kernel_ms, "logits_d2h":logits_d2h_ms, "total":total_started.elapsed().as_secs_f64()*1_000.0});
+    let memory = serde_json::json!({"device_free_before":device_free_before, "device_free_min":device_free_min, "device_peak_observed":device_free_before.saturating_sub(device_free_min), "host_free_before":host_free_before, "full_head_source":head_source_bytes, "full_head_fp32":head_f32_bytes, "headroom":FLASH_FINAL_HEAD_CANDIDATE_HEADROOM_BYTES});
+    let provenance = cublas.provenance();
+    let mut output = PendingResultFile::reserve(root.join("manifest.json"))?;
+    serde_json::to_writer_pretty(
+        output.file_mut(),
+        &serde_json::json!({
+            "schema": "colibri-flash-0731-final-head-gpu-exact-v1",
+            "scope": if official.is_some() { "head_only_replay_with_official_comparison" } else { "runtime_gpu_exact_without_per_input_oracle" }, "arm": "gpu_exact",
+            "input_hidden_fnv1a64": format!("{:016x}", fnv1a_u16(hidden)),
+            "sm": sm,
+            "binary": {"path": std::env::current_exe()?.canonicalize()?, "sha256": sha256_file(&std::env::current_exe()?)?},
+            "cublas": {"sha256": provenance.actual_sha256, "version": provenance.version, "math_mode": "CUBLAS_DEFAULT_MATH", "tf32": "off", "gate":{"m":4, "n":1, "k":16384}, "head":{"m":129280, "n":1, "k":4096}},
+            "config": verification_manifest.map(|manifest| manifest["config"].clone()).unwrap_or(serde_json::Value::Null),
+            "official_comparison": official.as_ref().map(|(directory, _)| serde_json::json!({"directory": directory, "collapsed_bf16":"exact", "normalized_bf16":"exact", "logits_f32":"exact", "argmax":argmax})).unwrap_or_else(|| serde_json::json!({"status":"not_requested","reason":"runtime input has no independent official oracle"})),
+            "timing_ms": timing.clone(),
+            "memory_bytes": memory.clone(),
+            "rms": {"debug_fields": ["square_sum", "mean_plus_eps", "newton_rsqrt", "libdevice_sqrt_rsqrt", "libdevice_rsqrt"], "debug_bits": rms_debug.iter().map(|value| format!("0x{value:08x}")).collect::<Vec<_>>(), "rsqrt_bits": format!("0x{:08x}", rsqrt[0].to_bits())},
+            "raw_dot_f32": {"file":"raw_dot_f32.bin", "bits": raw_dot.iter().map(|value| format!("0x{:08x}",value.to_bits())).collect::<Vec<_>>(), "sha256":sha256_file(&raw_dot_path)?},
+            "pre_f32": {"file":"pre_f32.bin", "bits": pre.iter().map(|value| format!("0x{:08x}",value.to_bits())).collect::<Vec<_>>(), "sha256":sha256_file(&pre_path)?},
+            "collapsed_bf16": {"file":"collapsed_bf16.bin", "fnv1a64":format!("{:016x}",fnv1a_u16(&collapsed)), "sha256":sha256_file(&collapsed_path)?},
+            "normalized_bf16": {"file":"normalized_bf16.bin", "fnv1a64":format!("{:016x}",fnv1a_u16(&normalized)), "sha256":sha256_file(&normalized_path)?},
+            "logits_f32": {"file":"logits_f32.bin", "fnv1a64":format!("{:016x}",fnv1a_f32(&logits)), "sha256":sha256_file(&logits_path)?},
+            "rms_debug_u32": {"file":"rms_debug_u32.bin", "sha256":sha256_file(&rms_path)?},
+        }),
+    )?;
+    output.file_mut().write_all(b"\n")?;
+    output.commit()?;
+    Ok(FlashFinalHeadGpuExactRun {
+        output: v4_state::FinalHeadOutput {
+            collapsed_bf16: collapsed,
+            normalized_bf16: normalized,
+            logits_f32: logits,
+            argmax: vec![argmax],
+        },
+        source_bytes: head_source_bytes,
+        timing,
+        memory,
+    })
+}
+
+// DSpark validates up to six base targets in one round.  The exact output
+// head is immutable, so keep its BF16-to-FP32 promotion and cuBLAS workspace
+// for that round's lifetime instead of rebuilding a multi-GiB context per
+// target.  Per-input gate/norm/logit buffers remain call-local.
+struct FlashDsparkFinalHeadGpuWorkspace {
+    stream: std::sync::Arc<CudaStream>,
+    module: kernels::LoadedModule,
+    hc_fn: DeviceBuffer<f32>,
+    hc_scale: DeviceBuffer<f32>,
+    hc_base: DeviceBuffer<f32>,
+    norm: DeviceBuffer<u16>,
+    head: DeviceBuffer<f32>,
+    cublas: cublas_exact::CublasExact,
+    cublas_workspace: DeviceBuffer<u8>,
+    head_source_bytes: usize,
+    head_f32_bytes: usize,
+    device_free_after_load: usize,
+    _context: std::sync::Arc<CudaContext>,
+}
+
+impl FlashDsparkFinalHeadGpuWorkspace {
+    fn new(weights: &v4_state::FinalHeadWeights) -> Result<Self, Box<dyn Error>> {
+        let head_elements = v4_spec::FLASH_0731
+            .vocab
+            .checked_mul(v4_spec::FLASH_0731.hidden)
+            .ok_or("Flash DSpark final-head element count overflow")?;
+        let head_source_bytes = head_elements
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or("Flash DSpark final-head source byte count overflow")?;
+        let head_f32_bytes = head_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or("Flash DSpark final-head FP32 byte count overflow")?;
+        let context = CudaContext::new(0)?;
+        let stream = context.default_stream();
+        let module = kernels::load(&context)?;
+        let gate_bytes = weights
+            .hc_fn_f32
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or("Flash DSpark gate byte count overflow")?;
+        let payload = head_source_bytes
+            .checked_add(head_f32_bytes)
+            .and_then(|bytes| bytes.checked_add(gate_bytes))
+            .and_then(|bytes| bytes.checked_add(cublas_exact::WORKSPACE_BYTES))
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or("Flash DSpark final-head device capacity overflow")?;
+        final_head_candidate_memory_gate("dspark_workspace", payload, head_source_bytes)?;
+        let mut head_bf16 = vec![0_u16; head_elements];
+        // SAFETY: the owning u16 vector has exactly the checkpoint's BF16 byte
+        // extent and the source checkpoint is little-endian.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(head_bf16.as_mut_ptr().cast::<u8>(), head_source_bytes)
+        };
+        weights.read_head_weight_bytes(0, v4_spec::FLASH_0731.vocab, bytes)?;
+        let head_bf16_device = DeviceBuffer::from_host(&stream, &head_bf16)?;
+        drop(head_bf16);
+        let mut head = DeviceBuffer::<f32>::zeroed(&stream, head_elements)?;
+        let hc_fn = DeviceBuffer::from_host(&stream, &weights.hc_fn_f32)?;
+        let hc_scale = DeviceBuffer::from_host(&stream, &[weights.hc_scale_f32])?;
+        let hc_base = DeviceBuffer::from_host(&stream, &weights.hc_base_f32)?;
+        let norm = DeviceBuffer::from_host(&stream, &weights.norm_bf16)?;
+        let cublas = cublas_exact::CublasExact::load()?;
+        let cublas_workspace = DeviceBuffer::<u8>::zeroed(&stream, cublas_exact::WORKSPACE_BYTES)?;
+        launch_v4_bf16_to_f32(&module, &stream, &head_bf16_device, &mut head)?;
+        stream.synchronize()?;
+        drop(head_bf16_device);
+        Ok(Self {
+            stream,
+            module,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm,
+            head,
+            cublas,
+            cublas_workspace,
+            head_source_bytes,
+            head_f32_bytes,
+            device_free_after_load: device_available_bytes()?,
+            _context: context,
+        })
+    }
+
+    fn run(
+        &self,
+        output_dir: &std::path::Path,
+        verification_manifest: Option<&serde_json::Value>,
+        hidden: &[u16],
+    ) -> Result<FlashFinalHeadGpuExactRun, Box<dyn Error>> {
+        self.run_inner(Some(output_dir), verification_manifest, hidden)
+    }
+
+    // The serving and DSpark paths need the same exact arithmetic, but no
+    // per-token artifacts or capture-only provenance contract.
+    fn run_runtime(&self, hidden: &[u16]) -> Result<FlashFinalHeadGpuExactRun, Box<dyn Error>> {
+        self.run_inner(None, None, hidden)
+    }
+
+    fn run_inner(
+        &self,
+        output_dir: Option<&std::path::Path>,
+        verification_manifest: Option<&serde_json::Value>,
+        hidden: &[u16],
+    ) -> Result<FlashFinalHeadGpuExactRun, Box<dyn Error>> {
+        if let Some(manifest) = verification_manifest {
+            validate_flash_final_head_candidate_config(manifest)?;
+        }
+        if hidden.len() != v4_state::HC * v4_spec::FLASH_0731.hidden {
+            return Err("Flash DSpark GPU final-head hidden geometry mismatch".into());
+        }
+        let official = if verification_manifest.is_some() {
+            let directory = std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR")
+                .map(std::path::PathBuf::from)
+                .ok_or("set COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR for GPU exact comparison")?;
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+            if manifest["schema"] != "colibri-flash-0731-final-head-official-v1"
+                || manifest["model_revision"] != v4_spec::FLASH_0731.revision
+                || manifest["input_hidden_fnv1a64"] != format!("{:016x}", fnv1a_u16(hidden))
+            {
+                return Err("Flash DSpark final-head official comparison manifest mismatch".into());
+            }
+            Some((directory, manifest))
+        } else {
+            None
+        };
+        let total_started = std::time::Instant::now();
+        let free_before = device_available_bytes()?;
+        let mut free_min = free_before;
+        let input = DeviceBuffer::from_host(&self.stream, hidden)?;
+        let mut input_f32 = DeviceBuffer::<f32>::zeroed(&self.stream, hidden.len())?;
+        let mut squares = DeviceBuffer::<f32>::zeroed(&self.stream, hidden.len())?;
+        let mut raw_dot = DeviceBuffer::<f32>::zeroed(&self.stream, v4_state::HC)?;
+        let mut rsqrt = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
+        let mut rms_debug =
+            DeviceBuffer::<u32>::zeroed(&self.stream, FLASH_MHC_RSQRT_DEBUG_FIELDS)?;
+        let mut pre = DeviceBuffer::<f32>::zeroed(&self.stream, v4_state::HC)?;
+        let mut collapsed_device =
+            DeviceBuffer::<u16>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
+        let gate_started = std::time::Instant::now();
+        launch_v4_bf16_to_f32(&self.module, &self.stream, &input, &mut input_f32)?;
+        let device_const = |pointer: u64| pointer as usize as *const std::ffi::c_void;
+        let device_mut = |pointer: u64| pointer as usize as *mut std::ffi::c_void;
+        self.cublas.sgemm_mn1(
+            self.stream.cu_stream().cast::<std::ffi::c_void>(),
+            device_mut(self.cublas_workspace.cu_deviceptr()),
+            self.cublas_workspace.num_bytes(),
+            device_const(self.hc_fn.cu_deviceptr()),
+            device_const(input_f32.cu_deviceptr()),
+            device_mut(raw_dot.cu_deviceptr()),
+            v4_state::HC,
+            hidden.len(),
+        )?;
+        // SAFETY: fixed four-lane Flash geometry and disjoint device buffers.
+        unsafe {
+            self.module.rmsnorm_flash_square_bf16(
+                &self.stream,
+                LaunchConfig::for_num_elems(u32::try_from(hidden.len())?),
+                &input,
+                &mut squares,
+            )?;
+            self.module.mhc_flash_reduce_rsqrt_16384(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (512, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &squares,
+                &mut rsqrt,
+                &mut rms_debug,
+            )?;
+            self.module.flash_final_head_sigmoid_collapse4(
+                &self.stream,
+                LaunchConfig::for_num_elems(u32::try_from(v4_spec::FLASH_0731.hidden)?),
+                &input,
+                &raw_dot,
+                &rsqrt,
+                &self.hc_scale,
+                &self.hc_base,
+                &mut pre,
+                &mut collapsed_device,
+            )?;
+        }
+        self.stream.synchronize()?;
+        final_head_candidate_observe_device_free(&mut free_min)?;
+        let gate_ms = gate_started.elapsed().as_secs_f64() * 1_000.0;
+        let raw_dot = raw_dot.to_host_vec(&self.stream)?;
+        let rsqrt = rsqrt.to_host_vec(&self.stream)?;
+        let rms_debug = rms_debug.to_host_vec(&self.stream)?;
+        let pre = pre.to_host_vec(&self.stream)?;
+        let collapsed = collapsed_device.to_host_vec(&self.stream)?;
+        let norm_started = std::time::Instant::now();
+        let mut normalized_device =
+            DeviceBuffer::<u16>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
+        let mut norm_trace = DeviceBuffer::<f32>::zeroed(&self.stream, 0)?;
+        run_flash_learned_rmsnorm_4096_device_into(
+            &self.module,
+            &self.stream,
+            &collapsed_device,
+            &self.norm,
+            &mut normalized_device,
+            &mut norm_trace,
+        )?;
+        self.stream.synchronize()?;
+        final_head_candidate_observe_device_free(&mut free_min)?;
+        let norm_ms = norm_started.elapsed().as_secs_f64() * 1_000.0;
+        let normalized = normalized_device.to_host_vec(&self.stream)?;
+        let logits_started = std::time::Instant::now();
+        let mut normalized_f32 =
+            DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
+        let mut logits_device =
+            DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.vocab)?;
+        launch_v4_bf16_to_f32(
+            &self.module,
+            &self.stream,
+            &normalized_device,
+            &mut normalized_f32,
+        )?;
+        self.cublas.sgemm_mn1(
+            self.stream.cu_stream().cast::<std::ffi::c_void>(),
+            device_mut(self.cublas_workspace.cu_deviceptr()),
+            self.cublas_workspace.num_bytes(),
+            device_const(self.head.cu_deviceptr()),
+            device_const(normalized_f32.cu_deviceptr()),
+            device_mut(logits_device.cu_deviceptr()),
+            v4_spec::FLASH_0731.vocab,
+            v4_spec::FLASH_0731.hidden,
+        )?;
+        self.stream.synchronize()?;
+        final_head_candidate_observe_device_free(&mut free_min)?;
+        let logits_ms = logits_started.elapsed().as_secs_f64() * 1_000.0;
+        let logits = logits_device.to_host_vec(&self.stream)?;
+        let (&first_logit, tail) = logits
+            .split_first()
+            .ok_or("Flash DSpark final-head logits are empty")?;
+        let mut argmax = 0_usize;
+        let mut max_logit = first_logit;
+        for (offset, &logit) in tail.iter().enumerate() {
+            if logit > max_logit {
+                argmax = offset + 1;
+                max_logit = logit;
+            }
+        }
+        if let Some((directory, manifest)) = official.as_ref() {
+            let expected = final_head_candidate_official_tensor(
+                directory,
+                manifest,
+                "collapsed_bf16",
+                "collapsed_bf16.bin",
+                "BF16",
+                collapsed.len() * std::mem::size_of::<u16>(),
+            )?;
+            final_head_candidate_require_exact(
+                "collapsed_bf16",
+                &final_head_u16_bytes(&collapsed),
+                &expected,
+                std::mem::size_of::<u16>(),
+            )?;
+            let expected = final_head_candidate_official_tensor(
+                directory,
+                manifest,
+                "normalized_bf16",
+                "normalized_bf16.bin",
+                "BF16",
+                normalized.len() * std::mem::size_of::<u16>(),
+            )?;
+            final_head_candidate_require_exact(
+                "normalized_bf16",
+                &final_head_u16_bytes(&normalized),
+                &expected,
+                std::mem::size_of::<u16>(),
+            )?;
+            let expected = final_head_candidate_official_tensor(
+                directory,
+                manifest,
+                "logits_f32",
+                "logits_f32.bin",
+                "F32",
+                logits.len() * std::mem::size_of::<f32>(),
+            )?;
+            final_head_candidate_require_exact(
+                "logits_f32",
+                &final_head_f32_bytes(&logits),
+                &expected,
+                std::mem::size_of::<f32>(),
+            )?;
+            if manifest["argmax"].as_u64() != Some(u64::try_from(argmax)?) {
+                return Err(
+                    format!("Flash DSpark final-head argmax mismatch actual={argmax}").into(),
+                );
+            }
+        }
+        let timing = serde_json::json!({"gate_kernel":gate_ms, "norm_kernel":norm_ms, "logits_kernel":logits_ms, "total":total_started.elapsed().as_secs_f64()*1_000.0});
+        let memory = serde_json::json!({"workspace_device_free_after_load":self.device_free_after_load, "call_device_free_before":free_before, "call_device_free_min":free_min, "call_device_peak_observed":free_before.saturating_sub(free_min), "full_head_source":self.head_source_bytes, "full_head_fp32":self.head_f32_bytes, "lifetime":"dspark_run"});
+        if let Some(output_dir) = output_dir {
+            let root = output_dir.join("gpu-exact-candidate");
+            let raw_dot_path = root.join("raw_dot_f32.bin");
+            let pre_path = root.join("pre_f32.bin");
+            let collapsed_path = root.join("collapsed_bf16.bin");
+            let normalized_path = root.join("normalized_bf16.bin");
+            let logits_path = root.join("logits_f32.bin");
+            let rms_path = root.join("rms_debug_u32.bin");
+            write_final_head_file(raw_dot_path.clone(), &final_head_f32_bytes(&raw_dot))?;
+            write_final_head_file(pre_path.clone(), &final_head_f32_bytes(&pre))?;
+            write_final_head_file(collapsed_path.clone(), &final_head_u16_bytes(&collapsed))?;
+            write_final_head_file(normalized_path.clone(), &final_head_u16_bytes(&normalized))?;
+            write_final_head_file(logits_path.clone(), &final_head_f32_bytes(&logits))?;
+            write_final_head_file(rms_path.clone(), &final_head_u32_bytes(&rms_debug))?;
+            let provenance = self.cublas.provenance();
+            let mut output = PendingResultFile::reserve(root.join("manifest.json"))?;
+            serde_json::to_writer_pretty(
+                output.file_mut(),
+                &serde_json::json!({
+                    "schema":"colibri-flash-0731-final-head-gpu-exact-v1",
+                    "scope":if official.is_some() { "head_only_replay_with_official_comparison" } else { "runtime_gpu_exact_without_per_input_oracle" },
+                    "arm":"gpu_exact",
+                    "input_hidden_fnv1a64":format!("{:016x}", fnv1a_u16(hidden)),
+                    "sm":flash_final_head_candidate_sm89()?,
+                    "binary":{"path":std::env::current_exe()?.canonicalize()?, "sha256":sha256_file(&std::env::current_exe()?)?},
+                    "cublas":{"sha256":provenance.actual_sha256, "version":provenance.version, "math_mode":"CUBLAS_DEFAULT_MATH", "tf32":"off", "gate":{"m":4,"n":1,"k":16384}, "head":{"m":129280,"n":1,"k":4096}},
+                    "config":verification_manifest.map(|manifest| manifest["config"].clone()).unwrap_or(serde_json::Value::Null),
+                    "official_comparison":official.as_ref().map(|(directory, _)| serde_json::json!({"directory":directory,"collapsed_bf16":"exact","normalized_bf16":"exact","logits_f32":"exact","argmax":argmax})).unwrap_or_else(|| serde_json::json!({"status":"not_requested","reason":"runtime input has no independent official oracle"})),
+                    "timing_ms":timing.clone(), "memory_bytes":memory.clone(),
+                    "rms":{"debug_fields":["square_sum","mean_plus_eps","newton_rsqrt","libdevice_sqrt_rsqrt","libdevice_rsqrt"], "debug_bits":rms_debug.iter().map(|value| format!("0x{value:08x}")).collect::<Vec<_>>(), "rsqrt_bits":format!("0x{:08x}", rsqrt[0].to_bits())},
+                    "raw_dot_f32":{"file":"raw_dot_f32.bin", "bits":raw_dot.iter().map(|value| format!("0x{:08x}", value.to_bits())).collect::<Vec<_>>(), "sha256":sha256_file(&raw_dot_path)?},
+                    "pre_f32":{"file":"pre_f32.bin", "bits":pre.iter().map(|value| format!("0x{:08x}", value.to_bits())).collect::<Vec<_>>(), "sha256":sha256_file(&pre_path)?},
+                    "collapsed_bf16":{"file":"collapsed_bf16.bin", "fnv1a64":format!("{:016x}",fnv1a_u16(&collapsed)), "sha256":sha256_file(&collapsed_path)?},
+                    "normalized_bf16":{"file":"normalized_bf16.bin", "fnv1a64":format!("{:016x}",fnv1a_u16(&normalized)), "sha256":sha256_file(&normalized_path)?},
+                    "logits_f32":{"file":"logits_f32.bin", "fnv1a64":format!("{:016x}",fnv1a_f32(&logits)), "sha256":sha256_file(&logits_path)?},
+                    "rms_debug_u32":{"file":"rms_debug_u32.bin", "sha256":sha256_file(&rms_path)?}
+                }),
+            )?;
+            output.file_mut().write_all(b"\n")?;
+            output.commit()?;
+        }
+        Ok(FlashFinalHeadGpuExactRun {
+            output: v4_state::FinalHeadOutput {
+                collapsed_bf16: collapsed,
+                normalized_bf16: normalized,
+                logits_f32: logits,
+                argmax: vec![argmax],
+            },
+            source_bytes: self.head_source_bytes,
+            timing,
+            memory,
+        })
+    }
+}
+
+fn run_flash_final_head_replay() -> Result<(), Box<dyn Error>> {
+    let input_dir = std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR to a captured input")?;
+    let output_dir = std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY_DIR")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY_DIR")?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(input_dir.join("manifest.json"))?)?;
+    if manifest["schema"] != FLASH_FINAL_HEAD_CAPTURE_SCHEMA
+        || manifest["model_revision"] != v4_spec::FLASH_0731.revision
+        || manifest["shape"] != serde_json::json!([1, v4_state::HC, v4_spec::FLASH_0731.hidden])
+    {
+        return Err("Flash final-head replay input manifest mismatch".into());
+    }
+    let bytes = std::fs::read(input_dir.join("final_hidden_bf16.bin"))?;
+    if bytes.len() != v4_state::HC * v4_spec::FLASH_0731.hidden * 2
+        || sha256_bytes(&bytes)? != manifest["hidden"]["sha256"].as_str().unwrap_or_default()
+    {
+        return Err("Flash final-head replay input bytes mismatch".into());
+    }
+    let hidden = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    if format!("{:016x}", fnv1a_u16(&hidden))
+        != manifest["hidden"]["fnv1a64"].as_str().unwrap_or_default()
+    {
+        return Err("Flash final-head replay input digest mismatch".into());
+    }
+    let weights = v4_state::load_final_head_for(
+        &v4_spec::FLASH_0731,
+        &v4_model_dir_for(&v4_spec::FLASH_0731)?,
+    )?;
+    let replay_arm = match std::env::var_os("COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY_ARM") {
+        None => None,
+        Some(value) => Some(
+            value
+                .into_string()
+                .map_err(|_| "COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY_ARM must be valid UTF-8")?,
+        ),
+    };
+    match replay_arm.as_deref() {
+        None | Some("cpu") => {}
+        Some("gpu_exact_candidate") => {
+            FlashDsparkFinalHeadGpuWorkspace::new(&weights)?.run(
+                &output_dir,
+                Some(&manifest),
+                &hidden,
+            )?;
+            println!(
+                "{{\"status\":\"PASS\",\"mode\":\"flash-final-head-gpu-exact-candidate\",\"output\":{}}}",
+                serde_json::to_string(&output_dir)?
+            );
+            return Ok(());
+        }
+        Some(value) => {
+            return Err(format!("unknown COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY_ARM={value}").into());
+        }
+    }
+    let cpu = v4_state::final_checkpoint_head_cpu_timed(&weights, &hidden, 1)?;
+    write_final_head_output(&output_dir, &hidden, &cpu, "head_only_replay")?;
+    write_final_head_replay_trace(&output_dir, &hidden, &weights, &cpu)?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"flash-final-head-replay\",\"output\":{}}}",
+        serde_json::to_string(&output_dir)?
+    );
+    Ok(())
+}
+
 fn parse_optional_one_flag(
     name: &str,
     value: Option<&std::ffi::OsStr>,
@@ -2628,6 +4581,22 @@ fn parse_optional_one_flag(
 fn optional_one_flag(name: &str) -> Result<bool, Box<dyn Error>> {
     let value = std::env::var_os(name);
     parse_optional_one_flag(name, value.as_deref())
+}
+
+fn validate_flash_parity_stop_mode() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER").is_none() {
+        return Ok(());
+    }
+    let base = optional_one_flag("COLIBRI_V4_FLASH_BASE")?;
+    let serve = optional_one_flag("COLIBRI_V4_FLASH_SERVE")?;
+    let dspark = optional_one_flag("COLIBRI_V4_FLASH_DSPARK")?;
+    if !base || serve || dspark {
+        return Err(
+            "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER is only valid when Flash base mode is the selected execution"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn mtp1_draft_max_scored_transitions() -> Result<usize, Box<dyn Error>> {
@@ -3010,6 +4979,19 @@ fn main() {
         sparse_attention_score_reuse_k128_attention_post_microgate();
         return;
     }
+    validate_flash_parity_stop_mode().expect("validate Flash parity L0 stop mode");
+    if optional_one_flag("COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY")
+        .expect("validate Flash final-head replay flag")
+    {
+        if std::env::var_os("COLIBRI_V4_FLASH_BASE").is_some()
+            || std::env::var_os("COLIBRI_V4_FLASH_DSPARK").is_some()
+            || std::env::var_os("COLIBRI_V4_FLASH_SERVE").is_some()
+        {
+            panic!("Flash final-head replay cannot be combined with a runtime mode");
+        }
+        run_flash_final_head_replay().expect("run Flash final-head replay");
+        return;
+    }
     // ponytail: this smoke uses synchronous safe copies for a terminal parity
     // check; switch to event-owned async buffers when production dispatch lands.
     let context = CudaContext::new(0).expect("create CUDA context");
@@ -3021,6 +5003,24 @@ fn main() {
     }
     let stream = context.default_stream();
     let module = kernels::load(&context).expect("load embedded Rust PTX");
+
+    if optional_one_flag("COLIBRI_V4_FLASH_SERVE").expect("validate Flash-0731 serve flag") {
+        run_real_v4_flash_serve(&context, &module, &stream)
+            .expect("run DeepSeek V4 Flash-0731 local service");
+        return;
+    }
+
+    if optional_one_flag("COLIBRI_V4_FLASH_DSPARK").expect("validate Flash-0731 DSpark flag") {
+        run_real_v4_flash_dspark(&context, &module, &stream)
+            .expect("run DeepSeek V4 Flash-0731 full DSpark generation");
+        return;
+    }
+
+    if optional_one_flag("COLIBRI_V4_FLASH_BASE").expect("validate Flash-0731 base flag") {
+        run_real_v4_flash_base(&context, &module, &stream)
+            .expect("run DeepSeek V4 Flash-0731 base-only generation");
+        return;
+    }
 
     if optional_one_flag("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_GATE")
         .expect("validate pinned fixed worker boundary-gate flag")
@@ -4783,6 +6783,7 @@ fn run_real_v4_full61_b1(
                             context,
                             module,
                             stream,
+                            None,
                             runtime,
                             qd4,
                             None,
@@ -6139,6 +8140,7 @@ fn run_real_v4_layer_stationary_prefill(
                                 run_real_layer_attention_rows(
                                     module,
                                     stream,
+                                    None,
                                     &runtime,
                                     mirror_hidden,
                                     token_position,
@@ -6201,6 +8203,7 @@ fn run_real_v4_layer_stationary_prefill(
                             context,
                             module,
                             stream,
+                            None,
                             &runtime,
                             qd4_lanes.as_deref_mut(),
                             qd4_immutable_cache.as_mut(),
@@ -6232,6 +8235,7 @@ fn run_real_v4_layer_stationary_prefill(
                             context,
                             module,
                             stream,
+                            None,
                             &runtime,
                             qd4_lanes.as_deref_mut(),
                             qd4_immutable_cache.as_mut(),
@@ -6272,6 +8276,7 @@ fn run_real_v4_layer_stationary_prefill(
                                 let oracle = run_real_layer_attention_rows(
                                     module,
                                     stream,
+                                    None,
                                     &runtime,
                                     &hidden[token_position],
                                     token_position,
@@ -6293,6 +8298,7 @@ fn run_real_v4_layer_stationary_prefill(
                                 context,
                                 module,
                                 stream,
+                                None,
                                 &runtime,
                                 qd4_lanes.as_deref_mut(),
                                 qd4_immutable_cache.as_mut(),
@@ -7207,6 +9213,7 @@ fn run_real_v4_layer_stationary_prefill(
                                     run_real_layer_attention_rows(
                                         module,
                                         stream,
+                                        None,
                                         runtime,
                                         mirror_hidden,
                                         token_position,
@@ -7253,6 +9260,7 @@ fn run_real_v4_layer_stationary_prefill(
                                     context,
                                     module,
                                     stream,
+                                    None,
                                     runtime,
                                     qd4_lanes.as_deref_mut(),
                                     None,
@@ -7882,6 +9890,7 @@ fn run_real_v4_layer_stationary_prefill(
                                         context,
                                         module,
                                         stream,
+                                        None,
                                         &runtime,
                                         qd4_lanes.as_deref_mut(),
                                         None,
@@ -7923,6 +9932,7 @@ fn run_real_v4_layer_stationary_prefill(
                             context,
                             module,
                             stream,
+                            None,
                             &runtime,
                             qd4_lanes.as_deref_mut(),
                             None,
@@ -8845,6 +10855,67 @@ fn launch_v4_activation_quantize(
     Ok(())
 }
 
+fn launch_v4_activation_quantize_raw(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u8>,
+    scales: &mut DeviceBuffer<u8>,
+) -> Result<(), Box<dyn Error>> {
+    const BLOCK: usize = v4_state::FP8_BLOCK;
+    if input.is_empty()
+        || input.len() % BLOCK != 0
+        || output.len() != input.len()
+        || scales.len() != input.len() / BLOCK
+    {
+        return Err("Flash FP4 raw activation buffers require complete 128-value groups".into());
+    }
+    // SAFETY: one thread owns one complete 128-value raw-FP8 group.
+    unsafe {
+        module.quantize_v4_activation_raw(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scales.len())?),
+            input,
+            output,
+            scales,
+        )
+    }?;
+    Ok(())
+}
+
+/// Materializes the raw FP8/E8M0 view of a live BF16 device buffer for the
+/// Flash L0 parity harness.  This is deliberately debug-only: production
+/// expert GEMMs retain their existing dequantized-F32 input path.
+fn flash_parity_capture_activation_fp8(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    const BLOCK: usize = v4_state::FP8_BLOCK;
+    if input.is_empty() || input.len() % BLOCK != 0 {
+        return Err("Flash parity FP8 trace requires complete 128-value groups".into());
+    }
+    let mut fp8 = DeviceBuffer::<u8>::zeroed(stream, input.len())?;
+    let mut scales = DeviceBuffer::<u8>::zeroed(stream, input.len() / BLOCK)?;
+    let mut no_dequantized = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    // SAFETY: one launch thread owns each complete 128-value group; this only
+    // snapshots the live source buffer and never feeds a model kernel.
+    unsafe {
+        module.quantize_v4_fp8_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(scales.len())?),
+            input,
+            &mut fp8,
+            &mut scales,
+            &mut no_dequantized,
+            u32::try_from(input.len())?,
+            u32::try_from(input.len())?,
+            u32::try_from(BLOCK)?,
+        )?;
+    }
+    Ok((fp8.to_host_vec(stream)?, scales.to_host_vec(stream)?))
+}
+
 fn launch_v4_fp4_matvec(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -8884,6 +10955,154 @@ fn launch_v4_fp4_matvec(
             output,
             u32::try_from(in_features)?,
             u32::try_from(out_features)?,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_fp4_matvec_block32(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<u8>,
+    packed: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Box<dyn Error>> {
+    const WEIGHT_BLOCK: usize = 32;
+    const ACTIVATION_BLOCK: usize = v4_state::FP8_BLOCK;
+    if rows == 0
+        || rows > v4_expert::V4_MAX_EXPERT_ROWS
+        || in_features % ACTIVATION_BLOCK != 0
+        || input.len() != rows * in_features
+        || input_scales.len() != rows * in_features / ACTIVATION_BLOCK
+        || packed.len() != out_features * in_features / 2
+        || scales.len() != out_features * in_features / WEIGHT_BLOCK
+        || output.len() != rows * out_features
+    {
+        return Err("Flash FP4 block32 buffers disagree with the expert layout".into());
+    }
+    let threads = u32::try_from(
+        output
+            .len()
+            .checked_mul(32)
+            .ok_or("Flash FP4 block32 launch overflow")?,
+    )?;
+    // SAFETY: one complete warp owns each output; each 32-K block is reduced
+    // before lane 0 applies the corresponding activation and weight scales.
+    unsafe {
+        module.matvec_v4_fp4_block32(
+            stream,
+            LaunchConfig::for_num_elems(threads),
+            input,
+            input_scales,
+            packed,
+            scales,
+            output,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_fp4_matvec_mma(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<u8>,
+    packed: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Box<dyn Error>> {
+    if rows == 0
+        || rows > v4_expert::V4_MAX_EXPERT_ROWS
+        || in_features % v4_state::FP8_BLOCK != 0
+        || out_features % 8 != 0
+        || input.len() != rows * in_features
+        || input_scales.len() != rows * in_features / v4_state::FP8_BLOCK
+        || packed.len() != out_features * in_features / 2
+        || scales.len() != out_features * in_features / 32
+        || output.len() != rows * out_features
+    {
+        return Err("Flash FP8-MMA buffers disagree with the expert layout".into());
+    }
+    let threads = rows
+        .checked_mul(out_features / 8)
+        .and_then(|tiles| tiles.checked_mul(32))
+        .ok_or("Flash FP8-MMA launch overflow")?;
+    // SAFETY: the locked kernel maps one full warp to an eight-wide output tile;
+    // host validation proves every FP8/FP4 packed span and E8M0 scale span.
+    unsafe {
+        module.matvec_v4_fp4_mma(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(threads)?),
+            input,
+            input_scales,
+            packed,
+            scales,
+            output,
+            u32::try_from(in_features)?,
+            u32::try_from(out_features)?,
+        )
+    }?;
+    Ok(())
+}
+
+fn launch_v4_fp4_tilelang_ref(
+    reference: &v4_tilelang_ref::TilelangFp4Reference,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u8>,
+    input_scales: &DeviceBuffer<u8>,
+    packed: &DeviceBuffer<u8>,
+    scales: &DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), Box<dyn Error>> {
+    if rows == 0
+        || rows > v4_expert::V4_MAX_EXPERT_ROWS
+        || input.len() != rows * in_features
+        || input_scales.len() != rows * in_features / v4_state::FP8_BLOCK
+        || packed.len() != out_features * in_features / 2
+        || scales.len() != out_features * in_features / 32
+        || output.len() != rows * out_features
+    {
+        return Err("TileLang reference buffers disagree with the locked expert layout".into());
+    }
+    let kernel = reference.for_dimensions(out_features, in_features)?;
+    let (block_x, block_y, block_z) = kernel.block();
+    let mut input_ptr = input.cu_deviceptr();
+    let mut packed_ptr = packed.cu_deviceptr();
+    let mut output_ptr = output.cu_deviceptr();
+    let mut input_scales_ptr = input_scales.cu_deviceptr();
+    let mut scales_ptr = scales.cu_deviceptr();
+    let mut rows_u32 = u32::try_from(rows)?;
+    let mut arguments = [
+        (&mut input_ptr as *mut _) as *mut std::ffi::c_void,
+        (&mut packed_ptr as *mut _) as *mut std::ffi::c_void,
+        (&mut output_ptr as *mut _) as *mut std::ffi::c_void,
+        (&mut input_scales_ptr as *mut _) as *mut std::ffi::c_void,
+        (&mut scales_ptr as *mut _) as *mut std::ffi::c_void,
+        (&mut rows_u32 as *mut _) as *mut std::ffi::c_void,
+    ];
+    // SAFETY: `v4_tilelang_ref` has already validated the exact raw ABI and
+    // PTX identity. These six local values remain alive through submission.
+    unsafe {
+        cuda_core::launch_kernel_on_stream(
+            kernel.function(),
+            (kernel.grid_x(), kernel.grid_y_for_rows(rows)?, 1),
+            (block_x, block_y, block_z),
+            kernel.dynamic_shared_bytes(),
+            stream,
+            &mut arguments,
         )
     }?;
     Ok(())
@@ -12136,7 +14355,21 @@ const V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES: usize = V4_QD4_IMMUTABLE_EXPER
         + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
         + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
 
+struct FlashExpertTrace {
+    input_fp8: Vec<u8>,
+    input_scale: Vec<u8>,
+    w1: Vec<u16>,
+    w3: Vec<u16>,
+    swiglu: Vec<u16>,
+    w2_input_fp8: Vec<u8>,
+    w2_input_scale: Vec<u8>,
+    output: Vec<u16>,
+}
+
 struct ExpertSlot<'a> {
+    spec: &'static v4_spec::V4Spec,
+    fp4_accum_arm: FlashFp4AccumArm,
+    tilelang_ref: Option<v4_tilelang_ref::TilelangFp4Reference>,
     module: &'a kernels::LoadedModule,
     stream: std::sync::Arc<CudaStream>,
     w1_host: PinnedHostBuffer<u8>,
@@ -12155,10 +14388,14 @@ struct ExpertSlot<'a> {
     w3_device: DeviceBuffer<u8>,
     w3_scale_device: DeviceBuffer<u8>,
     input_quantized: DeviceBuffer<f32>,
+    input_fp8: Option<DeviceBuffer<u8>>,
+    input_fp8_scales: Option<DeviceBuffer<u8>>,
     gate: DeviceBuffer<u16>,
     up: DeviceBuffer<u16>,
     routed: DeviceBuffer<u16>,
     routed_quantized: DeviceBuffer<f32>,
+    routed_fp8: Option<DeviceBuffer<u8>>,
+    routed_fp8_scales: Option<DeviceBuffer<u8>>,
     output_bf16: DeviceBuffer<u16>,
     output: DeviceBuffer<f32>,
     weight_h2d_ms: f64,
@@ -12184,10 +14421,10 @@ impl<'a> ExpertSlot<'a> {
         let w2_scale_host = PinnedHostBuffer::from_slice(context, &weights.w2_scale)?;
         let w3_host = PinnedHostBuffer::from_slice(context, &weights.w3)?;
         let w3_scale_host = PinnedHostBuffer::from_slice(context, &weights.w3_scale)?;
-        let input_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
-        let output_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
-        let input_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let spec = weights.spec;
+        let input_host = PinnedHostBuffer::zeroed(context, spec.hidden)?;
+        let output_host = PinnedHostBuffer::zeroed(context, spec.hidden)?;
+        let input_device = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
         let mut w1_device = unsafe { DeviceBuffer::uninitialized_async(stream, weights.w1.len())? };
         let mut w1_scale_device =
             unsafe { DeviceBuffer::uninitialized_async(stream, weights.w1_scale.len())? };
@@ -12213,29 +14450,53 @@ impl<'a> ExpertSlot<'a> {
         weight_h2d_end.record(stream)?;
         weight_h2d_end.synchronize()?;
         let weight_h2d_ms = weight_h2d_start.elapsed_ms(&weight_h2d_end)? as f64;
-        let input_quantized =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
-        let gate = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        let fp4_accum_arm = flash_fp4_accum_arm(spec)?;
+        let tilelang_ref = if fp4_accum_arm == FlashFp4AccumArm::TilelangRef {
+            let model_dir = v4_model_dir_for(spec)?;
+            let reference_dir = v4_tilelang_ref::reference_dir_from_env()?;
+            Some(v4_tilelang_ref::load_for_flash(
+                context,
+                spec,
+                &model_dir,
+                &reference_dir,
+            )?)
+        } else {
+            None
         };
-        let up = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let routed = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let routed_quantized = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let output_bf16 =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
-        let output = unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let input_quantized = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
+        let (input_fp8, input_fp8_scales, routed_fp8, routed_fp8_scales) =
+            if fp4_accum_arm.uses_raw_fp8() {
+                (
+                    Some(DeviceBuffer::<u8>::zeroed(stream, spec.hidden)?),
+                    Some(DeviceBuffer::<u8>::zeroed(
+                        stream,
+                        spec.hidden / v4_state::FP8_BLOCK,
+                    )?),
+                    Some(DeviceBuffer::<u8>::zeroed(stream, spec.moe_intermediate)?),
+                    Some(DeviceBuffer::<u8>::zeroed(
+                        stream,
+                        spec.moe_intermediate / v4_state::FP8_BLOCK,
+                    )?),
+                )
+            } else {
+                (None, None, None, None)
+            };
+        let gate = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let up = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let routed = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let routed_quantized =
+            unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let output_bf16 = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
+        let output = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
         let kernel_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         let kernel_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         let complete = context.new_event(None)?;
         complete.record(stream)?;
         complete.synchronize()?;
         Ok(Self {
+            spec,
+            fp4_accum_arm,
+            tilelang_ref,
             module,
             stream: stream.clone(),
             w1_host,
@@ -12254,10 +14515,14 @@ impl<'a> ExpertSlot<'a> {
             w3_device,
             w3_scale_device,
             input_quantized,
+            input_fp8,
+            input_fp8_scales,
             gate,
             up,
             routed,
             routed_quantized,
+            routed_fp8,
+            routed_fp8_scales,
             output_bf16,
             output,
             weight_h2d_ms,
@@ -12274,45 +14539,72 @@ impl<'a> ExpertSlot<'a> {
         module: &'a kernels::LoadedModule,
         stream: &std::sync::Arc<CudaStream>,
     ) -> Result<Self, Box<dyn Error>> {
-        let w1_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_BYTES)?;
-        let w1_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_SCALE_BYTES)?;
-        let w2_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W2_BYTES)?;
-        let w2_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W2_SCALE_BYTES)?;
-        let w3_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_BYTES)?;
-        let w3_scale_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_W1_SCALE_BYTES)?;
-        let input_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
-        let output_host = PinnedHostBuffer::zeroed(context, v4_expert::V4_HIDDEN)?;
-        let input_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
-        let w1_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_BYTES)? };
-        let w1_scale_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_SCALE_BYTES)? };
-        let w2_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W2_BYTES)? };
-        let w2_scale_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W2_SCALE_BYTES)? };
-        let w3_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_BYTES)? };
-        let w3_scale_device =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_W1_SCALE_BYTES)? };
-        let input_quantized =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
-        let gate = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
+        Self::new_empty_for(&v4_spec::PRO, context, module, stream)
+    }
+
+    fn new_empty_for(
+        spec: &'static v4_spec::V4Spec,
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+        stream: &std::sync::Arc<CudaStream>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let w1_bytes = spec.moe_intermediate * spec.hidden / 2;
+        let w1_scale_bytes = spec.moe_intermediate * spec.hidden / 32;
+        let w2_bytes = spec.hidden * spec.moe_intermediate / 2;
+        let w2_scale_bytes = spec.hidden * spec.moe_intermediate / 32;
+        let w1_host = PinnedHostBuffer::zeroed(context, w1_bytes)?;
+        let w1_scale_host = PinnedHostBuffer::zeroed(context, w1_scale_bytes)?;
+        let w2_host = PinnedHostBuffer::zeroed(context, w2_bytes)?;
+        let w2_scale_host = PinnedHostBuffer::zeroed(context, w2_scale_bytes)?;
+        let w3_host = PinnedHostBuffer::zeroed(context, w1_bytes)?;
+        let w3_scale_host = PinnedHostBuffer::zeroed(context, w1_scale_bytes)?;
+        let input_host = PinnedHostBuffer::zeroed(context, spec.hidden)?;
+        let output_host = PinnedHostBuffer::zeroed(context, spec.hidden)?;
+        let input_device = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
+        let w1_device = unsafe { DeviceBuffer::uninitialized_async(stream, w1_bytes)? };
+        let w1_scale_device = unsafe { DeviceBuffer::uninitialized_async(stream, w1_scale_bytes)? };
+        let w2_device = unsafe { DeviceBuffer::uninitialized_async(stream, w2_bytes)? };
+        let w2_scale_device = unsafe { DeviceBuffer::uninitialized_async(stream, w2_scale_bytes)? };
+        let w3_device = unsafe { DeviceBuffer::uninitialized_async(stream, w1_bytes)? };
+        let w3_scale_device = unsafe { DeviceBuffer::uninitialized_async(stream, w1_scale_bytes)? };
+        let fp4_accum_arm = flash_fp4_accum_arm(spec)?;
+        let tilelang_ref = if fp4_accum_arm == FlashFp4AccumArm::TilelangRef {
+            let model_dir = v4_model_dir_for(spec)?;
+            let reference_dir = v4_tilelang_ref::reference_dir_from_env()?;
+            Some(v4_tilelang_ref::load_for_flash(
+                context,
+                spec,
+                &model_dir,
+                &reference_dir,
+            )?)
+        } else {
+            None
         };
-        let up = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let routed = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let routed_quantized = unsafe {
-            DeviceBuffer::uninitialized_async(stream, v4_expert::V4_EXPERT_INTERMEDIATE)?
-        };
-        let output_bf16 =
-            unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
-        let output = unsafe { DeviceBuffer::uninitialized_async(stream, v4_expert::V4_HIDDEN)? };
+        let input_quantized = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
+        let (input_fp8, input_fp8_scales, routed_fp8, routed_fp8_scales) =
+            if fp4_accum_arm.uses_raw_fp8() {
+                (
+                    Some(DeviceBuffer::<u8>::zeroed(stream, spec.hidden)?),
+                    Some(DeviceBuffer::<u8>::zeroed(
+                        stream,
+                        spec.hidden / v4_state::FP8_BLOCK,
+                    )?),
+                    Some(DeviceBuffer::<u8>::zeroed(stream, spec.moe_intermediate)?),
+                    Some(DeviceBuffer::<u8>::zeroed(
+                        stream,
+                        spec.moe_intermediate / v4_state::FP8_BLOCK,
+                    )?),
+                )
+            } else {
+                (None, None, None, None)
+            };
+        let gate = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let up = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let routed = unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let routed_quantized =
+            unsafe { DeviceBuffer::uninitialized_async(stream, spec.moe_intermediate)? };
+        let output_bf16 = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
+        let output = unsafe { DeviceBuffer::uninitialized_async(stream, spec.hidden)? };
         let kernel_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         let kernel_end = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
         let weight_start = context.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?;
@@ -12321,6 +14613,9 @@ impl<'a> ExpertSlot<'a> {
         complete.record(stream)?;
         complete.synchronize()?;
         Ok(Self {
+            spec,
+            fp4_accum_arm,
+            tilelang_ref,
             module,
             stream: stream.clone(),
             w1_host,
@@ -12339,10 +14634,14 @@ impl<'a> ExpertSlot<'a> {
             w3_device,
             w3_scale_device,
             input_quantized,
+            input_fp8,
+            input_fp8_scales,
             gate,
             up,
             routed,
             routed_quantized,
+            routed_fp8,
+            routed_fp8_scales,
             output_bf16,
             output,
             weight_h2d_ms: 0.0,
@@ -12437,9 +14736,67 @@ impl<'a> ExpertSlot<'a> {
         input: &[u16],
         route_weight: f32,
     ) -> Result<(Vec<f32>, u64), Box<dyn Error>> {
-        let mut output = vec![0.0_f32; v4_expert::V4_HIDDEN];
+        let mut output = vec![0.0_f32; self.spec.hidden];
         let gpu_ns = self.execute_into(input, route_weight, &mut output, None, None)?;
         Ok((output, gpu_ns))
+    }
+
+    fn execute_with_flash_trace(
+        &mut self,
+        input: &[u16],
+        route_weight: f32,
+    ) -> Result<(Vec<f32>, u64, FlashExpertTrace), Box<dyn Error>> {
+        let (output, gpu_ns) = self.execute(input, route_weight)?;
+        let ((input_fp8, input_scale), (w2_input_fp8, w2_input_scale)) = if self
+            .fp4_accum_arm
+            .uses_raw_fp8()
+        {
+            let input_fp8 = self
+                .input_fp8
+                .as_ref()
+                .ok_or("Flash raw-FP8 arm lost its input FP8 buffer")?;
+            let input_scale = self
+                .input_fp8_scales
+                .as_ref()
+                .ok_or("Flash raw-FP8 arm lost its input FP8 scales")?;
+            let w2_input_fp8 = self
+                .routed_fp8
+                .as_ref()
+                .ok_or("Flash raw-FP8 arm lost its routed FP8 buffer")?;
+            let w2_input_scale = self
+                .routed_fp8_scales
+                .as_ref()
+                .ok_or("Flash raw-FP8 arm lost its routed FP8 scales")?;
+            (
+                (
+                    input_fp8.to_host_vec(&self.stream)?,
+                    input_scale.to_host_vec(&self.stream)?,
+                ),
+                (
+                    w2_input_fp8.to_host_vec(&self.stream)?,
+                    w2_input_scale.to_host_vec(&self.stream)?,
+                ),
+            )
+        } else {
+            (
+                flash_parity_capture_activation_fp8(self.module, &self.stream, &self.input_device)?,
+                flash_parity_capture_activation_fp8(self.module, &self.stream, &self.routed)?,
+            )
+        };
+        Ok((
+            output,
+            gpu_ns,
+            FlashExpertTrace {
+                input_fp8,
+                input_scale,
+                w1: self.gate.to_host_vec(&self.stream)?,
+                w3: self.up.to_host_vec(&self.stream)?,
+                swiglu: self.routed.to_host_vec(&self.stream)?,
+                w2_input_fp8,
+                w2_input_scale,
+                output: self.output_bf16.to_host_vec(&self.stream)?,
+            },
+        ))
     }
 
     fn execute_into(
@@ -12450,10 +14807,10 @@ impl<'a> ExpertSlot<'a> {
         mut timeline: Option<&mut RoutedLaneTimeline>,
         profile_origin: Option<std::time::Instant>,
     ) -> Result<u64, Box<dyn Error>> {
-        if v4_expert::validate_input(input, route_weight)? != 1 {
+        if v4_expert::validate_input_for(self.spec, input, route_weight)? != 1 {
             return Err("resident expert slot accepts exactly one row".into());
         }
-        if output.len() != v4_expert::V4_HIDDEN {
+        if output.len() != self.spec.hidden {
             return Err("resident expert output requires one complete hidden row".into());
         }
         self.stream.context().bind_to_thread()?;
@@ -12468,34 +14825,149 @@ impl<'a> ExpertSlot<'a> {
             timeline.kernel_enqueued_ns = timeline_elapsed_ns(origin);
         }
         self.kernel_start.record(&self.stream)?;
-        launch_v4_activation_quantize(
-            self.module,
-            &self.stream,
-            &self.input_device,
-            &mut self.input_quantized,
-        )?;
-        launch_v4_fp4_matvec(
-            self.module,
-            &self.stream,
-            &self.input_quantized,
-            &self.w1_device,
-            &self.w1_scale_device,
-            &mut self.gate,
-            1,
-            v4_expert::V4_EXPERT_INTERMEDIATE,
-            v4_expert::V4_HIDDEN,
-        )?;
-        launch_v4_fp4_matvec(
-            self.module,
-            &self.stream,
-            &self.input_quantized,
-            &self.w3_device,
-            &self.w3_scale_device,
-            &mut self.up,
-            1,
-            v4_expert::V4_EXPERT_INTERMEDIATE,
-            v4_expert::V4_HIDDEN,
-        )?;
+        if self.fp4_accum_arm.uses_raw_fp8() {
+            {
+                let input_fp8 = self
+                    .input_fp8
+                    .as_mut()
+                    .ok_or("Flash block32 arm lost its input FP8 buffer")?;
+                let input_scales = self
+                    .input_fp8_scales
+                    .as_mut()
+                    .ok_or("Flash block32 arm lost its input FP8 scales")?;
+                launch_v4_activation_quantize_raw(
+                    self.module,
+                    &self.stream,
+                    &self.input_device,
+                    input_fp8,
+                    input_scales,
+                )?;
+            }
+            let input_fp8 = self
+                .input_fp8
+                .as_ref()
+                .ok_or("Flash block32 arm lost its input FP8 buffer")?;
+            let input_scales = self
+                .input_fp8_scales
+                .as_ref()
+                .ok_or("Flash block32 arm lost its input FP8 scales")?;
+            match self.fp4_accum_arm {
+                FlashFp4AccumArm::Block32 => {
+                    launch_v4_fp4_matvec_block32(
+                        self.module,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w1_device,
+                        &self.w1_scale_device,
+                        &mut self.gate,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                    launch_v4_fp4_matvec_block32(
+                        self.module,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w3_device,
+                        &self.w3_scale_device,
+                        &mut self.up,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                }
+                FlashFp4AccumArm::TilelangRef => {
+                    let reference = self
+                        .tilelang_ref
+                        .as_ref()
+                        .ok_or("tilelang_ref arm lost its validated reference")?;
+                    launch_v4_fp4_tilelang_ref(
+                        reference,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w1_device,
+                        &self.w1_scale_device,
+                        &mut self.gate,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                    launch_v4_fp4_tilelang_ref(
+                        reference,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w3_device,
+                        &self.w3_scale_device,
+                        &mut self.up,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                }
+                FlashFp4AccumArm::Fp8Mma => {
+                    launch_v4_fp4_matvec_mma(
+                        self.module,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w1_device,
+                        &self.w1_scale_device,
+                        &mut self.gate,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                    launch_v4_fp4_matvec_mma(
+                        self.module,
+                        &self.stream,
+                        input_fp8,
+                        input_scales,
+                        &self.w3_device,
+                        &self.w3_scale_device,
+                        &mut self.up,
+                        1,
+                        self.spec.moe_intermediate,
+                        self.spec.hidden,
+                    )?;
+                }
+                FlashFp4AccumArm::Current => {
+                    return Err("current FP4 arm entered raw-FP8 branch".into());
+                }
+            }
+        } else {
+            launch_v4_activation_quantize(
+                self.module,
+                &self.stream,
+                &self.input_device,
+                &mut self.input_quantized,
+            )?;
+            launch_v4_fp4_matvec(
+                self.module,
+                &self.stream,
+                &self.input_quantized,
+                &self.w1_device,
+                &self.w1_scale_device,
+                &mut self.gate,
+                1,
+                self.spec.moe_intermediate,
+                self.spec.hidden,
+            )?;
+            launch_v4_fp4_matvec(
+                self.module,
+                &self.stream,
+                &self.input_quantized,
+                &self.w3_device,
+                &self.w3_scale_device,
+                &mut self.up,
+                1,
+                self.spec.moe_intermediate,
+                self.spec.hidden,
+            )?;
+        }
         launch_v4_swiglu_route(
             self.module,
             &self.stream,
@@ -12504,23 +14976,94 @@ impl<'a> ExpertSlot<'a> {
             &mut self.routed,
             route_weight,
         )?;
-        launch_v4_activation_quantize(
-            self.module,
-            &self.stream,
-            &self.routed,
-            &mut self.routed_quantized,
-        )?;
-        launch_v4_fp4_matvec(
-            self.module,
-            &self.stream,
-            &self.routed_quantized,
-            &self.w2_device,
-            &self.w2_scale_device,
-            &mut self.output_bf16,
-            1,
-            v4_expert::V4_HIDDEN,
-            v4_expert::V4_EXPERT_INTERMEDIATE,
-        )?;
+        if self.fp4_accum_arm.uses_raw_fp8() {
+            {
+                let routed_fp8 = self
+                    .routed_fp8
+                    .as_mut()
+                    .ok_or("Flash block32 arm lost its routed FP8 buffer")?;
+                let routed_scales = self
+                    .routed_fp8_scales
+                    .as_mut()
+                    .ok_or("Flash block32 arm lost its routed FP8 scales")?;
+                launch_v4_activation_quantize_raw(
+                    self.module,
+                    &self.stream,
+                    &self.routed,
+                    routed_fp8,
+                    routed_scales,
+                )?;
+            }
+            let routed_fp8 = self
+                .routed_fp8
+                .as_ref()
+                .ok_or("Flash block32 arm lost its routed FP8 buffer")?;
+            let routed_scales = self
+                .routed_fp8_scales
+                .as_ref()
+                .ok_or("Flash block32 arm lost its routed FP8 scales")?;
+            match self.fp4_accum_arm {
+                FlashFp4AccumArm::Block32 => launch_v4_fp4_matvec_block32(
+                    self.module,
+                    &self.stream,
+                    routed_fp8,
+                    routed_scales,
+                    &self.w2_device,
+                    &self.w2_scale_device,
+                    &mut self.output_bf16,
+                    1,
+                    self.spec.hidden,
+                    self.spec.moe_intermediate,
+                )?,
+                FlashFp4AccumArm::TilelangRef => launch_v4_fp4_tilelang_ref(
+                    self.tilelang_ref
+                        .as_ref()
+                        .ok_or("tilelang_ref arm lost its validated reference")?,
+                    &self.stream,
+                    routed_fp8,
+                    routed_scales,
+                    &self.w2_device,
+                    &self.w2_scale_device,
+                    &mut self.output_bf16,
+                    1,
+                    self.spec.hidden,
+                    self.spec.moe_intermediate,
+                )?,
+                FlashFp4AccumArm::Fp8Mma => launch_v4_fp4_matvec_mma(
+                    self.module,
+                    &self.stream,
+                    routed_fp8,
+                    routed_scales,
+                    &self.w2_device,
+                    &self.w2_scale_device,
+                    &mut self.output_bf16,
+                    1,
+                    self.spec.hidden,
+                    self.spec.moe_intermediate,
+                )?,
+                FlashFp4AccumArm::Current => {
+                    return Err("current FP4 arm entered raw-FP8 branch".into());
+                }
+            }
+        } else {
+            launch_v4_activation_quantize(
+                self.module,
+                &self.stream,
+                &self.routed,
+                &mut self.routed_quantized,
+            )?;
+            launch_v4_fp4_matvec(
+                self.module,
+                &self.stream,
+                &self.routed_quantized,
+                &self.w2_device,
+                &self.w2_scale_device,
+                &mut self.output_bf16,
+                1,
+                self.spec.hidden,
+                self.spec.moe_intermediate,
+            )?;
+        }
         launch_v4_bf16_to_f32(
             self.module,
             &self.stream,
@@ -13568,16 +16111,27 @@ fn read_v4_hash_rows(
     name: &str,
     input_ids: &[i64],
 ) -> Result<Vec<i64>, Box<dyn Error>> {
+    read_v4_hash_rows_for(&v4_spec::PRO, shard, name, input_ids)
+}
+
+fn read_v4_hash_rows_for(
+    spec: &v4_spec::V4Spec,
+    shard: &safetensors::ShardFile,
+    name: &str,
+    input_ids: &[i64],
+) -> Result<Vec<i64>, Box<dyn Error>> {
     let info = shard.tensor(name)?;
-    if info.dtype != safetensors::TensorDtype::I64 || info.shape != [129_280, 6] {
+    if info.dtype != safetensors::TensorDtype::I64
+        || info.shape != [spec.vocab as u64, spec.experts_per_token as u64]
+    {
         return Err(format!("{name} metadata does not match the pinned V4 hash table").into());
     }
-    let mut result = Vec::with_capacity(input_ids.len() * v4_router::V4_TOPK);
+    let mut result = Vec::with_capacity(input_ids.len() * spec.experts_per_token);
     for &input_id in input_ids {
-        if !(0..129_280).contains(&input_id) {
+        if !(0..i64::try_from(spec.vocab)?).contains(&input_id) {
             return Err(format!("V4 token id {input_id} is outside the hash table").into());
         }
-        let mut row = [0_u8; v4_router::V4_TOPK * 8];
+        let mut row = vec![0_u8; spec.experts_per_token * 8];
         shard.read_at(name, input_id as u64 * row.len() as u64, &mut row)?;
         result.extend(
             row.chunks_exact(8)
@@ -13592,13 +16146,21 @@ fn load_layer_hash_ids(
     layer: usize,
     input_ids: &[i64],
 ) -> Result<Vec<i64>, Box<dyn Error>> {
-    if layer >= 3 {
+    load_layer_hash_ids_for(&v4_spec::PRO, model_dir, layer, input_ids)
+}
+
+fn load_layer_hash_ids_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    input_ids: &[i64],
+) -> Result<Vec<i64>, Box<dyn Error>> {
+    if layer >= spec.hash_layers {
         return Ok(Vec::new());
     }
-    let shard = safetensors::ShardFile::open(
-        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
-    )?;
-    read_v4_hash_rows(
+    let shard = safetensors::ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?;
+    read_v4_hash_rows_for(
+        spec,
         &shard,
         &format!("layers.{layer}.ffn.gate.tid2eid"),
         input_ids,
@@ -14808,6 +17370,7 @@ struct DeviceLayerIndexer {
 }
 
 struct LayerDeviceWeights {
+    spec: &'static v4_spec::V4Spec,
     layer: usize,
     compression_ratio: v4_state::CompressionRatio,
     hc_attn_fn: DeviceBuffer<f32>,
@@ -14848,6 +17411,7 @@ impl LayerDeviceWeights {
         tail: &v4_state::L0TailWeights,
     ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
+            spec: &v4_spec::PRO,
             layer: 0,
             compression_ratio: v4_state::CompressionRatio::Hca128,
             hc_attn_fn: DeviceBuffer::from_host(stream, &state.hc_fn)?,
@@ -14907,7 +17471,7 @@ impl LayerDeviceWeights {
     ) -> Result<Self, Box<dyn Error>> {
         let (router_bias, hash_router) = match &state.router {
             v4_state::LayerRouterWeights::Hash { .. } => {
-                (vec![0.0_f32; v4_router::V4_ROUTED_EXPERTS], true)
+                (vec![0.0_f32; state.spec.routed_experts], true)
             }
             v4_state::LayerRouterWeights::Learned { bias } => (bias.clone(), false),
         };
@@ -14932,6 +17496,7 @@ impl LayerDeviceWeights {
             })
             .transpose()?;
         Ok(Self {
+            spec: state.spec,
             layer: state.layer,
             compression_ratio: state.compression_ratio,
             hc_attn_fn: DeviceBuffer::from_host(stream, &state.hc_fn)?,
@@ -15030,6 +17595,7 @@ fn upload_mtp_draft_weights(
     launch_e4m3fn_to_bf16(module, stream, &raw_wo_a, &mut wo_a)?;
     drop(raw_wo_a);
     Ok(LayerDeviceWeights {
+        spec: &v4_spec::PRO,
         layer: v4_state::V4_LAYER_COUNT,
         compression_ratio: v4_state::CompressionRatio::Hca128,
         hc_attn_fn: DeviceBuffer::from_host(stream, &host.hc_attn_fn)?,
@@ -15088,6 +17654,45 @@ fn upload_mtp_draft_prefix_weights(
 struct LoadedLayerRuntime {
     weights: LayerDeviceWeights,
     expert_shard: safetensors::ShardFile,
+}
+
+struct LoadedDsparkStage {
+    stage: usize,
+    weights: LayerDeviceWeights,
+    expert_shard: safetensors::ShardFile,
+    main_proj: Option<DeviceFp8Matrix>,
+    main_norm: Option<DeviceBuffer<u16>>,
+    head: Option<v4_state::DsparkHeadWeights>,
+}
+
+fn load_flash_dspark_stage(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    model_dir: &std::path::Path,
+    stage: usize,
+) -> Result<LoadedDsparkStage, Box<dyn Error>> {
+    let host = v4_state::load_flash_dspark_stage(model_dir, stage)?;
+    let weights =
+        LayerDeviceWeights::new_layer(stream, &host.state, &host.projections, &host.tail)?;
+    let main_proj = host
+        .main_proj
+        .as_ref()
+        .map(|matrix| DeviceFp8Matrix::new(stream, matrix))
+        .transpose()?;
+    let main_norm = host
+        .main_norm
+        .as_ref()
+        .map(|norm| DeviceBuffer::from_host(stream, norm))
+        .transpose()?;
+    let _ = module;
+    Ok(LoadedDsparkStage {
+        stage,
+        weights,
+        expert_shard: host.shard,
+        main_proj,
+        main_norm,
+        head: host.head,
+    })
 }
 
 struct RawLoadedLayerRuntime {
@@ -16259,6 +18864,18 @@ fn host_available_bytes() -> Result<usize, Box<dyn Error>> {
         .ok_or_else(|| "MemAvailable byte count overflow".into())
 }
 
+fn process_rss_bytes() -> Result<usize, Box<dyn Error>> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or("VmRSS is missing from /proc/self/status")?
+        .parse::<usize>()?;
+    kib.checked_mul(1024)
+        .ok_or_else(|| "VmRSS byte count overflow".into())
+}
+
 fn device_available_bytes() -> Result<usize, Box<dyn Error>> {
     let (mut free, mut total) = (0_usize, 0_usize);
     let result = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
@@ -16807,6 +19424,7 @@ fn device_attention_capacity_plan(
             .iter()
             .fold((0_usize, 0_usize), |(hca, csa), manifest| {
                 match manifest.compression_ratio {
+                    v4_state::CompressionRatio::WindowOnly => (hca, csa),
                     v4_state::CompressionRatio::Hca128 => (hca + 1, csa),
                     v4_state::CompressionRatio::Csa4 => (hca, csa + 1),
                 }
@@ -18010,14 +20628,20 @@ fn load_layer_host_inner(
     token_ids: &[i64],
     raw_wo_a: bool,
 ) -> Result<(DecodedLayerHost, FixedLoadTelemetry), Box<dyn Error>> {
+    load_layer_host_inner_for(&v4_spec::PRO, model_dir, layer, token_ids, raw_wo_a)
+}
+
+fn load_layer_host_inner_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+    raw_wo_a: bool,
+) -> Result<(DecodedLayerHost, FixedLoadTelemetry), Box<dyn Error>> {
     let read_started = std::time::Instant::now();
-    let state = v4_state::load_layer_state_weights(model_dir, layer, token_ids)?;
-    let projections = v4_state::load_layer_fp8_projections(model_dir, layer)?;
-    let tail = if raw_wo_a {
-        v4_state::load_layer_tail_raw(model_dir, layer)?
-    } else {
-        v4_state::load_layer_tail(model_dir, layer)?
-    };
+    let state = v4_state::load_layer_state_weights_for(spec, model_dir, layer, token_ids)?;
+    let projections = v4_state::load_layer_fp8_projections_for(spec, model_dir, layer)?;
+    let tail = v4_state::load_layer_tail_for(spec, model_dir, layer, raw_wo_a)?;
     let fixed_decode_ns = (tail.wo_a_decode_ms * 1_000_000.0) as u64;
     let fixed_read_alloc_ns = u64::try_from(read_started.elapsed().as_nanos())
         .unwrap_or(u64::MAX)
@@ -18046,9 +20670,17 @@ fn upload_layer_runtime(
     host: &DecodedLayerHost,
     stream: &CudaStream,
 ) -> Result<LoadedLayerRuntime, Box<dyn Error>> {
-    let expert_shard = safetensors::ShardFile::open(
-        model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)),
-    )?;
+    upload_layer_runtime_for(&v4_spec::PRO, model_dir, layer, host, stream)
+}
+
+fn upload_layer_runtime_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    stream: &CudaStream,
+) -> Result<LoadedLayerRuntime, Box<dyn Error>> {
+    let expert_shard = safetensors::ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?;
     let weights =
         LayerDeviceWeights::new_layer(stream, &host.state, &host.projections, &host.tail)?;
     Ok(LoadedLayerRuntime {
@@ -18231,6 +20863,7 @@ fn upload_pinned_layer_runtime_raw(
     Ok((
         LoadedLayerRuntime {
             weights: LayerDeviceWeights {
+                spec: state.spec,
                 layer,
                 compression_ratio: state.compression_ratio,
                 hc_attn_fn,
@@ -18358,9 +20991,20 @@ fn load_layer_runtime(
     token_ids: &[i64],
     stream: &CudaStream,
 ) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry), Box<dyn Error>> {
-    let (host, mut telemetry) = load_layer_host(model_dir, layer, token_ids)?;
+    load_layer_runtime_for(&v4_spec::PRO, model_dir, layer, token_ids, stream)
+}
+
+fn load_layer_runtime_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    token_ids: &[i64],
+    stream: &CudaStream,
+) -> Result<(LoadedLayerRuntime, FixedLoadTelemetry), Box<dyn Error>> {
+    let (host, mut telemetry) =
+        load_layer_host_inner_for(spec, model_dir, layer, token_ids, false)?;
     let h2d_started = std::time::Instant::now();
-    let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
+    let runtime = upload_layer_runtime_for(spec, model_dir, layer, &host, stream)?;
     if bench_telemetry_enabled() {
         stream.synchronize()?;
     }
@@ -18418,6 +21062,14 @@ fn parse_b2_generate_token_ids<const REQUESTS: usize>(
     value: &str,
     token_ids_env: &str,
 ) -> Result<[Vec<i64>; REQUESTS], Box<dyn Error>> {
+    parse_b2_generate_token_ids_for(&v4_spec::PRO, value, token_ids_env)
+}
+
+fn parse_b2_generate_token_ids_for<const REQUESTS: usize>(
+    spec: &'static v4_spec::V4Spec,
+    value: &str,
+    token_ids_env: &str,
+) -> Result<[Vec<i64>; REQUESTS], Box<dyn Error>> {
     let prompts = value
         .split(';')
         .map(|prompt| {
@@ -18433,7 +21085,7 @@ fn parse_b2_generate_token_ids<const REQUESTS: usize>(
                 .map(str::trim)
                 .map(str::parse::<i64>)
                 .collect::<Result<Vec<_>, _>>()?;
-            v4_state::validate_ids(&ids)?;
+            v4_state::validate_ids_for(spec, &ids)?;
             Ok(ids)
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -18509,6 +21161,15 @@ struct B2GenerateRequest {
     tokens: Vec<serde_json::Value>,
     finals: Vec<serde_json::Value>,
     physical: B2RequestPhysical,
+    flash_b1_phase: FlashB1PhaseTiming,
+}
+
+#[derive(Default)]
+struct FlashB1PhaseTiming {
+    layers: Vec<serde_json::Value>,
+    layer_outer_ns: u64,
+    final_heads: Vec<serde_json::Value>,
+    final_head_outer_ns: u64,
 }
 
 struct B2GenerateArm<const REQUESTS: usize> {
@@ -18516,6 +21177,111 @@ struct B2GenerateArm<const REQUESTS: usize> {
     physical: B2Physical,
     duration_ns: u64,
     peak_device_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlashParityStopAfterLayer {
+    layer: usize,
+    dir: std::path::PathBuf,
+}
+
+#[derive(Debug)]
+struct FlashParityStopped {
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Display for FlashParityStopped {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Flash parity intentionally stopped after the requested layer; partial artifact is {}",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for FlashParityStopped {}
+
+fn flash_parity_stop_after_layer_for(
+    spec: &v4_spec::V4Spec,
+    flash_base: bool,
+    dump_dir: Option<&std::ffi::OsStr>,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<FlashParityStopAfterLayer>, Box<dyn Error>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !flash_base || spec != &v4_spec::FLASH_0731 {
+        return Err(
+            "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER is only valid for Flash-0731 base mode"
+                .into(),
+        );
+    }
+    let Some(dump_dir) = dump_dir else {
+        return Err(
+            "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER requires COLIBRI_V4_FLASH_PARITY_DUMP_DIR"
+                .into(),
+        );
+    };
+    if dump_dir.is_empty() {
+        return Err("COLIBRI_V4_FLASH_PARITY_DUMP_DIR must not be empty".into());
+    }
+    let layer = value
+        .to_string_lossy()
+        .parse::<usize>()
+        .map_err(|_| "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER must be a layer index")?;
+    if layer >= spec.layers {
+        return Err("COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER is outside Flash-0731 depth".into());
+    }
+    Ok(Some(FlashParityStopAfterLayer {
+        layer,
+        dir: std::path::PathBuf::from(dump_dir),
+    }))
+}
+
+fn flash_parity_stop_after_layer(
+    spec: &v4_spec::V4Spec,
+) -> Result<Option<FlashParityStopAfterLayer>, Box<dyn Error>> {
+    flash_parity_stop_after_layer_for(
+        spec,
+        true,
+        std::env::var_os("COLIBRI_V4_FLASH_PARITY_DUMP_DIR").as_deref(),
+        std::env::var_os("COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER").as_deref(),
+    )
+}
+
+fn write_flash_parity_stop(
+    stop: &FlashParityStopAfterLayer,
+    spec: &v4_spec::V4Spec,
+    layers: &[B2LayerDigest],
+    phase_profile: Option<&serde_json::Value>,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    if layers.len() != stop.layer + 1
+        || layers.last().map(|digest| digest.layer) != Some(stop.layer)
+    {
+        return Err("Flash parity stop did not retain exactly the requested layer digest".into());
+    }
+    std::fs::create_dir_all(&stop.dir)?;
+    let path = stop.dir.join("parity-stop.json");
+    let ordered_layer_digest_sha256 = B2LayerDigest::ordered_chain_sha256(layers)?;
+    let mut output = PendingResultFile::reserve(path.clone())?;
+    let mut payload = serde_json::json!({
+        "schema": "colibri-flash-parity-stop-v1",
+        "revision": spec.revision,
+        "layer": stop.layer,
+        "ordered_layer_digest_sha256": ordered_layer_digest_sha256,
+        "partial": true,
+    });
+    if let Some(phase_profile) = phase_profile {
+        payload
+            .as_object_mut()
+            .ok_or("Flash parity-stop payload must be a JSON object")?
+            .insert("phase_profile".to_owned(), phase_profile.clone());
+    }
+    serde_json::to_writer_pretty(output.file_mut(), &payload)?;
+    output.file_mut().write_all(b"\n")?;
+    output.commit()?;
+    Ok(path)
 }
 
 struct B2GenerateSummary<const REQUESTS: usize> {
@@ -18727,10 +21493,205 @@ impl B2RequestPhysical {
     }
 }
 
+fn flash_b1_layer_phase_profile_json(
+    layer: usize,
+    outer_wall_ns: u64,
+    fixed_prepare_ns: u64,
+    fixed: &FixedLoadTelemetry,
+    wo_a_decode_sync_ns: u64,
+    stage: &LayerStageTelemetry,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let fixed_service_ns = fixed
+        .fixed_read_alloc_ns
+        .checked_add(fixed.fixed_decode_ns)
+        .and_then(|value| value.checked_add(fixed.fixed_h2d_ns))
+        .ok_or("Flash B1 fixed service timing overflow")?;
+    if (fixed.cache_status != "prefetched_host" && fixed_service_ns > fixed_prepare_ns)
+        || stage.attention_ns > outer_wall_ns
+        || stage.commit_ns > outer_wall_ns
+        || stage.router_ns > outer_wall_ns
+        || stage.shared_ns > outer_wall_ns
+        || stage.routed_ns > outer_wall_ns
+        || (!stage.routed_prefetched && stage.routed_read_ns > stage.routed_ns)
+        || stage.routed_h2d_ns > stage.routed_ns
+        || stage.routed_kernel_ns > stage.routed_ns
+    {
+        return Err("Flash B1 nested phase timing exceeds its parent scope".into());
+    }
+    let attention_wall_ns = stage
+        .attention_ns
+        .checked_add(stage.commit_ns)
+        .ok_or("Flash B1 attention timing overflow")?;
+    let attributed_ns = fixed_prepare_ns
+        .checked_add(wo_a_decode_sync_ns)
+        .and_then(|value| value.checked_add(attention_wall_ns))
+        .and_then(|value| value.checked_add(stage.router_ns))
+        .and_then(|value| value.checked_add(stage.shared_ns))
+        .and_then(|value| value.checked_add(stage.routed_ns))
+        .ok_or("Flash B1 layer phase timing overflow")?;
+    if attributed_ns > outer_wall_ns {
+        return Err("Flash B1 top-level phases exceed layer wall time".into());
+    }
+    let bench = bench_telemetry_enabled().then(|| serde_json::json!({
+        "attention": {
+            "device_state_setup_ns": stage.device_state_setup_ns,
+            "device_state_setup_count": stage.device_state_setup_count,
+            "device_state_reset_cuda_ns": stage.device_state_reset_cuda_ns,
+            "device_state_reset_calls": stage.device_state_reset_calls,
+            "audit_oracle_ns": stage.attention_audit_oracle_ns,
+            "hidden_h2d": {"count": stage.attention_hidden_h2d_count, "bytes": stage.attention_hidden_h2d_bytes},
+            "rope_lut_d2d": {"count": stage.attention_rope_lut_d2d_count, "bytes": stage.attention_rope_lut_d2d_bytes},
+            "terminal_d2h": {"count": stage.attention_terminal_d2h_count, "bytes": stage.attention_terminal_d2h_bytes},
+            "intermediate_or_audit_d2h": {"count": stage.attention_intermediate_or_audit_d2h_count, "bytes": stage.attention_intermediate_or_audit_d2h_bytes},
+            "steady_device_temporary_alloc_count": stage.attention_steady_device_temporary_alloc_count,
+            "certified_host_path": stage.attention_profile.as_ref().map(AttentionProfile::json),
+        },
+        "router": {
+            "mhc": {
+                "wall_ns": stage.router_mhc_ns,
+                "input_alloc_h2d_sync_ns": stage.router_mhc_input_alloc_h2d_sync_ns,
+                "workspace_alloc_sync_ns": stage.router_mhc_workspace_alloc_sync_ns,
+                "workspace_init_gpu_ns": stage.router_mhc_workspace_init_gpu_ns,
+                "mixing_linear_sync_ns": stage.router_mhc_mixing_linear_sync_ns,
+                "mixing_linear_gpu_ns": stage.router_mhc_mixing_linear_gpu_ns,
+                "sinkhorn_normalize_collapse_sync_ns": stage.router_mhc_sinkhorn_normalize_collapse_sync_ns,
+                "sinkhorn_normalize_collapse_gpu_ns": stage.router_mhc_sinkhorn_normalize_collapse_gpu_ns,
+                "output_d2h_sync_ns": stage.router_mhc_output_d2h_sync_ns,
+                "other_ns": stage.router_mhc_other_ns,
+            },
+            "host_prep_ns": stage.router_host_prep_ns,
+            "alloc_h2d_sync_ns": stage.router_alloc_h2d_sync_ns,
+            "workspace_alloc_ns": stage.router_workspace_alloc_ns,
+            "kernel_select_sync_ns": stage.router_kernel_select_sync_ns,
+            "kernel_select_gpu_ns": stage.router_kernel_select_gpu_ns,
+            "d2h_sync_ns": stage.router_d2h_sync_ns,
+            "other_ns": stage.router_other_ns,
+        },
+    }));
+    Ok(serde_json::json!({
+        "layer": layer,
+        "outer": {"wall_ns": outer_wall_ns},
+        "top_level": {
+            "fixed": {
+                "wall_ns": fixed_prepare_ns,
+                "host_prefetched": fixed.cache_status == "prefetched_host",
+                "read_alloc_ns": fixed.fixed_read_alloc_ns,
+                "decode_ns": fixed.fixed_decode_ns,
+                "h2d_ns": fixed.fixed_h2d_ns,
+                "source_bytes": fixed.fixed_source_bytes,
+                "h2d_bytes": fixed.fixed_h2d_bytes,
+            },
+            "wo_a_decode_gpu_sync": {"wall_ns": wo_a_decode_sync_ns},
+            "attention": {"wall_ns": attention_wall_ns, "execution_ns": stage.attention_ns, "commit_ns": stage.commit_ns},
+            "router": {"wall_ns": stage.router_ns},
+            "shared": {"wall_ns": stage.shared_ns},
+            "routed": {
+                "wall_ns": stage.routed_ns,
+                "host_prefetched": stage.routed_prefetched,
+                "diagnostics": {
+                    "read_ns": stage.routed_read_ns,
+                    "alloc_ns": stage.routed_alloc_ns,
+                    "setup_ns": stage.routed_setup_ns,
+                    "h2d_ns": stage.routed_h2d_ns,
+                    "kernel_ns": stage.routed_kernel_ns,
+                    "source_bytes": stage.routed_source_bytes,
+                    "h2d_bytes": stage.routed_h2d_bytes,
+                    "expert_loads": stage.routed_expert_loads,
+                },
+            },
+        },
+        "top_level_attributed_ns": attributed_ns,
+        "unattributed_gap_ns": outer_wall_ns - attributed_ns,
+        "bench": bench,
+        "closure": {
+            "equation": "top_level_attributed_ns + unattributed_gap_ns == outer.wall_ns",
+            "exact": true,
+        },
+    }))
+}
+
+fn flash_b1_request_phase_profile_json(
+    timing: &FlashB1PhaseTiming,
+    request_wall_ns: u64,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let layers_outer_ns = timing
+        .layers
+        .iter()
+        .map(|layer| {
+            layer["outer"]["wall_ns"]
+                .as_u64()
+                .ok_or("Flash B1 layer profile lacks wall time")
+        })
+        .try_fold(0_u64, |sum, value| {
+            value.and_then(|value| {
+                sum.checked_add(value)
+                    .ok_or("Flash B1 layer wall sum overflow")
+            })
+        })?;
+    if layers_outer_ns != timing.layer_outer_ns {
+        return Err("Flash B1 layer wall ledger does not close".into());
+    }
+    let attributed_ns = layers_outer_ns
+        .checked_add(timing.final_head_outer_ns)
+        .ok_or("Flash B1 request phase timing overflow")?;
+    if attributed_ns > request_wall_ns {
+        return Err("Flash B1 request phases exceed request wall time".into());
+    }
+    Ok(serde_json::json!({
+        "schema": "colibri-flash-0731-b1-phase-profile-v1",
+        "clock": "monotonic_host_ns; existing stream synchronization boundaries only",
+        "outer": {"wall_ns": request_wall_ns},
+        "layers": &timing.layers,
+        "final_heads": &timing.final_heads,
+        "top_level_attributed_ns": attributed_ns,
+        "unattributed_gap_ns": request_wall_ns - attributed_ns,
+        "closure": {
+            "equation": "top_level_attributed_ns + unattributed_gap_ns == outer.wall_ns",
+            "exact": true,
+        },
+    }))
+}
+
 struct B2RawRuntime {
     raw: RawLoadedLayerRuntime,
     fixed_source_bytes: usize,
     fixed_h2d_bytes: usize,
+    fixed: FixedLoadTelemetry,
+}
+
+fn flash_b1_prefetch_enabled(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<bool, Box<dyn Error>> {
+    // Keep the experimental worker confined to the standalone Flash B1 base
+    // runner. Serve, DSpark, Pro, QD4, and every multi-row execution retain
+    // their existing loading path.
+    if spec != &v4_spec::FLASH_0731 || requests != 1 || !optional_one_flag("COLIBRI_V4_FLASH_BASE")?
+    {
+        return Ok(false);
+    }
+    optional_one_flag("COLIBRI_V4_FLASH_PREFETCH")
+}
+
+fn flash_b1_prefetch_next_layer(
+    current_layer: usize,
+    layer_count: usize,
+) -> Result<Option<usize>, Box<dyn Error>> {
+    if layer_count == 0 || current_layer >= layer_count {
+        return Err("Flash B1 fixed prefetch layer is outside the model".into());
+    }
+    Ok((current_layer + 1 < layer_count).then_some(current_layer + 1))
+}
+
+fn flash_b1_prefetch_worker_result<T>(
+    expected_layer: usize,
+    scheduled_layer: usize,
+    result: Result<T, String>,
+) -> Result<T, Box<dyn Error>> {
+    if scheduled_layer != expected_layer {
+        return Err("Flash B1 fixed prefetch lost layer order".into());
+    }
+    result.map_err(|error| format!("Flash B1 fixed prefetch worker failed: {error}").into())
 }
 
 fn b2_raw_runtime_ledger(
@@ -18751,10 +21712,30 @@ fn load_b2_raw_runtime(
     layer: usize,
     stream: &CudaStream,
 ) -> Result<B2RawRuntime, Box<dyn Error>> {
+    load_b2_raw_runtime_for(&v4_spec::PRO, model_dir, layer, stream)
+}
+
+fn load_b2_raw_runtime_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    stream: &CudaStream,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
     // Request-specific router metadata belongs to the request ledger, not the
     // immutable layer runtime. `load_layer_state_weights` accepts this empty
     // row set only to build the hash-router mode without reading a request row.
-    let (mut host, telemetry) = load_layer_host_raw_wo_a(model_dir, layer, &[])?;
+    let (host, telemetry) = load_layer_host_inner_for(spec, model_dir, layer, &[], true)?;
+    load_b2_raw_runtime_from_host_for(spec, model_dir, layer, host, telemetry, stream)
+}
+
+fn load_b2_raw_runtime_from_host_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    mut host: DecodedLayerHost,
+    telemetry: FixedLoadTelemetry,
+    stream: &CudaStream,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
     let raw_wo_a_host = host
         .tail
         .wo_a_raw
@@ -18763,13 +21744,13 @@ fn load_b2_raw_runtime(
     if !host.tail.wo_a_bf16.is_empty() {
         return Err("B2 raw layer host retained decoded wo_a".into());
     }
-    let runtime = upload_layer_runtime(model_dir, layer, &host, stream)?;
+    let h2d_started = std::time::Instant::now();
+    let runtime = upload_layer_runtime_for(spec, model_dir, layer, &host, stream)?;
     let fixed_h2d_without_wo_a_bytes = runtime.weights.num_bytes();
-    let raw_h2d_started = std::time::Instant::now();
     let wo_a_raw = DeviceBuffer::from_host(stream, &raw_wo_a_host)?;
     stream.synchronize()?;
     let raw_h2d_bytes = wo_a_raw.num_bytes();
-    let _raw_h2d_ns = u64::try_from(raw_h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let (fixed_source_bytes, fixed_h2d_bytes) = b2_raw_runtime_ledger(
         telemetry.fixed_source_bytes,
         fixed_h2d_without_wo_a_bytes,
@@ -18783,6 +21764,15 @@ fn load_b2_raw_runtime(
     Ok(B2RawRuntime {
         fixed_source_bytes,
         fixed_h2d_bytes,
+        fixed: FixedLoadTelemetry {
+            fixed_read_alloc_ns: telemetry.fixed_read_alloc_ns,
+            fixed_decode_ns: telemetry.fixed_decode_ns,
+            fixed_h2d_ns,
+            fixed_h2d_bytes,
+            fixed_source_bytes,
+            cache_status: "miss",
+            ..FixedLoadTelemetry::default()
+        },
         raw: RawLoadedLayerRuntime {
             runtime,
             wo_a_raw,
@@ -18795,6 +21785,7 @@ fn run_b2_layer(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
+    flash_cublas: Option<&FlashCublasSession>,
     runtime: &LoadedLayerRuntime,
     lanes: &mut [ExpertSlot<'_>],
     hash_ids: &[i64],
@@ -18804,14 +21795,16 @@ fn run_b2_layer(
     persistent: &mut v4_state::V4SerialPersistentState,
 ) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
     let layer = runtime.weights.layer;
+    let spec = runtime.weights.spec;
     let mut result = None;
     persistent.transaction(layer, |state| {
         let run = run_real_layer_rows(
             context,
             module,
             stream,
+            flash_cublas,
             runtime,
-            Some(lanes),
+            (spec == &v4_spec::PRO).then_some(lanes),
             None,
             None,
             hash_ids,
@@ -18840,7 +21833,7 @@ fn run_b2_layer(
                 .collect(),
             attention_topk_digest: run.attention_topk_digest,
             hidden_digest: fnv1a_u16(&run.output),
-            kv_digest: fnv1a_u16(state.kv_bf16()),
+            kv_digest: fnv1a_u16(state.active_kv_bf16()),
             main_kv_state_digest: fnv1a_f32(main.kv()),
             main_score_state_digest: fnv1a_f32(main.score()),
             indexer_kv_state_digest: indexer.map(|value| fnv1a_f32(value.kv())),
@@ -18872,6 +21865,7 @@ fn prepare_b2_prefix(
                     context,
                     module,
                     stream,
+                    None,
                     &runtime,
                     Some(lanes),
                     None,
@@ -18909,10 +21903,18 @@ fn prepare_b2_initial_hidden_with_source_bytes(
     model_dir: &std::path::Path,
     token_id: i64,
 ) -> Result<(Vec<u16>, usize), Box<dyn Error>> {
-    let state = v4_state::load(model_dir, &[token_id])?;
+    prepare_b2_initial_hidden_with_source_bytes_for(&v4_spec::PRO, model_dir, token_id)
+}
+
+fn prepare_b2_initial_hidden_with_source_bytes_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    token_id: i64,
+) -> Result<(Vec<u16>, usize), Box<dyn Error>> {
+    let state = v4_state::load_for(spec, model_dir, &[token_id])?;
     let initial_state_source_bytes = state.range_bytes;
     let embedding = state.embedding;
-    let mut hidden = Vec::with_capacity(v4_state::HC * v4_state::HIDDEN);
+    let mut hidden = Vec::with_capacity(v4_state::HC * spec.hidden);
     for _ in 0..v4_state::HC {
         hidden.extend_from_slice(&embedding);
     }
@@ -18957,6 +21959,7 @@ fn prepare_two_token_prefix(
                         context,
                         module,
                         stream,
+                        None,
                         &runtime,
                         Some(lanes),
                         None,
@@ -19038,6 +22041,7 @@ fn run_b2_serial_request(
             context,
             module,
             stream,
+            None,
             &loaded.raw.runtime,
             lanes,
             row_hash_ids,
@@ -19202,6 +22206,7 @@ fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 context,
                 module,
                 stream,
+                None,
                 &loaded.raw.runtime,
                 lanes,
                 b2_router_metadata_row(
@@ -19284,11 +22289,14 @@ fn run_b2_batch_pair(
 }
 
 fn run_v4_b2_generate_arm<const REQUESTS: usize>(
+    spec: &'static v4_spec::V4Spec,
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
+    flash_cublas: Option<&FlashCublasSession>,
     model_dir: &std::path::Path,
-    final_weights: &v4_state::FinalHeadWeights,
+    final_weights: Option<&v4_state::FinalHeadWeights>,
+    flash_final_head_gpu: Option<&FlashDsparkFinalHeadGpuWorkspace>,
     lanes: &mut [ExpertSlot<'_>],
     mut scratch: &mut DeviceBuffer<u16>,
     prompts: [Vec<i64>; REQUESTS],
@@ -19296,7 +22304,26 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     forward_tokens: [usize; REQUESTS],
     record_final_head_loader: bool,
     capture_layer_trace: bool,
+    parity_stop_after_layer: Option<&FlashParityStopAfterLayer>,
+    on_generated: &mut dyn FnMut(
+        usize,
+        i64,
+        Option<GreedyStopReason>,
+    ) -> Result<(), Box<dyn Error>>,
 ) -> Result<B2GenerateArm<REQUESTS>, Box<dyn Error>> {
+    let wo_a_elements = spec
+        .q_heads
+        .checked_mul(spec.q_head_dim)
+        .and_then(|value| value.checked_mul(spec.o_lora_rank))
+        .ok_or("row-set wo_a scratch size overflow")?;
+    if scratch.len() != wo_a_elements {
+        return Err(format!(
+            "{} row-set wo_a scratch has {} elements, expected {wo_a_elements}",
+            spec.name,
+            scratch.len()
+        )
+        .into());
+    }
     let mut requests = prompts
         .into_iter()
         .enumerate()
@@ -19305,13 +22332,18 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 input_ids: prompt_ids.clone(),
                 prompt_ids,
                 position: 0,
-                persistent: v4_state::V4SerialPersistentState::new(forward_tokens[request])?,
+                persistent: v4_state::V4SerialPersistentState::new_for_spec(
+                    spec,
+                    forward_tokens[request],
+                    1,
+                )?,
                 hidden: Vec::new(),
                 generated_ids: Vec::with_capacity(greedy_steps),
                 stop_reason: None,
                 tokens: Vec::with_capacity(forward_tokens[request]),
                 finals: Vec::with_capacity(greedy_steps),
                 physical: B2RequestPhysical::default(),
+                flash_b1_phase: FlashB1PhaseTiming::default(),
             })
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -19321,6 +22353,7 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // one real loader read to the first request so request ledgers sum exactly
     // to the global physical ledger; streamed head rows stay per decision.
     if record_final_head_loader {
+        let final_weights = final_weights.ok_or("row-set generation needs final head weights")?;
         requests[0]
             .physical
             .record_final_head_source_bytes(final_weights.loader_source_bytes)?;
@@ -19328,6 +22361,20 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     }
     let mut peak_device_bytes = device_used_bytes()?;
     let request_started = std::time::Instant::now();
+    let flash_b1_profile = spec == &v4_spec::FLASH_0731 && REQUESTS == 1;
+    let final_head_arm = flash_final_head_arm(spec)?;
+    let flash_b1_prefetch = flash_b1_prefetch_enabled(spec, REQUESTS)?;
+    let layer_count = parity_stop_after_layer
+        .map(|stop| {
+            stop.layer
+                .checked_add(1)
+                .ok_or("Flash parity stop layer overflow")
+        })
+        .transpose()?
+        .unwrap_or(spec.layers);
+    if layer_count == 0 || layer_count > spec.layers {
+        return Err("Flash parity stop layer is outside the model depth".into());
+    }
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -19343,7 +22390,7 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
             .collect::<Result<Vec<_>, _>>()?;
         for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
             let (hidden, initial_state_source_bytes) =
-                prepare_b2_initial_hidden_with_source_bytes(&model_dir, token_id)?;
+                prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?;
             requests[request]
                 .physical
                 .record_initial_state_source_bytes(initial_state_source_bytes)?;
@@ -19351,66 +22398,176 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
             requests[request].hidden = hidden;
         }
         let mut layers = (0..REQUESTS)
-            .map(|_| Vec::with_capacity(v4_state::V4_LAYER_COUNT))
+            .map(|_| Vec::with_capacity(spec.layers))
             .collect::<Vec<Vec<B2LayerDigest>>>();
         let token_started = std::time::Instant::now();
-        for layer in 0..v4_state::V4_LAYER_COUNT {
-            let mut loaded = load_b2_raw_runtime(&model_dir, layer, stream)?;
-            let hash_ids = load_layer_hash_ids(&model_dir, layer, &token_ids)?;
-            let router_rows = active_requests
-                .iter()
-                .enumerate()
-                .map(|(row, _)| {
-                    b2_router_metadata_row(
-                        loaded.raw.runtime.weights.hash_router,
-                        &hash_ids,
-                        row,
-                        active_requests.len(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            physical.fixed_source_bytes += loaded.fixed_source_bytes;
-            physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
-            for row in &router_rows {
-                physical
-                    .record_request_router_metadata(loaded.raw.runtime.weights.hash_router, row)?;
-            }
-            peak_device_bytes = peak_device_bytes.max(device_used_bytes()?);
-            launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, &mut scratch)?;
-            stream.synchronize()?;
-            std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
-            let layer_run = (|| -> Result<(), Box<dyn Error>> {
-                for ((row, &request), &token_id) in
-                    active_requests.iter().enumerate().zip(&token_ids)
-                {
-                    let state = &mut requests[request];
-                    let (next, digest, stage) = run_b2_layer(
-                        context,
-                        module,
+        std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
+            let mut prefetched_next: Option<FixedPrefetchTask<'_>> = None;
+            for layer in 0..layer_count {
+                let layer_started = std::time::Instant::now();
+                let mut loaded = if let Some(task) = prefetched_next.take() {
+                    let scheduled_layer = task.layer;
+                    let prefetched = task
+                        .worker
+                        .join()
+                        .map_err(|_| "Flash B1 fixed prefetch worker panicked")?;
+                    let prefetched =
+                        flash_b1_prefetch_worker_result(layer, scheduled_layer, prefetched)?;
+                    if prefetched.layer != layer {
+                        return Err(
+                            "Flash B1 fixed prefetch worker returned the wrong layer".into()
+                        );
+                    }
+                    let mut loaded = load_b2_raw_runtime_from_host_for(
+                        spec,
+                        model_dir,
+                        layer,
+                        prefetched.host,
+                        prefetched.telemetry,
                         stream,
-                        &loaded.raw.runtime,
-                        lanes,
-                        router_rows[row],
-                        &state.hidden,
-                        token_id,
-                        state.position,
-                        &mut state.persistent,
                     )?;
-                    physical.routed_source_bytes += stage.routed_source_bytes;
-                    physical.routed_h2d_bytes += stage.routed_h2d_bytes;
-                    state.hidden = next;
-                    layers[request].push(digest);
+                    loaded.fixed.cache_status = "prefetched_host";
+                    loaded
+                } else {
+                    load_b2_raw_runtime_for(spec, model_dir, layer, stream)?
+                };
+                if flash_b1_prefetch {
+                    if let Some(next_layer) = flash_b1_prefetch_next_layer(layer, layer_count)? {
+                        let worker_root = model_dir.to_owned();
+                        let worker_started = timeline_elapsed_ns(request_started);
+                        let worker = scope.spawn(move || {
+                            let (host, telemetry) = load_layer_host_inner_for(
+                                spec,
+                                &worker_root,
+                                next_layer,
+                                &[],
+                                true,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            let worker_ended = timeline_elapsed_ns(request_started);
+                            Ok(FixedPrefetchedHost {
+                                layer: next_layer,
+                                host_bytes: host.num_bytes(),
+                                host,
+                                telemetry,
+                                worker_start_ns: worker_started,
+                                worker_end_ns: worker_ended,
+                            })
+                        });
+                        prefetched_next = Some(FixedPrefetchTask {
+                            layer: next_layer,
+                            transition: None,
+                            worker,
+                        });
+                    }
                 }
-                Ok(())
-            })();
-            std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
-            layer_run?;
+                let fixed_prepare_ns =
+                    u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &token_ids)?;
+                let router_rows = active_requests
+                    .iter()
+                    .enumerate()
+                    .map(|(row, _)| {
+                        b2_router_metadata_row(
+                            loaded.raw.runtime.weights.hash_router,
+                            &hash_ids,
+                            row,
+                            active_requests.len(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                physical.fixed_source_bytes += loaded.fixed_source_bytes;
+                physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
+                for row in &router_rows {
+                    physical.record_request_router_metadata(
+                        loaded.raw.runtime.weights.hash_router,
+                        row,
+                    )?;
+                }
+                peak_device_bytes = peak_device_bytes.max(device_used_bytes()?);
+                let wo_a_decode_started = std::time::Instant::now();
+                launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, &mut scratch)?;
+                stream.synchronize()?;
+                let wo_a_decode_sync_ns =
+                    u64::try_from(wo_a_decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
+                let mut flash_stage = None;
+                let layer_run = (|| -> Result<(), Box<dyn Error>> {
+                    for ((row, &request), &token_id) in
+                        active_requests.iter().enumerate().zip(&token_ids)
+                    {
+                        let state = &mut requests[request];
+                        let (next, digest, stage) = run_b2_layer(
+                            context,
+                            module,
+                            stream,
+                            flash_cublas,
+                            &loaded.raw.runtime,
+                            lanes,
+                            router_rows[row],
+                            &state.hidden,
+                            token_id,
+                            state.position,
+                            &mut state.persistent,
+                        )?;
+                        physical.routed_source_bytes += stage.routed_source_bytes;
+                        physical.routed_h2d_bytes += stage.routed_h2d_bytes;
+                        state.hidden = next;
+                        layers[request].push(digest);
+                        if flash_b1_profile {
+                            flash_stage = Some(stage);
+                        }
+                    }
+                    Ok(())
+                })();
+                std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
+                layer_run?;
+                if let Some(stage) = flash_stage {
+                    let layer_outer_ns =
+                        u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let profile = flash_b1_layer_phase_profile_json(
+                        layer,
+                        layer_outer_ns,
+                        fixed_prepare_ns,
+                        &loaded.fixed,
+                        wo_a_decode_sync_ns,
+                        &stage,
+                    )?;
+                    let timing = &mut requests[0].flash_b1_phase;
+                    timing.layer_outer_ns = timing
+                        .layer_outer_ns
+                        .checked_add(layer_outer_ns)
+                        .ok_or("Flash B1 layer outer timing overflow")?;
+                    timing.layers.push(profile);
+                }
+            }
+            if prefetched_next.is_some() {
+                return Err("Flash B1 fixed prefetch left an unconsumed host slot".into());
+            }
+            Ok(())
+        })?;
+        if let Some(stop) = parity_stop_after_layer {
+            if REQUESTS != 1 || active_requests.len() != 1 {
+                return Err("Flash parity stop requires one active B1 request".into());
+            }
+            let elapsed_ns = u64::try_from(token_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let phase_profile = flash_b1_profile
+                .then(|| {
+                    flash_b1_request_phase_profile_json(&requests[0].flash_b1_phase, elapsed_ns)
+                })
+                .transpose()?;
+            let path = write_flash_parity_stop(stop, spec, &layers[0], phase_profile.as_ref())?;
+            return Err(Box::new(FlashParityStopped { path }));
         }
         let elapsed_ns = u64::try_from(token_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
             let state = &mut requests[request];
-            if layers[request].len() != v4_state::V4_LAYER_COUNT {
-                return Err("row-set request committed fewer than 61 layers".into());
+            if layers[request].len() != spec.layers {
+                return Err(format!(
+                    "{} row-set request committed fewer than {} layers",
+                    spec.name, spec.layers
+                )
+                .into());
             }
             let input_kind = if state.position < state.prompt_ids.len() {
                 "prompt"
@@ -19429,8 +22586,80 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 "layers": if capture_layer_trace { layers[request].iter().map(B2LayerDigest::json).collect::<Vec<_>>() } else { Vec::new() },
             }));
             if b1_needs_final_head(state.prompt_ids.len(), state.position) {
-                let cpu =
-                    v4_state::final_checkpoint_head_cpu_timed(&final_weights, &state.hidden, 1)?;
+                let final_head_started = std::time::Instant::now();
+                let final_weights =
+                    final_weights.ok_or("row-set generation needs final head weights")?;
+                let final_head_dump = final_head_dump_dir()?;
+                if let Some(directory) = final_head_dump.as_deref() {
+                    write_final_head_input(directory, &state.hidden)?;
+                }
+                let mut gpu_exact_telemetry = None;
+                let cpu = match final_head_arm {
+                    FlashFinalHeadArm::Cpu => {
+                        v4_state::final_checkpoint_head_cpu_timed(final_weights, &state.hidden, 1)?
+                    }
+                    FlashFinalHeadArm::GpuExact => {
+                        let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu {
+                            (workspace.run_runtime(&state.hidden)?, None)
+                        } else {
+                            let output_dir = flash_final_head_gpu_production_dir()?;
+                            (
+                                run_flash_final_head_gpu_exact(
+                                    &output_dir,
+                                    Some(
+                                        &serde_json::json!({"config": final_head_capture_config()}),
+                                    ),
+                                    &state.hidden,
+                                    final_weights,
+                                )?,
+                                Some(output_dir),
+                            )
+                        };
+                        let wall_ns = (gpu.timing["total"].as_f64().unwrap_or(f64::INFINITY)
+                            * 1_000_000.0) as u64;
+                        gpu_exact_telemetry = Some(serde_json::json!({
+                            "timing_ms":gpu.timing, "memory_bytes":gpu.memory,
+                            "artifact_dir":artifact_dir,
+                        }));
+                        v4_state::FinalHeadCpuRun {
+                            output: gpu.output,
+                            read_ns: 0,
+                            streamed_source_bytes: gpu.source_bytes,
+                            wall_ns,
+                        }
+                    }
+                };
+                if let Some(directory) = final_head_dump.as_deref() {
+                    write_final_head_output(directory, &state.hidden, &cpu, "base_capture")?;
+                }
+                let final_head_wall_ns =
+                    u64::try_from(final_head_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if cpu.wall_ns > final_head_wall_ns {
+                    return Err("Flash B1 final-head timing exceeds its outer scope".into());
+                }
+                if flash_b1_profile {
+                    state.flash_b1_phase.final_head_outer_ns = state
+                        .flash_b1_phase
+                        .final_head_outer_ns
+                        .checked_add(final_head_wall_ns)
+                        .ok_or("Flash B1 final-head timing overflow")?;
+                    state.flash_b1_phase.final_heads.push(serde_json::json!({
+                        "token_position": state.position,
+                        "outer": {"wall_ns": final_head_wall_ns},
+                        "top_level": {
+                            "cpu_streamed_final_head": {
+                                "wall_ns": cpu.wall_ns,
+                                "streamed_weight_read_ns": cpu.read_ns,
+                                "source_bytes": cpu.streamed_source_bytes,
+                            },
+                        },
+                        "unattributed_gap_ns": final_head_wall_ns.saturating_sub(cpu.wall_ns),
+                        "closure": {
+                            "equation": "cpu_streamed_final_head.wall_ns + unattributed_gap_ns == outer.wall_ns",
+                            "exact": true,
+                        },
+                    }));
+                }
                 state
                     .physical
                     .record_final_head_source_bytes(cpu.streamed_source_bytes)?;
@@ -19455,14 +22684,22 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                     "token_position": state.position,
                     "input_id": token_id,
                     "input_kind": input_kind,
-                    "head": "canonical_cpu_streamed_bf16",
+                    "head": match final_head_arm { FlashFinalHeadArm::Cpu => "canonical_cpu_streamed_bf16", FlashFinalHeadArm::GpuExact => "gpu_exact" },
                     "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
                     "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
                     "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
                     "argmax": cpu.output.argmax[0],
+                    "gpu_exact": gpu_exact_telemetry,
                     "decision": decision_name,
                     "status": "PASS",
                 }));
+                match decision {
+                    GreedyDecision::IgnorePrompt => {}
+                    GreedyDecision::EmitAndContinue => on_generated(request, next_id, None)?,
+                    GreedyDecision::EmitAndStop(reason) => {
+                        on_generated(request, next_id, Some(reason))?
+                    }
+                }
                 match decision {
                     GreedyDecision::IgnorePrompt => {}
                     GreedyDecision::EmitAndContinue => {
@@ -19522,11 +22759,14 @@ fn run_real_v4_b2_generate<const REQUESTS: usize>(
     let mut scratch =
         DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
     let arm = run_v4_b2_generate_arm(
+        &v4_spec::PRO,
         context,
         module,
         stream,
+        None,
         &model_dir,
-        &final_weights,
+        Some(&final_weights),
+        None,
         &mut lanes,
         &mut scratch,
         prompts,
@@ -19534,6 +22774,8 @@ fn run_real_v4_b2_generate<const REQUESTS: usize>(
         forward_tokens,
         true,
         true,
+        None,
+        &mut |_, _, _| Ok(()),
     )?;
     writeln!(
         result.file_mut(),
@@ -19553,6 +22795,897 @@ fn run_real_v4_b2_generate<const REQUESTS: usize>(
     println!(
         "{{\"status\":\"PASS\",\"mode\":{},\"requests\":{REQUESTS},\"result_jsonl\":{}}}",
         serde_json::to_string(mode)?,
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
+fn run_real_v4_flash_base(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    let mhc_linear_arm = flash_mhc_linear_arm(spec)?;
+    let router_linear_arm = flash_router_linear_arm(spec)?;
+    let router_score_arm = flash_router_score_arm(spec)?;
+    let fp4_accum_arm = flash_fp4_accum_arm(spec)?;
+    let final_head_arm = flash_final_head_arm(spec)?;
+    let flash_cublas = (mhc_linear_arm == FlashMhcLinearArm::Cublas
+        || router_linear_arm == FlashMhcLinearArm::Cublas)
+        .then(|| FlashCublasSession::new(stream))
+        .transpose()?;
+    let cublas = flash_cublas.as_ref().map(|session| &session.cublas);
+    let mhc_cublas = (mhc_linear_arm == FlashMhcLinearArm::Cublas)
+        .then(|| flash_mhc_cublas_provenance(cublas.ok_or("Flash mHC provenance session missing")?))
+        .transpose()?;
+    let router_cublas = (router_linear_arm == FlashMhcLinearArm::Cublas)
+        .then(|| {
+            flash_router_cublas_provenance(cublas.ok_or("Flash router provenance session missing")?)
+        })
+        .transpose()?;
+    let token_ids_env = "COLIBRI_V4_FLASH_TOKEN_IDS";
+    let prompts = parse_b2_generate_token_ids_for::<1>(
+        spec,
+        &std::env::var(token_ids_env)
+            .map_err(|_| format!("set {token_ids_env}='<comma-separated ids>'"))?,
+        token_ids_env,
+    )?;
+    let greedy_steps = std::env::var("COLIBRI_V4_GREEDY_STEPS")
+        .map_err(|_| "set COLIBRI_V4_GREEDY_STEPS for Flash-0731 generation")?
+        .parse::<usize>()?;
+    let forward_tokens = validate_b2_generate_inputs::<1>(&prompts, greedy_steps)?;
+    let parity_stop = flash_parity_stop_after_layer(spec)?;
+    let model_dir = v4_model_dir_for(spec)?;
+    let final_weights = parity_stop
+        .is_none()
+        .then(|| v4_state::load_final_head_for(spec, &model_dir))
+        .transpose()?;
+    let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    let wo_a_elements = spec.q_heads * spec.q_head_dim * spec.o_lora_rank;
+    let mut scratch = DeviceBuffer::<u16>::zeroed(stream, wo_a_elements)?;
+    let arm = match run_v4_b2_generate_arm(
+        spec,
+        context,
+        module,
+        stream,
+        flash_cublas.as_ref(),
+        &model_dir,
+        final_weights.as_ref(),
+        None,
+        &mut lanes,
+        &mut scratch,
+        prompts,
+        greedy_steps,
+        forward_tokens,
+        !parity_stop.is_some(),
+        true,
+        parity_stop.as_ref(),
+        &mut |_, _, _| Ok(()),
+    ) {
+        Ok(arm) => arm,
+        Err(error) if error.downcast_ref::<FlashParityStopped>().is_some() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let result_path = std::env::var_os("COLIBRI_V4_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_RESULT_JSONL")?;
+    let mut result = PendingResultFile::reserve(result_path)?;
+    let phase_profile =
+        flash_b1_request_phase_profile_json(&arm.requests[0].flash_b1_phase, arm.duration_ns)?;
+    writeln!(
+        result.file_mut(),
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-deepseek-v4-flash-0731-base-v1",
+            "implementation": "rust-cuda",
+            "profile": spec.name,
+            "model_revision": spec.revision,
+            "model_dir": model_dir,
+            "layers": spec.layers,
+            "hidden_size": spec.hidden,
+            "attention_heads": spec.q_heads,
+            "routed_experts": spec.routed_experts,
+            "experts_per_token": spec.experts_per_token,
+            "generation_mode": "id_only_greedy_argmax",
+            "execution": "base_only_no_speculation",
+            "base_only_no_speculation": spec.base_only_no_speculation,
+            "dspark": "disabled",
+            "mhc_linear": {
+                "arm": mhc_linear_arm.name(),
+                "cublas": mhc_cublas,
+            },
+            "router_linear": {
+                "arm": router_linear_arm.name(),
+                "cublas": router_cublas,
+            },
+            "router_score": flash_router_score_provenance(router_score_arm),
+            "fp4_accum": fp4_accum_arm.name(),
+            "greedy_steps": greedy_steps,
+            "eos_token_id": V4_EOS_TOKEN_ID,
+            "final_head": match final_head_arm { FlashFinalHeadArm::Cpu => "canonical_cpu_streamed_bf16", FlashFinalHeadArm::GpuExact => "gpu_exact" },
+            "qd4_lanes": 0,
+            "raw_scratch_bytes": scratch.num_bytes(),
+            "request_e2e_ns": arm.duration_ns,
+            "phase_profile": phase_profile,
+            "physical": arm.physical.json(),
+            "requests": arm.requests.iter().enumerate().map(|(request, state)| b2_generate_request_json(request, state)).collect::<Vec<_>>(),
+            "peak_device_used_bytes": arm.peak_device_bytes,
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-flash-0731-base\",\"base_only_no_speculation\":true,\"dspark\":\"disabled\",\"result_jsonl\":{}}}",
+        serde_json::to_string(result.path())?
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FlashServeCancelled;
+
+impl std::fmt::Display for FlashServeCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CANCELLED")
+    }
+}
+
+impl Error for FlashServeCancelled {}
+
+fn run_real_v4_flash_serve(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    use std::collections::VecDeque;
+    use std::io::{BufReader, BufWriter};
+    use std::sync::mpsc;
+
+    let spec = &v4_spec::FLASH_0731;
+    let model_dir = v4_model_dir_for(spec)?;
+    let tokenizer = v4_tokenizer::V4Tokenizer::open(&model_dir)?;
+    let final_weights = v4_state::load_final_head_for(spec, &model_dir)?;
+    let flash_final_head_gpu = match flash_final_head_arm(spec)? {
+        FlashFinalHeadArm::Cpu => None,
+        FlashFinalHeadArm::GpuExact => Some(FlashDsparkFinalHeadGpuWorkspace::new(&final_weights)?),
+    };
+    let wo_a_elements = spec.q_heads * spec.q_head_dim * spec.o_lora_rank;
+    let mut scratch = DeviceBuffer::<u16>::zeroed(stream, wo_a_elements)?;
+    let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    let flash_cublas = (flash_mhc_linear_arm(spec)? == FlashMhcLinearArm::Cublas
+        || flash_router_linear_arm(spec)? == FlashMhcLinearArm::Cublas)
+        .then(|| FlashCublasSession::new(stream))
+        .transpose()?;
+
+    let (command_tx, command_rx) = mpsc::channel::<Result<v4_serve::Command, String>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut input = BufReader::new(stdin.lock());
+        loop {
+            match v4_serve::read_command(&mut input) {
+                Ok(Some(command)) => {
+                    if command_tx.send(Ok(command)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = command_tx.send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+
+    let stdout = std::io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    v4_serve::write_ready(&mut output)?;
+    let mut pending = VecDeque::new();
+    loop {
+        let command = if let Some(command) = pending.pop_front() {
+            command
+        } else {
+            match command_rx.recv() {
+                Ok(command) => command,
+                Err(_) => return Ok(()),
+            }
+        };
+        let command = match command {
+            Ok(command) => command,
+            Err(message) => {
+                v4_serve::write_error(&mut output, "0", &format!("PROTOCOL {message}"))?;
+                return Ok(());
+            }
+        };
+        let v4_serve::Command::Submit(submit) = command else {
+            continue;
+        };
+        let request_id = submit.request_id.clone();
+        let formatted = match v4_chat::format_messages_json_0731(
+            &submit.payload,
+            v4_chat::ThinkingMode::Chat,
+        ) {
+            Ok(formatted) => formatted,
+            Err(message) => {
+                v4_serve::write_error(&mut output, &request_id, &format!("PROMPT {message}"))?;
+                continue;
+            }
+        };
+        let prompt_ids = match tokenizer.encode_raw(&formatted) {
+            Ok(ids) => ids,
+            Err(error) => {
+                v4_serve::write_error(&mut output, &request_id, &format!("TOKENIZER {error}"))?;
+                continue;
+            }
+        };
+        if let Err(message) = v4_serve::validate_submit(&submit, prompt_ids.len()) {
+            v4_serve::write_error(&mut output, &request_id, &message)?;
+            continue;
+        }
+        let forward_tokens = match greedy_forward_tokens(prompt_ids.len(), submit.max_tokens) {
+            Ok(tokens) if tokens <= v4_state::KV_WINDOW => tokens,
+            Ok(_) => {
+                v4_serve::write_error(&mut output, &request_id, "CONTEXT_WINDOW_EXCEEDED")?;
+                continue;
+            }
+            Err(error) => {
+                v4_serve::write_error(&mut output, &request_id, &error.to_string())?;
+                continue;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let mut boundaries = Vec::with_capacity(submit.max_tokens);
+        let mut generated = Vec::with_capacity(submit.max_tokens);
+        let mut decoded = String::new();
+        let mut on_generated = |_: usize,
+                                token_id: i64,
+                                stop: Option<GreedyStopReason>|
+         -> Result<(), Box<dyn Error>> {
+            while let Ok(command) = command_rx.try_recv() {
+                match command {
+                    Ok(v4_serve::Command::Cancel(cancel_id)) if cancel_id == request_id => {
+                        return Err(Box::new(FlashServeCancelled));
+                    }
+                    other => pending.push_back(other),
+                }
+            }
+            boundaries.push(std::time::Instant::now());
+            generated.push(token_id);
+            if stop != Some(GreedyStopReason::Eos) {
+                let next = tokenizer.decode(&generated)?;
+                let delta = next.strip_prefix(&decoded).unwrap_or(&next);
+                v4_serve::write_data(&mut output, &request_id, delta.as_bytes())?;
+                decoded = next;
+            }
+            Ok(())
+        };
+        let result = run_v4_b2_generate_arm(
+            spec,
+            context,
+            module,
+            stream,
+            flash_cublas.as_ref(),
+            &model_dir,
+            Some(&final_weights),
+            flash_final_head_gpu.as_ref(),
+            &mut lanes,
+            &mut scratch,
+            [prompt_ids.clone()],
+            submit.max_tokens,
+            [forward_tokens],
+            false,
+            false,
+            None,
+            &mut on_generated,
+        );
+        drop(on_generated);
+        let arm = match result {
+            Ok(arm) => arm,
+            Err(error) if error.downcast_ref::<FlashServeCancelled>().is_some() => {
+                v4_serve::write_error(&mut output, &request_id, "CANCELLED")?;
+                continue;
+            }
+            Err(error) => {
+                v4_serve::write_error(&mut output, &request_id, &format!("ENGINE {error}"))?;
+                continue;
+            }
+        };
+        let request = &arm.requests[0];
+        let elapsed = started.elapsed().as_secs_f64();
+        let completion_tokens = request.generated_ids.len();
+        let tokens_per_second = completion_tokens as f64 / elapsed.max(f64::EPSILON);
+        let ttft_ms = boundaries.first().map_or(elapsed * 1_000.0, |time| {
+            time.duration_since(started).as_secs_f64() * 1_000.0
+        });
+        let itl_ms = if boundaries.len() < 2 {
+            0.0
+        } else {
+            boundaries
+                .last()
+                .unwrap()
+                .duration_since(boundaries[0])
+                .as_secs_f64()
+                * 1_000.0
+                / (boundaries.len() - 1) as f64
+        };
+        let stop = request
+            .stop_reason
+            .ok_or("Flash serve request lacked stop reason")?;
+        v4_serve::write_done(
+            &mut output,
+            &request_id,
+            completion_tokens,
+            tokens_per_second,
+            prompt_ids.len(),
+            stop == GreedyStopReason::MaxNewTokens,
+            ttft_ms,
+            itl_ms,
+            b2_generate_stop_reason(stop),
+            &request.generated_ids,
+        )?;
+    }
+}
+
+fn validate_flash_dspark_greedy_mode(temperature: f32) -> Result<(), Box<dyn Error>> {
+    if !temperature.is_finite() || temperature != 0.0 {
+        return Err("Flash-0731 DSpark exact mode requires temperature=0".into());
+    }
+    Ok(())
+}
+
+fn flash_dspark_state_capacity(
+    prompt_rows: usize,
+    greedy_steps: usize,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    if prompt_rows == 0 || greedy_steps == 0 {
+        return Err("Flash-0731 DSpark state capacity requires nonzero rows".into());
+    }
+    let max_new_tokens = greedy_steps
+        .checked_add(v4_state::DSPARK_B5_VALIDATED_INPUTS)
+        .ok_or("Flash-0731 DSpark generation capacity overflow")?;
+    let context_rows = prompt_rows
+        .checked_add(max_new_tokens - 1)
+        .ok_or("Flash-0731 DSpark context capacity overflow")?;
+    Ok((max_new_tokens, context_rows))
+}
+
+const FLASH_DSPARK_RSS_PROBE_CALLS: usize = 3;
+const FLASH_DSPARK_RSS_PROBE_MAX_STEP_BYTES: usize = 512 * 1024 * 1024;
+
+fn flash_dspark_rss_probe_enabled() -> Result<bool, Box<dyn Error>> {
+    optional_one_flag("COLIBRI_V4_FLASH_DSPARK_RSS_PROBE")
+}
+
+fn flash_dspark_rss_probe_sample(
+    position: usize,
+    token_id: i64,
+    argmax: u32,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(serde_json::json!({
+        "position":position,
+        "token_id":token_id,
+        "argmax":argmax,
+        "rss_bytes":process_rss_bytes()?,
+        "mem_available_bytes":host_available_bytes()?,
+        "head_runtime":"shared_compute_only",
+    }))
+}
+
+fn flash_dspark_rss_probe_gate(samples: &[serde_json::Value]) -> Result<usize, Box<dyn Error>> {
+    if samples.len() != FLASH_DSPARK_RSS_PROBE_CALLS {
+        return Err("Flash DSpark RSS probe did not collect three base calls".into());
+    }
+    let mut max_step = 0_usize;
+    for pair in samples.windows(2) {
+        let before = pair[0]["rss_bytes"]
+            .as_u64()
+            .ok_or("RSS probe first sample lost VmRSS")?;
+        let after = pair[1]["rss_bytes"]
+            .as_u64()
+            .ok_or("RSS probe second sample lost VmRSS")?;
+        max_step = max_step.max(usize::try_from(after.saturating_sub(before))?);
+    }
+    if max_step > FLASH_DSPARK_RSS_PROBE_MAX_STEP_BYTES {
+        return Err(format!(
+            "Flash DSpark RSS probe grew {max_step} bytes between base calls; exceeds {} byte no-linear-growth gate",
+            FLASH_DSPARK_RSS_PROBE_MAX_STEP_BYTES
+        ).into());
+    }
+    Ok(max_step)
+}
+
+fn flash_dspark_markov_greedy(
+    base_logits: &[f32],
+    markov_w1: &[u16],
+    markov_w2: &[u16],
+    vocab: usize,
+    rank: usize,
+    anchor: u32,
+) -> Result<([u32; 5], Vec<u16>), Box<dyn Error>> {
+    let rows = v4_state::DSPARK_B5_DRAFT_TOKENS;
+    if vocab == 0
+        || rank == 0
+        || base_logits.len() != rows * vocab
+        || markov_w1.len() != vocab * rank
+        || markov_w2.len() != vocab * rank
+        || usize::try_from(anchor)? >= vocab
+    {
+        return Err("Flash-0731 sequential Markov contract mismatch".into());
+    }
+    let mut proposals = [0_u32; 5];
+    let mut embeds = Vec::with_capacity(rows * rank);
+    let mut previous = usize::try_from(anchor)?;
+    for row in 0..rows {
+        let markov = &markov_w1[previous * rank..(previous + 1) * rank];
+        embeds.extend_from_slice(markov);
+        let mut best_token = 0_usize;
+        let mut best_logit = f32::NEG_INFINITY;
+        for token in 0..vocab {
+            let bias = markov
+                .iter()
+                .zip(&markov_w2[token * rank..(token + 1) * rank])
+                .map(|(&left, &right)| v4_router::bf16_to_f32(left) * v4_router::bf16_to_f32(right))
+                .sum::<f32>();
+            let value = base_logits[row * vocab + token] + bias;
+            if token == 0 || value > best_logit {
+                best_token = token;
+                best_logit = value;
+            }
+        }
+        proposals[row] = u32::try_from(best_token)?;
+        previous = best_token;
+    }
+    Ok((proposals, embeds))
+}
+
+fn flash_hc_mean(hidden: &[u16]) -> Result<Vec<u16>, Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    if hidden.len() != v4_state::HC * spec.hidden {
+        return Err("Flash-0731 auxiliary hidden row contract mismatch".into());
+    }
+    Ok((0..spec.hidden)
+        .map(|column| {
+            let sum = (0..v4_state::HC)
+                .map(|copy| v4_router::bf16_to_f32(hidden[copy * spec.hidden + column]))
+                .sum::<f32>();
+            v4_router::f32_to_bf16_rne(sum / v4_state::HC as f32)
+        })
+        .collect())
+}
+
+fn run_flash_base_input(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    flash_cublas: Option<&FlashCublasSession>,
+    model_dir: &std::path::Path,
+    gpu_exact: &FlashDsparkFinalHeadGpuWorkspace,
+    scratch: &mut DeviceBuffer<u16>,
+    persistent: &mut v4_state::V4SerialPersistentState,
+    token_id: i64,
+    position: usize,
+) -> Result<(Vec<u16>, u32), Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    let mut hidden = prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?.0;
+    let mut captures = Vec::with_capacity(3 * spec.hidden);
+    let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    for layer in 0..spec.layers {
+        let mut loaded = load_b2_raw_runtime_for(spec, model_dir, layer, stream)?;
+        let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &[token_id])?;
+        launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
+        stream.synchronize()?;
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        let result = run_b2_layer(
+            context,
+            module,
+            stream,
+            flash_cublas,
+            &loaded.raw.runtime,
+            &mut lanes,
+            &hash_ids,
+            &hidden,
+            token_id,
+            position,
+            persistent,
+        );
+        std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
+        hidden = result?.0;
+        if matches!(layer, 40 | 41 | 42) {
+            captures.extend(flash_hc_mean(&hidden)?);
+        }
+    }
+    if captures.len() != 3 * spec.hidden {
+        return Err("Flash-0731 did not capture layers 40/41/42".into());
+    }
+    let target = gpu_exact.run_runtime(&hidden)?.output.argmax[0];
+    Ok((captures, u32::try_from(target)?))
+}
+
+fn flash_dspark_head(
+    final_weights: &v4_state::FinalHeadWeights,
+    stage2: &LoadedDsparkStage,
+    hidden: &[u16],
+    anchor: u32,
+) -> Result<([u32; 5], v4_state::DsparkB5Observation), Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    let rows = v4_state::DSPARK_B5_DRAFT_TOKENS;
+    let head = stage2
+        .head
+        .as_ref()
+        .ok_or("Flash-0731 stage 2 head is missing")?;
+    let pre = v4_state::final_hc_gate_cpu(
+        hidden,
+        rows,
+        v4_state::HC,
+        spec.hidden,
+        &head.hc_head_fn,
+        head.hc_head_scale[0],
+        &head.hc_head_base,
+    )?;
+    let collapsed = v4_state::final_hc_head_cpu(
+        hidden,
+        rows,
+        v4_state::HC,
+        spec.hidden,
+        &pre,
+        &head
+            .norm
+            .iter()
+            .map(|&bits| v4_router::bf16_to_f32(bits))
+            .collect::<Vec<_>>(),
+        &vec![0.0; spec.hidden],
+        1,
+    )?;
+    let logits = v4_state::final_checkpoint_logits_from_normalized_cpu(
+        final_weights,
+        &collapsed.normalized_bf16,
+        rows,
+    )?
+    .logits_f32;
+    let (proposals, markov_embeds) = flash_dspark_markov_greedy(
+        &logits,
+        &head.markov_w1,
+        &head.markov_w2,
+        spec.vocab,
+        256,
+        anchor,
+    )?;
+    let mut confidence = [0.0_f32; 5];
+    for row in 0..rows {
+        let markov = &markov_embeds[row * 256..(row + 1) * 256];
+        let hidden_row = &collapsed.collapsed_bf16[row * spec.hidden..(row + 1) * spec.hidden];
+        confidence[row] = hidden_row
+            .iter()
+            .chain(markov)
+            .zip(&head.confidence)
+            .map(|(&value, &weight)| v4_router::bf16_to_f32(value) * v4_router::bf16_to_f32(weight))
+            .sum();
+    }
+    Ok((proposals, v4_state::DsparkB5Observation { confidence }))
+}
+
+fn flash_dspark_state_digests(
+    state: &v4_state::DsparkB5PersistentState<
+        v4_state::V4SerialPersistentState,
+        v4_state::V4LayerPersistentState,
+    >,
+) -> [u64; 4] {
+    [
+        state.base.semantic_digest(),
+        state.mtp_swa[0].semantic_digest(),
+        state.mtp_swa[1].semantic_digest(),
+        state.mtp_swa[2].semantic_digest(),
+    ]
+}
+
+fn run_real_v4_flash_dspark(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+) -> Result<(), Box<dyn Error>> {
+    let temperature = std::env::var("COLIBRI_V4_TEMPERATURE")
+        .unwrap_or_else(|_| "0".into())
+        .parse::<f32>()?;
+    validate_flash_dspark_greedy_mode(temperature)?;
+    let spec = &v4_spec::FLASH_0731;
+    let prompts = parse_b2_generate_token_ids_for::<1>(
+        spec,
+        &std::env::var("COLIBRI_V4_FLASH_TOKEN_IDS")
+            .map_err(|_| "set COLIBRI_V4_FLASH_TOKEN_IDS='<comma-separated ids>'")?,
+        "COLIBRI_V4_FLASH_TOKEN_IDS",
+    )?;
+    let prompt = &prompts[0];
+    if prompt.len() < 2 {
+        return Err("Flash-0731 DSpark needs at least two prompt tokens".into());
+    }
+    let greedy_steps = std::env::var("COLIBRI_V4_GREEDY_STEPS")
+        .map_err(|_| "set COLIBRI_V4_GREEDY_STEPS for Flash-0731 DSpark")?
+        .parse::<usize>()?;
+    if greedy_steps == 0 {
+        return Err("Flash-0731 DSpark requires at least one greedy step".into());
+    }
+    let result_path = std::env::var_os("COLIBRI_V4_RESULT_JSONL")
+        .map(std::path::PathBuf::from)
+        .ok_or("set COLIBRI_V4_RESULT_JSONL")?;
+    let mut result = PendingResultFile::reserve(result_path)?;
+    if flash_final_head_arm(spec)? != FlashFinalHeadArm::GpuExact {
+        return Err("Flash-0731 DSpark requires COLIBRI_V4_FLASH_FINAL_HEAD_ARM=gpu_exact".into());
+    }
+    let model_dir = v4_model_dir_for(spec)?;
+    v4_state::validate_flash_0731_dspark_model_dir(&model_dir)?;
+    let final_weights = v4_state::load_final_head_for(spec, &model_dir)?;
+    let gpu_exact = FlashDsparkFinalHeadGpuWorkspace::new(&final_weights)?;
+    let flash_cublas = (flash_mhc_linear_arm(spec)? == FlashMhcLinearArm::Cublas
+        || flash_router_linear_arm(spec)? == FlashMhcLinearArm::Cublas)
+        .then(|| FlashCublasSession::new(stream))
+        .transpose()?;
+    let rss_probe = flash_dspark_rss_probe_enabled()?;
+    if rss_probe && prompt.len() != 2 {
+        return Err("Flash DSpark RSS probe requires exactly two prompt inputs".into());
+    }
+    let rss_probe_before = rss_probe
+        .then(|| {
+            Ok::<_, Box<dyn Error>>(serde_json::json!({
+                "rss_bytes":process_rss_bytes()?,
+                "mem_available_bytes":host_available_bytes()?,
+            }))
+        })
+        .transpose()?;
+    let mut rss_probe_samples = Vec::with_capacity(FLASH_DSPARK_RSS_PROBE_CALLS);
+    let stages: [LoadedDsparkStage; v4_state::DSPARK_STAGES] = [0, 1, 2]
+        .map(|stage| load_flash_dspark_stage(module, stream, &model_dir, stage))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| "Flash-0731 DSpark stage count changed")?;
+    let (state_max_new_tokens, context_rows) =
+        flash_dspark_state_capacity(prompt.len(), greedy_steps)?;
+    let mut state = v4_state::DsparkB5PersistentState {
+        base: v4_state::V4SerialPersistentState::new_for_spec(
+            spec,
+            prompt.len(),
+            state_max_new_tokens,
+        )?,
+        mtp_swa: [0, 1, 2]
+            .map(|stage| v4_state::V4LayerPersistentState::new_flash_dspark(stage, context_rows))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| "Flash-0731 DSpark state count changed")?,
+    };
+    let mut scratch =
+        DeviceBuffer::<u16>::zeroed(stream, spec.q_heads * spec.q_head_dim * spec.o_lora_rank)?;
+    let mut pending_anchor = 0_u32;
+    for (position, &token) in prompt.iter().enumerate() {
+        let (main_hidden, target) = run_flash_base_input(
+            context,
+            module,
+            stream,
+            flash_cublas.as_ref(),
+            &model_dir,
+            &gpu_exact,
+            &mut scratch,
+            &mut state.base,
+            token,
+            position,
+        )?;
+        if rss_probe {
+            rss_probe_samples.push(flash_dspark_rss_probe_sample(position, token, target)?);
+        }
+        let main_x = flash_dspark_main_x(module, stream, &stages[0], &main_hidden)?;
+        advance_flash_dspark_context(
+            module,
+            stream,
+            &stages,
+            &mut state.mtp_swa,
+            &main_x,
+            position,
+        )?;
+        pending_anchor = target;
+    }
+    let mut ledger = v4_state::DsparkB5CacheLedger::new(prompt.len());
+    let mut generated = Vec::<u32>::with_capacity(greedy_steps);
+    let mut rounds = Vec::new();
+    while generated.len() < greedy_steps && pending_anchor != u32::try_from(V4_EOS_TOKEN_ID)? {
+        let position = ledger.next_input_position();
+        let base_before = state.clone();
+        let mut prefix0 = state.clone();
+        let (anchor_main_hidden, target0) = run_flash_base_input(
+            context,
+            module,
+            stream,
+            flash_cublas.as_ref(),
+            &model_dir,
+            &gpu_exact,
+            &mut scratch,
+            &mut prefix0.base,
+            i64::from(pending_anchor),
+            position,
+        )?;
+        if rss_probe {
+            rss_probe_samples.push(flash_dspark_rss_probe_sample(
+                position,
+                i64::from(pending_anchor),
+                target0,
+            )?);
+            let max_step_bytes = flash_dspark_rss_probe_gate(&rss_probe_samples)?;
+            writeln!(
+                result.file_mut(),
+                "{}",
+                serde_json::json!({
+                    "event":"rss_probe",
+                    "schema":"colibri-deepseek-v4-flash-0731-dspark-rss-probe-v1",
+                    "full_dspark":false,
+                    "binary":"same_workspace_binary",
+                    "workspace":"one immutable FP32 final head shared across base calls",
+                    "before":rss_probe_before,
+                    "samples":rss_probe_samples,
+                    "max_step_rss_bytes":max_step_bytes,
+                    "max_allowed_step_rss_bytes":FLASH_DSPARK_RSS_PROBE_MAX_STEP_BYTES,
+                    "conclusion":"PASS: excludes the prior approximately 2.6GB-per-base-call growth",
+                })
+            )?;
+            result.commit()?;
+            println!(
+                "{{\"status\":\"PASS\",\"mode\":\"v4-flash-0731-dspark-rss-probe\",\"base_calls\":3,\"max_step_rss_bytes\":{max_step_bytes}}}"
+            );
+            return Ok(());
+        }
+        let main_x = flash_dspark_main_x(module, stream, &stages[0], &anchor_main_hidden)?;
+        advance_flash_dspark_context(
+            module,
+            stream,
+            &stages,
+            &mut prefix0.mtp_swa,
+            &main_x,
+            position,
+        )?;
+        let draft_ids = [
+            i64::from(pending_anchor),
+            128_799,
+            128_799,
+            128_799,
+            128_799,
+        ];
+        let embeddings = v4_state::load_for(spec, &model_dir, &draft_ids)?.embedding;
+        let mut draft_hidden =
+            Vec::with_capacity(v4_state::DSPARK_B5_DRAFT_TOKENS * v4_state::HC * spec.hidden);
+        for embedding in embeddings.chunks_exact(spec.hidden) {
+            for _ in 0..v4_state::HC {
+                draft_hidden.extend_from_slice(embedding);
+            }
+        }
+        let mut draft_states = base_before.mtp_swa.clone();
+        for (stage, stage_state) in stages.iter().zip(&mut draft_states) {
+            draft_hidden = run_flash_dspark_stage(
+                context,
+                module,
+                stream,
+                stage,
+                stage_state,
+                &draft_hidden,
+                &main_x,
+                position,
+            )?;
+        }
+        if draft_states
+            .iter()
+            .zip(&prefix0.mtp_swa)
+            .any(|(draft, target)| draft.semantic_digest() != target.semantic_digest())
+        {
+            return Err("Flash-0731 DSpark draft/main context commit diverged".into());
+        }
+        let (proposed, observation) =
+            flash_dspark_head(&final_weights, &stages[2], &draft_hidden, pending_anchor)?;
+        let mut targets = [0_u32; v4_state::DSPARK_B5_VALIDATED_INPUTS];
+        targets[0] = target0;
+        let mut prefixes = Vec::with_capacity(v4_state::DSPARK_B5_VALIDATED_INPUTS);
+        prefixes.push(prefix0.clone());
+        let mut working = prefix0;
+        for (offset, &token) in proposed.iter().enumerate() {
+            let input_position = position + offset + 1;
+            let (main_hidden, target) = run_flash_base_input(
+                context,
+                module,
+                stream,
+                flash_cublas.as_ref(),
+                &model_dir,
+                &gpu_exact,
+                &mut scratch,
+                &mut working.base,
+                i64::from(token),
+                input_position,
+            )?;
+            let next_main_x = flash_dspark_main_x(module, stream, &stages[0], &main_hidden)?;
+            advance_flash_dspark_context(
+                module,
+                stream,
+                &stages,
+                &mut working.mtp_swa,
+                &next_main_x,
+                input_position,
+            )?;
+            targets[offset + 1] = target;
+            prefixes.push(working.clone());
+        }
+        let accepted_unbounded = proposed
+            .iter()
+            .zip(targets)
+            .take_while(|(draft, target)| *draft == target)
+            .count();
+        let mut max_inputs =
+            (greedy_steps - generated.len()).min(v4_state::DSPARK_B5_VALIDATED_INPUTS);
+        let mut accepted_tokens =
+            std::iter::once(pending_anchor).chain(proposed[..accepted_unbounded].iter().copied());
+        if let Some(eos) = accepted_tokens.position(|token| token == V4_EOS_TOKEN_ID as u32) {
+            max_inputs = max_inputs.min(eos + 1);
+        }
+        let prepared = v4_state::DsparkB5Prepared::from_prefixes(
+            &base_before,
+            ledger,
+            prefixes
+                .try_into()
+                .map_err(|_| "Flash-0731 target prefix count changed")?,
+        );
+        let validated =
+            prepared.validate_greedy_target_bounded(proposed, targets, observation, max_inputs)?;
+        let decision = validated.decision();
+        let emitted = std::iter::once(pending_anchor)
+            .chain(proposed[..decision.accepted_drafts].iter().copied())
+            .collect::<Vec<_>>();
+        validated.commit_prefix(&mut state, &mut ledger, |left, right| {
+            flash_dspark_state_digests(left) == flash_dspark_state_digests(right)
+        })?;
+        generated.extend(&emitted);
+        pending_anchor = decision.pending_anchor;
+        let digests = flash_dspark_state_digests(&state);
+        rounds.push(serde_json::json!({
+            "full_dspark": true,
+            "start_position": position,
+            "proposed": proposed,
+            "target": targets,
+            "accepted": decision.accepted_drafts,
+            "committed_inputs": decision.committed_inputs,
+            "bonus": (decision.accepted_drafts == 5).then_some(targets[5]),
+            "pending": pending_anchor,
+            "confidence": validated.observation().confidence,
+            "state_digests": {
+                "base": format!("{:016x}", digests[0]),
+                "mtp0": format!("{:016x}", digests[1]),
+                "mtp1": format!("{:016x}", digests[2]),
+                "mtp2": format!("{:016x}", digests[3]),
+            }
+        }));
+        if emitted.contains(&(V4_EOS_TOKEN_ID as u32)) {
+            break;
+        }
+    }
+    writeln!(
+        result.file_mut(),
+        "{}",
+        serde_json::json!({
+            "event": "run",
+            "schema": "colibri-deepseek-v4-flash-0731-dspark-v1",
+            "implementation": "rust-cuda",
+            "profile": spec.name,
+            "model_revision": spec.revision,
+            "generation_mode": "greedy_exact",
+            "temperature": 0,
+            "full_dspark": true,
+            "block_size": 5,
+            "prompt_ids": prompt,
+            "generated_ids": generated,
+            "pending": pending_anchor,
+            "rounds": rounds,
+            "state_digests": flash_dspark_state_digests(&state).map(|value| format!("{value:016x}")),
+        })
+    )?;
+    result.commit()?;
+    println!(
+        "{{\"status\":\"PASS\",\"mode\":\"v4-flash-0731-dspark\",\"full_dspark\":true,\"generated\":{},\"result_jsonl\":{}}}",
+        generated.len(),
         serde_json::to_string(result.path())?
     );
     Ok(())
@@ -19602,11 +23735,14 @@ fn run_real_v4_b4_greedy_abba_bench(
     )?;
     let summary = if arm == "A" {
         let first = run_v4_b2_generate_arm(
+            &v4_spec::PRO,
             context,
             module,
             stream,
+            None,
             &model_dir,
-            &final_weights,
+            Some(&final_weights),
+            None,
             &mut lanes,
             &mut scratch,
             [prompts[0].clone(), prompts[1].clone()],
@@ -19614,14 +23750,19 @@ fn run_real_v4_b4_greedy_abba_bench(
             [forward_tokens[0], forward_tokens[1]],
             false,
             false,
+            None,
+            &mut |_, _, _| Ok(()),
         )?
         .into_final_summary();
         let second = run_v4_b2_generate_arm(
+            &v4_spec::PRO,
             context,
             module,
             stream,
+            None,
             &model_dir,
-            &final_weights,
+            Some(&final_weights),
+            None,
             &mut lanes,
             &mut scratch,
             [prompts[2].clone(), prompts[3].clone()],
@@ -19629,6 +23770,8 @@ fn run_real_v4_b4_greedy_abba_bench(
             [forward_tokens[2], forward_tokens[3]],
             false,
             false,
+            None,
+            &mut |_, _, _| Ok(()),
         )?
         .into_final_summary();
         let duration_ns = b4_greedy_a_duration_ns(first.duration_ns, second.duration_ns)?;
@@ -19644,11 +23787,14 @@ fn run_real_v4_b4_greedy_abba_bench(
         }
     } else {
         run_v4_b2_generate_arm(
+            &v4_spec::PRO,
             context,
             module,
             stream,
+            None,
             &model_dir,
-            &final_weights,
+            Some(&final_weights),
+            None,
             &mut lanes,
             &mut scratch,
             prompts,
@@ -19656,6 +23802,8 @@ fn run_real_v4_b4_greedy_abba_bench(
             forward_tokens,
             false,
             false,
+            None,
+            &mut |_, _, _| Ok(()),
         )?
         .into_final_summary()
     };
@@ -20345,7 +24493,466 @@ struct MhcGpuOutput {
     collapsed: Vec<u16>,
     post: Vec<f32>,
     comb: Vec<f32>,
+    debug: Option<MhcDebugOutput>,
     telemetry: MhcTelemetry,
+}
+
+struct MhcDebugOutput {
+    mixes: Vec<f32>,
+    pre: Vec<f32>,
+    sinkhorn_trace: Vec<f32>,
+    raw_dot: Option<Vec<f32>>,
+    rsqrt: Option<Vec<f32>>,
+    rsqrt_debug: Option<Vec<u32>>,
+}
+
+const FLASH_MHC_RSQRT_DEBUG_FIELDS: usize = 5;
+const FLASH_MHC_RSQRT_COMMITTED_CANDIDATE: usize = 4;
+const FLASH_MHC_RSQRT_COMMITTED_FIELD: &str = "libdevice_rsqrt_f32_bits";
+
+fn flash_mhc_rsqrt_debug_fields() -> [&'static str; FLASH_MHC_RSQRT_DEBUG_FIELDS] {
+    [
+        "square_sum_f32_bits",
+        "mean_square_plus_eps_f32_bits",
+        "newton_candidate_f32_bits",
+        "libdevice_sqrt_f32_bits",
+        "libdevice_rsqrt_f32_bits",
+    ]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlashMhcLinearArm {
+    Canonical,
+    Cublas,
+}
+
+impl FlashMhcLinearArm {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Cublas => "cublas",
+        }
+    }
+}
+
+fn flash_mhc_linear_arm_for(
+    spec: &v4_spec::V4Spec,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 {
+        return Ok(FlashMhcLinearArm::Canonical);
+    }
+    match value {
+        None => Ok(FlashMhcLinearArm::Canonical),
+        Some(value) if value == "canonical" => Ok(FlashMhcLinearArm::Canonical),
+        Some(value) if value == "cublas" => Ok(FlashMhcLinearArm::Cublas),
+        Some(_) => {
+            Err("COLIBRI_V4_FLASH_MHC_LINEAR_ARM must be canonical or cublas for Flash-0731".into())
+        }
+    }
+}
+
+fn flash_mhc_linear_arm(spec: &v4_spec::V4Spec) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_FLASH_MHC_LINEAR_ARM");
+    flash_mhc_linear_arm_for(spec, value.as_deref())
+}
+
+fn flash_router_linear_arm_for(
+    spec: &v4_spec::V4Spec,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 {
+        return Ok(FlashMhcLinearArm::Canonical);
+    }
+    match value {
+        None => Ok(FlashMhcLinearArm::Canonical),
+        Some(value) if value == "canonical" => Ok(FlashMhcLinearArm::Canonical),
+        Some(value) if value == "cublas" => Ok(FlashMhcLinearArm::Cublas),
+        Some(_) => Err(
+            "COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM must be canonical or cublas for Flash-0731".into(),
+        ),
+    }
+}
+
+fn flash_router_linear_arm(spec: &v4_spec::V4Spec) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM");
+    flash_router_linear_arm_for(spec, value.as_deref())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlashRouterScoreArm {
+    Canonical,
+    Libdevice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlashFp4AccumArm {
+    Current,
+    Block32,
+    TilelangRef,
+    Fp8Mma,
+}
+
+impl FlashFp4AccumArm {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Block32 => "block32",
+            Self::TilelangRef => "tilelang_ref",
+            Self::Fp8Mma => "fp8_mma",
+        }
+    }
+
+    const fn uses_raw_fp8(self) -> bool {
+        matches!(self, Self::Block32 | Self::TilelangRef | Self::Fp8Mma)
+    }
+}
+
+fn flash_fp4_accum_arm_for(
+    spec: &v4_spec::V4Spec,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<FlashFp4AccumArm, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 {
+        return Ok(FlashFp4AccumArm::Current);
+    }
+    match value {
+        None => Ok(FlashFp4AccumArm::Current),
+        Some(value) if value == "current" => Ok(FlashFp4AccumArm::Current),
+        Some(value) if value == "block32" => Ok(FlashFp4AccumArm::Block32),
+        Some(value) if value == "tilelang_ref" => Ok(FlashFp4AccumArm::TilelangRef),
+        Some(value) if value == "fp8_mma" => Ok(FlashFp4AccumArm::Fp8Mma),
+        Some(_) => {
+            Err("COLIBRI_V4_FLASH_FP4_ACCUM_ARM must be current, block32, tilelang_ref, or fp8_mma for Flash-0731".into())
+        }
+    }
+}
+
+fn flash_fp4_accum_arm(spec: &v4_spec::V4Spec) -> Result<FlashFp4AccumArm, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_FLASH_FP4_ACCUM_ARM");
+    flash_fp4_accum_arm_for(spec, value.as_deref())
+}
+
+impl FlashRouterScoreArm {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Libdevice => "libdevice",
+        }
+    }
+
+    const fn kernel_flag(self) -> u32 {
+        match self {
+            Self::Canonical => 0,
+            Self::Libdevice => 1,
+        }
+    }
+}
+
+fn flash_router_score_arm_for(
+    spec: &v4_spec::V4Spec,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<FlashRouterScoreArm, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 {
+        return Ok(FlashRouterScoreArm::Canonical);
+    }
+    match value {
+        None => Ok(FlashRouterScoreArm::Canonical),
+        Some(value) if value == "canonical" => Ok(FlashRouterScoreArm::Canonical),
+        Some(value) if value == "libdevice" => Ok(FlashRouterScoreArm::Libdevice),
+        Some(_) => Err(
+            "COLIBRI_V4_FLASH_ROUTER_SCORE_ARM must be canonical or libdevice for Flash-0731"
+                .into(),
+        ),
+    }
+}
+
+fn flash_router_score_arm(spec: &v4_spec::V4Spec) -> Result<FlashRouterScoreArm, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_FLASH_ROUTER_SCORE_ARM");
+    flash_router_score_arm_for(spec, value.as_deref())
+}
+
+fn flash_router_score_provenance(arm: FlashRouterScoreArm) -> serde_json::Value {
+    match arm {
+        FlashRouterScoreArm::Canonical => serde_json::json!({
+            "arm": arm.name(),
+        }),
+        FlashRouterScoreArm::Libdevice => serde_json::json!({
+            "arm": arm.name(),
+            "softplus": "x > 20 ? x : __nv_log1pf(__nv_expf(x))",
+            "sqrt": "__nv_sqrtf",
+            "device_symbol_execution": "requires GPU parity gate",
+        }),
+    }
+}
+
+#[cfg(test)]
+fn flash_router_libdevice_score_host_reference(logit: f32) -> f32 {
+    let softplus = if logit > 20.0 {
+        logit
+    } else {
+        libm::log1pf(libm::expf(logit))
+    };
+    libm::sqrtf(softplus)
+}
+
+struct FlashCublasSession {
+    cublas: cublas_exact::CublasExact,
+    workspace: DeviceBuffer<u8>,
+}
+
+impl FlashCublasSession {
+    fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            // Keep the verified object mapped for the full request.  Reopening it
+            // cannot improve numerical behavior and used to repeat a 105 MiB SHA.
+            cublas: cublas_exact::CublasExact::load()?,
+            workspace: DeviceBuffer::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?,
+        })
+    }
+}
+
+fn flash_mhc_cublas_provenance(
+    cublas: &cublas_exact::CublasExact,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut provenance = flash_cublas_sgemm_provenance(
+        cublas,
+        v4_state::MIX,
+        v4_state::HC * v4_spec::FLASH_0731.hidden,
+    )?;
+    provenance
+        .as_object_mut()
+        .ok_or("Flash cuBLAS provenance must be an object")?
+        .insert(
+            "rsqrt".into(),
+            serde_json::json!({
+                "actual": "direct __nv_rsqrtf(mean_square_plus_eps)",
+                "actual_instruction": "shared device helper calling libdevice __nv_rsqrtf; this is debug candidate 4",
+                "committed_debug_candidate": FLASH_MHC_RSQRT_COMMITTED_FIELD,
+                "debug_candidates": flash_mhc_rsqrt_debug_fields(),
+                "debug_candidate_notes": {
+                    "libdevice_sqrt_f32_bits": "1.0 / core::f32::math::sqrt(x), lowered by cuda-oxide to libdevice __nv_sqrtf",
+                    "libdevice_rsqrt_f32_bits": "direct #[device] extern C call to libdevice __nv_rsqrtf(x), also the committed Flash cuBLAS-arm normalization",
+                },
+            }),
+        );
+    Ok(provenance)
+}
+
+fn flash_router_cublas_provenance(
+    cublas: &cublas_exact::CublasExact,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    flash_cublas_sgemm_provenance(
+        cublas,
+        v4_spec::FLASH_0731.routed_experts,
+        v4_spec::FLASH_0731.hidden,
+    )
+}
+
+fn flash_cublas_sgemm_provenance(
+    cublas: &cublas_exact::CublasExact,
+    m: usize,
+    k: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let provenance = cublas.provenance();
+    Ok(serde_json::json!({
+        "abi": "cublasSgemm_v2",
+        "resolved_path": provenance.resolved_path,
+        "dladdr_path": provenance.dladdr_path,
+        "maps_path": provenance.maps_path,
+        "sha256": provenance.actual_sha256,
+        "version": provenance.version,
+        "math_mode": "CUBLAS_DEFAULT_MATH",
+        "tf32": "off",
+        "trans_a": "T",
+        "trans_b": "N",
+        "m": m,
+        "n": 1,
+        "k": k,
+        "alpha": 1.0_f32,
+        "beta": 0.0_f32,
+        "workspace_bytes": cublas_exact::WORKSPACE_BYTES,
+    }))
+}
+
+struct MhcCublasBuffers {
+    _input_f32: DeviceBuffer<f32>,
+    _squares: DeviceBuffer<f32>,
+    raw_dot: DeviceBuffer<f32>,
+    rsqrt: DeviceBuffer<f32>,
+    rsqrt_debug: Option<DeviceBuffer<u32>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_flash_mhc_cublas_linear_device_into(
+    session: &FlashCublasSession,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    hc_fn: &DeviceBuffer<f32>,
+    mixes: &mut DeviceBuffer<f32>,
+    rows: usize,
+    hidden: usize,
+    capture_rsqrt_debug: bool,
+) -> Result<MhcCublasBuffers, Box<dyn Error>> {
+    let k = v4_state::HC
+        .checked_mul(hidden)
+        .ok_or("Flash mHC cuBLAS K overflow")?;
+    if hidden != v4_spec::FLASH_0731.hidden
+        || k != 16_384
+        || rows == 0
+        || input.len() != rows * k
+        || hc_fn.len() != v4_state::MIX * k
+        || mixes.len() != rows * v4_state::MIX
+    {
+        return Err("Flash mHC cuBLAS SGEMM geometry must be rows x 24 x 16384".into());
+    }
+    let mut input_f32 = DeviceBuffer::<f32>::zeroed(stream, input.len())?;
+    let mut squares = DeviceBuffer::<f32>::zeroed(stream, input.len())?;
+    let raw_dot = DeviceBuffer::<f32>::zeroed(stream, mixes.len())?;
+    let mut rsqrt = DeviceBuffer::<f32>::zeroed(stream, rows)?;
+    let mut rsqrt_debug = capture_rsqrt_debug
+        .then(|| DeviceBuffer::<u32>::zeroed(stream, rows * FLASH_MHC_RSQRT_DEBUG_FIELDS))
+        .transpose()?;
+    launch_v4_bf16_to_f32(module, stream, input, &mut input_f32)?;
+    let device_const = |pointer: u64| pointer as usize as *const std::ffi::c_void;
+    let device_mut = |pointer: u64| pointer as usize as *mut std::ffi::c_void;
+    for row in 0..rows {
+        let input_offset = row
+            .checked_mul(k)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or("Flash mHC cuBLAS input offset overflow")?;
+        let output_offset = row
+            .checked_mul(v4_state::MIX)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or("Flash mHC cuBLAS output offset overflow")?;
+        session.cublas.sgemm_mn1(
+            stream.cu_stream().cast::<std::ffi::c_void>(),
+            device_mut(session.workspace.cu_deviceptr()),
+            session.workspace.num_bytes(),
+            device_const(hc_fn.cu_deviceptr()),
+            device_const(
+                input_f32
+                    .cu_deviceptr()
+                    .checked_add(u64::try_from(input_offset)?)
+                    .ok_or("Flash mHC cuBLAS input pointer overflow")?,
+            ),
+            device_mut(
+                raw_dot
+                    .cu_deviceptr()
+                    .checked_add(u64::try_from(output_offset)?)
+                    .ok_or("Flash mHC cuBLAS output pointer overflow")?,
+            ),
+            v4_state::MIX,
+            k,
+        )?;
+    }
+    let mut empty_debug = DeviceBuffer::<u32>::zeroed(stream, 0)?;
+    let debug = rsqrt_debug.as_mut().unwrap_or(&mut empty_debug);
+    // SAFETY: the square launch owns each input lane, the fixed reduction owns
+    // one complete 16,384-wide row, and the final scale owns 24 disjoint dots.
+    unsafe {
+        module.rmsnorm_flash_square_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len())?),
+            input,
+            &mut squares,
+        )?;
+        module.mhc_flash_reduce_rsqrt_16384(
+            stream,
+            LaunchConfig {
+                grid_dim: (u32::try_from(rows)?, 1, 1),
+                block_dim: (512, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &squares,
+            &mut rsqrt,
+            debug,
+        )?;
+        module.mhc_scale_raw_dot_by_rsqrt_v4(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(rows)?),
+            &raw_dot,
+            &rsqrt,
+            mixes,
+        )?;
+    }
+    Ok(MhcCublasBuffers {
+        _input_f32: input_f32,
+        _squares: squares,
+        raw_dot,
+        rsqrt,
+        rsqrt_debug,
+    })
+}
+
+struct RouterCublasBuffers {
+    _input_f32: DeviceBuffer<f32>,
+    _gate_f32: DeviceBuffer<f32>,
+}
+
+fn run_flash_router_cublas_linear_device_into(
+    session: &FlashCublasSession,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    gate: &DeviceBuffer<u16>,
+    logits: &mut DeviceBuffer<f32>,
+    rows: usize,
+    hidden: usize,
+    experts: usize,
+) -> Result<RouterCublasBuffers, Box<dyn Error>> {
+    if hidden != v4_spec::FLASH_0731.hidden
+        || experts != v4_spec::FLASH_0731.routed_experts
+        || rows == 0
+        || input.len() != rows * hidden
+        || gate.len() != experts * hidden
+        || logits.len() != rows * experts
+    {
+        return Err("Flash router cuBLAS SGEMM geometry must be rows x 256 x 4096".into());
+    }
+    let mut input_f32 = DeviceBuffer::<f32>::zeroed(stream, input.len())?;
+    let mut gate_f32 = DeviceBuffer::<f32>::zeroed(stream, gate.len())?;
+    // ponytail: converts the 256x4096 gate per router call; merge into an
+    // existing fixed-weight cache only after this arm proves parity and a
+    // profile attributes material time to conversion.
+    launch_v4_bf16_to_f32(module, stream, input, &mut input_f32)?;
+    launch_v4_bf16_to_f32(module, stream, gate, &mut gate_f32)?;
+    let device_const = |pointer: u64| pointer as usize as *const std::ffi::c_void;
+    let device_mut = |pointer: u64| pointer as usize as *mut std::ffi::c_void;
+    for row in 0..rows {
+        let input_offset = row
+            .checked_mul(hidden)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or("Flash router cuBLAS input offset overflow")?;
+        let output_offset = row
+            .checked_mul(experts)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or("Flash router cuBLAS output offset overflow")?;
+        session.cublas.sgemm_mn1(
+            stream.cu_stream().cast::<std::ffi::c_void>(),
+            device_mut(session.workspace.cu_deviceptr()),
+            session.workspace.num_bytes(),
+            device_const(gate_f32.cu_deviceptr()),
+            device_const(
+                input_f32
+                    .cu_deviceptr()
+                    .checked_add(u64::try_from(input_offset)?)
+                    .ok_or("Flash router cuBLAS input pointer overflow")?,
+            ),
+            device_mut(
+                logits
+                    .cu_deviceptr()
+                    .checked_add(u64::try_from(output_offset)?)
+                    .ok_or("Flash router cuBLAS output pointer overflow")?,
+            ),
+            experts,
+            hidden,
+        )?;
+    }
+    Ok(RouterCublasBuffers {
+        _input_f32: input_f32,
+        _gate_f32: gate_f32,
+    })
 }
 
 #[derive(Default)]
@@ -20389,7 +24996,11 @@ fn run_l0_mhc_pre_device_into(
     trace: &mut DeviceBuffer<f32>,
     mut telemetry: Option<&mut MhcTelemetry>,
 ) -> Result<(), Box<dyn Error>> {
-    let row_width = v4_state::HC * v4_state::HIDDEN;
+    if hc_fn.len() % (v4_state::MIX * v4_state::HC) != 0 {
+        return Err("device mHC weight geometry mismatch".into());
+    }
+    let hidden = hc_fn.len() / (v4_state::MIX * v4_state::HC);
+    let row_width = v4_state::HC * hidden;
     if input.is_empty()
         || !input.len().is_multiple_of(row_width)
         || mixes.len() != input.len() / row_width * v4_state::MIX
@@ -20464,7 +25075,35 @@ fn run_l0_mhc_pre(
     hc_scale: &DeviceBuffer<f32>,
     hc_base: &DeviceBuffer<f32>,
 ) -> Result<MhcGpuOutput, Box<dyn Error>> {
-    let row_width = v4_state::HC * v4_state::HIDDEN;
+    run_l0_mhc_pre_with_arm(
+        module,
+        stream,
+        input,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        FlashMhcLinearArm::Canonical,
+        false,
+        None,
+    )
+}
+
+fn run_l0_mhc_pre_with_arm(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    hc_fn: &DeviceBuffer<f32>,
+    hc_scale: &DeviceBuffer<f32>,
+    hc_base: &DeviceBuffer<f32>,
+    linear_arm: FlashMhcLinearArm,
+    capture_rsqrt_debug: bool,
+    session: Option<&FlashCublasSession>,
+) -> Result<MhcGpuOutput, Box<dyn Error>> {
+    if hc_fn.len() % (v4_state::MIX * v4_state::HC) != 0 {
+        return Err("L0 mHC weight geometry mismatch".into());
+    }
+    let hidden = hc_fn.len() / (v4_state::MIX * v4_state::HC);
+    let row_width = v4_state::HC * hidden;
     if input.len() % row_width != 0 || input.is_empty() {
         return Err("L0 mHC input is not complete rows".into());
     }
@@ -20498,7 +25137,7 @@ fn run_l0_mhc_pre(
     let mut pre = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC)?;
     let mut post = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC)?;
     let mut comb = DeviceBuffer::<f32>::zeroed(stream, rows * v4_state::HC * v4_state::HC)?;
-    let mut collapsed = DeviceBuffer::<u16>::zeroed(stream, rows * v4_state::HIDDEN)?;
+    let mut collapsed = DeviceBuffer::<u16>::zeroed(stream, rows * hidden)?;
     let mut trace = DeviceBuffer::<f32>::zeroed(stream, rows * 41 * v4_state::HC * v4_state::HC)?;
     if let Some((start, end)) = workspace_events.as_ref() {
         end.record(stream)?;
@@ -20507,25 +25146,133 @@ fn run_l0_mhc_pre(
         telemetry.workspace_alloc_sync_ns =
             u64::try_from(workspace_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     }
-    run_l0_mhc_pre_device_into(
-        module,
-        stream,
-        &input,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        &mut mixes,
-        &mut pre,
-        &mut post,
-        &mut comb,
-        &mut collapsed,
-        &mut trace,
-        profile.then_some(&mut telemetry),
-    )?;
+    let owned_session = (linear_arm == FlashMhcLinearArm::Cublas && session.is_none())
+        .then(|| FlashCublasSession::new(stream))
+        .transpose()?;
+    let session = session.or(owned_session.as_ref());
+    let cublas_buffers = if linear_arm == FlashMhcLinearArm::Canonical {
+        run_l0_mhc_pre_device_into(
+            module,
+            stream,
+            &input,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            &mut mixes,
+            &mut pre,
+            &mut post,
+            &mut comb,
+            &mut collapsed,
+            &mut trace,
+            profile.then_some(&mut telemetry),
+        )?;
+        None
+    } else {
+        let session = session.ok_or("Flash cuBLAS mHC session is missing")?;
+        let linear_events = profile
+            .then(|| {
+                Ok::<_, Box<dyn Error>>((
+                    input
+                        .context()
+                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                    input
+                        .context()
+                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                ))
+            })
+            .transpose()?;
+        let linear_started = std::time::Instant::now();
+        if let Some((start, _)) = linear_events.as_ref() {
+            start.record(stream)?;
+        }
+        let buffers = run_flash_mhc_cublas_linear_device_into(
+            session,
+            module,
+            stream,
+            &input,
+            hc_fn,
+            &mut mixes,
+            rows,
+            hidden,
+            capture_rsqrt_debug,
+        )?;
+        if let Some((start, end)) = linear_events.as_ref() {
+            end.record(stream)?;
+            end.synchronize()?;
+            telemetry.mixing_linear_gpu_ns = (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+            telemetry.mixing_linear_sync_ns =
+                u64::try_from(linear_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
+        let sinkhorn_events = profile
+            .then(|| {
+                Ok::<_, Box<dyn Error>>((
+                    input
+                        .context()
+                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                    input
+                        .context()
+                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                ))
+            })
+            .transpose()?;
+        let sinkhorn_started = std::time::Instant::now();
+        if let Some((start, _)) = sinkhorn_events.as_ref() {
+            start.record(stream)?;
+        }
+        // SAFETY: the cuBLAS arm wrote complete mixes rows; Sinkhorn owns its
+        // disjoint output tensors in the same stream.
+        unsafe {
+            module.mhc_sinkhorn_v4_bf16(
+                stream,
+                LaunchConfig::for_num_elems(u32::try_from(rows)?),
+                &input,
+                &mixes,
+                hc_scale,
+                hc_base,
+                &mut pre,
+                &mut post,
+                &mut comb,
+                &mut collapsed,
+                &mut trace,
+            )?;
+        }
+        if let Some((start, end)) = sinkhorn_events.as_ref() {
+            end.record(stream)?;
+            end.synchronize()?;
+            telemetry.sinkhorn_normalize_collapse_gpu_ns =
+                (start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64;
+            telemetry.sinkhorn_normalize_collapse_sync_ns =
+                u64::try_from(sinkhorn_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
+        Some(buffers)
+    };
     let d2h_started = std::time::Instant::now();
     let collapsed = collapsed.to_host_vec(stream)?;
     let post = post.to_host_vec(stream)?;
     let comb = comb.to_host_vec(stream)?;
+    let debug = std::env::var_os("COLIBRI_V4_FLASH_PARITY_DUMP_DIR")
+        .is_some()
+        .then(|| {
+            Ok::<_, Box<dyn Error>>(MhcDebugOutput {
+                mixes: mixes.to_host_vec(stream)?,
+                pre: pre.to_host_vec(stream)?,
+                sinkhorn_trace: trace.to_host_vec(stream)?,
+                raw_dot: cublas_buffers
+                    .as_ref()
+                    .map(|buffers| buffers.raw_dot.to_host_vec(stream))
+                    .transpose()?,
+                rsqrt: cublas_buffers
+                    .as_ref()
+                    .map(|buffers| buffers.rsqrt.to_host_vec(stream))
+                    .transpose()?,
+                rsqrt_debug: cublas_buffers
+                    .as_ref()
+                    .and_then(|buffers| buffers.rsqrt_debug.as_ref())
+                    .map(|debug| debug.to_host_vec(stream))
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
     if profile {
         telemetry.output_d2h_sync_ns =
             u64::try_from(d2h_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -20538,6 +25285,7 @@ fn run_l0_mhc_pre(
         collapsed,
         post,
         comb,
+        debug,
         telemetry,
     })
 }
@@ -20569,6 +25317,58 @@ fn run_l0_rmsnorm_device_into(
         )?;
     }
     Ok(())
+}
+
+fn run_flash_learned_rmsnorm_4096_device_into(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    norm: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+    trace: &mut DeviceBuffer<f32>,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    const WIDTH: usize = 4_096;
+    if input.is_empty()
+        || !input.len().is_multiple_of(WIDTH)
+        || norm.len() != WIDTH
+        || output.len() != input.len()
+        || !(trace.is_empty() || trace.len() == input.len() / WIDTH * 3)
+    {
+        return Err("Flash learned RMSNorm 4096 workspace contract mismatch".into());
+    }
+    let rows = input.len() / WIDTH;
+    let mut squares = DeviceBuffer::<f32>::zeroed(stream, input.len())?;
+    // SAFETY: the fixed Flash contract proves contiguous [rows, 4096] BF16
+    // input, one square per element, and one 512-thread reduction block per row.
+    unsafe {
+        module.rmsnorm_flash_square_bf16(
+            stream,
+            LaunchConfig::for_num_elems(u32::try_from(input.len())?),
+            input,
+            &mut squares,
+        )?;
+    }
+    let traced_squares = if trace.is_empty() {
+        Vec::new()
+    } else {
+        squares.to_host_vec(stream)?
+    };
+    unsafe {
+        module.rmsnorm_flash_learned_4096_bf16(
+            stream,
+            LaunchConfig {
+                grid_dim: (u32::try_from(rows)?, 1, 1),
+                block_dim: (512, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            input,
+            norm,
+            &squares,
+            output,
+            trace,
+        )?;
+    }
+    Ok(traced_squares)
 }
 
 fn run_l0_rmsnorm(
@@ -20745,6 +25545,223 @@ fn maybe_write_v4_audit_f32(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum FlashParityDtype {
+    Bf16,
+    F32,
+    I32,
+    U32,
+    U8,
+}
+
+impl FlashParityDtype {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::F32 => "F32",
+            Self::I32 => "I32",
+            Self::U32 => "U32",
+            Self::U8 => "U8",
+        }
+    }
+
+    const fn bytes(self) -> usize {
+        match self {
+            Self::Bf16 => std::mem::size_of::<u16>(),
+            Self::F32 | Self::I32 | Self::U32 => std::mem::size_of::<u32>(),
+            Self::U8 => std::mem::size_of::<u8>(),
+        }
+    }
+}
+
+fn flash_parity_dump_dir(
+    spec: &v4_spec::V4Spec,
+    layer: usize,
+    start_pos: usize,
+    rows: usize,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 || start_pos != 0 || rows != 1 {
+        return Ok(None);
+    }
+    let target_layer = std::env::var("COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER must be a layer index")
+        })
+        .transpose()?;
+    if target_layer != Some(layer) {
+        return Ok(None);
+    }
+    let Some(path) = std::env::var_os("COLIBRI_V4_FLASH_PARITY_DUMP_DIR") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Err("COLIBRI_V4_FLASH_PARITY_DUMP_DIR must not be empty".into());
+    }
+    let path = std::path::PathBuf::from(path);
+    std::fs::create_dir_all(&path)?;
+    Ok(Some(path))
+}
+
+/// Narrow router-only dump for a later parity-stop layer.  The broader L0
+/// dump remains intentionally L0-only because its attention/expert tensors
+/// are not evidence for a later router mismatch.
+fn flash_router_trace_dump_dir(
+    spec: &v4_spec::V4Spec,
+    layer: usize,
+    start_pos: usize,
+    rows: usize,
+) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 || start_pos != 0 || rows != 1 {
+        return Ok(None);
+    }
+    let Some(path) = std::env::var_os("COLIBRI_V4_FLASH_PARITY_DUMP_DIR") else {
+        return Ok(None);
+    };
+    let target_layer = std::env::var("COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER must be a layer index")
+        })
+        .transpose()?;
+    if target_layer != Some(layer) {
+        return Ok(None);
+    }
+    if path.is_empty() {
+        return Err("COLIBRI_V4_FLASH_PARITY_DUMP_DIR must not be empty".into());
+    }
+    let path = std::path::PathBuf::from(path);
+    std::fs::create_dir_all(&path)?;
+    Ok(Some(path))
+}
+
+fn flash_parity_manifest(
+    name: &str,
+    dtype: FlashParityDtype,
+    shape: &[usize],
+    byte_len: usize,
+    sha256: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let elements = shape.iter().try_fold(1_usize, |product, &dimension| {
+        product
+            .checked_mul(dimension)
+            .ok_or("Flash parity dump shape overflows")
+    })?;
+    if elements
+        .checked_mul(dtype.bytes())
+        .ok_or("Flash parity dump byte length overflows")?
+        != byte_len
+    {
+        return Err(format!(
+            "Flash parity dump {name} shape/dtype does not match {byte_len} bytes"
+        )
+        .into());
+    }
+    Ok(serde_json::json!({
+        "schema": "colibri-flash-parity-array-v1",
+        "name": name,
+        "layout": "row_major",
+        "endianness": "little",
+        "dtype": dtype.name(),
+        "shape": shape,
+        "elements": elements,
+        "byte_len": byte_len,
+        "sha256": sha256,
+        "binary": format!("{name}.bin"),
+    }))
+}
+
+fn flash_parity_dump_bytes(
+    dir: &std::path::Path,
+    name: &str,
+    dtype: FlashParityDtype,
+    shape: &[usize],
+    bytes: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let binary = dir.join(format!("{name}.bin"));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&binary)?;
+    output.write_all(bytes)?;
+    output.sync_all()?;
+    let manifest = flash_parity_manifest(name, dtype, shape, bytes.len(), &sha256_file(&binary)?)?;
+    let manifest_path = dir.join(format!("{name}.manifest.json"));
+    let mut manifest_output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(manifest_path)?;
+    serde_json::to_writer_pretty(&mut manifest_output, &manifest)?;
+    manifest_output.write_all(b"\n")?;
+    manifest_output.sync_all()?;
+    Ok(())
+}
+
+fn flash_parity_dump_u16(
+    dir: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[u16],
+) -> Result<(), Box<dyn Error>> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    flash_parity_dump_bytes(dir, name, FlashParityDtype::Bf16, shape, &bytes)
+}
+
+fn flash_parity_dump_f32(
+    dir: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[f32],
+) -> Result<(), Box<dyn Error>> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    flash_parity_dump_bytes(dir, name, FlashParityDtype::F32, shape, &bytes)
+}
+
+fn flash_parity_dump_i32(
+    dir: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[i32],
+) -> Result<(), Box<dyn Error>> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    flash_parity_dump_bytes(dir, name, FlashParityDtype::I32, shape, &bytes)
+}
+
+fn flash_parity_dump_u32(
+    dir: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    flash_parity_dump_bytes(dir, name, FlashParityDtype::U32, shape, &bytes)
+}
+
+fn flash_parity_dump_u8(
+    dir: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    flash_parity_dump_bytes(dir, name, FlashParityDtype::U8, shape, values)
+}
+
 fn run_l0_rope(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -20899,8 +25916,8 @@ fn run_layer_compressor(
         return Err("layer Compressor APE shape mismatch".into());
     }
     let outputs = weights.compressor_ape.len() / ratio;
-    if weights.compressor_wkv.len() != outputs * v4_state::HIDDEN
-        || weights.compressor_wgate.len() != outputs * v4_state::HIDDEN
+    if weights.compressor_wkv.len() != outputs * weights.spec.hidden
+        || weights.compressor_wgate.len() != outputs * weights.spec.hidden
     {
         return Err("layer Compressor weight shape mismatch".into());
     }
@@ -20964,16 +25981,18 @@ fn run_compressor(
     ratio: usize,
     start_pos: usize,
 ) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
+    let hidden = wkv.len().checked_div(outputs).unwrap_or(0);
     if input.is_empty()
-        || input.len() % v4_state::HIDDEN != 0
+        || hidden == 0
+        || input.len() % hidden != 0
         || outputs == 0
-        || wkv.len() != outputs * v4_state::HIDDEN
-        || wgate.len() != outputs * v4_state::HIDDEN
+        || wkv.len() != outputs * hidden
+        || wgate.len() != outputs * hidden
         || ape.len() != ratio * outputs
     {
         return Err("layer Compressor input/weight geometry mismatch".into());
     }
-    let rows = input.len() / v4_state::HIDDEN;
+    let rows = input.len() / hidden;
     let input = DeviceBuffer::from_host(stream, input)?;
     let mut kv = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
     let mut score = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
@@ -21277,6 +26296,26 @@ fn run_compressor_official_cublas_from_device(
     )
 }
 
+fn official_cublas_compressor_geometry(
+    input_len: usize,
+    wkv_len: usize,
+    wgate_len: usize,
+    ape_len: usize,
+    outputs: usize,
+    ratio: usize,
+) -> Option<(usize, usize)> {
+    let hidden = wkv_len.checked_div(outputs)?;
+    let rows = input_len.checked_div(hidden)?;
+    (hidden != 0
+        && rows != 0
+        && input_len == rows.checked_mul(hidden)?
+        && wkv_len == outputs.checked_mul(hidden)?
+        && wgate_len == outputs.checked_mul(hidden)?
+        && ape_len == ratio.checked_mul(outputs)?
+        && matches!(ratio, 4 | 128))
+    .then_some((hidden, rows))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_compressor_official_cublas_host(
     cublas: &cublas_exact::CublasExact,
@@ -21289,56 +26328,64 @@ fn run_compressor_official_cublas_host(
     ratio: usize,
     start_pos: usize,
 ) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
-    if input_bf16.len() != v4_state::HIDDEN
-        || outputs == 0
-        || !matches!(ratio, 4 | 128)
-        || wkv_bf16.len() != outputs * v4_state::HIDDEN
-        || wgate_bf16.len() != outputs * v4_state::HIDDEN
-        || ape_f32.len() != ratio * outputs
-    {
-        return Err("official cuBLAS Compressor geometry mismatch".into());
-    }
+    let (hidden, rows) = official_cublas_compressor_geometry(
+        input_bf16.len(),
+        wkv_bf16.len(),
+        wgate_bf16.len(),
+        ape_f32.len(),
+        outputs,
+        ratio,
+    )
+    .ok_or("official cuBLAS Compressor geometry mismatch")?;
     let to_f32 = |values: &[u16]| {
         values
             .iter()
             .map(|&bits| f32::from_bits(u32::from(bits) << 16))
             .collect::<Vec<_>>()
     };
-    let input = DeviceBuffer::from_host(stream, &to_f32(input_bf16))?;
     let wkv = DeviceBuffer::from_host(stream, &to_f32(wkv_bf16))?;
     let wgate = DeviceBuffer::from_host(stream, &to_f32(wgate_bf16))?;
     let workspace = DeviceBuffer::<u8>::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?;
-    let kv = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
-    let score = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
     let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
     let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
     let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
-    cublas.sgemm_mn1(
-        stream_pointer,
-        device_mut(workspace.cu_deviceptr()),
-        workspace.num_bytes(),
-        device_const(wkv.cu_deviceptr()),
-        device_const(input.cu_deviceptr()),
-        device_mut(kv.cu_deviceptr()),
-        outputs,
-        v4_state::HIDDEN,
-    )?;
-    cublas.sgemm_mn1(
-        stream_pointer,
-        device_mut(workspace.cu_deviceptr()),
-        workspace.num_bytes(),
-        device_const(wgate.cu_deviceptr()),
-        device_const(input.cu_deviceptr()),
-        device_mut(score.cu_deviceptr()),
-        outputs,
-        v4_state::HIDDEN,
-    )?;
-    let kv_f32 = kv.to_host_vec(stream)?;
-    let score_f32 = score.to_host_vec(stream)?;
+    let mut kv_f32 = Vec::with_capacity(rows * outputs);
+    let mut score_f32 = Vec::with_capacity(rows * outputs);
+    for input_bf16 in input_bf16.chunks_exact(hidden) {
+        let input = DeviceBuffer::from_host(stream, &to_f32(input_bf16))?;
+        let kv = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
+        let score = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
+        cublas.sgemm_mn1(
+            stream_pointer,
+            device_mut(workspace.cu_deviceptr()),
+            workspace.num_bytes(),
+            device_const(wkv.cu_deviceptr()),
+            device_const(input.cu_deviceptr()),
+            device_mut(kv.cu_deviceptr()),
+            outputs,
+            hidden,
+        )?;
+        cublas.sgemm_mn1(
+            stream_pointer,
+            device_mut(workspace.cu_deviceptr()),
+            workspace.num_bytes(),
+            device_const(wgate.cu_deviceptr()),
+            device_const(input.cu_deviceptr()),
+            device_mut(score.cu_deviceptr()),
+            outputs,
+            hidden,
+        )?;
+        kv_f32.extend(kv.to_host_vec(stream)?);
+        score_f32.extend(score.to_host_vec(stream)?);
+    }
     let score_plus_ape_f32 = score_f32
-        .iter()
-        .zip(&ape_f32[start_pos % ratio * outputs..][..outputs])
-        .map(|(&score, &ape)| score + ape)
+        .chunks_exact(outputs)
+        .flat_map(|scores| {
+            scores
+                .iter()
+                .zip(&ape_f32[start_pos % ratio * outputs..][..outputs])
+                .map(|(&score, &ape)| score + ape)
+        })
         .collect::<Vec<_>>();
     if kv_f32
         .iter()
@@ -21370,6 +26417,7 @@ fn run_compressor_device_into(
     ratio: usize,
     start_pos: usize,
 ) -> Result<(), Box<dyn Error>> {
+    let hidden = wkv.len().checked_div(outputs).unwrap_or(0);
     if !compressor_workspace_contract_matches(
         input.len(),
         wkv.len(),
@@ -21396,7 +26444,7 @@ fn run_compressor_device_into(
             score,
             score_plus_ape,
             u32::try_from(start_pos)?,
-            u32::try_from(v4_state::HIDDEN)?,
+            u32::try_from(hidden)?,
             u32::try_from(outputs)?,
             u32::try_from(ratio)?,
         )?;
@@ -21415,13 +26463,15 @@ fn compressor_workspace_contract_matches(
     outputs: usize,
     ratio: usize,
 ) -> bool {
+    let hidden = wkv_elements.checked_div(outputs).unwrap_or(0);
     input_elements != 0
-        && input_elements.is_multiple_of(v4_state::HIDDEN)
+        && hidden != 0
+        && input_elements.is_multiple_of(hidden)
         && outputs != 0
-        && wkv_elements == outputs * v4_state::HIDDEN
-        && wgate_elements == outputs * v4_state::HIDDEN
+        && wkv_elements == outputs * hidden
+        && wgate_elements == outputs * hidden
         && ape_elements == ratio * outputs
-        && kv_elements == input_elements / v4_state::HIDDEN * outputs
+        && kv_elements == input_elements / hidden * outputs
         && score_elements == kv_elements
         && score_plus_ape_elements == kv_elements
 }
@@ -21644,7 +26694,25 @@ fn l0_pos0_compressor_probe_enabled(layer: usize, start_pos: usize) -> bool {
 fn strict_compressor_enabled() -> bool {
     strict_compressor_enabled_with(|name| {
         std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"))
-    })
+    }) || flash_runtime_strict_compressor_enabled(
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"))
+            || std::env::var_os("COLIBRI_V4_FLASH_DSPARK").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            || std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+        std::env::var_os("COLIBRI_V4_FLASH_MHC_LINEAR_ARM").as_deref()
+            == Some(std::ffi::OsStr::new("cublas")),
+        std::env::var_os("COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM").as_deref()
+            == Some(std::ffi::OsStr::new("cublas")),
+    )
+}
+
+fn flash_runtime_strict_compressor_enabled(
+    flash_runtime: bool,
+    mhc_cublas: bool,
+    router_cublas: bool,
+) -> bool {
+    flash_exact_runtime_requires_strict_compressor(flash_runtime, mhc_cublas, router_cublas)
 }
 
 fn strict_compressor_enabled_with(enabled: impl Fn(&str) -> bool) -> bool {
@@ -21658,6 +26726,14 @@ fn strict_compressor_enabled_with(enabled: impl Fn(&str) -> bool) -> bool {
     ]
     .into_iter()
     .any(enabled)
+}
+
+fn flash_exact_runtime_requires_strict_compressor(
+    flash_runtime: bool,
+    mhc_cublas: bool,
+    router_cublas: bool,
+) -> bool {
+    flash_runtime && (mhc_cublas || router_cublas)
 }
 
 fn print_l0_pos0_compressor_probe(source: &str, kv: &[f32], score: &[f32], score_plus_ape: &[f32]) {
@@ -21711,6 +26787,7 @@ struct CsaIndexerPrepared {
 }
 
 fn run_csa_indexer_projections(
+    spec: &'static v4_spec::V4Spec,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     attention_input: &[u16],
@@ -21721,10 +26798,10 @@ fn run_csa_indexer_projections(
     cublas: Option<&cublas_exact::CublasExact>,
     strict_scratch: Option<&mut StrictCompressorScratch>,
 ) -> Result<CsaIndexerPrepared, Box<dyn Error>> {
-    let rows = attention_input.len() / v4_state::HIDDEN;
+    let rows = attention_input.len() / spec.hidden;
     if rows == 0
-        || attention_input.len() != rows * v4_state::HIDDEN
-        || q_lora.len() != rows * 1_536
+        || attention_input.len() != rows * spec.hidden
+        || q_lora.len() != rows * spec.q_lora_rank
         || freqs.len() != rows * v4_state::Q_ROPE_DIM
     {
         return Err("CSA indexer projection input contract mismatch".into());
@@ -21737,7 +26814,7 @@ fn run_csa_indexer_projections(
         stream,
         attention_input,
         &indexer.weights_proj,
-        v4_state::HIDDEN,
+        spec.hidden,
         64,
     )?;
     let scale = 1.0_f32 / (128.0_f32 * 64.0).sqrt();
@@ -21797,6 +26874,7 @@ fn run_csa_indexer_projections(
 }
 
 fn run_indexer_topk_gpu(
+    spec: &'static v4_spec::V4Spec,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     q_f32: &[f32],
@@ -21841,7 +26919,7 @@ fn run_indexer_topk_gpu(
             u32::try_from(keys)?,
         )?;
     }
-    let topk = keys.min(v4_state::INDEX_TOPK);
+    let topk = keys.min(spec.index_topk);
     let valid = DeviceBuffer::from_host(
         stream,
         &valid_keys
@@ -21879,7 +26957,8 @@ fn run_l0_sparse_attention(
     attn_sink: &DeviceBuffer<f32>,
     start_pos: usize,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let heads = attn_sink.len();
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     if q.is_empty() || q.len() % row_width != 0 {
         return Err("L0 sparse attention query shape mismatch".into());
     }
@@ -21896,7 +26975,7 @@ fn run_sparse_attention(
     attn_sink: &DeviceBuffer<f32>,
     topk: &v4_state::SparseTopk,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let row_width = attn_sink.len() * v4_state::Q_HEAD_DIM;
     let rows = q.len() / row_width;
     if q.is_empty()
         || q.len() % row_width != 0
@@ -21943,7 +27022,8 @@ fn run_sparse_attention_score_reuse(
     attn_sink: &DeviceBuffer<f32>,
     topk: &v4_state::SparseTopk,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let heads = attn_sink.len();
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     let rows = q.len() / row_width;
     if q.is_empty()
         || q.len() % row_width != 0
@@ -21957,7 +27037,8 @@ fn run_sparse_attention_score_reuse(
     let kv = DeviceBuffer::from_host(stream, kv)?;
     let topk_device = DeviceBuffer::from_host(stream, &topk.indices)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, q.len())?;
-    let mut scratch = SparseAttentionScoreReuseScratch::new(stream, rows, topk.per_row)?;
+    let mut scratch =
+        SparseAttentionScoreReuseScratch::new_for_heads(stream, rows, heads, topk.per_row)?;
     run_sparse_attention_score_reuse_device_into(
         module,
         stream,
@@ -21983,7 +27064,8 @@ fn run_sparse_attention_device_into(
     output: &mut DeviceBuffer<u16>,
     topk_per_row: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let heads = attn_sink.len();
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     if q.is_empty()
         || !q.len().is_multiple_of(row_width)
         || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
@@ -22004,6 +27086,8 @@ fn run_sparse_attention_device_into(
             topk,
             output,
             u32::try_from(topk_per_row)?,
+            u32::try_from(heads)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
         )?;
     }
     Ok(())
@@ -22018,12 +27102,21 @@ struct SparseAttentionScoreReuseScratch {
 
 impl SparseAttentionScoreReuseScratch {
     fn new(stream: &CudaStream, rows: usize, topk_per_row: usize) -> Result<Self, Box<dyn Error>> {
+        Self::new_for_heads(stream, rows, v4_state::Q_HEADS, topk_per_row)
+    }
+
+    fn new_for_heads(
+        stream: &CudaStream,
+        rows: usize,
+        heads: usize,
+        topk_per_row: usize,
+    ) -> Result<Self, Box<dyn Error>> {
         let score_len = rows
-            .checked_mul(v4_state::Q_HEADS)
+            .checked_mul(heads)
             .and_then(|value| value.checked_mul(topk_per_row))
             .ok_or("sparse attention score scratch length overflow")?;
         let head_len = rows
-            .checked_mul(v4_state::Q_HEADS)
+            .checked_mul(heads)
             .ok_or("sparse attention head scratch length overflow")?;
         Ok(Self {
             scores: DeviceBuffer::zeroed(stream, score_len)?,
@@ -22052,19 +27145,20 @@ fn run_sparse_attention_reference_state_device_into(
     scratch: &mut SparseAttentionScoreReuseScratch,
     topk_per_row: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let heads = attn_sink.len();
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     let rows = q.len() / row_width;
     let score_len = rows
-        .checked_mul(v4_state::Q_HEADS)
+        .checked_mul(heads)
         .and_then(|value| value.checked_mul(topk_per_row))
         .ok_or("sparse attention reference-state length overflow")?;
     let head_len = rows
-        .checked_mul(v4_state::Q_HEADS)
+        .checked_mul(heads)
         .ok_or("sparse attention reference-state head length overflow")?;
     if q.is_empty()
         || q.len() != rows * row_width
         || !kv.len().is_multiple_of(v4_state::Q_HEAD_DIM)
-        || attn_sink.len() != v4_state::Q_HEADS
+        || attn_sink.len() != heads
         || topk_per_row == 0
         || topk.len() < rows * topk_per_row
         || scratch.scores.len() < score_len
@@ -22089,6 +27183,8 @@ fn run_sparse_attention_reference_state_device_into(
             &mut scratch.denominators,
             &mut scratch.valid_counts,
             u32::try_from(topk_per_row)?,
+            u32::try_from(heads)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
         )?;
     }
     Ok(())
@@ -22106,14 +27202,15 @@ fn run_sparse_attention_score_reuse_device_into(
     scratch: &mut SparseAttentionScoreReuseScratch,
     topk_per_row: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let heads = attn_sink.len();
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     let rows = q.len() / row_width;
     let score_len = rows
-        .checked_mul(v4_state::Q_HEADS)
+        .checked_mul(heads)
         .and_then(|value| value.checked_mul(topk_per_row))
         .ok_or("sparse attention score launch length overflow")?;
     let head_len = rows
-        .checked_mul(v4_state::Q_HEADS)
+        .checked_mul(heads)
         .ok_or("sparse attention probability launch length overflow")?;
     if !sparse_attention_score_reuse_workspace_matches(
         q.len(),
@@ -22126,6 +27223,7 @@ fn run_sparse_attention_score_reuse_device_into(
         scratch.denominators.len(),
         scratch.valid_counts.len(),
         topk_per_row,
+        heads,
     ) {
         return Err("score-reuse sparse attention workspace contract mismatch".into());
     }
@@ -22141,6 +27239,8 @@ fn run_sparse_attention_score_reuse_device_into(
             topk,
             &mut scratch.scores,
             u32::try_from(topk_per_row)?,
+            u32::try_from(heads)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
         )?;
         module.sparse_attn_v4_probabilities(
             stream,
@@ -22153,6 +27253,8 @@ fn run_sparse_attention_score_reuse_device_into(
             &mut scratch.denominators,
             &mut scratch.valid_counts,
             u32::try_from(topk_per_row)?,
+            u32::try_from(heads)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
         )?;
         module.sparse_attn_v4_values(
             stream,
@@ -22164,6 +27266,8 @@ fn run_sparse_attention_score_reuse_device_into(
             &scratch.valid_counts,
             output,
             u32::try_from(topk_per_row)?,
+            u32::try_from(heads)?,
+            u32::try_from(v4_state::Q_HEAD_DIM)?,
         )?;
     }
     Ok(())
@@ -22181,25 +27285,26 @@ fn sparse_attention_score_reuse_workspace_matches(
     denominator_elements: usize,
     valid_count_elements: usize,
     active_topk_per_row: usize,
+    heads: usize,
 ) -> bool {
-    let row_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
+    let row_width = heads * v4_state::Q_HEAD_DIM;
     let rows = q_elements / row_width;
     let Some(active_topk) = rows.checked_mul(active_topk_per_row) else {
         return false;
     };
     let Some(active_scores) = rows
-        .checked_mul(v4_state::Q_HEADS)
+        .checked_mul(heads)
         .and_then(|value| value.checked_mul(active_topk_per_row))
     else {
         return false;
     };
-    let Some(head_elements) = rows.checked_mul(v4_state::Q_HEADS) else {
+    let Some(head_elements) = rows.checked_mul(heads) else {
         return false;
     };
     q_elements != 0
         && q_elements == rows * row_width
         && kv_elements.is_multiple_of(v4_state::Q_HEAD_DIM)
-        && attn_sink_elements == v4_state::Q_HEADS
+        && attn_sink_elements == heads
         && active_topk_per_row != 0
         && topk_capacity >= active_topk
         && output_elements == q_elements
@@ -22216,10 +27321,23 @@ fn run_l0_wo_a_device_into(
     weight: &DeviceBuffer<u16>,
     output: &mut DeviceBuffer<u16>,
 ) -> Result<(), Box<dyn Error>> {
-    let input_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
-    let output_width = v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    run_l0_wo_a_device_into_for(&v4_spec::PRO, module, stream, input, weight, output)
+}
+
+fn run_l0_wo_a_device_into_for(
+    spec: &v4_spec::V4Spec,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &DeviceBuffer<u16>,
+    weight: &DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<u16>,
+) -> Result<(), Box<dyn Error>> {
+    let input_width = spec.q_heads * spec.q_head_dim;
+    let output_width = spec.o_groups * spec.o_lora_rank;
+    let weight_elements = output_width * input_width / spec.o_groups;
     if input.is_empty()
         || !input.len().is_multiple_of(input_width)
+        || weight.len() != weight_elements
         || output.len() != input.len() / input_width * output_width
     {
         return Err("device wo_a workspace contract mismatch".into());
@@ -22232,6 +27350,10 @@ fn run_l0_wo_a_device_into(
             input,
             weight,
             output,
+            u32::try_from(spec.q_heads)?,
+            u32::try_from(spec.q_head_dim)?,
+            u32::try_from(spec.o_groups)?,
+            u32::try_from(spec.o_lora_rank)?,
         )?;
     }
     Ok(())
@@ -22243,14 +27365,24 @@ fn run_l0_wo_a(
     input: &[u16],
     weight: &DeviceBuffer<u16>,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    let input_width = v4_state::Q_HEADS * v4_state::Q_HEAD_DIM;
-    let output_width = v4_state::O_GROUPS * v4_state::O_LORA_RANK;
+    run_l0_wo_a_for(&v4_spec::PRO, module, stream, input, weight)
+}
+
+fn run_l0_wo_a_for(
+    spec: &v4_spec::V4Spec,
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weight: &DeviceBuffer<u16>,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let input_width = spec.q_heads * spec.q_head_dim;
+    let output_width = spec.o_groups * spec.o_lora_rank;
     if input.is_empty() || input.len() % input_width != 0 {
         return Err("L0 wo_a input shape mismatch".into());
     }
     let input = DeviceBuffer::from_host(stream, input)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len() / input_width * output_width)?;
-    run_l0_wo_a_device_into(module, stream, &input, weight, &mut output)?;
+    run_l0_wo_a_device_into_for(spec, module, stream, &input, weight, &mut output)?;
     Ok(output.to_host_vec(stream)?)
 }
 
@@ -22264,10 +27396,16 @@ fn run_l0_hc_post_device_into(
     comb: &DeviceBuffer<f32>,
     output: &mut DeviceBuffer<u16>,
 ) -> Result<(), Box<dyn Error>> {
+    if post.len() % v4_state::HC != 0 {
+        return Err("device HC post metadata mismatch".into());
+    }
+    let rows = post.len() / v4_state::HC;
+    if rows == 0 || branch.len() % rows != 0 {
+        return Err("device HC post row mismatch".into());
+    }
     if branch.is_empty()
-        || !branch.len().is_multiple_of(v4_state::HIDDEN)
         || residual.len() != branch.len() * v4_state::HC
-        || post.len() != branch.len() / v4_state::HIDDEN * v4_state::HC
+        || post.len() != rows * v4_state::HC
         || comb.len() != post.len() * v4_state::HC
         || output.len() != residual.len()
     {
@@ -22296,8 +27434,13 @@ fn run_l0_hc_post(
     post: &[f32],
     comb: &[f32],
 ) -> Result<Vec<u16>, Box<dyn Error>> {
+    if post.len() % v4_state::HC != 0 {
+        return Err("L0 HC post metadata mismatch".into());
+    }
+    let rows = post.len() / v4_state::HC;
     if branch.is_empty()
-        || branch.len() % v4_state::HIDDEN != 0
+        || rows == 0
+        || branch.len() % rows != 0
         || residual.len() != branch.len() * v4_state::HC
     {
         return Err("L0 HC post shape mismatch".into());
@@ -22319,23 +27462,66 @@ fn run_l0_hc_post(
     Ok(output.to_host_vec(stream)?)
 }
 
+fn run_l0_hc_post_trace(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    branch: &[u16],
+    residual: &[u16],
+    post: &[f32],
+    comb: &[f32],
+    audit_index: usize,
+) -> Result<Vec<u32>, Box<dyn Error>> {
+    const WORDS: usize = 21;
+    if audit_index >= residual.len() {
+        return Err("Flash HC post trace index is outside residual".into());
+    }
+    let branch = DeviceBuffer::from_host(stream, branch)?;
+    let residual = DeviceBuffer::from_host(stream, residual)?;
+    let post = DeviceBuffer::from_host(stream, post)?;
+    let comb = DeviceBuffer::from_host(stream, comb)?;
+    let mut audit = DeviceBuffer::<u32>::zeroed(stream, WORDS)?;
+    // SAFETY: the trace kernel repeats the checked HC-post geometry for one index.
+    unsafe {
+        module.hc_post_v4_bf16_trace(
+            stream,
+            LaunchConfig::for_num_elems(1),
+            &branch,
+            &residual,
+            &post,
+            &comb,
+            u32::try_from(audit_index)?,
+            &mut audit,
+        )?;
+    }
+    Ok(audit.to_host_vec(stream)?)
+}
+
 fn run_layer_router(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
+    session: Option<&FlashCublasSession>,
     input: &[u16],
     weights: &LayerDeviceWeights,
     hash_ids: &[i64],
+    capture_debug: bool,
 ) -> Result<LayerRouterRun, Box<dyn Error>> {
-    if input.is_empty() || !input.len().is_multiple_of(v4_state::HIDDEN) {
+    let spec = weights.spec;
+    let score_arm = flash_router_score_arm(spec)?;
+    let linear_arm = flash_router_linear_arm(spec)?;
+    if input.is_empty() || !input.len().is_multiple_of(spec.hidden) {
         return Err("layer router host input mismatch".into());
     }
-    let rows = input.len() / v4_state::HIDDEN;
-    if (weights.hash_router && hash_ids.len() != rows * v4_router::V4_TOPK)
+    let rows = input.len() / spec.hidden;
+    if (weights.hash_router && hash_ids.len() != rows * spec.experts_per_token)
         || (!weights.hash_router && !hash_ids.is_empty())
     {
         return Err("layer router mode/input mismatch".into());
     }
     let profile = bench_telemetry_enabled();
+    let owned_session = (linear_arm == FlashMhcLinearArm::Cublas && session.is_none())
+        .then(|| FlashCublasSession::new(stream))
+        .transpose()?;
+    let session = session.or(owned_session.as_ref());
     let mut telemetry = RouterTelemetry::default();
     let alloc_h2d_started = std::time::Instant::now();
     let input = DeviceBuffer::from_host(stream, input)?;
@@ -22346,9 +27532,9 @@ fn run_layer_router(
     }
     let workspace_alloc_started = std::time::Instant::now();
     let mut normalized_device = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
-    let mut logits = DeviceBuffer::<f32>::zeroed(stream, rows * v4_router::V4_ROUTED_EXPERTS)?;
-    let mut ids = DeviceBuffer::<i32>::zeroed(stream, rows * v4_router::V4_TOPK)?;
-    let mut route_weights = DeviceBuffer::<f32>::zeroed(stream, rows * v4_router::V4_TOPK)?;
+    let mut logits = DeviceBuffer::<f32>::zeroed(stream, rows * spec.routed_experts)?;
+    let mut ids = DeviceBuffer::<i32>::zeroed(stream, rows * spec.experts_per_token)?;
+    let mut route_weights = DeviceBuffer::<f32>::zeroed(stream, rows * spec.experts_per_token)?;
     if profile {
         telemetry.workspace_alloc_ns =
             u64::try_from(workspace_alloc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -22369,6 +27555,49 @@ fn run_layer_router(
     if let Some((start, _)) = events.as_ref() {
         start.record(stream)?;
     }
+    let mut router_debug = if capture_debug {
+        Some((
+            DeviceBuffer::<f32>::zeroed(stream, rows * 3)?,
+            Vec::<f32>::new(),
+            DeviceBuffer::<f32>::zeroed(stream, logits.len())?,
+            DeviceBuffer::<f32>::zeroed(stream, logits.len())?,
+            DeviceBuffer::<f32>::zeroed(stream, ids.len())?,
+            DeviceBuffer::<f32>::zeroed(stream, ids.len())?,
+        ))
+    } else {
+        None
+    };
+    let mut empty_rmsnorm_trace = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut empty_rmsnorm_squares = Vec::new();
+    let mut empty_softplus = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut empty_post_scores = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut empty_selected_scores = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let mut empty_denom_steps = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+    let (
+        trace_rmsnorm,
+        trace_rmsnorm_squares,
+        trace_softplus,
+        trace_post_scores,
+        trace_selected_scores,
+        trace_denom_steps,
+    ) = match router_debug.as_mut() {
+        Some((rmsnorm, rmsnorm_squares, softplus, post_scores, selected_scores, denom_steps)) => (
+            rmsnorm,
+            rmsnorm_squares,
+            softplus,
+            post_scores,
+            selected_scores,
+            denom_steps,
+        ),
+        None => (
+            &mut empty_rmsnorm_trace,
+            &mut empty_rmsnorm_squares,
+            &mut empty_softplus,
+            &mut empty_post_scores,
+            &mut empty_selected_scores,
+            &mut empty_denom_steps,
+        ),
+    };
     run_layer_router_device_into(
         module,
         stream,
@@ -22379,6 +27608,14 @@ fn run_layer_router(
         &mut logits,
         &mut ids,
         &mut route_weights,
+        session,
+        score_arm,
+        trace_rmsnorm,
+        trace_rmsnorm_squares,
+        trace_softplus,
+        trace_post_scores,
+        trace_selected_scores,
+        trace_denom_steps,
     )?;
     if let Some((start, end)) = events.as_ref() {
         end.record(stream)?;
@@ -22393,12 +27630,34 @@ fn run_layer_router(
         ids: ids.to_host_vec(stream)?,
         weights: route_weights.to_host_vec(stream)?,
     };
+    let debug = if let Some((
+        rmsnorm,
+        rmsnorm_squares,
+        softplus,
+        post_scores,
+        selected_scores,
+        denom_steps,
+    )) = router_debug.take()
+    {
+        Some(RouterDebug {
+            rmsnorm: rmsnorm.to_host_vec(stream)?,
+            rmsnorm_squares,
+            logits: logits.to_host_vec(stream)?,
+            softplus: softplus.to_host_vec(stream)?,
+            post_scores: post_scores.to_host_vec(stream)?,
+            selected_scores: selected_scores.to_host_vec(stream)?,
+            denom_steps: denom_steps.to_host_vec(stream)?,
+        })
+    } else {
+        None
+    };
     if profile {
         telemetry.d2h_sync_ns = u64::try_from(d2h_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     }
     Ok(LayerRouterRun {
         input: normalized,
         routes,
+        debug,
         telemetry,
     })
 }
@@ -22414,38 +27673,84 @@ fn run_layer_router_device_into(
     logits: &mut DeviceBuffer<f32>,
     ids: &mut DeviceBuffer<i32>,
     route_weights: &mut DeviceBuffer<f32>,
+    session: Option<&FlashCublasSession>,
+    score_arm: FlashRouterScoreArm,
+    trace_rmsnorm: &mut DeviceBuffer<f32>,
+    trace_rmsnorm_squares: &mut Vec<f32>,
+    trace_softplus: &mut DeviceBuffer<f32>,
+    trace_post_scores: &mut DeviceBuffer<f32>,
+    trace_selected_scores: &mut DeviceBuffer<f32>,
+    trace_denom_steps: &mut DeviceBuffer<f32>,
 ) -> Result<(), Box<dyn Error>> {
-    if input.is_empty() || !input.len().is_multiple_of(v4_state::HIDDEN) {
+    let spec = weights.spec;
+    if input.is_empty() || !input.len().is_multiple_of(spec.hidden) {
         return Err("device router input contract mismatch".into());
     }
-    let rows = input.len() / v4_state::HIDDEN;
+    let rows = input.len() / spec.hidden;
     if normalized.len() != input.len()
-        || logits.len() != rows * v4_router::V4_ROUTED_EXPERTS
-        || ids.len() != rows * v4_router::V4_TOPK
+        || logits.len() != rows * spec.routed_experts
+        || ids.len() != rows * spec.experts_per_token
         || route_weights.len() != ids.len()
         || (weights.hash_router && hash_ids.len() != ids.len())
         || (!weights.hash_router && !hash_ids.is_empty())
     {
         return Err("device router workspace contract mismatch".into());
     }
-    run_l0_rmsnorm_device_into(
-        module,
-        stream,
-        input,
-        &weights.ffn_norm,
-        normalized,
-        v4_state::HIDDEN,
-    )?;
-    let launch = LaunchConfig::for_num_elems(u32::try_from(rows)?);
-    // SAFETY: the fixed gate matrix and selected router mode satisfy both kernels.
-    unsafe {
-        module.gate_logits_v4_bf16(
+    if spec == &v4_spec::FLASH_0731
+        && !weights.hash_router
+        && spec.hidden == 4_096
+        && weights.ffn_norm.len() == 4_096
+    {
+        *trace_rmsnorm_squares = run_flash_learned_rmsnorm_4096_device_into(
+            module,
             stream,
-            LaunchConfig::for_num_elems(u32::try_from(logits.len())?),
+            input,
+            &weights.ffn_norm,
+            normalized,
+            trace_rmsnorm,
+        )?;
+    } else {
+        run_l0_rmsnorm_device_into(
+            module,
+            stream,
+            input,
+            &weights.ffn_norm,
+            normalized,
+            spec.hidden,
+        )?;
+    }
+    let launch = LaunchConfig::for_num_elems(u32::try_from(rows)?);
+    let _router_cublas = match flash_router_linear_arm(spec)? {
+        FlashMhcLinearArm::Canonical => {
+            // SAFETY: the fixed gate matrix satisfies the canonical gate kernel.
+            unsafe {
+                module.gate_logits_v4_bf16(
+                    stream,
+                    LaunchConfig::for_num_elems(u32::try_from(logits.len())?),
+                    normalized,
+                    &weights.gate,
+                    logits,
+                    u32::try_from(spec.hidden)?,
+                    u32::try_from(spec.routed_experts)?,
+                )?;
+            }
+            None
+        }
+        FlashMhcLinearArm::Cublas => Some(run_flash_router_cublas_linear_device_into(
+            session.ok_or("Flash cuBLAS router session is missing")?,
+            module,
+            stream,
             normalized,
             &weights.gate,
             logits,
-        )?;
+            rows,
+            spec.hidden,
+            spec.routed_experts,
+        )?),
+    };
+    // SAFETY: both router-linear arms produce complete logits under the same
+    // fixed gate geometry; selection retains the existing score/top-k path.
+    unsafe {
         module.select_v4_router(
             stream,
             launch,
@@ -22454,7 +27759,14 @@ fn run_layer_router_device_into(
             hash_ids,
             ids,
             route_weights,
+            trace_softplus,
+            trace_post_scores,
+            trace_selected_scores,
+            trace_denom_steps,
             u32::from(weights.hash_router),
+            u32::try_from(spec.routed_experts)?,
+            spec.route_scale(),
+            score_arm.kernel_flag(),
         )?;
     }
     Ok(())
@@ -22466,6 +27778,15 @@ fn run_layer_shared_expert(
     input: &[u16],
     weights: &LayerDeviceWeights,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
+    Ok(run_layer_shared_expert_with_bf16(module, stream, input, weights)?.0)
+}
+
+fn run_layer_shared_expert_with_bf16(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    input: &[u16],
+    weights: &LayerDeviceWeights,
+) -> Result<(Vec<f32>, Vec<u16>), Box<dyn Error>> {
     let (_, gate) = run_l0_fp8_linear(module, stream, input, &weights.shared_w1, false)?;
     let (_, up) = run_l0_fp8_linear(module, stream, input, &weights.shared_w3, false)?;
     let gate = DeviceBuffer::from_host(stream, &gate)?;
@@ -22474,7 +27795,10 @@ fn run_layer_shared_expert(
     launch_v4_swiglu_route(module, stream, &gate, &up, &mut activated, 1.0)?;
     let activated = activated.to_host_vec(stream)?;
     let (_, output) = run_l0_fp8_linear(module, stream, &activated, &weights.shared_w2, false)?;
-    Ok(output.into_iter().map(v4_router::bf16_to_f32).collect())
+    Ok((
+        output.iter().copied().map(v4_router::bf16_to_f32).collect(),
+        output,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22484,11 +27808,42 @@ fn commit_layer_attention_state(
     weights: &LayerDeviceWeights,
     state: &mut v4_state::V4LayerPersistentState,
     kv: &[u16],
-    compressor: &v4_state::CompressorPrepared,
+    compressor: Option<&v4_state::CompressorPrepared>,
     indexer: Option<&CsaIndexerPrepared>,
     start_pos: usize,
 ) -> Result<(v4_state::SparseTopk, u64), Box<dyn Error>> {
     let rows = kv.len() / v4_state::Q_HEAD_DIM;
+    if weights.compression_ratio == v4_state::CompressionRatio::WindowOnly {
+        if rows == 0
+            || kv.len() != rows * v4_state::Q_HEAD_DIM
+            || indexer.is_some()
+            || compressor.is_some()
+        {
+            return Err(format!(
+                "layer {} window-only attention state input contract mismatch",
+                weights.layer
+            )
+            .into());
+        }
+        for row in 0..rows {
+            state.append_kv_row(
+                start_pos + row,
+                &kv[row * v4_state::Q_HEAD_DIM..(row + 1) * v4_state::Q_HEAD_DIM],
+            )?;
+        }
+        let (indices, per_row) = v4_state::window_topk_cpu(rows, start_pos, v4_state::KV_WINDOW)?;
+        return Ok((
+            v4_state::SparseTopk {
+                indices,
+                rows,
+                per_row,
+                window_per_row: per_row,
+                compressed_per_row: 0,
+            },
+            0,
+        ));
+    }
+    let compressor = compressor.ok_or("compressed attention omitted compressor projections")?;
     let compressor_width = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
         1_024
     } else {
@@ -22641,6 +27996,7 @@ fn commit_layer_attention_state(
         .map(|row| (start_pos + row + 1) / ratio)
         .collect::<Vec<_>>();
     let (compressed, indexer_topk_gpu_ns) = run_indexer_topk_gpu(
+        weights.spec,
         module,
         stream,
         &indexer.q_f32,
@@ -22670,6 +28026,63 @@ fn commit_layer_attention_state(
     ))
 }
 
+#[derive(Clone, Default)]
+struct AttentionProfileStep {
+    sync_wall_ns: u64,
+    gpu_event_ns: u64,
+}
+
+#[derive(Clone, Default)]
+struct AttentionProfile {
+    mhc: AttentionProfileStep,
+    attn_norm: AttentionProfileStep,
+    q_a_projection: AttentionProfileStep,
+    q_a_norm: AttentionProfileStep,
+    q_b_projection: AttentionProfileStep,
+    q_b_norm: AttentionProfileStep,
+    q_rope: AttentionProfileStep,
+    kv_projection: AttentionProfileStep,
+    kv_norm: AttentionProfileStep,
+    kv_rope_quantize: AttentionProfileStep,
+    compressor: AttentionProfileStep,
+    indexer: AttentionProfileStep,
+    commit_topk: AttentionProfileStep,
+    sparse_score: AttentionProfileStep,
+    sparse_inverse_rope: AttentionProfileStep,
+    wo_a: AttentionProfileStep,
+    wo_b: AttentionProfileStep,
+    hc_post: AttentionProfileStep,
+}
+
+impl AttentionProfile {
+    fn step_json(step: &AttentionProfileStep) -> serde_json::Value {
+        serde_json::json!({"sync_wall_ns": step.sync_wall_ns, "gpu_event_ns": step.gpu_event_ns})
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mhc": Self::step_json(&self.mhc),
+            "attn_norm": Self::step_json(&self.attn_norm),
+            "q_a_projection": Self::step_json(&self.q_a_projection),
+            "q_a_norm": Self::step_json(&self.q_a_norm),
+            "q_b_projection": Self::step_json(&self.q_b_projection),
+            "q_b_norm": Self::step_json(&self.q_b_norm),
+            "q_rope": Self::step_json(&self.q_rope),
+            "kv_projection": Self::step_json(&self.kv_projection),
+            "kv_norm": Self::step_json(&self.kv_norm),
+            "kv_rope_quantize": Self::step_json(&self.kv_rope_quantize),
+            "compressor": Self::step_json(&self.compressor),
+            "indexer": Self::step_json(&self.indexer),
+            "commit_topk": Self::step_json(&self.commit_topk),
+            "sparse_score": Self::step_json(&self.sparse_score),
+            "sparse_inverse_rope": Self::step_json(&self.sparse_inverse_rope),
+            "wo_a": Self::step_json(&self.wo_a),
+            "wo_b": Self::step_json(&self.wo_b),
+            "hc_post": Self::step_json(&self.hc_post),
+        })
+    }
+}
+
 #[derive(Default)]
 struct LayerStageTelemetry {
     layer_prepare_ns: u64,
@@ -22689,6 +28102,7 @@ struct LayerStageTelemetry {
     attention_intermediate_or_audit_d2h_count: usize,
     attention_intermediate_or_audit_d2h_bytes: usize,
     attention_steady_device_temporary_alloc_count: usize,
+    attention_profile: Option<AttentionProfile>,
     router_ns: u64,
     router_mhc_ns: u64,
     router_mhc_input_alloc_h2d_sync_ns: u64,
@@ -22709,6 +28123,7 @@ struct LayerStageTelemetry {
     router_other_ns: u64,
     shared_ns: u64,
     routed_ns: u64,
+    routed_prefetched: bool,
     routed_read_ns: u64,
     routed_alloc_ns: u64,
     routed_setup_ns: u64,
@@ -23147,7 +28562,18 @@ struct RouterTelemetry {
 struct LayerRouterRun {
     input: Vec<u16>,
     routes: v4_router::RouterSelection,
+    debug: Option<RouterDebug>,
     telemetry: RouterTelemetry,
+}
+
+struct RouterDebug {
+    rmsnorm: Vec<f32>,
+    rmsnorm_squares: Vec<f32>,
+    logits: Vec<f32>,
+    softplus: Vec<f32>,
+    post_scores: Vec<f32>,
+    selected_scores: Vec<f32>,
+    denom_steps: Vec<f32>,
 }
 
 struct RealLayerRun {
@@ -23248,6 +28674,7 @@ struct RealAttentionRun {
     attention_ns: u64,
     commit_ns: u64,
     device_transfer: Option<DeviceAttentionTransfer>,
+    profile: Option<AttentionProfile>,
 }
 
 #[derive(Clone, Default)]
@@ -23378,6 +28805,9 @@ enum GenericStationaryPath {
 impl GenericStationaryPath {
     const fn from_ratio(ratio: v4_state::CompressionRatio) -> Self {
         match ratio {
+            v4_state::CompressionRatio::WindowOnly => {
+                panic!("generic stationary path does not execute window-only layers")
+            }
             v4_state::CompressionRatio::Hca128 => Self::Hca128,
             v4_state::CompressionRatio::Csa4 => Self::Csa4,
         }
@@ -25276,6 +30706,7 @@ fn prepare_generic_device_attention_row(
                 intermediate_or_audit_d2h_count: 0,
                 intermediate_or_audit_d2h_bytes: 0,
             }),
+            profile: None,
         },
         position,
         boundary,
@@ -27712,6 +33143,7 @@ fn run_attention_arm_a(
             let run = run_real_layer_attention_rows(
                 module,
                 stream,
+                None,
                 runtime,
                 &inputs[position],
                 position,
@@ -29599,6 +35031,7 @@ fn run_real_v4_device_token_state_gate(
                 let run = run_real_layer_attention_rows(
                     module,
                     stream,
+                    None,
                     &runtime,
                     &layer_inputs[position],
                     position,
@@ -29952,6 +35385,7 @@ fn prepare_qd4_stationary_gate_inputs(
                         context,
                         module,
                         stream,
+                        None,
                         &runtime,
                         None,
                         None,
@@ -30036,6 +35470,7 @@ fn run_qd4_stationary_gate_arm(
                 context,
                 module,
                 stream,
+                None,
                 runtime,
                 lanes.as_deref_mut(),
                 immutable_cache.as_mut(),
@@ -30186,8 +35621,9 @@ fn run_qd4_immutable_cache_targeted_gate(
     let mut persistent = v4_state::V4SerialPersistentState::new(token_ids.len())?;
     let mut prepared = None;
     persistent.transaction(LAYER, |state| {
-        let attention =
-            run_real_layer_attention_rows(module, stream, &runtime, input, 0, state, None, None)?;
+        let attention = run_real_layer_attention_rows(
+            module, stream, None, &runtime, input, 0, state, None, None,
+        )?;
         let ffn_hc = run_l0_mhc_pre(
             module,
             stream,
@@ -30204,9 +35640,11 @@ fn run_qd4_immutable_cache_targeted_gate(
         let router = run_layer_router(
             module,
             stream,
+            None,
             &ffn_hc.collapsed,
             &runtime.weights,
             row_hash_ids,
+            false,
         )?;
         let shared = run_layer_shared_expert(module, stream, &router.input, &runtime.weights)?;
         prepared = Some((router.input, router.routes, shared));
@@ -30943,6 +36381,7 @@ fn run_real_v4_cache_off_bench() -> Result<(), Box<dyn Error>> {
 fn run_real_layer_attention_rows(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
+    flash_cublas: Option<&FlashCublasSession>,
     runtime: &LoadedLayerRuntime,
     hc_hidden: &[u16],
     start_pos: usize,
@@ -30951,7 +36390,9 @@ fn run_real_layer_attention_rows(
     mut strict_scratch: Option<&mut StrictCompressorScratch>,
 ) -> Result<RealAttentionRun, Box<dyn Error>> {
     let weights = &runtime.weights;
-    let row_width = v4_state::HC * v4_state::HIDDEN;
+    let spec = weights.spec;
+    let mhc_linear_arm = flash_mhc_linear_arm(spec)?;
+    let row_width = v4_state::HC * spec.hidden;
     let rows = hc_hidden.len() / row_width;
     if rows == 0
         || rows > 2
@@ -30966,21 +36407,163 @@ fn run_real_layer_attention_rows(
         .into());
     }
     let attention_started = std::time::Instant::now();
+    let profile_enabled = bench_telemetry_enabled();
+    let mut profile = AttentionProfile::default();
+    macro_rules! profile_step {
+        ($field:ident, $operation:expr) => {{
+            let started = std::time::Instant::now();
+            let events = profile_enabled
+                .then(|| {
+                    Ok::<_, Box<dyn Error>>((
+                        stream
+                            .context()
+                            .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                        stream
+                            .context()
+                            .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                    ))
+                })
+                .transpose()?;
+            if let Some((start, _)) = events.as_ref() {
+                start.record(stream)?;
+            }
+            let value = $operation?;
+            if let Some((start, end)) = events.as_ref() {
+                end.record(stream)?;
+                end.synchronize()?;
+                profile.$field.gpu_event_ns = profile
+                    .$field
+                    .gpu_event_ns
+                    .saturating_add((start.elapsed_ms(end)? as f64 * 1_000_000.0) as u64);
+                profile.$field.sync_wall_ns = profile.$field.sync_wall_ns.saturating_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+            }
+            value
+        }};
+    }
     let capture_stages = std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").is_some();
+    let parity_dump = flash_parity_dump_dir(spec, weights.layer, start_pos, rows)?;
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "input_hidden_bf16",
+            &[rows, v4_state::HC, spec.hidden],
+            hc_hidden,
+        )?;
+    }
     let mut stage_digests = Vec::new();
-    let freqs = (0..rows)
-        .flat_map(|row| v4_state::compressed_rope_freqs(start_pos + row))
-        .collect::<Vec<_>>();
-    let attn_hc = run_l0_mhc_pre(
-        module,
-        stream,
-        hc_hidden,
-        &weights.hc_attn_fn,
-        &weights.hc_attn_scale,
-        &weights.hc_attn_base,
-    )?;
+    let mut freqs = Vec::with_capacity(rows * v4_state::Q_ROPE_DIM);
+    for row in 0..rows {
+        freqs.extend(v4_state::attention_rope_freqs(
+            spec,
+            weights.layer,
+            start_pos + row,
+        )?);
+    }
+    if optional_one_flag("COLIBRI_V4_ROPE_TRACE")?
+        && start_pos == 1
+        && rows == 1
+        && weights.layer <= 2
+    {
+        let ratio = v4_state::compression_ratio_for_spec_layer(spec, weights.layer)?;
+        let (scheme, theta, yarn_factor) = match ratio {
+            v4_state::CompressionRatio::WindowOnly => ("base", 10_000, None),
+            v4_state::CompressionRatio::Csa4 | v4_state::CompressionRatio::Hca128 => {
+                ("compressed", 160_000, Some(16))
+            }
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "v4-rope-trace",
+                "layer": weights.layer,
+                "position": start_pos,
+                "compression_ratio": ratio.get(),
+                "scheme": scheme,
+                "theta": theta,
+                "yarn_factor": yarn_factor,
+            })
+        );
+    }
+    let attn_hc = profile_step!(
+        mhc,
+        run_l0_mhc_pre_with_arm(
+            module,
+            stream,
+            hc_hidden,
+            &weights.hc_attn_fn,
+            &weights.hc_attn_scale,
+            &weights.hc_attn_base,
+            mhc_linear_arm,
+            parity_dump.is_some(),
+            flash_cublas,
+        )
+    );
     maybe_write_v4_audit_f32(weights.layer, "attn_hc_post", &attn_hc.post)?;
     maybe_write_v4_audit_f32(weights.layer, "attn_hc_comb", &attn_hc.comb)?;
+    if let Some(dir) = parity_dump.as_deref() {
+        let debug = attn_hc
+            .debug
+            .as_ref()
+            .ok_or("Flash parity dump did not retain mHC debug state")?;
+        flash_parity_dump_f32(
+            dir,
+            "attn_hc_mixes_f32",
+            &[rows, v4_state::MIX],
+            &debug.mixes,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "attn_hc_sinkhorn_trace_f32",
+            &[rows, 41, v4_state::HC, v4_state::HC],
+            &debug.sinkhorn_trace,
+        )?;
+        flash_parity_dump_f32(dir, "attn_hc_pre_f32", &[rows, v4_state::HC], &debug.pre)?;
+        flash_parity_dump_f32(
+            dir,
+            "attn_hc_post_f32",
+            &[rows, v4_state::HC],
+            &attn_hc.post,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "attn_hc_comb_f32",
+            &[rows, v4_state::HC, v4_state::HC],
+            &attn_hc.comb,
+        )?;
+        if mhc_linear_arm == FlashMhcLinearArm::Cublas {
+            let raw_dot = debug
+                .raw_dot
+                .as_deref()
+                .ok_or("Flash cuBLAS mHC parity dump did not retain raw dots")?;
+            let rsqrt = debug
+                .rsqrt
+                .as_deref()
+                .ok_or("Flash cuBLAS mHC parity dump did not retain rsqrt")?;
+            flash_parity_dump_f32(dir, "hc_raw_dot_f32", &[rows, v4_state::MIX], raw_dot)?;
+            flash_parity_dump_f32(dir, "hc_rsqrt_f32", &[rows], rsqrt)?;
+            let rsqrt_debug = debug
+                .rsqrt_debug
+                .as_deref()
+                .ok_or("Flash cuBLAS mHC parity dump did not retain rsqrt debug words")?;
+            if rsqrt_debug.len() != rows * FLASH_MHC_RSQRT_DEBUG_FIELDS {
+                return Err("Flash cuBLAS mHC rsqrt debug geometry mismatch".into());
+            }
+            flash_parity_dump_u32(
+                dir,
+                "hc_rsqrt_debug_u32",
+                &[rows, FLASH_MHC_RSQRT_DEBUG_FIELDS],
+                rsqrt_debug,
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "hc_scaled_mixes_f32",
+                &[rows, v4_state::MIX],
+                &debug.mixes,
+            )?;
+        }
+    }
     if capture_stages {
         stage_digests.extend([
             ("mhc_collapsed", fnv1a_u16(&attn_hc.collapsed)),
@@ -30988,94 +36571,221 @@ fn run_real_layer_attention_rows(
             ("mhc_comb", fnv1a_f32(&attn_hc.comb)),
         ]);
     }
-    let attn_input = run_l0_rmsnorm(
-        module,
-        stream,
-        &attn_hc.collapsed,
-        &weights.attn_norm,
-        v4_state::HIDDEN,
-    )?;
+    let attn_input =
+        if spec == &v4_spec::FLASH_0731 && spec.hidden == 4_096 && weights.attn_norm.len() == 4_096
+        {
+            let input = DeviceBuffer::from_host(stream, &attn_hc.collapsed)?;
+            let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
+            let mut trace = DeviceBuffer::<f32>::zeroed(stream, 0)?;
+            profile_step!(
+                attn_norm,
+                run_flash_learned_rmsnorm_4096_device_into(
+                    module,
+                    stream,
+                    &input,
+                    &weights.attn_norm,
+                    &mut output,
+                    &mut trace,
+                )
+            );
+            profile_step!(attn_norm, output.to_host_vec(stream))
+        } else {
+            profile_step!(
+                attn_norm,
+                run_l0_rmsnorm(
+                    module,
+                    stream,
+                    &attn_hc.collapsed,
+                    &weights.attn_norm,
+                    spec.hidden,
+                )
+            )
+        };
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "attn_norm_bf16", &[rows, spec.hidden], &attn_input)?;
+    }
     if capture_stages {
         stage_digests.push(("attn_input", fnv1a_u16(&attn_input)));
     }
-    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let (_, q_lora_raw) = profile_step!(
+        q_a_projection,
+        run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "q_a_linear_bf16",
+            &[rows, spec.q_lora_rank],
+            &q_lora_raw,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("q_lora_raw", fnv1a_u16(&q_lora_raw)));
     }
     maybe_write_v4_audit_u16(weights.layer, "q_lora_raw", &q_lora_raw)?;
-    let q_lora = run_l0_rmsnorm(
-        module,
-        stream,
-        &q_lora_raw,
-        &weights.q_norm,
-        weights.wq_a.out_features,
-    )?;
+    let q_lora = profile_step!(
+        q_a_norm,
+        run_l0_rmsnorm(
+            module,
+            stream,
+            &q_lora_raw,
+            &weights.q_norm,
+            weights.wq_a.out_features,
+        )
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "q_a_norm_bf16", &[rows, spec.q_lora_rank], &q_lora)?;
+    }
     if capture_stages {
         stage_digests.push(("q_lora", fnv1a_u16(&q_lora)));
     }
-    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let (_, q_raw) = profile_step!(
+        q_b_projection,
+        run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "q_b_logical_bf16",
+            &[rows, spec.q_heads, spec.q_head_dim],
+            &q_raw,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("q_raw", fnv1a_u16(&q_raw)));
     }
     maybe_write_v4_audit_u16(weights.layer, "q_raw", &q_raw)?;
     let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
-    let q = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    let q = profile_step!(
+        q_b_norm,
+        run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "q_b_norm_bf16",
+            &[rows, spec.q_heads, spec.q_head_dim],
+            &q,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("q_norm", fnv1a_u16(&q)));
     }
     maybe_write_v4_audit_u16(weights.layer, "q_norm", &q)?;
-    let q = run_l0_rope(module, stream, &q, &freqs, v4_state::Q_HEADS, false)?;
+    let q = profile_step!(
+        q_rope,
+        run_l0_rope(module, stream, &q, &freqs, spec.q_heads, false)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "q_rope_bf16",
+            &[rows, spec.q_heads, spec.q_head_dim],
+            &q,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("q_rope", fnv1a_u16(&q)));
     }
-    let (_, kv) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let (_, kv) = profile_step!(
+        kv_projection,
+        run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "wkv_linear_bf16", &[rows, spec.q_head_dim], &kv)?;
+    }
     if capture_stages {
         stage_digests.push(("kv_raw", fnv1a_u16(&kv)));
     }
-    let kv = run_l0_rmsnorm(module, stream, &kv, &weights.kv_norm, v4_state::Q_HEAD_DIM)?;
+    let kv = profile_step!(
+        kv_norm,
+        run_l0_rmsnorm(module, stream, &kv, &weights.kv_norm, v4_state::Q_HEAD_DIM)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "kv_norm_bf16", &[rows, spec.q_head_dim], &kv)?;
+    }
     if capture_stages {
         stage_digests.push(("kv_norm", fnv1a_u16(&kv)));
     }
-    let kv = run_l0_rope(module, stream, &kv, &freqs, 1, false)?;
+    let kv = profile_step!(
+        kv_rope_quantize,
+        run_l0_rope(module, stream, &kv, &freqs, 1, false)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "k_rope_bf16", &[rows, 1, spec.q_head_dim], &kv)?;
+    }
     if capture_stages {
         stage_digests.push(("kv_rope", fnv1a_u16(&kv)));
     }
-    let kv = run_l0_kv_quantize(module, stream, &kv)?;
+    let kv = profile_step!(kv_rope_quantize, run_l0_kv_quantize(module, stream, &kv));
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "cache_kv_row_bf16", &[rows, spec.q_head_dim], &kv)?;
+    }
     if capture_stages {
         stage_digests.push(("kv_ready", fnv1a_u16(&kv)));
     }
-    let compressor = run_layer_compressor(
-        module,
-        stream,
-        &attn_input,
-        weights,
-        start_pos,
-        cublas,
-        strict_scratch.as_deref_mut(),
-    )?;
-    if l0_pos0_compressor_probe_enabled(weights.layer, start_pos) {
-        print_l0_pos0_compressor_probe(
-            "host_pre_commit",
-            &compressor.kv_f32,
-            &compressor.score_f32,
-            &compressor.score_plus_ape_f32,
-        );
+    let compressor = if weights.compression_ratio == v4_state::CompressionRatio::WindowOnly {
+        None
+    } else {
+        Some(profile_step!(
+            compressor,
+            run_layer_compressor(
+                module,
+                stream,
+                &attn_input,
+                weights,
+                start_pos,
+                cublas,
+                strict_scratch.as_deref_mut(),
+            )
+        ))
+    };
+    if let Some(compressor) = compressor.as_ref() {
+        if let Some(dir) = parity_dump
+            .as_deref()
+            .filter(|_| weights.layer == 2 && start_pos == 0)
+        {
+            let width = compressor.kv_f32.len() / rows;
+            if width == 0 || compressor.kv_f32.len() != rows * width {
+                return Err("Flash L2 main Compressor precommit geometry mismatch".into());
+            }
+            flash_parity_dump_f32(
+                dir,
+                "main_compressor_kv_precommit_f32",
+                &[rows, 1, width],
+                &compressor.kv_f32,
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "main_compressor_score_precommit_f32",
+                &[rows, 1, width],
+                &compressor.score_plus_ape_f32,
+            )?;
+        }
+        if l0_pos0_compressor_probe_enabled(weights.layer, start_pos) {
+            print_l0_pos0_compressor_probe(
+                "host_pre_commit",
+                &compressor.kv_f32,
+                &compressor.score_f32,
+                &compressor.score_plus_ape_f32,
+            );
+        }
+        if capture_stages {
+            stage_digests.extend([
+                ("compressor_kv", fnv1a_f32(&compressor.kv_f32)),
+                ("compressor_score", fnv1a_f32(&compressor.score_f32)),
+                (
+                    "compressor_score_plus_ape",
+                    fnv1a_f32(&compressor.score_plus_ape_f32),
+                ),
+            ]);
+        }
     }
-    if capture_stages {
-        stage_digests.extend([
-            ("compressor_kv", fnv1a_f32(&compressor.kv_f32)),
-            ("compressor_score", fnv1a_f32(&compressor.score_f32)),
-            (
-                "compressor_score_plus_ape",
-                fnv1a_f32(&compressor.score_plus_ape_f32),
-            ),
-        ]);
-    }
-    let indexer = weights
-        .indexer
-        .as_ref()
-        .map(|indexer| {
+    let indexer = if let Some(indexer) = weights.indexer.as_ref() {
+        Some(profile_step!(
+            indexer,
             run_csa_indexer_projections(
+                spec,
                 module,
                 stream,
                 &attn_input,
@@ -31086,19 +36796,46 @@ fn run_real_layer_attention_rows(
                 cublas,
                 strict_scratch.as_deref_mut(),
             )
-        })
-        .transpose()?;
+        ))
+    } else {
+        None
+    };
+    if let Some((dir, indexer)) = parity_dump
+        .as_deref()
+        .filter(|_| weights.layer == 2 && start_pos == 0)
+        .zip(indexer.as_ref())
+    {
+        let width = indexer.compressor.kv_f32.len() / rows;
+        if width == 0 || indexer.compressor.kv_f32.len() != rows * width {
+            return Err("Flash L2 indexer Compressor precommit geometry mismatch".into());
+        }
+        flash_parity_dump_f32(
+            dir,
+            "indexer_compressor_kv_precommit_f32",
+            &[rows, 1, width],
+            &indexer.compressor.kv_f32,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "indexer_compressor_score_precommit_f32",
+            &[rows, 1, width],
+            &indexer.compressor.score_plus_ape_f32,
+        )?;
+    }
     let commit_started = std::time::Instant::now();
-    let (topk, indexer_topk_gpu_ns) = commit_layer_attention_state(
-        module,
-        stream,
-        weights,
-        state,
-        &kv,
-        &compressor,
-        indexer.as_ref(),
-        start_pos,
-    )?;
+    let (topk, indexer_topk_gpu_ns) = profile_step!(
+        commit_topk,
+        commit_layer_attention_state(
+            module,
+            stream,
+            weights,
+            state,
+            &kv,
+            compressor.as_ref(),
+            indexer.as_ref(),
+            start_pos,
+        )
+    );
     let commit_ns = u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     maybe_write_v4_audit_f32(
         weights.layer,
@@ -31112,45 +36849,138 @@ fn run_real_layer_attention_rows(
     )?;
     let attention_topk_digest = fnv1a_i32(&topk.indices);
     let cache = state.attention_cache_bf16();
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "cache_kv_bf16",
+            &[cache.len() / spec.q_head_dim, spec.q_head_dim],
+            &cache,
+        )?;
+    }
     let sparse = match sparse_attention_arm_from_env()? {
         SparseAttentionArm::Reference => {
-            run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+            profile_step!(
+                sparse_score,
+                run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
+            )
         }
         SparseAttentionArm::ScoreReuse => {
-            run_sparse_attention_score_reuse(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+            profile_step!(
+                sparse_score,
+                run_sparse_attention_score_reuse(
+                    module,
+                    stream,
+                    &q,
+                    &cache,
+                    &weights.attn_sink,
+                    &topk
+                )
+            )
         }
         SparseAttentionArm::Sm89Crossover if topk.per_row >= SM89_SCORE_REUSE_MIN_TOPK => {
-            run_sparse_attention_score_reuse(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+            profile_step!(
+                sparse_score,
+                run_sparse_attention_score_reuse(
+                    module,
+                    stream,
+                    &q,
+                    &cache,
+                    &weights.attn_sink,
+                    &topk
+                )
+            )
         }
         SparseAttentionArm::Sm89Crossover => {
-            run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)?
+            profile_step!(
+                sparse_score,
+                run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
+            )
         }
     };
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "attn_context_bf16",
+            &[rows, spec.q_heads, spec.q_head_dim],
+            &sparse,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("sparse", fnv1a_u16(&sparse)));
     }
-    let sparse = run_l0_rope(module, stream, &sparse, &freqs, v4_state::Q_HEADS, true)?;
+    let sparse = profile_step!(
+        sparse_inverse_rope,
+        run_l0_rope(module, stream, &sparse, &freqs, spec.q_heads, true)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "attn_context_inverse_rope_bf16",
+            &[rows, spec.q_heads, spec.q_head_dim],
+            &sparse,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("sparse_inverse", fnv1a_u16(&sparse)));
     }
-    let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
+    let wo_a = profile_step!(
+        wo_a,
+        run_l0_wo_a_for(spec, module, stream, &sparse, &weights.wo_a)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "wo_a_logical_bf16",
+            &[rows, spec.o_groups, spec.o_lora_rank],
+            &wo_a,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("wo_a", fnv1a_u16(&wo_a)));
     }
     maybe_write_v4_audit_u16(weights.layer, "wo_a", &wo_a)?;
-    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let (_, attention) = profile_step!(
+        wo_b,
+        run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "wo_b_hidden_bf16", &[rows, spec.hidden], &attention)?;
+    }
     if capture_stages {
         stage_digests.push(("attention", fnv1a_u16(&attention)));
     }
+    if let Some(dir) = parity_dump.as_deref() {
+        let audit = run_l0_hc_post_trace(
+            module,
+            stream,
+            &attention,
+            hc_hidden,
+            &attn_hc.post,
+            &attn_hc.comb,
+            16_102,
+        )?;
+        flash_parity_dump_u32(dir, "attn_hc_post_index16102_u32", &[audit.len()], &audit)?;
+    }
     maybe_write_v4_audit_u16(weights.layer, "attention", &attention)?;
-    let output = run_l0_hc_post(
-        module,
-        stream,
-        &attention,
-        hc_hidden,
-        &attn_hc.post,
-        &attn_hc.comb,
-    )?;
+    let output = profile_step!(
+        hc_post,
+        run_l0_hc_post(
+            module,
+            stream,
+            &attention,
+            hc_hidden,
+            &attn_hc.post,
+            &attn_hc.comb,
+        )
+    );
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "post_attn_hidden_bf16",
+            &[rows, v4_state::HC, spec.hidden],
+            &output,
+        )?;
+    }
     if capture_stages {
         stage_digests.push(("attention_post", fnv1a_u16(&output)));
     }
@@ -31167,6 +36997,7 @@ fn run_real_layer_attention_rows(
             .saturating_sub(commit_ns),
         commit_ns,
         device_transfer: None,
+        profile: profile_enabled.then_some(profile),
     })
 }
 
@@ -31219,6 +37050,7 @@ fn run_device_attention_row(
             intermediate_or_audit_d2h_count: usize::from(observe_topk),
             intermediate_or_audit_d2h_bytes: audit_topk_bytes,
         }),
+        profile: None,
     })
 }
 
@@ -31227,6 +37059,7 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     context: &std::sync::Arc<CudaContext>,
     module: &'module kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
+    flash_cublas: Option<&FlashCublasSession>,
     runtime: &LoadedLayerRuntime,
     qd4_lanes: Option<&mut [ExpertSlot<'lane>]>,
     qd4_immutable_cache: Option<&mut Qd4ImmutableExpertCache<'lane>>,
@@ -31249,7 +37082,9 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     strict_scratch: Option<&mut StrictCompressorScratch>,
 ) -> Result<RealLayerRun, Box<dyn Error>> {
     let weights = &runtime.weights;
-    let row_width = v4_state::HC * v4_state::HIDDEN;
+    let spec = weights.spec;
+    let mhc_linear_arm = flash_mhc_linear_arm(spec)?;
+    let row_width = v4_state::HC * spec.hidden;
     let rows = hc_hidden.len() / row_width;
     if rows == 0
         || rows > 2
@@ -31272,6 +37107,10 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     }
     if device_state.is_some() && generic_device.is_some() {
         return Err("real layer runner cannot mix frozen and generic device state".into());
+    }
+    let parity_dump = flash_parity_dump_dir(spec, weights.layer, start_pos, rows)?;
+    if parity_dump.is_some() && qd4_lanes.is_some() {
+        return Err("Flash parity dump requires the single-stream routed path".into());
     }
     let mut stage = LayerStageTelemetry::default();
     let mut critical_path_timeline = critical_path_origin.map(CriticalPathTimeline::new);
@@ -31309,11 +37148,12 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         run_real_layer_attention_rows(
             module,
             stream,
+            flash_cublas,
             runtime,
             hc_hidden,
             start_pos,
             state.ok_or("host layer runner is missing persistent state")?,
-            None,
+            flash_cublas.map(|session| &session.cublas),
             strict_scratch,
         )?
     };
@@ -31326,6 +37166,7 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     let indexer_topk_gpu_ns = attention.indexer_topk_gpu_ns;
     stage.attention_ns = attention.attention_ns;
     stage.commit_ns = attention.commit_ns;
+    stage.attention_profile = attention.profile;
     if let Some(transfer) = device_transfer.as_ref() {
         stage.attention_hidden_h2d_count = transfer.h2d_count;
         stage.attention_hidden_h2d_bytes = transfer.h2d_bytes;
@@ -31342,14 +37183,45 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         timeline.router_start_ns = timeline.now();
     }
     let router_started = std::time::Instant::now();
-    let ffn_hc = run_l0_mhc_pre(
+    let ffn_hc = run_l0_mhc_pre_with_arm(
         module,
         stream,
         &after_attention,
         &weights.hc_ffn_fn,
         &weights.hc_ffn_scale,
         &weights.hc_ffn_base,
+        mhc_linear_arm,
+        false,
+        flash_cublas,
     )?;
+    if let Some(dir) = parity_dump.as_deref() {
+        let debug = ffn_hc
+            .debug
+            .as_ref()
+            .ok_or("Flash ffn mHC coefficient trace was not retained")?;
+        if debug.pre.len() != v4_state::HC {
+            return Err("Flash ffn mHC coefficient trace must be one four-lane row".into());
+        }
+        flash_parity_dump_u16(
+            dir,
+            "ffn_hc_collapsed_bf16",
+            &[rows, spec.hidden],
+            &ffn_hc.collapsed,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "ffn_hc_pre_for_hidden124_f32",
+            &[v4_state::HC],
+            &debug.pre,
+        )?;
+        flash_parity_dump_f32(dir, "ffn_hc_post_f32", &[rows, v4_state::HC], &ffn_hc.post)?;
+        flash_parity_dump_f32(
+            dir,
+            "ffn_hc_comb_f32",
+            &[rows, v4_state::HC, v4_state::HC],
+            &ffn_hc.comb,
+        )?;
+    }
     stage.router_mhc_ns = ffn_hc.telemetry.wall_ns;
     stage.router_mhc_input_alloc_h2d_sync_ns = ffn_hc.telemetry.input_alloc_h2d_sync_ns;
     stage.router_mhc_workspace_alloc_sync_ns = ffn_hc.telemetry.workspace_alloc_sync_ns;
@@ -31364,7 +37236,7 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     stage.router_mhc_other_ns = ffn_hc.telemetry.other_ns;
     let router_host_prep_started = std::time::Instant::now();
     let hash_ids = if weights.hash_router {
-        if hash_ids.len() != rows * v4_router::V4_TOPK {
+        if hash_ids.len() != rows * spec.experts_per_token {
             return Err(format!("layer {} hash router rows disappeared", weights.layer).into());
         }
         hash_ids.to_vec()
@@ -31373,7 +37245,110 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
     };
     stage.router_host_prep_ns =
         u64::try_from(router_host_prep_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let router = run_layer_router(module, stream, &ffn_hc.collapsed, weights, &hash_ids)?;
+    let router_parity_dump = flash_router_trace_dump_dir(spec, weights.layer, start_pos, rows)?;
+    let router = run_layer_router(
+        module,
+        stream,
+        flash_cublas,
+        &ffn_hc.collapsed,
+        weights,
+        &hash_ids,
+        router_parity_dump.is_some(),
+    )?;
+    if let Some(dir) = router_parity_dump.as_deref() {
+        let debug = router
+            .debug
+            .as_ref()
+            .ok_or("Flash parity dump did not retain GPU router debug buffers")?;
+        if debug.rmsnorm.len() != rows * 3
+            || debug.rmsnorm_squares.len() != rows * spec.hidden
+            || debug.logits.len() != rows * spec.routed_experts
+            || debug.softplus.len() != debug.logits.len()
+            || debug.post_scores.len() != debug.logits.len()
+            || debug.selected_scores.len() != rows * spec.experts_per_token
+            || debug.denom_steps.len() != rows * spec.experts_per_token
+        {
+            return Err("Flash parity router debug geometry mismatch".into());
+        }
+        flash_parity_dump_u16(
+            dir,
+            "router_input_bf16",
+            &[rows, spec.hidden],
+            &router.input,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_rmsnorm_square_f32",
+            &[rows, spec.hidden],
+            &debug.rmsnorm_squares,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_rmsnorm_sum_sq_f32",
+            &[rows],
+            &debug.rmsnorm[0..rows],
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_rmsnorm_mean_f32",
+            &[rows],
+            &debug.rmsnorm[rows..rows * 2],
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_rmsnorm_inv_f32",
+            &[rows],
+            &debug.rmsnorm[rows * 2..rows * 3],
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_gate_logits_f32",
+            &[rows, spec.routed_experts],
+            &debug.logits,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_softplus_f32",
+            &[rows, spec.routed_experts],
+            &debug.softplus,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "router_post_score_f32",
+            &[rows, spec.routed_experts],
+            &debug.post_scores,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "selected_scores_f32",
+            &[rows, spec.experts_per_token],
+            &debug.selected_scores,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "route_denom_steps_f32",
+            &[rows, spec.experts_per_token],
+            &debug.denom_steps,
+        )?;
+        let route_denoms = debug
+            .denom_steps
+            .chunks_exact(spec.experts_per_token)
+            .map(|steps| steps[spec.experts_per_token - 1])
+            .collect::<Vec<_>>();
+        flash_parity_dump_f32(dir, "route_denom_f32", &[rows], &route_denoms)?;
+        flash_parity_dump_i32(
+            dir,
+            "route_ids_i32",
+            &[rows, spec.experts_per_token],
+            &router.routes.ids,
+        )?;
+        flash_parity_dump_f32(
+            dir,
+            "route_weights_f32",
+            &[rows, spec.experts_per_token],
+            &router.routes.weights,
+        )?;
+    }
     let ffn_input = router.input;
     let routes = router.routes;
     stage.router_alloc_h2d_sync_ns = router.telemetry.alloc_h2d_sync_ns;
@@ -31388,8 +37363,62 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         timeline.router_end_ns = timeline.now();
         timeline.shared_start_ns = timeline.now();
     }
+    let flash_routed_prefetch =
+        flash_b1_prefetch_enabled(spec, rows)? && qd4_lanes.is_none() && expert_slots.is_none();
+    let mut prefetched_routed_experts = None;
     let shared_started = std::time::Instant::now();
-    let shared = run_layer_shared_expert(module, stream, &ffn_input, weights)?;
+    let (shared, shared_bf16) = if flash_routed_prefetch {
+        if routes.ids.len() != spec.experts_per_token {
+            return Err("Flash B1 routed prefetch requires exactly one route row".into());
+        }
+        let route_ids = routes.ids.clone();
+        let loaded = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            let worker = scope.spawn(|| {
+                route_ids
+                    .into_iter()
+                    .map(|expert_id| {
+                        let expert_id =
+                            u16::try_from(expert_id).map_err(|error| error.to_string())?;
+                        let expert = v4_expert::RoutedExpert::load_layer_for(
+                            spec,
+                            &runtime.expert_shard,
+                            weights.layer,
+                            expert_id,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok::<_, String>((expert_id, expert))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            let shared = if parity_dump.is_some() {
+                run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+            } else {
+                (
+                    run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                    Vec::new(),
+                )
+            };
+            let experts = worker
+                .join()
+                .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                .map_err(|error| format!("Flash B1 routed prefetch worker failed: {error}"))?;
+            Ok((shared, experts))
+        })?;
+        prefetched_routed_experts = Some(loaded.1);
+        loaded.0
+    } else {
+        if parity_dump.is_some() {
+            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+        } else {
+            (
+                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                Vec::new(),
+            )
+        }
+    };
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "shared_out_bf16", &[rows, spec.hidden], &shared_bf16)?;
+    }
     stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.shared_end_ns = timeline.now();
@@ -31461,23 +37490,22 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         (qd4.output, qd4.contributions)
     } else {
         let mut contributions: Vec<Vec<Option<Vec<f32>>>> = (0..rows)
-            .map(|_| (0..v4_router::V4_TOPK).map(|_| None).collect())
+            .map(|_| (0..spec.experts_per_token).map(|_| None).collect())
             .collect();
-        let mut expert_union = routes
-            .ids
-            .iter()
-            .map(|&id| u16::try_from(id))
-            .collect::<Result<Vec<_>, _>>()?;
-        expert_union.sort_unstable();
-        expert_union.dedup();
-        for expert_id in expert_union {
-            let mut temporary_slot = None;
-            let mut load_slot = || -> Result<ExpertSlot<'module>, Box<dyn Error>> {
-                let expert = v4_expert::RoutedExpert::load_layer(
-                    &runtime.expert_shard,
-                    weights.layer,
-                    expert_id,
-                )?;
+        let mut flash_traces = parity_dump.as_ref().map(|_| {
+            (0..spec.experts_per_token)
+                .map(|_| None)
+                .collect::<Vec<Option<FlashExpertTrace>>>()
+        });
+        if let Some(experts) = prefetched_routed_experts.take() {
+            if rows != 1 || experts.len() != spec.experts_per_token {
+                return Err("Flash B1 routed prefetch returned an incomplete route row".into());
+            }
+            stage.routed_prefetched = true;
+            for (route_slot, (expert_id, expert)) in experts.into_iter().enumerate() {
+                if routes.ids[route_slot] != i32::from(expert_id) {
+                    return Err("Flash B1 routed prefetch changed canonical route order".into());
+                }
                 stage.routed_read_ns = stage
                     .routed_read_ns
                     .saturating_add((expert.read_ms * 1_000_000.0) as u64);
@@ -31488,7 +37516,7 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
                     stage.routed_source_bytes.saturating_add(expert.h2d_bytes());
                 stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
                 let setup_started = std::time::Instant::now();
-                let slot = ExpertSlot::new(context, module, stream, &expert)?;
+                let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
                 stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(
                     u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 );
@@ -31496,61 +37524,236 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
                     .routed_h2d_ns
                     .saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
                 stage.routed_h2d_bytes = stage.routed_h2d_bytes.saturating_add(expert.h2d_bytes());
-                Ok(slot)
-            };
-            let slot = if let Some(expert_slots) = expert_slots.as_deref_mut() {
-                if expert_slots.contains_key(&expert_id) {
-                    expert_slots
-                        .get_mut(&expert_id)
-                        .ok_or("retained expert slot disappeared")?
-                } else if should_retain_layer_expert(expert_slots.len()) {
-                    expert_slots.insert(expert_id, load_slot()?);
-                    expert_slots
-                        .get_mut(&expert_id)
-                        .ok_or("expert slot disappeared after insertion")?
+                let input = &ffn_input[..spec.hidden];
+                let (output, kernel_ns, trace) = if parity_dump.is_some() {
+                    let (output, kernel_ns, trace) =
+                        slot.execute_with_flash_trace(input, routes.weights[route_slot])?;
+                    (output, kernel_ns, Some(trace))
+                } else {
+                    let (output, kernel_ns) = slot.execute(input, routes.weights[route_slot])?;
+                    (output, kernel_ns, None)
+                };
+                stage.routed_kernel_ns = stage.routed_kernel_ns.saturating_add(kernel_ns);
+                contributions[0][route_slot] = Some(output);
+                if let Some(traces) = flash_traces.as_mut() {
+                    traces[route_slot] = trace;
+                }
+            }
+        } else {
+            let mut expert_union = routes
+                .ids
+                .iter()
+                .map(|&id| u16::try_from(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            expert_union.sort_unstable();
+            expert_union.dedup();
+            for expert_id in expert_union {
+                let mut temporary_slot = None;
+                let mut load_slot = || -> Result<ExpertSlot<'module>, Box<dyn Error>> {
+                    let expert = v4_expert::RoutedExpert::load_layer_for(
+                        spec,
+                        &runtime.expert_shard,
+                        weights.layer,
+                        expert_id,
+                    )?;
+                    stage.routed_read_ns = stage
+                        .routed_read_ns
+                        .saturating_add((expert.read_ms * 1_000_000.0) as u64);
+                    stage.routed_alloc_ns = stage
+                        .routed_alloc_ns
+                        .saturating_add((expert.alloc_ms * 1_000_000.0) as u64);
+                    stage.routed_source_bytes =
+                        stage.routed_source_bytes.saturating_add(expert.h2d_bytes());
+                    stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
+                    let setup_started = std::time::Instant::now();
+                    let slot = ExpertSlot::new(context, module, stream, &expert)?;
+                    stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(
+                        u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                    stage.routed_h2d_ns = stage
+                        .routed_h2d_ns
+                        .saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
+                    stage.routed_h2d_bytes =
+                        stage.routed_h2d_bytes.saturating_add(expert.h2d_bytes());
+                    Ok(slot)
+                };
+                let slot = if let Some(expert_slots) = expert_slots.as_deref_mut() {
+                    if expert_slots.contains_key(&expert_id) {
+                        expert_slots
+                            .get_mut(&expert_id)
+                            .ok_or("retained expert slot disappeared")?
+                    } else if should_retain_layer_expert(expert_slots.len()) {
+                        expert_slots.insert(expert_id, load_slot()?);
+                        expert_slots
+                            .get_mut(&expert_id)
+                            .ok_or("expert slot disappeared after insertion")?
+                    } else {
+                        temporary_slot.insert(load_slot()?)
+                    }
                 } else {
                     temporary_slot.insert(load_slot()?)
-                }
-            } else {
-                temporary_slot.insert(load_slot()?)
-            };
-            drop(load_slot);
-            for row in 0..rows {
-                for route_slot in 0..v4_router::V4_TOPK {
-                    let route = row * v4_router::V4_TOPK + route_slot;
-                    if routes.ids[route] == i32::from(expert_id) {
-                        let input =
-                            &ffn_input[row * v4_state::HIDDEN..(row + 1) * v4_state::HIDDEN];
-                        contributions[row][route_slot] = Some({
-                            let (output, kernel_ns) = slot.execute(input, routes.weights[route])?;
-                            stage.routed_kernel_ns =
-                                stage.routed_kernel_ns.saturating_add(kernel_ns);
-                            output
-                        });
+                };
+                drop(load_slot);
+                for row in 0..rows {
+                    for route_slot in 0..spec.experts_per_token {
+                        let route = row * spec.experts_per_token + route_slot;
+                        if routes.ids[route] == i32::from(expert_id) {
+                            let input = &ffn_input[row * spec.hidden..(row + 1) * spec.hidden];
+                            contributions[row][route_slot] = Some({
+                                let (output, kernel_ns, trace) = if parity_dump.is_some() {
+                                    let (output, kernel_ns, trace) = slot
+                                        .execute_with_flash_trace(input, routes.weights[route])?;
+                                    (output, kernel_ns, Some(trace))
+                                } else {
+                                    let (output, kernel_ns) =
+                                        slot.execute(input, routes.weights[route])?;
+                                    (output, kernel_ns, None)
+                                };
+                                stage.routed_kernel_ns =
+                                    stage.routed_kernel_ns.saturating_add(kernel_ns);
+                                if let Some(traces) = flash_traces.as_mut() {
+                                    if row != 0 {
+                                        return Err(
+                                            "Flash parity dump requires exactly one row".into()
+                                        );
+                                    }
+                                    traces[route_slot] = trace;
+                                }
+                                output
+                            });
+                        }
                     }
                 }
             }
         }
-        let mut moe = Vec::with_capacity(rows * v4_state::HIDDEN);
+        let mut moe = Vec::with_capacity(rows * spec.hidden);
+        let mut routed_sum = parity_dump
+            .as_ref()
+            .map(|_| Vec::with_capacity(rows * spec.hidden));
         for row in 0..rows {
-            let routed = (0..v4_router::V4_TOPK)
+            let routed = (0..spec.experts_per_token)
                 .map(|slot| {
                     Ok((
-                        u16::try_from(routes.ids[row * v4_router::V4_TOPK + slot])?,
+                        u16::try_from(routes.ids[row * spec.experts_per_token + slot])?,
                         contributions[row][slot]
                             .as_deref()
                             .ok_or("missing routed expert contribution")?,
                     ))
                 })
                 .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-            moe.extend(v4_expert::reduce_moe_canonical(
-                &routed,
-                &shared[row * v4_state::HIDDEN..(row + 1) * v4_state::HIDDEN],
-            )?);
+            if let Some(routed_sum) = routed_sum.as_mut() {
+                let (row_moe, row_routed_sum) =
+                    v4_expert::reduce_moe_canonical_with_routed_sum_for(
+                        spec,
+                        &routed,
+                        &shared[row * spec.hidden..(row + 1) * spec.hidden],
+                    )?;
+                moe.extend(row_moe);
+                routed_sum.extend(row_routed_sum);
+            } else {
+                moe.extend(v4_expert::reduce_moe_canonical_for(
+                    spec,
+                    &routed,
+                    &shared[row * spec.hidden..(row + 1) * spec.hidden],
+                )?);
+            }
+        }
+        if let Some(dir) = parity_dump.as_deref() {
+            let traces = flash_traces
+                .ok_or("Flash parity expert traces were not initialized")?
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or("Flash parity route slot trace is incomplete")?;
+            let mut input_fp8 = Vec::with_capacity(spec.experts_per_token * spec.hidden);
+            let mut input_scale =
+                Vec::with_capacity(spec.experts_per_token * spec.hidden / v4_state::FP8_BLOCK);
+            let mut w1 = Vec::with_capacity(spec.experts_per_token * spec.moe_intermediate);
+            let mut w3 = Vec::with_capacity(spec.experts_per_token * spec.moe_intermediate);
+            let mut swiglu = Vec::with_capacity(spec.experts_per_token * spec.moe_intermediate);
+            let mut w2_input_fp8 =
+                Vec::with_capacity(spec.experts_per_token * spec.moe_intermediate);
+            let mut w2_input_scale = Vec::with_capacity(
+                spec.experts_per_token * spec.moe_intermediate / v4_state::FP8_BLOCK,
+            );
+            let mut expert_out = Vec::with_capacity(spec.experts_per_token * spec.hidden);
+            for trace in traces {
+                input_fp8.extend(trace.input_fp8);
+                input_scale.extend(trace.input_scale);
+                w1.extend(trace.w1);
+                w3.extend(trace.w3);
+                swiglu.extend(trace.swiglu);
+                w2_input_fp8.extend(trace.w2_input_fp8);
+                w2_input_scale.extend(trace.w2_input_scale);
+                expert_out.extend(trace.output);
+            }
+            flash_parity_dump_u8(
+                dir,
+                "expert_input_fp8_e4m3",
+                &[rows, spec.experts_per_token, spec.hidden],
+                &input_fp8,
+            )?;
+            flash_parity_dump_u8(
+                dir,
+                "expert_input_scale_e8m0",
+                &[
+                    rows,
+                    spec.experts_per_token,
+                    spec.hidden / v4_state::FP8_BLOCK,
+                ],
+                &input_scale,
+            )?;
+            flash_parity_dump_u16(
+                dir,
+                "routed_w1_bf16",
+                &[rows, spec.experts_per_token, spec.moe_intermediate],
+                &w1,
+            )?;
+            flash_parity_dump_u16(
+                dir,
+                "routed_w3_bf16",
+                &[rows, spec.experts_per_token, spec.moe_intermediate],
+                &w3,
+            )?;
+            flash_parity_dump_u16(
+                dir,
+                "swiglu_bf16",
+                &[rows, spec.experts_per_token, spec.moe_intermediate],
+                &swiglu,
+            )?;
+            flash_parity_dump_u8(
+                dir,
+                "w2_input_fp8_e4m3",
+                &[rows, spec.experts_per_token, spec.moe_intermediate],
+                &w2_input_fp8,
+            )?;
+            flash_parity_dump_u8(
+                dir,
+                "w2_input_scale_e8m0",
+                &[
+                    rows,
+                    spec.experts_per_token,
+                    spec.moe_intermediate / v4_state::FP8_BLOCK,
+                ],
+                &w2_input_scale,
+            )?;
+            flash_parity_dump_u16(
+                dir,
+                "routed_expert_out_bf16",
+                &[rows, spec.experts_per_token, spec.hidden],
+                &expert_out,
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "routed_sum_f32",
+                &[rows, spec.hidden],
+                routed_sum
+                    .as_deref()
+                    .ok_or("Flash parity routed sum disappeared")?,
+            )?;
         }
         let audit = if capture_routed_contributions {
             Some(
-                (0..v4_router::V4_TOPK)
+                (0..spec.experts_per_token)
                     .map(|slot| {
                         contributions[0][slot]
                             .take()
@@ -31563,6 +37766,9 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         };
         (moe, audit)
     };
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(dir, "moe_out_bf16", &[rows, spec.hidden], &moe)?;
+    }
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.routed_end_ns = timeline.now();
         timeline.hc_post_start_ns = timeline.now();
@@ -31575,6 +37781,14 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         &ffn_hc.post,
         &ffn_hc.comb,
     )?;
+    if let Some(dir) = parity_dump.as_deref() {
+        flash_parity_dump_u16(
+            dir,
+            "block_output_hidden_bf16",
+            &[rows, v4_state::HC, spec.hidden],
+            &output,
+        )?;
+    }
     maybe_write_v4_audit_u16(weights.layer, "hidden", &output)?;
     if let Some((state, scratch, prepared, audit_expected_compressed_prefix)) = generic_prepared {
         stage.routed_ns = u64::try_from(routed_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -31626,6 +37840,241 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
         critical_path_timeline,
         routed_audit,
     })
+}
+
+fn flash_dspark_main_x(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    stage0: &LoadedDsparkStage,
+    main_hidden: &[u16],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    if stage0.stage != 0 || main_hidden.len() != 3 * spec.hidden {
+        return Err("Flash-0731 DSpark main hidden contract mismatch".into());
+    }
+    let projection = stage0
+        .main_proj
+        .as_ref()
+        .ok_or("Flash-0731 stage 0 main_proj is missing")?;
+    let norm = stage0
+        .main_norm
+        .as_ref()
+        .ok_or("Flash-0731 stage 0 main_norm is missing")?;
+    let projected = run_l0_fp8_linear(module, stream, main_hidden, projection, false)?.1;
+    run_l0_rmsnorm(module, stream, &projected, norm, spec.hidden)
+}
+
+fn flash_dspark_context_kv(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    stage: &LoadedDsparkStage,
+    main_x: &[u16],
+    position: usize,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    if main_x.len() != spec.hidden {
+        return Err("Flash-0731 DSpark main_x contract mismatch".into());
+    }
+    let kv = run_l0_fp8_linear(module, stream, main_x, &stage.weights.wkv, false)?.1;
+    let kv = run_l0_rmsnorm(module, stream, &kv, &stage.weights.kv_norm, spec.q_head_dim)?;
+    let kv = run_l0_rope(
+        module,
+        stream,
+        &kv,
+        &v4_state::attention_rope_freqs(spec, stage.weights.layer, position)?,
+        1,
+        false,
+    )?;
+    run_l0_kv_quantize(module, stream, &kv)
+}
+
+fn advance_flash_dspark_context(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    stages: &[LoadedDsparkStage; v4_state::DSPARK_STAGES],
+    states: &mut [v4_state::V4LayerPersistentState; v4_state::DSPARK_STAGES],
+    main_x: &[u16],
+    position: usize,
+) -> Result<(), Box<dyn Error>> {
+    for (stage, state) in stages.iter().zip(states) {
+        let kv = flash_dspark_context_kv(module, stream, stage, main_x, position)?;
+        state.append_kv_row(position, &kv)?;
+    }
+    Ok(())
+}
+
+fn flash_dspark_moe(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    stage: &LoadedDsparkStage,
+    after_attention: &[u16],
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    let rows = after_attention.len() / (v4_state::HC * spec.hidden);
+    if rows != v4_state::DSPARK_B5_DRAFT_TOKENS {
+        return Err("Flash-0731 DSpark MoE requires exactly five rows".into());
+    }
+    let ffn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        after_attention,
+        &stage.weights.hc_ffn_fn,
+        &stage.weights.hc_ffn_scale,
+        &stage.weights.hc_ffn_base,
+    )?;
+    let router = run_layer_router(
+        module,
+        stream,
+        None,
+        &ffn_hc.collapsed,
+        &stage.weights,
+        &[],
+        false,
+    )?;
+    let shared = run_layer_shared_expert(module, stream, &router.input, &stage.weights)?;
+    let mut contributions = (0..rows)
+        .map(|_| {
+            (0..spec.experts_per_token)
+                .map(|_| None)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<Vec<Option<Vec<f32>>>>>();
+    let mut experts = router
+        .routes
+        .ids
+        .iter()
+        .map(|&expert| u16::try_from(expert))
+        .collect::<Result<Vec<_>, _>>()?;
+    experts.sort_unstable();
+    experts.dedup();
+    for expert_id in experts {
+        let expert =
+            v4_expert::RoutedExpert::load_dspark(&stage.expert_shard, stage.stage, expert_id)?;
+        let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
+        for (row, row_contributions) in contributions.iter_mut().enumerate() {
+            for (route_slot, contribution) in row_contributions.iter_mut().enumerate() {
+                let route = row * spec.experts_per_token + route_slot;
+                if router.routes.ids[route] == i32::from(expert_id) {
+                    *contribution = Some(
+                        slot.execute(
+                            &router.input[row * spec.hidden..(row + 1) * spec.hidden],
+                            router.routes.weights[route],
+                        )?
+                        .0,
+                    );
+                }
+            }
+        }
+    }
+    let mut moe = Vec::with_capacity(rows * spec.hidden);
+    for (row, row_contributions) in contributions.iter().enumerate() {
+        let routed = row_contributions
+            .iter()
+            .enumerate()
+            .map(|(slot, output)| {
+                Ok((
+                    u16::try_from(router.routes.ids[row * spec.experts_per_token + slot])?,
+                    output
+                        .as_deref()
+                        .ok_or("Flash-0731 DSpark routed contribution is missing")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        moe.extend(v4_expert::reduce_moe_canonical_for(
+            spec,
+            &routed,
+            &shared[row * spec.hidden..(row + 1) * spec.hidden],
+        )?);
+    }
+    run_l0_hc_post(
+        module,
+        stream,
+        &moe,
+        after_attention,
+        &ffn_hc.post,
+        &ffn_hc.comb,
+    )
+}
+
+fn run_flash_dspark_stage(
+    context: &std::sync::Arc<CudaContext>,
+    module: &kernels::LoadedModule,
+    stream: &std::sync::Arc<CudaStream>,
+    stage: &LoadedDsparkStage,
+    state: &mut v4_state::V4LayerPersistentState,
+    x: &[u16],
+    main_x: &[u16],
+    start_pos: usize,
+) -> Result<Vec<u16>, Box<dyn Error>> {
+    let spec = &v4_spec::FLASH_0731;
+    let rows = v4_state::DSPARK_B5_DRAFT_TOKENS;
+    if x.len() != rows * v4_state::HC * spec.hidden
+        || state.layer() != spec.layers + stage.stage
+        || state.committed_kv_rows() != start_pos
+    {
+        return Err("Flash-0731 DSpark stage state/input contract mismatch".into());
+    }
+    let attn_hc = run_l0_mhc_pre(
+        module,
+        stream,
+        x,
+        &stage.weights.hc_attn_fn,
+        &stage.weights.hc_attn_scale,
+        &stage.weights.hc_attn_base,
+    )?;
+    let attn_input = run_l0_rmsnorm(
+        module,
+        stream,
+        &attn_hc.collapsed,
+        &stage.weights.attn_norm,
+        spec.hidden,
+    )?;
+    let q_lora = run_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wq_a, false)?.1;
+    let q_lora = run_l0_rmsnorm(
+        module,
+        stream,
+        &q_lora,
+        &stage.weights.q_norm,
+        spec.q_lora_rank,
+    )?;
+    let q = run_l0_fp8_linear(module, stream, &q_lora, &stage.weights.wq_b, true)?.1;
+    let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
+    let q = run_l0_rmsnorm(module, stream, &q, &unit_norm, spec.q_head_dim)?;
+    let mut query_freqs = Vec::with_capacity(rows * v4_state::Q_ROPE_DIM);
+    for offset in 1..=rows {
+        query_freqs.extend(v4_state::attention_rope_freqs(
+            spec,
+            stage.weights.layer,
+            start_pos + offset,
+        )?);
+    }
+    let q = run_l0_rope(module, stream, &q, &query_freqs, spec.q_heads, false)?;
+    let query_kv = run_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wkv, false)?.1;
+    let query_kv = run_l0_rmsnorm(
+        module,
+        stream,
+        &query_kv,
+        &stage.weights.kv_norm,
+        spec.q_head_dim,
+    )?;
+    let query_kv = run_l0_rope(module, stream, &query_kv, &query_freqs, 1, false)?;
+    let query_kv = run_l0_kv_quantize(module, stream, &query_kv)?;
+    let main_kv = flash_dspark_context_kv(module, stream, stage, main_x, start_pos)?;
+    let mut cache = state.attention_cache_bf16();
+    let slot = start_pos % v4_state::KV_WINDOW;
+    cache[slot * spec.q_head_dim..(slot + 1) * spec.q_head_dim].copy_from_slice(&main_kv);
+    cache.extend_from_slice(&query_kv);
+    let topk = v4_state::flash_dspark_b5_topk(start_pos)?;
+    let sparse = run_sparse_attention(module, stream, &q, &cache, &stage.weights.attn_sink, &topk)?;
+    let sparse = run_l0_rope(module, stream, &sparse, &query_freqs, spec.q_heads, true)?;
+    let wo_a = run_l0_wo_a_for(spec, module, stream, &sparse, &stage.weights.wo_a)?;
+    let attention = run_l0_fp8_linear(module, stream, &wo_a, &stage.weights.wo_b, false)?.1;
+    let after_attention =
+        run_l0_hc_post(module, stream, &attention, x, &attn_hc.post, &attn_hc.comb)?;
+    let output = flash_dspark_moe(context, module, stream, stage, &after_attention)?;
+    state.append_kv_row(start_pos, &main_kv)?;
+    Ok(output)
 }
 
 struct MtpDraftRun {
@@ -31900,7 +38349,7 @@ fn advance_mtp1_draft_state(
         &weights.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    let freqs = v4_state::compressed_rope_freqs(start_pos);
+    let freqs = v4_state::attention_rope_freqs(&v4_spec::PRO, v4_state::V4_LAYER_COUNT, start_pos)?;
     let kv_rope = run_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
     let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
     let kv_ready = DeviceBuffer::from_host(stream, &kv)?;
@@ -32035,7 +38484,7 @@ fn run_mtp1_draft_candidate(
     let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
     let empty_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
     let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &empty_norm, v4_state::Q_HEAD_DIM)?;
-    let freqs = v4_state::compressed_rope_freqs(start_pos);
+    let freqs = v4_state::attention_rope_freqs(&v4_spec::PRO, v4_state::V4_LAYER_COUNT, start_pos)?;
     let q = run_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
     let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
     let kv_norm = run_l0_rmsnorm(
@@ -32101,7 +38550,15 @@ fn run_mtp1_draft_candidate(
         &weights.hc_ffn_scale,
         &weights.hc_ffn_base,
     )?;
-    let router = run_layer_router(module, stream, &ffn_hc.collapsed, &weights, &[])?;
+    let router = run_layer_router(
+        module,
+        stream,
+        None,
+        &ffn_hc.collapsed,
+        &weights,
+        &[],
+        false,
+    )?;
     let shared = run_layer_shared_expert(module, stream, &router.input, &weights)?;
     let mut contributions = Vec::with_capacity(v4_router::V4_TOPK);
     let mut expert_bytes = 0_usize;
@@ -32561,7 +39018,15 @@ fn run_real_l0_rows(
         &weights.hc_ffn_scale,
         &weights.hc_ffn_base,
     )?;
-    let router = run_layer_router(module, stream, &ffn_hc.collapsed, weights, hash_ids)?;
+    let router = run_layer_router(
+        module,
+        stream,
+        None,
+        &ffn_hc.collapsed,
+        weights,
+        hash_ids,
+        false,
+    )?;
     let ffn_input = router.input;
     let routes = router.routes;
     maybe_write_v4_audit_u16(weights.layer, "ffn_input", &ffn_input)?;
@@ -33663,6 +40128,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn final_head_capture_bytes_are_little_endian() {
+        assert_eq!(
+            final_head_u16_bytes(&[0x1234, 0xabcd]),
+            [0x34, 0x12, 0xcd, 0xab]
+        );
+        assert_eq!(
+            final_head_f32_bytes(&[1.0]),
+            1.0_f32.to_bits().to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn flash_final_head_arm_is_flash_only_and_defaults_to_cpu() {
+        assert_eq!(
+            flash_final_head_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
+            FlashFinalHeadArm::Cpu
+        );
+        assert_eq!(
+            flash_final_head_arm_for(
+                &v4_spec::FLASH_0731,
+                Some(std::ffi::OsStr::new("gpu_exact")),
+            )
+            .unwrap(),
+            FlashFinalHeadArm::GpuExact
+        );
+        assert!(
+            flash_final_head_arm_for(&v4_spec::PRO, Some(std::ffi::OsStr::new("gpu_exact")),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_cublas_runtime_requires_the_strict_compressor_including_serve() {
+        assert!(flash_runtime_strict_compressor_enabled(true, true, false));
+        assert!(flash_runtime_strict_compressor_enabled(true, false, true));
+        assert!(!flash_runtime_strict_compressor_enabled(true, false, false));
+        assert!(!flash_runtime_strict_compressor_enabled(false, true, true));
+    }
+
+    #[test]
+    fn mhc_sum4_matches_tilelang_xor_tree_not_left_fold() {
+        let large = f32::from_bits(0x4c80_0000); // 2^26
+        let tree = tilelang_sum4!(large, -large, 1.0_f32, 1.0_f32);
+        let left_fold = ((large + -large) + 1.0_f32) + 1.0_f32;
+        assert_eq!(tree.to_bits(), 0, "TileLang xor2/xor1 reduction");
+        assert_eq!(left_fold.to_bits(), 2.0_f32.to_bits());
+        assert_ne!(tree.to_bits(), left_fold.to_bits());
+    }
+
+    #[test]
     fn b2_generate_flag_enables_strict_compressor_without_global_env_mutation() {
         assert!(!strict_compressor_enabled_with(|_| false));
         assert!(strict_compressor_enabled_with(
@@ -33671,6 +40186,50 @@ mod tests {
         assert!(strict_compressor_enabled_with(
             |name| name == "COLIBRI_V4_B4_GENERATE"
         ));
+    }
+
+    #[test]
+    fn flash_exact_runtime_cublas_arm_enables_strict_compressor_selector() {
+        assert!(!flash_exact_runtime_requires_strict_compressor(
+            false, true, true
+        ));
+        assert!(!flash_exact_runtime_requires_strict_compressor(
+            true, false, false
+        ));
+        assert!(flash_exact_runtime_requires_strict_compressor(
+            true, true, false
+        ));
+        assert!(flash_exact_runtime_requires_strict_compressor(
+            true, false, true
+        ));
+    }
+
+    #[test]
+    fn official_cublas_compressor_geometry_accepts_flash_and_pro_hidden_widths() {
+        for hidden in [4_096, 7_168] {
+            assert_eq!(
+                official_cublas_compressor_geometry(
+                    hidden,
+                    1_024 * hidden,
+                    1_024 * hidden,
+                    4 * 1_024,
+                    1_024,
+                    4,
+                ),
+                Some((hidden, 1)),
+            );
+        }
+        assert_eq!(
+            official_cublas_compressor_geometry(
+                4_097,
+                1_024 * 4_096,
+                1_024 * 4_096,
+                4_096,
+                1_024,
+                4
+            ),
+            None,
+        );
     }
 
     #[test]
@@ -33688,6 +40247,1016 @@ mod tests {
         assert!(validate_b2_generate_inputs::<2>(&prompts, 0).is_err());
         let at_window = [vec![0; v4_state::KV_WINDOW], vec![1]];
         assert!(validate_b2_generate_inputs::<2>(&at_window, 2).is_err());
+    }
+
+    #[test]
+    fn flash_0731_base_input_is_one_bounded_profile_checked_prompt() {
+        let prompts = parse_b2_generate_token_ids_for::<1>(
+            &v4_spec::FLASH_0731,
+            "0, 128799",
+            "COLIBRI_V4_FLASH_TOKEN_IDS",
+        )
+        .unwrap();
+        assert_eq!(prompts, [vec![0, 128_799]]);
+        assert_eq!(validate_b2_generate_inputs::<1>(&prompts, 1).unwrap(), [2]);
+        assert!(
+            parse_b2_generate_token_ids_for::<1>(
+                &v4_spec::FLASH_0731,
+                "129280",
+                "COLIBRI_V4_FLASH_TOKEN_IDS",
+            )
+            .is_err()
+        );
+        assert!(v4_spec::FLASH_0731.base_only_no_speculation);
+        assert_eq!(v4_spec::FLASH_0731.layers, 43);
+    }
+
+    #[test]
+    fn flash_mhc_cublas_arm_is_flash_scoped_and_opt_in() {
+        let cublas = std::ffi::OsStr::new("cublas");
+        assert_eq!(
+            flash_mhc_linear_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
+            FlashMhcLinearArm::Canonical
+        );
+        assert_eq!(
+            flash_mhc_linear_arm_for(&v4_spec::FLASH_0731, Some(cublas)).unwrap(),
+            FlashMhcLinearArm::Cublas
+        );
+        assert_eq!(
+            flash_mhc_linear_arm_for(&v4_spec::PRO, Some(cublas)).unwrap(),
+            FlashMhcLinearArm::Canonical
+        );
+        assert!(
+            flash_mhc_linear_arm_for(&v4_spec::FLASH_0731, Some(std::ffi::OsStr::new("other")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_router_cublas_arm_is_flash_scoped_and_opt_in() {
+        let cublas = std::ffi::OsStr::new("cublas");
+        assert_eq!(
+            flash_router_linear_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
+            FlashMhcLinearArm::Canonical
+        );
+        assert_eq!(
+            flash_router_linear_arm_for(&v4_spec::FLASH_0731, Some(cublas)).unwrap(),
+            FlashMhcLinearArm::Cublas
+        );
+        assert_eq!(
+            flash_router_linear_arm_for(&v4_spec::PRO, Some(cublas)).unwrap(),
+            FlashMhcLinearArm::Canonical
+        );
+        assert!(
+            flash_router_linear_arm_for(&v4_spec::FLASH_0731, Some(std::ffi::OsStr::new("other")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_fp4_accum_arms_are_flash_scoped_and_opt_in() {
+        let block32 = std::ffi::OsStr::new("block32");
+        let tilelang_ref = std::ffi::OsStr::new("tilelang_ref");
+        let fp8_mma = std::ffi::OsStr::new("fp8_mma");
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
+            FlashFp4AccumArm::Current
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, Some(block32)).unwrap(),
+            FlashFp4AccumArm::Block32
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::PRO, Some(block32)).unwrap(),
+            FlashFp4AccumArm::Current
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, Some(tilelang_ref)).unwrap(),
+            FlashFp4AccumArm::TilelangRef
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::PRO, Some(tilelang_ref)).unwrap(),
+            FlashFp4AccumArm::Current
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, Some(fp8_mma)).unwrap(),
+            FlashFp4AccumArm::Fp8Mma
+        );
+        assert_eq!(
+            flash_fp4_accum_arm_for(&v4_spec::PRO, Some(fp8_mma)).unwrap(),
+            FlashFp4AccumArm::Current
+        );
+        assert!(
+            flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, Some(std::ffi::OsStr::new("other")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_fp4_block32_shape_matches_all_three_expert_gemms() {
+        let spec = &v4_spec::FLASH_0731;
+        assert_eq!((spec.hidden, spec.moe_intermediate), (4_096, 2_048));
+        for (name, out_features, in_features) in [
+            ("w1", spec.moe_intermediate, spec.hidden),
+            ("w3", spec.moe_intermediate, spec.hidden),
+            ("w2", spec.hidden, spec.moe_intermediate),
+        ] {
+            assert_eq!(in_features % v4_state::FP8_BLOCK, 0, "{name}");
+            assert_eq!(in_features % 32, 0, "{name}");
+            assert_eq!(
+                out_features * in_features / 2,
+                out_features * (in_features / 2),
+                "{name} packed FP4"
+            );
+            assert_eq!(
+                out_features * in_features / 32,
+                out_features * (in_features / 32),
+                "{name} E8M0 scales"
+            );
+        }
+    }
+
+    #[test]
+    fn flash_fp4_mma_lut_is_exact_e2m1_to_e4m3() {
+        let expected = [
+            0x00, 0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x80, 0xb0, 0xb8, 0xbc, 0xc0, 0xc4,
+            0xc8, 0xcc,
+        ];
+        for (nibble, expected) in expected.into_iter().enumerate() {
+            assert_eq!(v4_fp4_nibble_to_e4m3(nibble as u8), expected);
+        }
+        assert_eq!(v4_fp4_pair_to_e4m3x2(0x81), 0x8030);
+    }
+
+    #[test]
+    fn flash_hc_post_serial_source_tree_preserves_ffn_boundary() {
+        // L0 FFN flat index 3390.  These are the four already-rounded FP32
+        // residual products and branch product from the pinned Flash-0731
+        // oracle input.  The serial source-order tree lands exactly on the
+        // BF16 tie and RNE selects 0xc210.
+        let products = [
+            f32::from_bits(0xc20f_788d),
+            f32::from_bits(0xbba0_18a8),
+            f32::from_bits(0xb782_1796),
+            f32::from_bits(0xbc7e_fa8a),
+        ];
+        let branch = f32::from_bits(0x3c58_21c6);
+        let serial = flash_test_add_rn_f32(
+            flash_test_add_rn_f32(flash_test_add_rn_f32(products[0], products[1]), products[2]),
+            products[3],
+        );
+        let adjacent = (products[0] + products[1]) + (products[2] + products[3]);
+        let cross = (products[0] + products[2]) + (products[1] + products[3]);
+        let serial_total = flash_test_add_rn_f32(branch, serial);
+        let adjacent_total = branch + adjacent;
+        let cross_total = branch + cross;
+        let rne = |value: f32| {
+            let bits = value.to_bits();
+            ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+        };
+        assert_eq!(serial.to_bits(), 0xc20f_8d82);
+        assert_eq!(adjacent.to_bits(), 0xc20f_8d82);
+        assert_eq!(cross.to_bits(), 0xc20f_8d81);
+        assert_eq!(serial_total.to_bits(), 0xc20f_8000);
+        assert_eq!(adjacent_total.to_bits(), 0xc20f_8000);
+        assert_eq!(cross_total.to_bits(), 0xc20f_7fff);
+        assert_eq!(rne(serial_total), 0xc210);
+        assert_eq!(rne(adjacent_total), 0xc210);
+        assert_eq!(rne(cross_total), 0xc20f);
+    }
+
+    #[test]
+    fn flash_l17_attention_hc_post_uses_serial_source_tree_at_bf16_boundary() {
+        // L17 post-attention flat index 7441 (output lane 1, hidden column
+        // 3345).  Pairwise addition crosses the BF16 tie by one FP32 ULP;
+        // the pinned torch kernel's serial source fold lands on the tie.
+        let products = [
+            f32::from_bits(0xc18e_836c),
+            f32::from_bits(0x4494_20f3),
+            f32::from_bits(0x432d_176c),
+            f32::from_bits(0x3e61_4bf9),
+        ];
+        let branch = f32::from_bits(0x4377_7922);
+        let sum01 = flash_test_add_rn_f32(products[0], products[1]);
+        let sum012 = flash_test_add_rn_f32(sum01, products[2]);
+        let serial = flash_test_add_rn_f32(sum012, products[3]);
+        let pairwise =
+            flash_test_add_rn_f32(sum01, flash_test_add_rn_f32(products[2], products[3]));
+        let serial_total = flash_test_add_rn_f32(branch, serial);
+        let pairwise_total = flash_test_add_rn_f32(branch, pairwise);
+
+        assert_eq!(serial.to_bits(), 0x44a7_90dc);
+        assert_eq!(pairwise.to_bits(), 0x44a7_90dd);
+        assert_eq!(serial_total.to_bits(), 0x44c6_8000);
+        assert_eq!(pairwise_total.to_bits(), 0x44c6_8001);
+        assert_eq!(v4_router::f32_to_bf16_rne(serial_total), 0x44c6);
+        assert_eq!(v4_router::f32_to_bf16_rne(pairwise_total), 0x44c7);
+    }
+
+    #[test]
+    fn flash_router_l1_uses_pinned_six_score_denominator_tree() {
+        // L1 official selected post-score words in final route slot order.
+        let raw = [
+            f32::from_bits(0x3f51_0172),
+            f32::from_bits(0x3f82_1af9),
+            f32::from_bits(0x3f5b_eea7),
+            f32::from_bits(0x3f2a_684f),
+            f32::from_bits(0x3f13_cbc4),
+            f32::from_bits(0x3f1e_c433),
+        ];
+        let left_04 = raw[0] + raw[4];
+        let left = left_04 + raw[2];
+        let right_15 = raw[1] + raw[5];
+        let right = right_15 + raw[3];
+        let total = left + right;
+        assert_eq!(left_04.to_bits(), 0x3fb2_669b);
+        assert_eq!(left.to_bits(), 0x4010_2ef7);
+        assert_eq!(right_15.to_bits(), 0x3fd1_7d12);
+        assert_eq!(right.to_bits(), 0x4013_589d);
+        assert_eq!(total.to_bits(), 0x4091_c3ca);
+    }
+
+    #[test]
+    fn flash_fp4_mma_launch_shape_matches_all_three_expert_gemms() {
+        let spec = &v4_spec::FLASH_0731;
+        for (name, out_features, in_features) in [
+            ("w1", spec.moe_intermediate, spec.hidden),
+            ("w3", spec.moe_intermediate, spec.hidden),
+            ("w2", spec.hidden, spec.moe_intermediate),
+        ] {
+            assert_eq!(in_features % 128, 0, "{name}");
+            assert_eq!(out_features % 8, 0, "{name}");
+            assert_eq!(
+                out_features * in_features / 2,
+                out_features * (in_features / 2)
+            );
+            assert_eq!(
+                out_features * in_features / 32,
+                out_features * (in_features / 32)
+            );
+            assert_eq!(
+                (out_features / 8) * 32,
+                out_features * 4,
+                "{name} threads/row"
+            );
+        }
+    }
+
+    #[test]
+    fn flash_fp4_block32_scales_after_each_raw_dot() {
+        let mut raw_products = [0.0_f32; 32];
+        raw_products[0] = 1.0e20;
+        raw_products[1] = -1.0e20;
+        raw_products[2] = 1.0;
+        let scale = 0.5_f32;
+
+        let block32 = raw_products.iter().copied().sum::<f32>() * scale;
+        let mut lanes = raw_products.map(|value| value * scale);
+        for offset in [16, 8, 4, 2, 1] {
+            let prior = lanes;
+            for lane in 0..32 {
+                lanes[lane] += prior[lane ^ offset];
+            }
+        }
+        assert_eq!(block32, 0.5);
+        assert_eq!(lanes[0], 0.0);
+    }
+
+    #[test]
+    fn flash_parity_stop_is_base_scoped_and_accepts_in_range_layers() {
+        let dump = std::ffi::OsStr::new("/tmp/flash-parity");
+        let zero = std::ffi::OsStr::new("0");
+        let stop =
+            flash_parity_stop_after_layer_for(&v4_spec::FLASH_0731, true, Some(dump), Some(zero))
+                .unwrap()
+                .unwrap();
+        assert_eq!(stop.layer, 0);
+        assert_eq!(stop.dir, std::path::PathBuf::from(dump));
+        assert!(
+            flash_parity_stop_after_layer_for(&v4_spec::FLASH_0731, false, Some(dump), Some(zero))
+                .is_err()
+        );
+        assert!(
+            flash_parity_stop_after_layer_for(&v4_spec::PRO, true, Some(dump), Some(zero)).is_err()
+        );
+        let one = std::ffi::OsStr::new("1");
+        assert_eq!(
+            flash_parity_stop_after_layer_for(&v4_spec::FLASH_0731, true, Some(dump), Some(one))
+                .unwrap()
+                .unwrap()
+                .layer,
+            1
+        );
+    }
+
+    #[test]
+    fn flash_parity_stop_rejects_missing_dump_and_out_of_range_values() {
+        assert!(
+            flash_parity_stop_after_layer_for(
+                &v4_spec::FLASH_0731,
+                true,
+                None,
+                Some(std::ffi::OsStr::new("0"))
+            )
+            .is_err()
+        );
+        assert!(
+            flash_parity_stop_after_layer_for(
+                &v4_spec::FLASH_0731,
+                true,
+                Some(std::ffi::OsStr::new("/tmp/flash-parity")),
+                Some(std::ffi::OsStr::new("43"))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_router_cublas_layout_is_rows_by_256_by_4096() {
+        let rows = 1;
+        let m = v4_spec::FLASH_0731.routed_experts;
+        let k = v4_spec::FLASH_0731.hidden;
+        assert_eq!((m, k), (256, 4_096));
+        assert_eq!(rows * m, 256);
+        assert_eq!(m * k, 1_048_576);
+        let weight = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input = [2.0_f32, 3.0];
+        let output = (0..3)
+            .map(|row| {
+                (0..2)
+                    .map(|col| weight[row * 2 + col] * input[col])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output, [8.0, 18.0, 28.0]);
+    }
+
+    #[test]
+    fn flash_router_libdevice_score_arm_is_flash_scoped_and_opt_in() {
+        let libdevice = std::ffi::OsStr::new("libdevice");
+        assert_eq!(
+            flash_router_score_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
+            FlashRouterScoreArm::Canonical
+        );
+        assert_eq!(
+            flash_router_score_arm_for(&v4_spec::FLASH_0731, Some(libdevice)).unwrap(),
+            FlashRouterScoreArm::Libdevice
+        );
+        assert_eq!(
+            flash_router_score_arm_for(&v4_spec::PRO, Some(libdevice)).unwrap(),
+            FlashRouterScoreArm::Canonical
+        );
+        assert!(
+            flash_router_score_arm_for(&v4_spec::FLASH_0731, Some(std::ffi::OsStr::new("other")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn flash_router_libdevice_score_reference_has_official_threshold_bits() {
+        let cases = [
+            (0xbf80_0000, 0x3f0f_485c),
+            (0x0000_0000, 0x3f55_224d),
+            (0x3f80_0000, 0x3f92_af5a),
+            (0x41a0_0000, 0x408f_1bbd),
+            (0x41a0_0001, 0x408f_1bbd),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                flash_router_libdevice_score_host_reference(f32::from_bits(input)).to_bits(),
+                expected,
+                "input=0x{input:08x}"
+            );
+        }
+    }
+
+    #[test]
+    fn flash_mhc_cublas_layout_is_24_by_16384_row_major_dot() {
+        let m = v4_state::MIX;
+        let k = v4_state::HC * v4_spec::FLASH_0731.hidden;
+        assert_eq!((m, k), (24, 16_384));
+        let weight = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input = [2.0_f32, 3.0];
+        let output = (0..3)
+            .map(|row| {
+                (0..2)
+                    .map(|col| weight[row * 2 + col] * input[col])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output, [8.0, 18.0, 28.0]);
+    }
+
+    #[test]
+    fn flash_mhc_rsqrt_debug_layout_records_input_and_committed_candidate() {
+        assert_eq!(FLASH_MHC_RSQRT_DEBUG_FIELDS, 5);
+        assert_eq!(
+            flash_mhc_rsqrt_debug_fields(),
+            [
+                "square_sum_f32_bits",
+                "mean_square_plus_eps_f32_bits",
+                "newton_candidate_f32_bits",
+                "libdevice_sqrt_f32_bits",
+                "libdevice_rsqrt_f32_bits",
+            ]
+        );
+        assert_eq!(
+            flash_mhc_rsqrt_debug_fields()[FLASH_MHC_RSQRT_COMMITTED_CANDIDATE],
+            FLASH_MHC_RSQRT_COMMITTED_FIELD
+        );
+    }
+
+    #[test]
+    fn flash_l1_rmsnorm_direct_rsqrt_preserves_raw_bits() {
+        const L1_CUTPOINT: &str =
+            "results/flash-0731-l1-full-cutpoints-20260802T054500Z/official-cutpoints";
+        const LANES: [(usize, u16); 3] = [(468, 0xbe75), (558, 0x3d75), (2290, 0x3d75)];
+
+        let cutpoint = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(L1_CUTPOINT);
+        let input = std::fs::read(cutpoint.join("ffn_hc_collapsed_bf16.bin"))
+            .expect("read locked L1 FFN RMSNorm input");
+        let input = input
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(input.len(), v4_spec::FLASH_0731.hidden);
+
+        let model_dir = v4_model_dir_for(&v4_spec::FLASH_0731).expect("pinned Flash model");
+        let shard = safetensors::ShardFile::open(
+            model_dir.join(v4_spec::FLASH_0731.shard_name(3).expect("L1 shard name")),
+        )
+        .expect("open pinned L1 shard");
+        let norm = read_v4_bf16(&shard, "layers.1.ffn_norm.weight", &[4_096])
+            .expect("read pinned L1 FFN norm");
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input_device =
+            DeviceBuffer::from_host(&stream, &input).expect("upload L1 RMSNorm input");
+        let norm_device =
+            DeviceBuffer::from_host(&stream, &norm).expect("upload L1 RMSNorm weight");
+        let mut debug = DeviceBuffer::<u32>::zeroed(&stream, FLASH_MHC_RSQRT_DEBUG_FIELDS)
+            .expect("allocate rsqrt probe");
+        unsafe {
+            module
+                .mhc_rsqrt_debug_v4(
+                    &stream,
+                    LaunchConfig::for_num_elems(1),
+                    &input_device,
+                    &mut debug,
+                )
+                .expect("launch direct rsqrt probe");
+        }
+        let debug = debug.to_host_vec(&stream).expect("copy rsqrt probe");
+        assert_eq!(debug[0], 42_009_416.0_f32.to_bits());
+        assert_eq!(debug[FLASH_MHC_RSQRT_COMMITTED_CANDIDATE], 0x3c21_c7d9);
+
+        let output = run_l0_rmsnorm(
+            &module,
+            &stream,
+            &input,
+            &norm_device,
+            v4_spec::FLASH_0731.hidden,
+        )
+        .expect("run L1 learned-weight RMSNorm");
+        for (lane, expected) in LANES {
+            assert_eq!(output[lane], expected, "lane {lane}");
+        }
+    }
+
+    fn flash_pytorch_210_rmsnorm_tree(input: &[u16]) -> (f32, f32, f32) {
+        assert_eq!(input.len(), 4_096);
+        let squares = input
+            .iter()
+            .map(|&bits| {
+                let value = v4_router::bf16_to_f32(bits);
+                value * value
+            })
+            .collect::<Vec<_>>();
+        let mut reduced = [0.0_f32; 512];
+        for (thread, slot) in reduced.iter_mut().enumerate() {
+            let base = thread * 4;
+            let upper = base + 2_048;
+            let a0 = squares[base] + squares[upper];
+            let a1 = squares[base + 1] + squares[upper + 1];
+            let a2 = squares[base + 2] + squares[upper + 2];
+            let a3 = squares[base + 3] + squares[upper + 3];
+            *slot = ((a0 + a1) + a2) + a3;
+        }
+        for offset in [256, 128, 64, 32] {
+            for thread in 0..offset {
+                reduced[thread] += reduced[thread + offset];
+            }
+        }
+        for offset in [16, 8, 4, 2, 1] {
+            for lane in 0..32 - offset {
+                reduced[lane] += reduced[lane + offset];
+            }
+        }
+        let sum = reduced[0];
+        let mean = sum * (1.0 / 4_096.0);
+        (sum, mean, 1.0 / (mean + 1e-6).sqrt())
+    }
+
+    fn flash_rmsnorm_test_input() -> Vec<u16> {
+        (0..4_096)
+            .map(|index| v4_router::f32_to_bf16_rne((index % 257) as f32 * 0.03125 - 4.0))
+            .collect()
+    }
+
+    #[test]
+    fn flash_rmsnorm_host_tree_preserves_pinned_raw_bits() {
+        let (sum, mean, _) = flash_pytorch_210_rmsnorm_tree(&flash_rmsnorm_test_input());
+        assert_eq!(sum.to_bits(), 0x46aa_e594);
+        assert_eq!(mean.to_bits(), 0x40aa_e594);
+    }
+
+    #[test]
+    fn flash_rmsnorm_oxide_preserves_pinned_raw_bits() {
+        let input = flash_rmsnorm_test_input();
+        let norm = vec![v4_router::f32_to_bf16_rne(1.0); 4_096];
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input = DeviceBuffer::from_host(&stream, &input).expect("upload RMSNorm input");
+        let norm = DeviceBuffer::from_host(&stream, &norm).expect("upload RMSNorm norm");
+        let mut squares = DeviceBuffer::<f32>::zeroed(&stream, 4_096).expect("allocate squares");
+        let mut output = DeviceBuffer::<u16>::zeroed(&stream, 4_096).expect("allocate output");
+        let mut trace = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("allocate raw trace");
+        unsafe {
+            module
+                .rmsnorm_flash_square_bf16(
+                    &stream,
+                    LaunchConfig::for_num_elems(4_096),
+                    &input,
+                    &mut squares,
+                )
+                .expect("launch rounded square materialization");
+            module
+                .rmsnorm_flash_learned_4096_bf16(
+                    &stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (512, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &input,
+                    &norm,
+                    &squares,
+                    &mut output,
+                    &mut trace,
+                )
+                .expect("launch pinned Flash RMSNorm reduction");
+        }
+        let trace = trace.to_host_vec(&stream).expect("copy raw trace");
+        for (actual, file) in [
+            (trace[0], 0x46aa_e594),
+            (trace[1], 0x40aa_e594),
+            (trace[2], 0x3edd_8d9c),
+        ] {
+            assert_eq!(actual.to_bits(), file);
+        }
+        let output = output.to_host_vec(&stream).expect("copy normalized output");
+        for (lane, expected) in [
+            (0, 0xbfde),
+            (1, 0xbfdc),
+            (127, 0xbc5e),
+            (128, 0),
+            (256, 0x3fde),
+            (4095, 0x3fc2),
+        ] {
+            assert_eq!(output[lane], expected, "lane {lane}");
+        }
+    }
+
+    fn flash_l17_attention_rmsnorm_fixture() -> (Vec<u16>, Vec<u16>, [f32; 4]) {
+        const CUTPOINT: &str =
+            "results/flash-0731-l17-full-router-trace-20260802T051640Z/official-cutpoints";
+        let cutpoint = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CUTPOINT);
+        let input = std::fs::read(cutpoint.join("input_hidden_bf16.bin"))
+            .expect("read locked L17 mHC input")
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let pre = std::fs::read(cutpoint.join("attn_hc_pre_tilelang_f32.bin"))
+            .expect("read locked L17 mHC pre")
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        assert_eq!(input.len(), v4_state::HC * v4_spec::FLASH_0731.hidden);
+        let pre: [f32; 4] = pre.try_into().expect("L17 mHC pre has four lanes");
+        let collapsed = (0..v4_spec::FLASH_0731.hidden)
+            .map(|column| {
+                let lanes = [
+                    input[column],
+                    input[v4_spec::FLASH_0731.hidden + column],
+                    input[2 * v4_spec::FLASH_0731.hidden + column],
+                    input[3 * v4_spec::FLASH_0731.hidden + column],
+                ];
+                v4_router::f32_to_bf16_rne(flash_hc_serial_sum4(pre, lanes).3)
+            })
+            .collect::<Vec<_>>();
+        let model_dir = v4_model_dir_for(&v4_spec::FLASH_0731).expect("pinned Flash model");
+        let shard = safetensors::ShardFile::open(
+            model_dir.join(v4_spec::FLASH_0731.shard_name(19).expect("L17 shard name")),
+        )
+        .expect("open pinned L17 shard");
+        let norm = read_v4_bf16(&shard, "layers.17.attn_norm.weight", &[4_096])
+            .expect("read pinned L17 attention norm");
+        (collapsed, norm, pre)
+    }
+
+    #[inline(never)]
+    fn flash_test_mul_rn_f32(left: f32, right: f32) -> f32 {
+        let left = std::hint::black_box(left);
+        let right = std::hint::black_box(right);
+        let value = left * right;
+        unsafe { core::ptr::read_volatile(&value) }
+    }
+
+    #[inline(never)]
+    fn flash_test_add_rn_f32(left: f32, right: f32) -> f32 {
+        let left = std::hint::black_box(left);
+        let right = std::hint::black_box(right);
+        let value = left + right;
+        unsafe { core::ptr::read_volatile(&value) }
+    }
+
+    #[test]
+    fn flash_l17_attention_rmsnorm_preserves_raw_bits() {
+        let (input, norm, pre) = flash_l17_attention_rmsnorm_fixture();
+        let (sum, mean, inv) = flash_pytorch_210_rmsnorm_tree(&input);
+        assert_eq!(sum.to_bits(), 0x51ad_0f12);
+        assert_eq!((mean + 1e-6).to_bits(), 0x4bad_0f12);
+        assert_eq!(inv.to_bits(), 0x395c_2a34);
+
+        let squares = input
+            .iter()
+            .map(|&bits| {
+                let value = v4_router::bf16_to_f32(bits);
+                value * value
+            })
+            .collect::<Vec<_>>();
+        let legacy_sum = v4_router::pytorch_contiguous_sum_f32(&squares);
+        let legacy_mean = legacy_sum * (1.0 / 4_096.0) + 1e-6;
+        let legacy_inv = 1.0 / legacy_mean.sqrt();
+        assert_eq!(legacy_sum.to_bits(), 0x51ad_0f14);
+        assert_eq!(legacy_mean.to_bits(), 0x4bad_0f14);
+        assert_eq!(legacy_inv.to_bits(), 0x395c_2a33);
+
+        let lane = 741;
+        assert_eq!(
+            pre.map(f32::to_bits),
+            [0x3f0e_e430, 0x3f50_e4a5, 0x3e8a_94a8, 0x3c09_abf2]
+        );
+        assert_eq!(input[lane], 0x449c);
+        assert_eq!(norm[lane], 0x3d87);
+        let official_value = flash_test_mul_rn_f32(
+            flash_test_mul_rn_f32(v4_router::bf16_to_f32(input[lane]), inv),
+            v4_router::bf16_to_f32(norm[lane]),
+        );
+        let legacy_value = flash_test_mul_rn_f32(
+            flash_test_mul_rn_f32(v4_router::bf16_to_f32(input[lane]), legacy_inv),
+            v4_router::bf16_to_f32(norm[lane]),
+        );
+        assert_eq!(official_value.to_bits(), 0x3c8d_8000);
+        assert_eq!(legacy_value.to_bits(), 0x3c8d_7fff);
+        assert_eq!(v4_router::f32_to_bf16_rne(official_value), 0x3c8e);
+        assert_eq!(v4_router::f32_to_bf16_rne(legacy_value), 0x3c8d);
+
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input = DeviceBuffer::from_host(&stream, &input).expect("upload L17 RMSNorm input");
+        let norm = DeviceBuffer::from_host(&stream, &norm).expect("upload L17 RMSNorm weight");
+        let mut output = DeviceBuffer::<u16>::zeroed(&stream, 4_096).expect("allocate output");
+        let mut trace = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("allocate raw trace");
+        let squares = run_flash_learned_rmsnorm_4096_device_into(
+            &module,
+            &stream,
+            &input,
+            &norm,
+            &mut output,
+            &mut trace,
+        )
+        .expect("run pinned L17 attention RMSNorm");
+        assert_eq!(squares[741].to_bits(), 0x49be_2000);
+        let trace = trace.to_host_vec(&stream).expect("copy raw trace");
+        assert_eq!(
+            trace.iter().copied().map(f32::to_bits).collect::<Vec<_>>(),
+            [0x51ad_0f12, 0x4bad_0f12, 0x395c_2a34]
+        );
+        assert_eq!(
+            output
+                .to_host_vec(&stream)
+                .expect("copy L17 RMSNorm output")[741],
+            0x3c8e
+        );
+    }
+
+    fn flash_pytorch_210_mhc_tree(input: &[u16]) -> (f32, f32) {
+        assert_eq!(input.len(), 16_384);
+        let squares = input
+            .iter()
+            .map(|&bits| {
+                let value = v4_router::bf16_to_f32(bits);
+                value * value
+            })
+            .collect::<Vec<_>>();
+        let mut reduced = [0.0_f32; 512];
+        for (thread, slot) in reduced.iter_mut().enumerate() {
+            let base = thread * 4;
+            let mut lanes = [
+                squares[base],
+                squares[base + 1],
+                squares[base + 2],
+                squares[base + 3],
+            ];
+            for k in 1..8 {
+                let offset = 2_048 * k;
+                for lane in 0..4 {
+                    lanes[lane] += squares[base + offset + lane];
+                }
+            }
+            *slot = ((lanes[0] + lanes[1]) + lanes[2]) + lanes[3];
+        }
+        for offset in [256, 128, 64, 32] {
+            for thread in 0..offset {
+                reduced[thread] += reduced[thread + offset];
+            }
+        }
+        for offset in [16, 8, 4, 2, 1] {
+            for lane in 0..32 - offset {
+                reduced[lane] += reduced[lane + offset];
+            }
+        }
+        let sum = reduced[0];
+        (sum, sum * (1.0 / 16_384.0) + 1e-6)
+    }
+
+    fn flash_l6_mhc_input() -> Vec<u16> {
+        const L6_CUTPOINT: &str =
+            "results/flash-0731-l6-full-router-trace-20260802T044543Z/official-cutpoints";
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(L6_CUTPOINT)
+                .join("input_hidden_bf16.bin"),
+        )
+        .expect("read locked L6 mHC input")
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect()
+    }
+
+    #[test]
+    fn flash_mhc_16384_host_tree_preserves_l6_raw_bits() {
+        let (sum, mean_eps) = flash_pytorch_210_mhc_tree(&flash_l6_mhc_input());
+        assert_eq!(sum.to_bits(), 0x5208_aec4);
+        assert_eq!(mean_eps.to_bits(), 0x4b08_aec4);
+    }
+
+    #[test]
+    fn flash_mhc_16384_oxide_preserves_l6_raw_bits() {
+        let input = flash_l6_mhc_input();
+        let context = CudaContext::new(0).expect("create CUDA context");
+        let stream = context.default_stream();
+        let module = kernels::load(&context).expect("load embedded Rust PTX");
+        let input = DeviceBuffer::from_host(&stream, &input).expect("upload L6 mHC input");
+        let mut squares = DeviceBuffer::<f32>::zeroed(&stream, 16_384).expect("allocate squares");
+        let mut rsqrt = DeviceBuffer::<f32>::zeroed(&stream, 1).expect("allocate rsqrt");
+        let mut debug = DeviceBuffer::<u32>::zeroed(&stream, FLASH_MHC_RSQRT_DEBUG_FIELDS)
+            .expect("allocate mHC trace");
+        unsafe {
+            module
+                .rmsnorm_flash_square_bf16(
+                    &stream,
+                    LaunchConfig::for_num_elems(16_384),
+                    &input,
+                    &mut squares,
+                )
+                .expect("launch mHC square materialization");
+            module
+                .mhc_flash_reduce_rsqrt_16384(
+                    &stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (512, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &squares,
+                    &mut rsqrt,
+                    &mut debug,
+                )
+                .expect("launch fixed mHC reduction");
+        }
+        let debug = debug.to_host_vec(&stream).expect("copy mHC trace");
+        assert_eq!(debug[0], 0x5208_aec4);
+        assert_eq!(debug[1], 0x4b08_aec4);
+        assert_eq!(debug[FLASH_MHC_RSQRT_COMMITTED_CANDIDATE], 0x39af_2ce9);
+        assert_eq!(
+            rsqrt.to_host_vec(&stream).expect("copy mHC rsqrt")[0].to_bits(),
+            0x39af_2ce9
+        );
+    }
+
+    fn flash_hc_serial_sum4(coefficients: [f32; 4], inputs: [u16; 4]) -> ([f32; 4], f32, f32, f32) {
+        let product = |coefficient: f32, input: u16| {
+            let value = coefficient * f32::from_bits((input as u32) << 16);
+            // Keep the CPU regression's products observably rounded before
+            // the following add, matching the explicit device intrinsics.
+            unsafe { core::ptr::read_volatile(&value) }
+        };
+        let products = [
+            product(coefficients[0], inputs[0]),
+            product(coefficients[1], inputs[1]),
+            product(coefficients[2], inputs[2]),
+            product(coefficients[3], inputs[3]),
+        ];
+        let p01 = unsafe { core::ptr::read_volatile(&(products[0] + products[1])) };
+        let p012 = unsafe { core::ptr::read_volatile(&(p01 + products[2])) };
+        let value = unsafe { core::ptr::read_volatile(&(p012 + products[3])) };
+        (products, p01, p012, value)
+    }
+
+    #[test]
+    fn flash_ffn_hc_index124_uses_official_serial_raw_bits() {
+        // L3/token0 single-index certificate: the four BF16 source lanes
+        // and actual official TileLang pre coefficients.  The final cast is
+        // the official `ffn_hc_collapsed_bf16[124]` bit pattern.
+        let coefficients = [
+            f32::from_bits(0x3d83_6612),
+            f32::from_bits(0x3b27_6525),
+            f32::from_bits(0x3d69_48b1),
+            f32::from_bits(0x3f71_20ff),
+        ];
+        let (products, p01, p012, value) =
+            flash_hc_serial_sum4(coefficients, [0xc529, 0xc349, 0xc56e, 0x4348]);
+        assert_eq!(
+            products.map(f32::to_bits),
+            [0xc32d_7cc4, 0xbf03_6e6a, 0xc358_e195, 0x433c_61c7]
+        );
+        assert_eq!(p01.to_bits(), 0xc32e_0032);
+        assert_eq!(p012.to_bits(), 0xc3c3_70e4);
+        assert_eq!(value.to_bits(), 0xc34a_8001);
+        assert_eq!(v4_router::f32_to_bf16_rne(value), 0xc34b);
+    }
+
+    #[test]
+    fn flash_parity_manifest_records_row_major_little_endian_bf16_shape() {
+        let manifest = flash_parity_manifest(
+            "input_hidden_bf16",
+            FlashParityDtype::Bf16,
+            &[1, 4, 8],
+            64,
+            "a".repeat(64).as_str(),
+        )
+        .unwrap();
+        assert_eq!(manifest["dtype"], "BF16");
+        assert_eq!(manifest["shape"], serde_json::json!([1, 4, 8]));
+        assert_eq!(manifest["layout"], "row_major");
+        assert_eq!(manifest["endianness"], "little");
+        assert_eq!(manifest["byte_len"], 64);
+    }
+
+    #[test]
+    fn flash_parity_manifest_records_raw_u32_trace_words() {
+        let manifest = flash_parity_manifest(
+            "attn_hc_post_index16102_u32",
+            FlashParityDtype::U32,
+            &[21],
+            84,
+            "b".repeat(64).as_str(),
+        )
+        .unwrap();
+        assert_eq!(manifest["dtype"], "U32");
+        assert_eq!(manifest["shape"], serde_json::json!([21]));
+        assert_eq!(manifest["byte_len"], 84);
+    }
+
+    #[test]
+    fn flash_parity_manifest_records_route_slot_fp8_shapes() {
+        let spec = &v4_spec::FLASH_0731;
+        let input = flash_parity_manifest(
+            "expert_input_fp8_e4m3",
+            FlashParityDtype::U8,
+            &[1, spec.experts_per_token, spec.hidden],
+            spec.experts_per_token * spec.hidden,
+            "f".repeat(64).as_str(),
+        )
+        .unwrap();
+        let scale = flash_parity_manifest(
+            "expert_input_scale_e8m0",
+            FlashParityDtype::U8,
+            &[1, spec.experts_per_token, spec.hidden / v4_state::FP8_BLOCK],
+            spec.experts_per_token * spec.hidden / v4_state::FP8_BLOCK,
+            "0".repeat(64).as_str(),
+        )
+        .unwrap();
+        assert_eq!(input["shape"], serde_json::json!([1, 6, 4096]));
+        assert_eq!(scale["shape"], serde_json::json!([1, 6, 32]));
+        assert_eq!(input["dtype"], "U8");
+        assert_eq!(scale["dtype"], "U8");
+    }
+
+    #[test]
+    fn flash_parity_router_debug_manifest_shapes_are_explicit() {
+        let logits = flash_parity_manifest(
+            "router_gate_logits_f32",
+            FlashParityDtype::F32,
+            &[1, v4_spec::FLASH_0731.routed_experts],
+            v4_spec::FLASH_0731.routed_experts * std::mem::size_of::<f32>(),
+            "c".repeat(64).as_str(),
+        )
+        .unwrap();
+        let selected = flash_parity_manifest(
+            "selected_scores_f32",
+            FlashParityDtype::F32,
+            &[1, v4_spec::FLASH_0731.experts_per_token],
+            v4_spec::FLASH_0731.experts_per_token * std::mem::size_of::<f32>(),
+            "d".repeat(64).as_str(),
+        )
+        .unwrap();
+        let denom = flash_parity_manifest(
+            "route_denom_f32",
+            FlashParityDtype::F32,
+            &[1],
+            std::mem::size_of::<f32>(),
+            "e".repeat(64).as_str(),
+        )
+        .unwrap();
+        assert_eq!(logits["shape"], serde_json::json!([1, 256]));
+        assert_eq!(selected["shape"], serde_json::json!([1, 6]));
+        assert_eq!(denom["shape"], serde_json::json!([1]));
+    }
+
+    #[test]
+    fn flash_b1_phase_profile_closes_without_double_counting_nested_work() {
+        let fixed = FixedLoadTelemetry {
+            fixed_read_alloc_ns: 5,
+            fixed_decode_ns: 7,
+            fixed_h2d_ns: 8,
+            fixed_h2d_bytes: 40,
+            fixed_source_bytes: 40,
+            cache_status: "miss",
+            ..FixedLoadTelemetry::default()
+        };
+        let stage = LayerStageTelemetry {
+            attention_ns: 10,
+            commit_ns: 2,
+            router_ns: 15,
+            shared_ns: 8,
+            routed_ns: 20,
+            routed_read_ns: 3,
+            routed_h2d_ns: 4,
+            routed_kernel_ns: 5,
+            ..LayerStageTelemetry::default()
+        };
+        let layer = flash_b1_layer_phase_profile_json(0, 100, 20, &fixed, 10, &stage).unwrap();
+        assert_eq!(layer["top_level_attributed_ns"], 85);
+        assert_eq!(layer["unattributed_gap_ns"], 15);
+        let timing = FlashB1PhaseTiming {
+            layers: vec![layer],
+            layer_outer_ns: 100,
+            final_heads: vec![serde_json::json!({"outer":{"wall_ns":20}})],
+            final_head_outer_ns: 20,
+        };
+        let request = flash_b1_request_phase_profile_json(&timing, 140).unwrap();
+        assert_eq!(request["top_level_attributed_ns"], 120);
+        assert_eq!(request["unattributed_gap_ns"], 20);
+        assert!(request["closure"]["exact"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn flash_b1_phase_profile_marks_background_host_work_without_charging_it_twice() {
+        let fixed = FixedLoadTelemetry {
+            fixed_read_alloc_ns: 50,
+            fixed_decode_ns: 20,
+            fixed_h2d_ns: 10,
+            fixed_h2d_bytes: 40,
+            fixed_source_bytes: 40,
+            cache_status: "prefetched_host",
+            ..FixedLoadTelemetry::default()
+        };
+        let stage = LayerStageTelemetry {
+            routed_prefetched: true,
+            routed_ns: 10,
+            routed_read_ns: 50,
+            ..LayerStageTelemetry::default()
+        };
+        let layer = flash_b1_layer_phase_profile_json(1, 30, 5, &fixed, 5, &stage).unwrap();
+        assert!(
+            layer["top_level"]["fixed"]["host_prefetched"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            layer["top_level"]["routed"]["host_prefetched"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(layer["top_level_attributed_ns"], 20);
     }
 
     #[test]
@@ -33902,6 +41471,7 @@ mod tests {
                 initial_state_source_bytes: 14,
                 final_head_source_bytes: 28,
             },
+            flash_b1_phase: FlashB1PhaseTiming::default(),
         };
         let request_json = b2_generate_request_json(1, &request);
         assert_eq!(request_json["request"], 1);
@@ -34857,6 +42427,7 @@ mod tests {
                 v4_state::Q_HEADS,
                 v4_state::Q_HEADS,
                 active_topk,
+                v4_state::Q_HEADS,
             ));
             assert!(
                 !sparse_attention_score_reuse_workspace_matches(
@@ -34870,6 +42441,7 @@ mod tests {
                     v4_state::Q_HEADS,
                     v4_state::Q_HEADS,
                     active_topk,
+                    v4_state::Q_HEADS,
                 ),
                 "physical top-k capacity must cover the active geometry"
             );
@@ -34887,6 +42459,7 @@ mod tests {
             v4_state::Q_HEADS,
             v4_state::Q_HEADS,
             128,
+            v4_state::Q_HEADS,
         ));
     }
 
@@ -35273,6 +42846,24 @@ mod tests {
     }
 
     #[test]
+    fn flash_b1_prefetch_schedule_loads_each_future_layer_once_in_order() {
+        let scheduled = (0..4)
+            .map(|layer| flash_b1_prefetch_next_layer(layer, 4).unwrap())
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(scheduled, vec![1, 2, 3]);
+        assert_eq!(flash_b1_prefetch_next_layer(3, 4).unwrap(), None);
+        assert!(flash_b1_prefetch_next_layer(4, 4).is_err());
+    }
+
+    #[test]
+    fn flash_b1_prefetch_worker_propagates_failure_and_rejects_reorder() {
+        assert_eq!(flash_b1_prefetch_worker_result(2, 2, Ok(7)).unwrap(), 7);
+        assert!(flash_b1_prefetch_worker_result::<()>(2, 2, Err("read failed".into())).is_err());
+        assert!(flash_b1_prefetch_worker_result(2, 3, Ok(())).is_err());
+    }
+
+    #[test]
     fn stationary_phase_profile_keeps_nested_diagnostics_out_of_top_level_sum() {
         let fixed = FixedLoadTelemetry {
             fixed_read_alloc_ns: 10,
@@ -35451,8 +43042,9 @@ mod tests {
         );
 
         let serial_with_parallel_work = LayerStageTelemetry {
+            routed_ns: parallel.routed_ns,
             routed_h2d_ns: 101,
-            ..parallel
+            ..LayerStageTelemetry::default()
         };
         assert!(
             stationary_layer_phase_profile_json(
@@ -36870,6 +44462,8 @@ mod tests {
                     &topk,
                     &mut output,
                     2,
+                    u32::try_from(v4_state::Q_HEADS).unwrap(),
+                    u32::try_from(v4_state::Q_HEAD_DIM).unwrap(),
                 )
                 .expect("launch sparse attention with compressed KV");
         }
@@ -37461,6 +45055,33 @@ fn sparse_attention_score_reuse_k128_attention_post_microgate() {
 #[cfg(test)]
 mod tests_continued {
     use super::*;
+
+    #[test]
+    fn flash_dspark_greedy_mode_rejects_sampling() {
+        validate_flash_dspark_greedy_mode(0.0).unwrap();
+        validate_flash_dspark_greedy_mode(-0.0).unwrap();
+        assert!(validate_flash_dspark_greedy_mode(0.01).is_err());
+        assert!(validate_flash_dspark_greedy_mode(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn flash_dspark_b5_capacity_includes_validation_scratch() {
+        assert_eq!(flash_dspark_state_capacity(2, 1).unwrap(), (7, 8));
+        assert_eq!(flash_dspark_state_capacity(128, 64).unwrap(), (70, 197));
+        assert!(flash_dspark_state_capacity(0, 1).is_err());
+        assert!(flash_dspark_state_capacity(2, 0).is_err());
+    }
+
+    #[test]
+    fn flash_dspark_markov_is_sequential() {
+        let bf16 = |value| v4_router::f32_to_bf16_rne(value);
+        let w1 = [bf16(1.0), bf16(-1.0), bf16(2.0)];
+        let w2 = [bf16(0.0), bf16(1.0), bf16(-1.0)];
+        let (tokens, embeds) = flash_dspark_markov_greedy(&[0.0; 15], &w1, &w2, 3, 1, 0)
+            .expect("fixed sequential Markov chain");
+        assert_eq!(tokens, [1, 2, 1, 2, 1]);
+        assert_eq!(embeds, vec![w1[0], w1[1], w1[2], w1[1], w1[2]]);
+    }
 
     #[test]
     fn csa_indexer_scores_match_cpu_oracle_and_select_causal_topk() {

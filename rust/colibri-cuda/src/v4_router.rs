@@ -1,6 +1,8 @@
 //! DeepSeek-V4 router oracle. The projection is deliberately scalar: it
 //! validates pinned semantics until a measured GEMM path exists.
 
+use crate::v4_spec::{PRO, V4Spec};
+
 pub const V4_HIDDEN: usize = 7_168;
 pub const V4_ROUTED_EXPERTS: usize = 384;
 pub const V4_TOPK: usize = 6;
@@ -206,13 +208,21 @@ pub(crate) fn pytorch_contiguous_sum_f32(values: &[f32]) -> f32 {
 }
 
 pub fn project_gate_logits(input: &[u16], gate: &[u16]) -> Result<Vec<f32>, RouterError> {
-    if input.len() % V4_HIDDEN != 0 {
+    project_gate_logits_for(&PRO, input, gate)
+}
+
+pub fn project_gate_logits_for(
+    spec: &V4Spec,
+    input: &[u16],
+    gate: &[u16],
+) -> Result<Vec<f32>, RouterError> {
+    if input.len() % spec.hidden != 0 {
         return Err(RouterError::InputLength {
-            expected_multiple: V4_HIDDEN,
+            expected_multiple: spec.hidden,
             actual: input.len(),
         });
     }
-    let expected = V4_ROUTED_EXPERTS * V4_HIDDEN;
+    let expected = spec.routed_experts * spec.hidden;
     if gate.len() != expected {
         return Err(RouterError::GateLength {
             expected,
@@ -226,47 +236,64 @@ pub fn project_gate_logits(input: &[u16], gate: &[u16]) -> Result<Vec<f32>, Rout
     }
     // ponytail: scalar oracle GEMM; replace only after an SM89 projection
     // benchmark and selected-ID parity prove a tensor-core path.
-    let mut logits = vec![0.0; input.len() / V4_HIDDEN * V4_ROUTED_EXPERTS];
-    for (row, input) in input.chunks_exact(V4_HIDDEN).enumerate() {
-        for expert in 0..V4_ROUTED_EXPERTS {
+    let mut logits = vec![0.0; input.len() / spec.hidden * spec.routed_experts];
+    for (row, input) in input.chunks_exact(spec.hidden).enumerate() {
+        for expert in 0..spec.routed_experts {
             let mut dot = 0.0;
-            for column in 0..V4_HIDDEN {
-                dot += bf16_to_f32(input[column]) * bf16_to_f32(gate[expert * V4_HIDDEN + column]);
+            for column in 0..spec.hidden {
+                dot +=
+                    bf16_to_f32(input[column]) * bf16_to_f32(gate[expert * spec.hidden + column]);
             }
-            logits[row * V4_ROUTED_EXPERTS + expert] = dot;
+            logits[row * spec.routed_experts + expert] = dot;
         }
     }
     Ok(logits)
 }
 
 pub fn select_hash(logits: &[f32], hash_ids: &[i64]) -> Result<RouterSelection, RouterError> {
-    let rows = checked_logit_rows(logits)?;
-    if hash_ids.len() != rows * V4_TOPK {
+    select_hash_for(&PRO, logits, hash_ids)
+}
+
+pub fn select_hash_for(
+    spec: &V4Spec,
+    logits: &[f32],
+    hash_ids: &[i64],
+) -> Result<RouterSelection, RouterError> {
+    let rows = checked_logit_rows(spec, logits)?;
+    if hash_ids.len() != rows * spec.experts_per_token {
         return Err(RouterError::HashLength {
-            expected_multiple: rows * V4_TOPK,
+            expected_multiple: rows * spec.experts_per_token,
             actual: hash_ids.len(),
         });
     }
     let mut ids = Vec::with_capacity(hash_ids.len());
     let mut weights = Vec::with_capacity(hash_ids.len());
     for row in 0..rows {
-        let selected = &hash_ids[row * V4_TOPK..][..V4_TOPK];
-        let mut raw = [0.0; V4_TOPK];
+        let selected = &hash_ids[row * spec.experts_per_token..][..spec.experts_per_token];
+        let mut raw = vec![0.0; spec.experts_per_token];
         for (slot, &id) in selected.iter().enumerate() {
-            let id = checked_expert_id(row * V4_TOPK + slot, id)?;
+            let id = checked_expert_id(spec, row * spec.experts_per_token + slot, id)?;
             ids.push(id as i32);
-            raw[slot] = sqrtsoftplus(logits[row * V4_ROUTED_EXPERTS + id]);
+            raw[slot] = sqrtsoftplus(logits[row * spec.routed_experts + id]);
         }
-        append_weights(&raw, &mut weights);
+        append_weights(spec, &raw, &mut weights);
     }
     Ok(RouterSelection { ids, weights })
 }
 
 pub fn select_learned(logits: &[f32], bias: &[f32]) -> Result<RouterSelection, RouterError> {
-    let rows = checked_logit_rows(logits)?;
-    if bias.len() != V4_ROUTED_EXPERTS {
+    select_learned_for(&PRO, logits, bias)
+}
+
+pub fn select_learned_for(
+    spec: &V4Spec,
+    logits: &[f32],
+    bias: &[f32],
+) -> Result<RouterSelection, RouterError> {
+    let rows = checked_logit_rows(spec, logits)?;
+    if bias.len() != spec.routed_experts {
         return Err(RouterError::BiasLength {
-            expected: V4_ROUTED_EXPERTS,
+            expected: spec.routed_experts,
             actual: bias.len(),
         });
     }
@@ -275,24 +302,24 @@ pub fn select_learned(logits: &[f32], bias: &[f32]) -> Result<RouterSelection, R
             return Err(RouterError::NonFiniteBias { index });
         }
     }
-    let mut ids = Vec::with_capacity(rows * V4_TOPK);
-    let mut weights = Vec::with_capacity(rows * V4_TOPK);
+    let mut ids = Vec::with_capacity(rows * spec.experts_per_token);
+    let mut weights = Vec::with_capacity(rows * spec.experts_per_token);
     for row in 0..rows {
-        let mut selected_ids = [0usize; V4_TOPK];
-        let mut selected_scores = [f32::NEG_INFINITY; V4_TOPK];
-        let mut selected_raw = [0.0; V4_TOPK];
-        for expert in 0..V4_ROUTED_EXPERTS {
-            let raw = sqrtsoftplus(logits[row * V4_ROUTED_EXPERTS + expert]);
+        let mut selected_ids = vec![0; spec.experts_per_token];
+        let mut selected_scores = vec![f32::NEG_INFINITY; spec.experts_per_token];
+        let mut selected_raw = vec![0.0; spec.experts_per_token];
+        for expert in 0..spec.routed_experts {
+            let raw = sqrtsoftplus(logits[row * spec.routed_experts + expert]);
             let score = raw + bias[expert];
             // PyTorch does not promise a tie order. The pinned smoke has no
             // ties; this stable fallback exists only so CPU and GPU oracles
             // take the same path for malformed/adversarial inputs.
             let mut slot = 0;
-            while slot < V4_TOPK && score <= selected_scores[slot] {
+            while slot < spec.experts_per_token && score <= selected_scores[slot] {
                 slot += 1;
             }
-            if slot < V4_TOPK {
-                let mut tail = V4_TOPK - 1;
+            if slot < spec.experts_per_token {
+                let mut tail = spec.experts_per_token - 1;
                 while tail > slot {
                     selected_ids[tail] = selected_ids[tail - 1];
                     selected_scores[tail] = selected_scores[tail - 1];
@@ -304,16 +331,16 @@ pub fn select_learned(logits: &[f32], bias: &[f32]) -> Result<RouterSelection, R
                 selected_raw[slot] = raw;
             }
         }
-        ids.extend(selected_ids.map(|id| id as i32));
-        append_weights(&selected_raw, &mut weights);
+        ids.extend(selected_ids.into_iter().map(|id| id as i32));
+        append_weights(spec, &selected_raw, &mut weights);
     }
     Ok(RouterSelection { ids, weights })
 }
 
-fn checked_logit_rows(logits: &[f32]) -> Result<usize, RouterError> {
-    if logits.len() % V4_ROUTED_EXPERTS != 0 {
+fn checked_logit_rows(spec: &V4Spec, logits: &[f32]) -> Result<usize, RouterError> {
+    if logits.len() % spec.routed_experts != 0 {
         return Err(RouterError::LogitLength {
-            expected_multiple: V4_ROUTED_EXPERTS,
+            expected_multiple: spec.routed_experts,
             actual: logits.len(),
         });
     }
@@ -322,12 +349,12 @@ fn checked_logit_rows(logits: &[f32]) -> Result<usize, RouterError> {
             return Err(RouterError::NonFiniteLogit { index });
         }
     }
-    Ok(logits.len() / V4_ROUTED_EXPERTS)
+    Ok(logits.len() / spec.routed_experts)
 }
 
-fn checked_expert_id(index: usize, value: i64) -> Result<usize, RouterError> {
+fn checked_expert_id(spec: &V4Spec, index: usize, value: i64) -> Result<usize, RouterError> {
     let id = usize::try_from(value).ok();
-    match id.filter(|id| *id < V4_ROUTED_EXPERTS) {
+    match id.filter(|id| *id < spec.routed_experts) {
         Some(id) => Ok(id),
         None => Err(RouterError::ExpertIdOutOfRange { index, value }),
     }
@@ -344,14 +371,26 @@ fn sqrtsoftplus(value: f32) -> f32 {
     softplus.sqrt()
 }
 
-fn append_weights(raw: &[f32; V4_TOPK], weights: &mut Vec<f32>) {
+fn append_weights(spec: &V4Spec, raw: &[f32], weights: &mut Vec<f32>) {
     let sum = raw.iter().sum::<f32>();
-    weights.extend(raw.iter().map(|raw| raw / sum * V4_ROUTE_SCALE));
+    weights.extend(raw.iter().map(|raw| raw / sum * spec.route_scale()));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v4_spec::FLASH_0731;
+
+    #[test]
+    fn flash_0731_router_uses_4096_by_256_and_scale_1_5() {
+        let input = vec![f32_to_bf16_rne(1.0); FLASH_0731.hidden];
+        let gate = vec![f32_to_bf16_rne(0.0); FLASH_0731.hidden * FLASH_0731.routed_experts];
+        let logits = project_gate_logits_for(&FLASH_0731, &input, &gate).unwrap();
+        let routes = select_hash_for(&FLASH_0731, &logits, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(routes.ids, [0, 1, 2, 3, 4, 5]);
+        assert!((routes.weights.iter().sum::<f32>() - 1.5).abs() < 1e-6);
+        assert!(select_hash_for(&FLASH_0731, &logits, &[256, 1, 2, 3, 4, 5]).is_err());
+    }
 
     #[test]
     fn hash_uses_table_order_and_learned_uses_biased_selection() {

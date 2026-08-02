@@ -5,6 +5,7 @@ use std::error::Error;
 use crate::safetensors::{ShardFile, TensorDtype};
 use crate::v4_fp4::{PackedFp4E2M1x2, decode_e8m0, decode_fp4};
 use crate::v4_router::{bf16_to_f32, f32_to_bf16_rne};
+use crate::v4_spec::{FLASH_0731, PRO, V4Spec};
 
 pub const V4_HIDDEN: usize = 7_168;
 pub const V4_EXPERT_INTERMEDIATE: usize = 3_072;
@@ -66,6 +67,7 @@ impl Error for ExpertError {}
 
 /// One compressed official L0 expert. No decoded expert matrix is retained.
 pub struct RoutedExpert {
+    pub spec: &'static V4Spec,
     pub w1: Vec<u8>,
     pub w1_scale: Vec<u8>,
     pub w2: Vec<u8>,
@@ -90,18 +92,37 @@ pub struct RoutedRangeReadTelemetry {
 
 impl RoutedExpertRangePlan {
     pub fn new(shard: &ShardFile, layer: usize, expert_id: u16) -> Result<Self, Box<dyn Error>> {
-        let prefix = routed_expert_prefix(layer, expert_id)?;
-        Self::new_with_prefix(shard, expert_id, &prefix)
+        Self::new_for(&PRO, shard, layer, expert_id)
+    }
+
+    pub fn new_for(
+        spec: &V4Spec,
+        shard: &ShardFile,
+        layer: usize,
+        expert_id: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let prefix = routed_expert_prefix_for(spec, layer, expert_id)?;
+        Self::new_with_prefix(spec, shard, expert_id, &prefix)
     }
 
     /// MTP is the one official routed-expert namespace outside `layers.*`.
     /// Keeping it explicit prevents the ordinary layer range from widening.
     pub fn new_mtp(shard: &ShardFile, expert_id: u16) -> Result<Self, Box<dyn Error>> {
         let prefix = mtp_routed_expert_prefix(expert_id)?;
-        Self::new_with_prefix(shard, expert_id, &prefix)
+        Self::new_with_prefix(&PRO, shard, expert_id, &prefix)
+    }
+
+    pub fn new_dspark(
+        shard: &ShardFile,
+        stage: usize,
+        expert_id: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let prefix = dspark_routed_expert_prefix(stage, expert_id)?;
+        Self::new_with_prefix(&FLASH_0731, shard, expert_id, &prefix)
     }
 
     fn new_with_prefix(
+        spec: &V4Spec,
         shard: &ShardFile,
         expert_id: u16,
         prefix: &str,
@@ -115,45 +136,45 @@ impl RoutedExpertRangePlan {
             format!("{prefix}.w3.scale"),
         ];
         let bytes = [
-            V4_W1_BYTES,
-            V4_W1_SCALE_BYTES,
-            V4_W2_BYTES,
-            V4_W2_SCALE_BYTES,
-            V4_W1_BYTES,
-            V4_W1_SCALE_BYTES,
+            spec.moe_intermediate * spec.hidden / 2,
+            spec.moe_intermediate * spec.hidden / WEIGHT_BLOCK,
+            spec.hidden * spec.moe_intermediate / 2,
+            spec.hidden * spec.moe_intermediate / WEIGHT_BLOCK,
+            spec.moe_intermediate * spec.hidden / 2,
+            spec.moe_intermediate * spec.hidden / WEIGHT_BLOCK,
         ];
         let expected = [
             (
                 TensorDtype::Fp4E2M1x2,
-                [V4_EXPERT_INTERMEDIATE as u64, (V4_HIDDEN / 2) as u64],
+                [spec.moe_intermediate as u64, (spec.hidden / 2) as u64],
             ),
             (
                 TensorDtype::F8E8M0,
                 [
-                    V4_EXPERT_INTERMEDIATE as u64,
-                    (V4_HIDDEN / WEIGHT_BLOCK) as u64,
+                    spec.moe_intermediate as u64,
+                    (spec.hidden / WEIGHT_BLOCK) as u64,
                 ],
             ),
             (
                 TensorDtype::Fp4E2M1x2,
-                [V4_HIDDEN as u64, (V4_EXPERT_INTERMEDIATE / 2) as u64],
+                [spec.hidden as u64, (spec.moe_intermediate / 2) as u64],
             ),
             (
                 TensorDtype::F8E8M0,
                 [
-                    V4_HIDDEN as u64,
-                    (V4_EXPERT_INTERMEDIATE / WEIGHT_BLOCK) as u64,
+                    spec.hidden as u64,
+                    (spec.moe_intermediate / WEIGHT_BLOCK) as u64,
                 ],
             ),
             (
                 TensorDtype::Fp4E2M1x2,
-                [V4_EXPERT_INTERMEDIATE as u64, (V4_HIDDEN / 2) as u64],
+                [spec.moe_intermediate as u64, (spec.hidden / 2) as u64],
             ),
             (
                 TensorDtype::F8E8M0,
                 [
-                    V4_EXPERT_INTERMEDIATE as u64,
-                    (V4_HIDDEN / WEIGHT_BLOCK) as u64,
+                    spec.moe_intermediate as u64,
+                    (spec.hidden / WEIGHT_BLOCK) as u64,
                 ],
             ),
         ];
@@ -249,54 +270,77 @@ impl RoutedExpert {
         layer: usize,
         expert_id: u16,
     ) -> Result<Self, Box<dyn Error>> {
-        let prefix = routed_expert_prefix(layer, expert_id)?;
-        Self::load_with_prefix(shard, &prefix)
+        Self::load_layer_for(&PRO, shard, layer, expert_id)
+    }
+
+    pub fn load_layer_for(
+        spec: &'static V4Spec,
+        shard: &ShardFile,
+        layer: usize,
+        expert_id: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let prefix = routed_expert_prefix_for(spec, layer, expert_id)?;
+        Self::load_with_prefix(spec, shard, &prefix)
     }
 
     /// Loads one official MTP expert without extending the production layer ABI.
     pub fn load_mtp(shard: &ShardFile, expert_id: u16) -> Result<Self, Box<dyn Error>> {
         let prefix = mtp_routed_expert_prefix(expert_id)?;
-        Self::load_with_prefix(shard, &prefix)
+        Self::load_with_prefix(&PRO, shard, &prefix)
     }
 
-    fn load_with_prefix(shard: &ShardFile, prefix: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn load_dspark(
+        shard: &ShardFile,
+        stage: usize,
+        expert_id: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let prefix = dspark_routed_expert_prefix(stage, expert_id)?;
+        Self::load_with_prefix(&FLASH_0731, shard, &prefix)
+    }
+
+    fn load_with_prefix(
+        spec: &'static V4Spec,
+        shard: &ShardFile,
+        prefix: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let w1 = read_fp4(
             shard,
             &format!("{prefix}.w1"),
-            V4_EXPERT_INTERMEDIATE,
-            V4_HIDDEN,
+            spec.moe_intermediate,
+            spec.hidden,
         )?;
         let w1_scale = read_scale(
             shard,
             &format!("{prefix}.w1"),
-            V4_EXPERT_INTERMEDIATE,
-            V4_HIDDEN,
+            spec.moe_intermediate,
+            spec.hidden,
         )?;
         let w2 = read_fp4(
             shard,
             &format!("{prefix}.w2"),
-            V4_HIDDEN,
-            V4_EXPERT_INTERMEDIATE,
+            spec.hidden,
+            spec.moe_intermediate,
         )?;
         let w2_scale = read_scale(
             shard,
             &format!("{prefix}.w2"),
-            V4_HIDDEN,
-            V4_EXPERT_INTERMEDIATE,
+            spec.hidden,
+            spec.moe_intermediate,
         )?;
         let w3 = read_fp4(
             shard,
             &format!("{prefix}.w3"),
-            V4_EXPERT_INTERMEDIATE,
-            V4_HIDDEN,
+            spec.moe_intermediate,
+            spec.hidden,
         )?;
         let w3_scale = read_scale(
             shard,
             &format!("{prefix}.w3"),
-            V4_EXPERT_INTERMEDIATE,
-            V4_HIDDEN,
+            spec.moe_intermediate,
+            spec.hidden,
         )?;
         Ok(Self {
+            spec,
             w1: w1.bytes,
             w1_scale: w1_scale.bytes,
             w2: w2.bytes,
@@ -329,13 +373,21 @@ impl RoutedExpert {
 }
 
 fn routed_expert_prefix(layer: usize, expert_id: u16) -> Result<String, ExpertError> {
-    if layer >= crate::v4_state::V4_LAYER_COUNT {
+    routed_expert_prefix_for(&PRO, layer, expert_id)
+}
+
+fn routed_expert_prefix_for(
+    spec: &V4Spec,
+    layer: usize,
+    expert_id: u16,
+) -> Result<String, ExpertError> {
+    if layer >= spec.layers {
         return Err(ExpertError::Tensor(format!(
-            "invalid V4 layer {layer}; expected 0..{}",
-            crate::v4_state::V4_LAYER_COUNT
+            "invalid {} layer {layer}; expected 0..{}",
+            spec.name, spec.layers
         )));
     }
-    if expert_id as usize >= crate::v4_router::V4_ROUTED_EXPERTS {
+    if expert_id as usize >= spec.routed_experts {
         return Err(ExpertError::Tensor(format!(
             "invalid routed expert id {expert_id}"
         )));
@@ -350,6 +402,20 @@ fn mtp_routed_expert_prefix(expert_id: u16) -> Result<String, ExpertError> {
         )));
     }
     Ok(format!("mtp.0.ffn.experts.{expert_id}"))
+}
+
+fn dspark_routed_expert_prefix(stage: usize, expert_id: u16) -> Result<String, ExpertError> {
+    if stage >= 3 {
+        return Err(ExpertError::Tensor(format!(
+            "invalid Flash-0731 DSpark stage {stage}"
+        )));
+    }
+    if expert_id as usize >= FLASH_0731.routed_experts {
+        return Err(ExpertError::Tensor(format!(
+            "invalid routed expert id {expert_id}"
+        )));
+    }
+    Ok(format!("mtp.{stage}.ffn.experts.{expert_id}"))
 }
 
 struct ReadBuffer {
@@ -418,16 +484,24 @@ fn read_scale(
 }
 
 pub fn validate_input(input: &[u16], route_weight: f32) -> Result<usize, ExpertError> {
+    validate_input_for(&PRO, input, route_weight)
+}
+
+pub fn validate_input_for(
+    spec: &V4Spec,
+    input: &[u16],
+    route_weight: f32,
+) -> Result<usize, ExpertError> {
     if !route_weight.is_finite() {
         return Err(ExpertError::RouteWeight(route_weight));
     }
-    if input.len() % V4_HIDDEN != 0 {
+    if input.len() % spec.hidden != 0 {
         return Err(ExpertError::InputLength {
-            expected: V4_HIDDEN,
+            expected: spec.hidden,
             actual: input.len(),
         });
     }
-    let rows = input.len() / V4_HIDDEN;
+    let rows = input.len() / spec.hidden;
     if rows == 0 || rows > V4_MAX_EXPERT_ROWS {
         return Err(ExpertError::Rows { actual: rows });
     }
@@ -467,23 +541,23 @@ pub fn forward_cpu(
     input: &[u16],
     route_weight: f32,
 ) -> Result<Vec<f32>, ExpertError> {
-    let rows = validate_input(input, route_weight)?;
+    let rows = validate_input_for(weights.spec, input, route_weight)?;
     let input_quantized = quantize_activation(input);
     let mut gate = matvec_fp4(
         &weights.w1,
         &weights.w1_scale,
         &input_quantized,
         rows,
-        V4_EXPERT_INTERMEDIATE,
-        V4_HIDDEN,
+        weights.spec.moe_intermediate,
+        weights.spec.hidden,
     );
     let up = matvec_fp4(
         &weights.w3,
         &weights.w3_scale,
         &input_quantized,
         rows,
-        V4_EXPERT_INTERMEDIATE,
-        V4_HIDDEN,
+        weights.spec.moe_intermediate,
+        weights.spec.hidden,
     );
     for (gate, up) in gate.iter_mut().zip(up) {
         let gate_value = bf16_to_f32(*gate);
@@ -497,8 +571,8 @@ pub fn forward_cpu(
         &weights.w2_scale,
         &gate_quantized,
         rows,
-        V4_HIDDEN,
-        V4_EXPERT_INTERMEDIATE,
+        weights.spec.hidden,
+        weights.spec.moe_intermediate,
     );
     Ok(output.into_iter().map(bf16_to_f32).collect())
 }
@@ -509,17 +583,46 @@ pub fn reduce_moe_canonical(
     routed: &[(u16, &[f32])],
     shared: &[f32],
 ) -> Result<Vec<u16>, ExpertError> {
-    if routed.len() != crate::v4_router::V4_TOPK {
+    reduce_moe_canonical_for(&PRO, routed, shared)
+}
+
+pub fn reduce_moe_canonical_for(
+    spec: &V4Spec,
+    routed: &[(u16, &[f32])],
+    shared: &[f32],
+) -> Result<Vec<u16>, ExpertError> {
+    reduce_moe_canonical_inner(spec, routed, shared, None)
+}
+
+/// Same canonical reducer as production, with the routed-only FP32 state
+/// retained for the Flash L0 parity harness before the shared expert is added.
+pub fn reduce_moe_canonical_with_routed_sum_for(
+    spec: &V4Spec,
+    routed: &[(u16, &[f32])],
+    shared: &[f32],
+) -> Result<(Vec<u16>, Vec<f32>), ExpertError> {
+    let mut routed_sum = Vec::with_capacity(shared.len());
+    let output = reduce_moe_canonical_inner(spec, routed, shared, Some(&mut routed_sum))?;
+    Ok((output, routed_sum))
+}
+
+fn reduce_moe_canonical_inner(
+    spec: &V4Spec,
+    routed: &[(u16, &[f32])],
+    shared: &[f32],
+    mut routed_sum: Option<&mut Vec<f32>>,
+) -> Result<Vec<u16>, ExpertError> {
+    if routed.len() != spec.experts_per_token {
         return Err(ExpertError::ContributionCount {
             actual: routed.len(),
         });
     }
-    if shared.len() % V4_HIDDEN != 0 {
+    if shared.len() % spec.hidden != 0 {
         return Err(ExpertError::ContributionLength {
             actual: shared.len(),
         });
     }
-    let rows = shared.len() / V4_HIDDEN;
+    let rows = shared.len() / spec.hidden;
     if rows == 0
         || rows > V4_MAX_EXPERT_ROWS
         || routed
@@ -549,7 +652,7 @@ pub fn reduce_moe_canonical(
     }
     if let Some(&(expert, _)) = canonical
         .iter()
-        .find(|(expert, _)| *expert as usize >= crate::v4_router::V4_ROUTED_EXPERTS)
+        .find(|(expert, _)| *expert as usize >= spec.routed_experts)
     {
         return Err(ExpertError::Tensor(format!(
             "invalid routed expert id {expert}"
@@ -561,6 +664,9 @@ pub fn reduce_moe_canonical(
         let mut sum = 0.0_f32;
         for (_, values) in &canonical {
             sum += values[lane];
+        }
+        if let Some(routed_sum) = routed_sum.as_deref_mut() {
+            routed_sum.push(sum);
         }
         sum += shared[lane];
         if !sum.is_finite() {
@@ -698,6 +804,18 @@ mod tests {
             .map(|(expert, values)| (*expert, values.as_slice()))
             .collect();
         let batched = reduce_moe_canonical(&routed, &shared).unwrap();
+        let (traced, routed_sum) =
+            reduce_moe_canonical_with_routed_sum_for(&PRO, &routed, &shared).unwrap();
+        assert_eq!(
+            traced, batched,
+            "parity trace changed canonical BF16 output"
+        );
+        assert_eq!(routed_sum.len(), shared.len());
+        assert_eq!(
+            routed_sum[0], 16.0,
+            "trace is expert-id ordered and shared-free"
+        );
+        assert_eq!(routed_sum[V4_HIDDEN], 2.625);
 
         let mut sequential = Vec::new();
         for row in 0..2 {

@@ -4,123 +4,102 @@
 
 你的下一台LLM基础设施，何必是H100
 
-| **1.6T参数** | **12GB显存** | **快3.58倍** |
+| 全量检查点 | exact优化链 | 最终游戏本结果 |
 | --- | --- | --- |
-| 完整810GiB模型目录 | exact有界GPU工作集 | 198.948s降至55.550s |
+| 1.6TFlash-0731FP4权重 | 两个匹配区块派生7.11倍 | 12GB显存RTX4080Laptop GPU上0.0762tok/s |
 
-![exact完整请求加速](docs/assets/readme/19-full-request-speedup.svg)
+![Flash-0731exact优化链](docs/assets/readme/23-flash-0731-exact-abba.svg)
 
-localMoE是一个Rust和CUDA运行时，围绕一个很固执的想法展开：游戏本也应该能以全量权重形态运行完整DeepSeek-V4-Pro检查点。权重留在WSL原生ext4卷上，RAM和VRAM承载移动的工作集。运行时判断下一步该移动哪些字节，以及哪些工作可以共享。
+localMoE让游戏本运行全量权重的DeepSeek-V4-Flash-0731检查点，把内存移动视为推理工作。模型保存在WSL原生ext4卷。每一层把固定tensor与6个routed专家带入有界工作集，CUDA完成对应工作后才释放lease。
 
-在实测的12GB显存RTX4080Laptop GPU上，已验收的P5/N3请求用时`55.550s`，记录的exact基线用时`198.948s`。这个可见结果是`3.58倍`的跨来源谱系描述性加速，墙钟时间减少`72.1%`。这项历史本地比较的原始trace保存在本地证据档案中，仓库未收录。下方命令可以用当前源码复现同一workload。
+完整优化链从单token、43层请求的`93.349479730s`开始，最终达到`13.126173804s`。这是跨两个独立匹配新进程区块派生的`7.111705294倍`端到端优化链，最终中位数约为`0.0762tok/s`。该比值连接两个区块的中位数，README将它标记为派生链路值。
 
-## 大型MoE需要不同的运行时
+| 匹配区块 | 变化 | exact计时结果 |
+| --- | --- | --- |
+| `A-B-B-A` | 一个已经检查的cuBLAS session和workspace覆盖请求内mHC与router调用 | `93.349479730s`降至`34.611048076s`，配对中位数`2.697283513倍`，`4/4` exact |
+| `A-F-F-A` | 同一个请求级session继续覆盖compressor与indexer | `31.973254411s`降至`13.126173804s`，配对中位数`2.435841263倍`，`4/4` exact |
 
-V4-Pro有61个串行层。每层混合固定权重与router选择的专家。GPU无法常驻完整810GiB检查点，但每一层仍然需要在恰当的时刻拿到恰当的权重。难点在于调度数据移动，同时保持路由、归约顺序、KV状态和最终提交状态不变。
+精简的[样本台账](docs/assets/readme/flash-0731-abba.csv)记录全部8个E2E数值、maxRSS、binary SHA-256和exact gate。final-release二进制SHA-256为`6a47f8fe48c87f4205f8f835a60f2f824940dea67c198463ccfb60ccf333bb77`。它的独立full43证书运行用时`14.298313983s`，maxRSS为`1,412,424KiB`，该证书运行位于匹配计时区块之外。
 
-localMoE让检查点拥有一个移动的工作集：
+![Flash-0731最大RSS](docs/assets/readme/24-flash-0731-rss.svg)
 
-`ext4 SSD -> CPU read and decode -> pinned RAM -> retained VRAM -> canonical GPU reduction -> transactional state commit`
+第一组A区块的maxRSS中位数约为`7.66GiB`，最终F区块约为`1.35GiB`。这些样本来自不同匹配区块，因此图中的`6.31GiB`减少量与完整加速链一样属于派生结果。
 
-![有界的SSD、RAM与VRAM执行路径](docs/assets/readme/02-execution-path.svg)
+## 一个请求，一条经过检查的CUDA生命周期
 
-当前层被消费时，下一层payload已经开始准备。固定payload可以留在host或device retention中，routed专家通过immutable cache复用。CUDA stream和有界Rust channel让磁盘读取、CPU decode、H2D复制与GPU执行同时在途。所有权保持显式：move-only lease持有cache slot直到GPU工作完成，RAII在每条退出路径释放pinned memory、event和device buffer。
+Rust让请求生命周期变成明确对象。请求拥有CUDA stream、event、pinned staging buffer、cache slot、已经检查的cuBLAS handle及其workspace。排队的GPU操作会持续持有lease。少量有状态CUDA对象因此能够跨43层保持热态，流式权重仍然保持有界。
 
-![检查点容量与游戏本内存层级](docs/assets/readme/01-capacity.svg)
+第一个匹配区块让已经验证的cuBLAS handle与workspace跨越mHC和router linear调用。最终审查修复使同一生命周期继续经过compressor与indexer。最终profile中的attention时间从`19.862862s`降至`1.586645s`。这是一条所有权规则在整条固定权重路径上的一致表达。
 
-## 共享模型本来就在共享的工作
+server遵循同样的规则。它的`gpu_exact` final head在`READY`时从活跃模型初始化，属于runtime的一部分。捕获artifact目录位于服务启动路径之外。strict compressor与DSpark路径也会复用经过检查的session。
 
-> 四条full61请求共享每层固定工作，在四组配对比较中达到`1.1690倍`聚合decode吞吐，提升`16.9%`。
+## exact Flash-0731执行
 
-![B4四请求聚合decode吞吐](docs/assets/readme/22-b4-greedy-throughput.svg)
+exact路径固定了控制路由和状态的数值工作：FP8MMA累积、有序归约、RMSNorm行为、cuBLAS compressor调用、KV更新以及GPU final head。对token ID`0`的一步greedy路径，`43/43`层在声明的比较字段上匹配捕获的官方reference。最终argmax为`33832`，已检查digest如下：
 
-B4分别保存四条请求的状态，让整个row-set每层只承担一次固定工作。在default-buffered一步greedy执行下，四组比较中的4/4有序层digest、final semantics和physical ledger均通过exact检查。
+```
+collapsed BF16   5e9764a6e105a3d6
+normalized BF16  91495daa576afcb3
+logits FP32      e9d90c64a1441d20
+```
+
+该证书覆盖固定Flash-0731revision、一个prompt token、一步greedy路径与捕获reference字段。长上下文行为、sampling质量、持续多用户吞吐和其他prompt都需要各自的证据。
+
+## DSpark提交经过验证的前缀
+
+DSpark先提出一个block，再计算base target，随后提交被接受的前缀。状态transaction在提交前携带base和3个MTP状态digest。已记录的B regression运行在`161.55s`内通过，maxRSS为`1.124GiB`。它完成8个base等价计数，覆盖2个prompt与6个validated input，生成`[33832]`，接受`0`个proposal，提交1个input，保留pending token`120159`，并记录4个状态digest。
+
+DSpark结果台账与certified-base台账具有逐字节相同的SHA-256`34734f…e553`。保留的artifact集合包含transaction记录与4个状态digest。`exact-vs-certified-base`定义这份证据的边界。独立官方DSpark oracle属于后续验证工作。
 
 ## 从游戏本走向桌面平台
 
-运行时围绕有界内存设计，适用于不同GPU尺寸。更多显存可以常驻更多固定工作，更多主机内存可以把更多已解码payload留在GPU附近。它为12GB游戏本、16GB、24GB以及32GB到48GB显存的桌面平台给出一条清晰的升级路径。
+当前12GB路径的最终F组中位值为`0.0762tok/s`。下表保留早期内存常驻模型的相对容量乘数，并把它们应用于这个实测中位数。它们是配置容量估算，目前缺少benchmark运行证据。不同scheduler窗口仅适合指导配置。
 
-| 家用平台 | Flash投影 | 前提 |
+| 硬件 | 容量估算 | 模型假设 |
 | --- | ---: | --- |
-| 12GB游戏本 | `0.103到0.125tok/s` | cold H1 |
-| 16GB桌面平台 | `0.313到0.658tok/s` | fixed-resident H1 |
-| 24GB桌面平台 | `0.548到1.153 committed tok/s` | fixed-resident H2，`q=0.8` |
-| 32GB桌面平台 | `0.500到1.052 committed tok/s` | fixed-resident H5，`q=0.8` |
-| 48GB工作站 | `0.500到1.052 committed tok/s` | 沿用冻结的32GB到48GB H5包络 |
+| 12GB游戏本 | `0.0750到0.0774tok/s` | 已观测的最终F组样本 |
+| 16GB桌面平台 | `0.209到0.440tok/s` | fixed-resident H1乘数 |
+| 24GB桌面平台 | `0.366到0.771committed tok/s` | fixed-resident H2，`q=0.8`模型 |
+| 32GB到48GB工作站 | `0.334到0.703committed tok/s` | fixed-resident H5，`q=0.8`模型 |
 
-各行应在自身scheduler假设内比较：H2与H5采用不同的scheduler span和连续提交窗口，因此横向排名需要先对齐这些假设；更大显存带来更长的可用窗口和更多余量。
+估算使用`0.0761837tok/s`，乘以早期容量模型区间再除以其12GB中点`0.114tok/s`。fixed residency、route union、draft成本、rollback、scheduler span与接受率仍需要在每台机器上测量。
 
-![Flash家用硬件投影包络](docs/assets/readme/20-flash-projection-envelope.svg)
+## 运行
 
-这些Flash范围属于设计投影，目前Flash基准运行数为0。随着更多固定工作进入常驻区，同一调度模型有机会释放表中的性能。32GB与48GB配置共享冻结的H5包络。fixed residency、draft成本、rollback、实际专家并集、scheduler span和接受率仍需测量。
-
-## 此处exact的含义
-
-localMoE保持Rust引擎声明的规范约束：在已测试谱系内，路由顺序、归约、KV更新、lease释放和transactional state commit都经过检查。头条完整请求对比的两个端点来自不同来源谱系，因此属于描述性结果。官方PyTorch完整模型一致性、长上下文行为、提示词质量、sampling和持续吞吐仍有各自的验收目标。
-
-实验协议、原始证据边界和限制都在[技术机制记录](docs/experiments/v4-pro-mechanisms-2026-07-24.md)中。README保持产品故事简洁，那份记录负责让每个主张可以检查。
-
-## 运行完整检查点
-
-当前路径面向WSL2/Linux、CUDA12.4、LLVM/NVPTX、libclang和Ada`sm_89`。固定模型revision必须存放在WSL原生ext4块设备，运行时会拒绝`/mnt/c`和`/mnt/d`。
+Flash路径面向WSL2/Linux、CUDA12.4、Ada`sm_89`，模型目录必须位于WSL原生ext4块设备。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
-export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-pro-b5968e9190ef611bbf34a7229255be88a0e937c1
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
-export LD_LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
+export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
 ./run-identified.sh build --arch sm_89 -- --release -p colibri-cuda
-export COLIBRI_SOURCE_IDENTITY_MANIFEST="$PWD/.source-identity.manifest"
-export COLIBRI_SOURCE_IDENTITY="$(sha256sum "$COLIBRI_SOURCE_IDENTITY_MANIFEST" | cut -d' ' -f1)"
-export LOCALMOE_RUN_DIR="$(mktemp -d)"
 ```
 
-使用文本prompt运行实测P5/N3单请求路径：
+运行经过认证的单token Flash base路径：
 
 ```bash
-/usr/bin/time -f 'single_request_wall=%e s' env \
-  COLIBRI_V4_FULL61_B1=1 \
-  COLIBRI_V4_LAYER_STATIONARY_PREFILL=1 \
-  COLIBRI_V4_GENERIC_DEVICE_STATIONARY=1 \
-  COLIBRI_V4_CHAT_USER=hi \
-  COLIBRI_V4_GREEDY_STEPS=3 \
-  COLIBRI_V4_MAX_LAYERS=61 \
-  COLIBRI_V4_DEVICE_FIXED_CACHE_GIB=0 \
-  COLIBRI_V4_HOST_FIXED_CACHE_GIB=0 \
-  COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB=4.0 \
-  COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB=13 \
-  COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH=1 \
-  COLIBRI_V4_RAW_WO_A_GPU_DECODE=1 \
-  COLIBRI_V4_PINNED_FIXED_PIPELINE=1 \
-  COLIBRI_V4_BOUNDED_READAHEAD=1 \
-  COLIBRI_V4_ROUTED_QD4=1 \
-  COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE=1 \
-  COLIBRI_V4_SPARSE_ATTN_ARM=sm89_crossover \
-  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/single.jsonl" \
-  "$PWD/target/release/colibri-cuda"
-```
-
-使用实测default-buffered B4 arm，让四条独立full61请求通过同一个row-set：
-
-```bash
-/usr/bin/time -f 'b4_cohort_wall=%e s' env \
-  COLIBRI_V4_STREAM_READ_MODE=buffered \
-  COLIBRI_V4_B4_GREEDY_ABBA_BENCH=1 \
-  COLIBRI_V4_B4_GREEDY_ABBA_ARM=B \
-  COLIBRI_V4_B4_TOKEN_IDS='0;1;2;3' \
+env \
+  COLIBRI_V4_FLASH_BASE=1 \
+  COLIBRI_V4_FLASH_TOKEN_IDS=0 \
   COLIBRI_V4_GREEDY_STEPS=1 \
-  COLIBRI_V4_B4_GREEDY_ABBA_RESULT_JSONL="$LOCALMOE_RUN_DIR/b4.jsonl" \
+  COLIBRI_V4_STREAM_READ_MODE=buffered \
+  COLIBRI_V4_FLASH_PREFETCH=1 \
+  COLIBRI_V4_FLASH_MHC_LINEAR_ARM=cublas \
+  COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM=cublas \
+  COLIBRI_V4_FLASH_ROUTER_SCORE_ARM=libdevice \
+  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=fp8_mma \
+  COLIBRI_V4_FLASH_FINAL_HEAD_ARM=gpu_exact \
+  COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-密封复现记录使用独立新进程，固定顺序为`AB, BA, BA, AB`，aggregate SHA-256为`7049525af8b0b5e246175920e51d6904749f7a4cd07d3fc590b3a77d4a57e4d0`，binary SHA-256为`9a34c61754a7c66fc0124850e2fcc11056f25915c43bd4cff886ade784a04fbb`。所有arm均低于14.726GiB RSS上限，采样swap为0。两条可运行路径都会对严格规范检查执行fail closed，并在61层全部完成后提交结果。
-
-代码采用[Apache License 2.0](LICENSE)。模型权重遵循各自的发布条款。
+检查`flash-result.jsonl`里的`layers: 43`、final`status: PASS`、argmax`33832`及上方3个digest。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
 
 ## 灵感
 
-localMoE受[JustVugg/colibri](https://github.com/JustVugg/colibri)启发，并沿着这条路线继续推进家用硬件上的exact全量MoE推理。
+localMoE受[JustVugg/colibri](https://github.com/JustVugg/colibri)启发，并继续推进家用硬件上的可用全量权重MoE推理。

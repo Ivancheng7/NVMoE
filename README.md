@@ -4,123 +4,102 @@
 
 Does Your Next LLM Infrastructure Really Need to Be an H100?
 
-| **1.6T parameters** | **12GB VRAM** | **3.58x faster** |
+| Full checkpoint | Exact optimization chain | Final laptop result |
 | --- | --- | --- |
-| Full 810GiB model directory | Exact bounded GPU working set | 198.948s to 55.550s |
+| 1.6T Flash-0731 FP4 weights | 7.11x derived across two matched blocks | 0.0762tok/s on 12GB RTX 4080 Laptop GPU |
 
-![Exact full-request speedup](docs/assets/readme/19-full-request-speedup.svg)
+![Flash-0731 exact optimization chain](docs/assets/readme/23-flash-0731-exact-abba.svg)
 
-localMoE is a Rust and CUDA runtime for one stubborn idea: a gaming laptop should be able to run the full DeepSeek-V4-Pro checkpoint in its full-weight form. The weights stay on a WSL-native ext4 volume. RAM and VRAM carry a moving working set. The runtime decides which bytes must move next and which work can stay shared.
+localMoE runs a full-weight DeepSeek-V4-Flash-0731 checkpoint on a gaming laptop by treating memory movement as inference work. The model stays on a WSL-native ext4 volume. Each layer brings fixed tensors and six routed experts into a bounded working set, then releases the lease after CUDA finishes with it.
 
-On the measured RTX 4080 Laptop GPU with 12GB VRAM, the accepted P5/N3 request finished in `55.550s`; the recorded exact baseline took `198.948s`. That makes the visible result a `3.58x` descriptive cross-lineage speedup, with `72.1%` less wall time. The raw traces behind this historical local comparison remain in the local evidence archive and are absent from the repository. The commands below reproduce the workload against current source.
+The full chain begins at `93.349479730s` and ends at `13.126173804s` per one-token, 43-layer request. That is a `7.111705294x` derived end-to-end optimization chain, or about `0.0762tok/s` at the final median. The ratio joins two separately matched fresh-process blocks and carries the label derived chain value.
 
-## A large MoE asks for a different runtime
+| Matched block | What changed | Exact timing result |
+| --- | --- | --- |
+| `A-B-B-A` | One checked cuBLAS session and workspace span the request's mHC and router calls | `93.349479730s` to `34.611048076s`, paired median `2.697283513x`, `4/4` exact |
+| `A-F-F-A` | The same request-scoped session also reaches the compressor and indexer | `31.973254411s` to `13.126173804s`, paired median `2.435841263x`, `4/4` exact |
 
-V4-Pro has 61 serial layers. Each layer mixes fixed weights with router-selected experts. The GPU cannot keep the full 810GiB checkpoint resident, yet every layer still needs the right weights at the right instant. The hard part is therefore scheduling data movement without changing routes, reduction order, KV state, or the final committed state.
+The compact [sample ledger](docs/assets/readme/flash-0731-abba.csv) contains all eight E2E values, maxRSS values, binary SHA-256 values, and exact gates. The final-release binary SHA-256 is `6a47f8fe48c87f4205f8f835a60f2f824940dea67c198463ccfb60ccf333bb77`. Its standalone full43 certificate run completed in `14.298313983s` with `1,412,424KiB` maxRSS; that certificate sits outside the matched timing blocks.
 
-localMoE gives the checkpoint a travelling working set:
+![Flash-0731 maximum RSS](docs/assets/readme/24-flash-0731-rss.svg)
 
-`ext4 SSD -> CPU read and decode -> pinned RAM -> retained VRAM -> canonical GPU reduction -> transactional state commit`
+Median maxRSS fell from about `7.66GiB` in the first A block to `1.35GiB` in the final F block. Those samples sit in separate matched blocks, so the displayed `6.31GiB` reduction is derived in the same sense as the complete speedup chain.
 
-![Bounded SSD, RAM, and VRAM execution path](docs/assets/readme/02-execution-path.svg)
+## One request, one checked CUDA lifetime
 
-One layer is consumed while the next payload is prepared. Fixed payloads can remain in host or device retention. Routed experts use an immutable cache. CUDA streams and bounded Rust channels keep disk reads, CPU decode, H2D copies, and GPU execution in flight together. Ownership is explicit: move-only leases hold cache slots until GPU work is done, and RAII closes pinned-memory, event, and device-buffer lifetimes on every exit path.
+Rust makes the lifetime of a request concrete. The request owns CUDA streams, events, pinned staging buffers, cache slots, the checked cuBLAS handle, and its workspace. A queued GPU operation keeps its lease alive. That allows a small set of stateful CUDA objects to stay warm across 43 layers while streamed weights remain bounded.
 
-![Checkpoint capacity versus laptop memory tiers](docs/assets/readme/01-capacity.svg)
+The first matched block keeps the verified cuBLAS handle and workspace across mHC and router linear calls. A final review repair carries the same lifetime through the compressor and indexer. In the final profile, attention time falls from `19.862862s` to `1.586645s`. This is one ownership rule expressed through the entire fixed-weight path.
 
-## Share the work that the model already shares
+The server follows the same rule. Its `gpu_exact` final head initializes from the live model at `READY` and remains part of the runtime. Captured-artifact directories stay outside the service startup path. The strict compressor and DSpark path reuse the checked session too.
 
-> Four full61 requests shared each layer's fixed work and reached `1.1690x` aggregate decode throughput, a `16.9%` gain across four paired comparisons.
+## Exact Flash-0731 execution
 
-![B4 four-request aggregate decode throughput](docs/assets/readme/22-b4-greedy-throughput.svg)
+The exact path fixes the numerical work that controls routes and state: FP8 MMA accumulation, ordered reductions, RMSNorm behavior, cuBLAS compressor calls, KV updates, and the GPU final head. For token ID `0` with one greedy step, all `43/43` layers matched the captured official reference at the declared comparison fields. The final argmax is `33832` and the checked digests are:
 
-B4 keeps four request states independent while the row set pays the fixed work once per layer. Across all four pairs, 4/4 ordered layer digests, final semantics, and the physical ledger matched exactly under default buffered, one-step greedy execution.
+```
+collapsed BF16   5e9764a6e105a3d6
+normalized BF16  91495daa576afcb3
+logits FP32      e9d90c64a1441d20
+```
 
-## The path from gaming laptop to desktop build
+This certificate covers the pinned Flash-0731 revision, one prompt token, one greedy step, and the captured reference fields. Long contexts, sampling quality, sustained multi-user throughput, and other prompts each need their own evidence.
 
-The runtime is designed around bounded memory across GPU sizes. More VRAM can retain more fixed work; more host memory can keep more decoded payloads close to the GPU. That gives a clear upgrade path from a 12GB gaming laptop to a desktop with 16GB, 24GB, or 32GB to 48GB of VRAM.
+## DSpark commits a verified prefix
 
-| Home hardware | Flash projection | Assumption |
+DSpark proposes a block, evaluates the base targets, then commits the accepted prefix. Its state transaction carries the base and three MTP state digests until commit. The recorded B regression run passed in `161.55s` with `1.124GiB` maxRSS. It completed eight base-equivalence counts across two prompt and six validated inputs, generated `[33832]`, accepted `0` proposals, committed one input, retained pending token `120159`, and recorded all four state digests.
+
+The DSpark result ledger and the certified-base ledger have byte-identical SHA-256 `34734f…e553`. The retained artifact set contains the transaction record and four state digests. `exact-vs-certified-base` describes this evidence boundary. An independent official DSpark oracle remains future validation work.
+
+## From gaming laptop to desktop platform
+
+The final F median is `0.0762tok/s` on the current 12GB path. The planning ranges below retain the earlier memory-residency model's relative capacity multipliers and apply them to that measured median. They are sizing estimates with no benchmark-run evidence yet. Different scheduler windows guide configuration only.
+
+| Hardware | Planning estimate | Model assumption |
 | --- | ---: | --- |
-| 12GB gaming laptop | `0.103 to 0.125tok/s` | cold H1 |
-| 16GB desktop | `0.313 to 0.658tok/s` | fixed-resident H1 |
-| 24GB desktop | `0.548 to 1.153 committed tok/s` | fixed-resident H2, `q=0.8` |
-| 32GB desktop | `0.500 to 1.052 committed tok/s` | fixed-resident H5, `q=0.8` |
-| 48GB workstation | `0.500 to 1.052 committed tok/s` | same frozen 32GB to 48GB H5 envelope |
+| 12GB gaming laptop | `0.0750 to 0.0774tok/s` | observed final F samples |
+| 16GB desktop | `0.209 to 0.440tok/s` | fixed-resident H1 multiplier |
+| 24GB desktop | `0.366 to 0.771committed tok/s` | fixed-resident H2, `q=0.8` model |
+| 32GB to 48GB workstation | `0.334 to 0.703committed tok/s` | fixed-resident H5, `q=0.8` model |
 
-Compare each row within its scheduler assumption: H2 and H5 use different scheduler spans and continuous commit windows, so a cross-row ranking requires matching assumptions; more VRAM buys a longer usable window and more headroom.
+The estimates use `0.0761837tok/s`, multiplied by the earlier capacity-model band and divided by its 12GB midpoint of `0.114tok/s`. Fixed residency, route unions, draft cost, rollback, scheduler span, and acceptance rate still need measurements on each machine.
 
-![Flash home-hardware projection envelope](docs/assets/readme/20-flash-projection-envelope.svg)
+## Run it
 
-These Flash ranges are design projections, with zero Flash benchmark runs so far. They show what the same scheduling model could unlock as more fixed work becomes resident. The 32GB and 48GB rows share the frozen H5 envelope. Fixed residency, draft cost, rollback, the actual route union, scheduler span, and acceptance rate still need measurement.
-
-## What "exact" means here
-
-localMoE preserves the Rust engine's declared canonical contract: route order, reductions, KV updates, lease release, and transactional state commits are checked within the tested lineage. The headline full-request comparison is descriptive because its endpoints come from different source lineages. Official PyTorch full-model parity, long-context behavior, prompt quality, sampling, and sustained throughput remain separate acceptance targets.
-
-The experiment protocol, raw evidence boundaries, and limitations are in the [technical mechanism record](docs/experiments/v4-pro-mechanisms-2026-07-24.md). The README keeps the product story short; that record keeps the claims inspectable.
-
-## Run the full checkpoint
-
-The current path targets WSL2/Linux, CUDA 12.4, LLVM/NVPTX, libclang, and Ada `sm_89`. Store the pinned model revision on a WSL-native ext4 block device. The runtime rejects `/mnt/c` and `/mnt/d`.
+The Flash path targets WSL2/Linux, CUDA 12.4, Ada `sm_89`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
-export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-pro-b5968e9190ef611bbf34a7229255be88a0e937c1
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
-export LD_LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
+export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
 ./run-identified.sh build --arch sm_89 -- --release -p colibri-cuda
-export COLIBRI_SOURCE_IDENTITY_MANIFEST="$PWD/.source-identity.manifest"
-export COLIBRI_SOURCE_IDENTITY="$(sha256sum "$COLIBRI_SOURCE_IDENTITY_MANIFEST" | cut -d' ' -f1)"
-export LOCALMOE_RUN_DIR="$(mktemp -d)"
 ```
 
-Run the measured P5/N3 single-request path with a text prompt:
+Run the certified one-token Flash base path:
 
 ```bash
-/usr/bin/time -f 'single_request_wall=%e s' env \
-  COLIBRI_V4_FULL61_B1=1 \
-  COLIBRI_V4_LAYER_STATIONARY_PREFILL=1 \
-  COLIBRI_V4_GENERIC_DEVICE_STATIONARY=1 \
-  COLIBRI_V4_CHAT_USER=hi \
-  COLIBRI_V4_GREEDY_STEPS=3 \
-  COLIBRI_V4_MAX_LAYERS=61 \
-  COLIBRI_V4_DEVICE_FIXED_CACHE_GIB=0 \
-  COLIBRI_V4_HOST_FIXED_CACHE_GIB=0 \
-  COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB=4.0 \
-  COLIBRI_V4_STATIONARY_RAW_HOST_RETENTION_GIB=13 \
-  COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH=1 \
-  COLIBRI_V4_RAW_WO_A_GPU_DECODE=1 \
-  COLIBRI_V4_PINNED_FIXED_PIPELINE=1 \
-  COLIBRI_V4_BOUNDED_READAHEAD=1 \
-  COLIBRI_V4_ROUTED_QD4=1 \
-  COLIBRI_V4_QD4_IMMUTABLE_EXPERT_CACHE=1 \
-  COLIBRI_V4_SPARSE_ATTN_ARM=sm89_crossover \
-  COLIBRI_V4_RESULT_JSONL="$LOCALMOE_RUN_DIR/single.jsonl" \
-  "$PWD/target/release/colibri-cuda"
-```
-
-Run the measured default-buffered B4 arm, which advances four independent full61 requests through one row set:
-
-```bash
-/usr/bin/time -f 'b4_cohort_wall=%e s' env \
-  COLIBRI_V4_STREAM_READ_MODE=buffered \
-  COLIBRI_V4_B4_GREEDY_ABBA_BENCH=1 \
-  COLIBRI_V4_B4_GREEDY_ABBA_ARM=B \
-  COLIBRI_V4_B4_TOKEN_IDS='0;1;2;3' \
+env \
+  COLIBRI_V4_FLASH_BASE=1 \
+  COLIBRI_V4_FLASH_TOKEN_IDS=0 \
   COLIBRI_V4_GREEDY_STEPS=1 \
-  COLIBRI_V4_B4_GREEDY_ABBA_RESULT_JSONL="$LOCALMOE_RUN_DIR/b4.jsonl" \
+  COLIBRI_V4_STREAM_READ_MODE=buffered \
+  COLIBRI_V4_FLASH_PREFETCH=1 \
+  COLIBRI_V4_FLASH_MHC_LINEAR_ARM=cublas \
+  COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM=cublas \
+  COLIBRI_V4_FLASH_ROUTER_SCORE_ARM=libdevice \
+  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=fp8_mma \
+  COLIBRI_V4_FLASH_FINAL_HEAD_ARM=gpu_exact \
+  COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-The sealed reproduction record used fresh processes in the fixed `AB, BA, BA, AB` order, aggregate SHA-256 `7049525af8b0b5e246175920e51d6904749f7a4cd07d3fc590b3a77d4a57e4d0`, and binary SHA-256 `9a34c61754a7c66fc0124850e2fcc11056f25915c43bd4cff886ade784a04fbb`. Every arm stayed below the 14.726GiB RSS cap with zero sampled swap. Both runnable paths fail closed on strict canonical checks and commit their result only after all 61 layers complete.
-
-Code is available under the [Apache License 2.0](LICENSE). Model weights follow their own release terms.
+Inspect `flash-result.jsonl` for `layers: 43`, final `status: PASS`, argmax `33832`, and the three digests above. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
 
 ## Inspiration
 
-localMoE was inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) and continues that line of work toward exact, full-weight MoE inference on home hardware.
+localMoE was inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) and continues toward usable full-weight MoE inference on home hardware.

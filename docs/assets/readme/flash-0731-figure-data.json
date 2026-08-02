@@ -1,0 +1,95 @@
+{
+  "attention_profile_s": {
+    "after": 1.586645,
+    "before": 19.862862
+  },
+  "blocks": [
+    {
+      "median_paired_speedup": 2.6972835125606025,
+      "order": "A-B-B-A",
+      "paired_speedup": [
+        2.6734287807619177,
+        2.7211382443592873
+      ],
+      "rows": [
+        "A1",
+        "B"
+      ]
+    },
+    {
+      "median_paired_speedup": 2.435841263113098,
+      "order": "A-F-F-A",
+      "paired_speedup": [
+        2.435948096803747,
+        2.4357344294224488
+      ],
+      "rows": [
+        "A2",
+        "F"
+      ]
+    }
+  ],
+  "derived_chain_speedup": 7.111705293857467,
+  "exact_gate": "layers=43;argmax=33832;collapsed=5e9764a6e105a3d6;normalized=91495daa576afcb3;logits=e9d90c64a1441d20",
+  "rows": [
+    {
+      "arm": "A1",
+      "binary_sha256": "680e8bf724d9aa041474f3166059755e38da51f711aa1d728224c61529c357dc",
+      "label": "stage 1 baseline",
+      "max_rss_kib": [
+        8030632,
+        8030040
+      ],
+      "request_e2e_s": [
+        93.23953778,
+        93.45942168
+      ]
+    },
+    {
+      "arm": "B",
+      "binary_sha256": "1cc7b299658bbefbbf7c9249c0dc8cf3a34f28793e3bbcb511ff30808c5c1f03",
+      "label": "request session",
+      "max_rss_kib": [
+        1412388,
+        1411612
+      ],
+      "request_e2e_s": [
+        34.876387376,
+        34.345708776
+      ]
+    },
+    {
+      "arm": "A2",
+      "binary_sha256": "d75ee989bca0fd52245c9c508fdc823af83570ae00c96f372839bf9a15929098",
+      "label": "release rebaseline",
+      "max_rss_kib": [
+        1413208,
+        1413716
+      ],
+      "request_e2e_s": [
+        31.48746934,
+        32.459039482
+      ]
+    },
+    {
+      "arm": "F",
+      "binary_sha256": "6a47f8fe48c87f4205f8f835a60f2f824940dea67c198463ccfb60ccf333bb77",
+      "label": "final release",
+      "max_rss_kib": [
+        1412112,
+        1412524
+      ],
+      "request_e2e_s": [
+        12.926165948,
+        13.32618166
+      ]
+    }
+  ],
+  "schema": "localmoe-flash-0731-readme-figures-v2",
+  "standalone_final_release": {
+    "binary_sha256": "6a47f8fe48c87f4205f8f835a60f2f824940dea67c198463ccfb60ccf333bb77",
+    "max_rss_kib": 1412424,
+    "request_e2e_s": 14.298313983
+  },
+  "workload": "one token, 43 layers, token ID 0, fresh processes; two separately matched blocks"
+}

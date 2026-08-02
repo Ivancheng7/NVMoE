@@ -9,8 +9,9 @@ use crate::safetensors::{
     IndexedSafetensors, ShardFile, SourceManifest, TensorDtype, TensorLocation, TensorRange,
 };
 use crate::v4_router::{bf16_to_f32, f32_to_bf16_rne, rmsnorm_bf16, rmsnorm_bf16_width};
+use crate::v4_spec::{PRO, V4Spec};
 
-pub const REVISION: &str = "b5968e9190ef611bbf34a7229255be88a0e937c1";
+pub const REVISION: &str = crate::v4_spec::PRO_REVISION;
 pub const PINNED_SHARD_BYTES: u64 = 864_721_029_744;
 pub const V4_LAYER_COUNT: usize = 61;
 pub const HIDDEN: usize = 7_168;
@@ -131,6 +132,7 @@ impl LayerStationaryRequestPlan {
 
     fn compressed_rows(self, ratio: CompressionRatio) -> usize {
         match ratio {
+            CompressionRatio::WindowOnly => 0,
             CompressionRatio::Csa4 => self.csa_compressed_rows,
             CompressionRatio::Hca128 => self.hca_compressed_rows,
         }
@@ -140,6 +142,7 @@ impl LayerStationaryRequestPlan {
 /// One request-local staging row. GPU production will use a bounded prepared
 /// delta; this CPU object only keeps the semantic oracle's staging boundary
 /// explicit.
+#[derive(Clone)]
 pub struct LayerStationaryTokenScratch {
     kv_row: Vec<u16>,
 }
@@ -297,6 +300,7 @@ pub mod mtp1_swa {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompressionRatio {
+    WindowOnly,
     Csa4,
     Hca128,
 }
@@ -304,21 +308,29 @@ pub enum CompressionRatio {
 impl CompressionRatio {
     pub const fn get(self) -> usize {
         match self {
+            Self::WindowOnly => 0,
             Self::Csa4 => 4,
             Self::Hca128 => 128,
         }
     }
 }
 
-pub fn compression_ratio_for_layer(layer: usize) -> Result<CompressionRatio, Box<dyn Error>> {
-    if layer >= V4_LAYER_COUNT {
-        return Err(format!("V4 layer {layer} is outside 0..{V4_LAYER_COUNT}").into());
-    }
-    Ok(if layer >= 2 && layer.is_multiple_of(2) {
-        CompressionRatio::Csa4
-    } else {
-        CompressionRatio::Hca128
+pub fn compression_ratio_for_spec_layer(
+    spec: &V4Spec,
+    layer: usize,
+) -> Result<CompressionRatio, Box<dyn Error>> {
+    Ok(match spec.compression_ratio(layer)? {
+        0 => CompressionRatio::WindowOnly,
+        4 => CompressionRatio::Csa4,
+        128 => CompressionRatio::Hca128,
+        ratio => {
+            return Err(format!("{} has unsupported compression ratio {ratio}", spec.name).into());
+        }
     })
+}
+
+pub fn compression_ratio_for_layer(layer: usize) -> Result<CompressionRatio, Box<dyn Error>> {
+    compression_ratio_for_spec_layer(&PRO, layer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +345,17 @@ pub struct LayerTensorContract {
 pub struct LayerExecutionManifest {
     pub layer: usize,
     pub compression_ratio: CompressionRatio,
+    pub shard: String,
+    pub tensors: Vec<LayerTensorContract>,
+    pub contract_range_bytes: u64,
+}
+
+/// Metadata-only base-layer contract. Flash-0731 uses this for its 43 main
+/// layers; its DSpark `mtp.*` stages remain intentionally outside this gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseLayerExecutionManifest {
+    pub layer: usize,
+    pub compression_ratio: usize,
     pub shard: String,
     pub tensors: Vec<LayerTensorContract>,
     pub contract_range_bytes: u64,
@@ -353,17 +376,28 @@ pub fn layer_tensor_manifest(
     layer: usize,
     expert_id: u16,
 ) -> Result<Vec<LayerTensorContract>, Box<dyn Error>> {
-    let ratio = compression_ratio_for_layer(layer)?;
-    if expert_id as usize >= crate::v4_router::V4_ROUTED_EXPERTS {
+    base_layer_tensor_manifest(&PRO, layer, expert_id)
+}
+
+pub fn base_layer_tensor_manifest(
+    spec: &V4Spec,
+    layer: usize,
+    expert_id: u16,
+) -> Result<Vec<LayerTensorContract>, Box<dyn Error>> {
+    let ratio = spec.compression_ratio(layer)?;
+    if expert_id as usize >= spec.routed_experts {
         return Err(format!("invalid routed expert id {expert_id}").into());
+    }
+    if !matches!(ratio, 0 | 4 | 128) {
+        return Err(format!("{} has unsupported compression ratio {ratio}", spec.name).into());
     }
     let prefix = format!("layers.{layer}");
     let mut tensors = vec![
         LayerTensorContract {
             name: format!("{prefix}.hc_attn_fn"),
             dtype: TensorDtype::F32,
-            shape: vec![24, 28_672],
-            byte_len: 2_752_512,
+            shape: vec![MIX as u64, (HC * spec.hidden) as u64],
+            byte_len: u64::try_from(MIX * HC * spec.hidden * std::mem::size_of::<f32>())?,
         },
         LayerTensorContract {
             name: format!("{prefix}.hc_attn_base"),
@@ -380,101 +414,92 @@ pub fn layer_tensor_manifest(
         LayerTensorContract {
             name: format!("{prefix}.attn_norm.weight"),
             dtype: TensorDtype::Bf16,
-            shape: vec![7_168],
-            byte_len: 14_336,
+            shape: vec![spec.hidden as u64],
+            byte_len: u64::try_from(spec.hidden * std::mem::size_of::<u16>())?,
         },
         LayerTensorContract {
             name: format!("{prefix}.attn.wq_a.weight"),
             dtype: TensorDtype::F8E4M3,
-            shape: vec![1_536, 7_168],
-            byte_len: 11_010_048,
-        },
-        LayerTensorContract {
-            name: format!("{prefix}.attn.compressor.ape"),
-            dtype: TensorDtype::F32,
-            shape: match ratio {
-                CompressionRatio::Csa4 => vec![4, 1_024],
-                CompressionRatio::Hca128 => vec![128, 512],
-            },
-            byte_len: match ratio {
-                CompressionRatio::Csa4 => 16_384,
-                CompressionRatio::Hca128 => 262_144,
-            },
-        },
-        LayerTensorContract {
-            name: format!("{prefix}.attn.compressor.wkv.weight"),
-            dtype: TensorDtype::Bf16,
-            shape: vec![
-                match ratio {
-                    CompressionRatio::Csa4 => 1_024,
-                    CompressionRatio::Hca128 => 512,
-                },
-                7_168,
-            ],
-            byte_len: match ratio {
-                CompressionRatio::Csa4 => 14_680_064,
-                CompressionRatio::Hca128 => 7_340_032,
-            },
-        },
-        LayerTensorContract {
-            name: format!("{prefix}.attn.compressor.wgate.weight"),
-            dtype: TensorDtype::Bf16,
-            shape: vec![
-                match ratio {
-                    CompressionRatio::Csa4 => 1_024,
-                    CompressionRatio::Hca128 => 512,
-                },
-                7_168,
-            ],
-            byte_len: match ratio {
-                CompressionRatio::Csa4 => 14_680_064,
-                CompressionRatio::Hca128 => 7_340_032,
-            },
-        },
-        LayerTensorContract {
-            name: format!("{prefix}.attn.compressor.norm.weight"),
-            dtype: TensorDtype::Bf16,
-            shape: vec![512],
-            byte_len: 1_024,
+            shape: vec![spec.q_lora_rank as u64, spec.hidden as u64],
+            byte_len: u64::try_from(spec.q_lora_rank * spec.hidden)?,
         },
         LayerTensorContract {
             name: format!("{prefix}.ffn_norm.weight"),
             dtype: TensorDtype::Bf16,
-            shape: vec![7_168],
-            byte_len: 14_336,
+            shape: vec![spec.hidden as u64],
+            byte_len: u64::try_from(spec.hidden * std::mem::size_of::<u16>())?,
         },
         LayerTensorContract {
             name: format!("{prefix}.ffn.gate.weight"),
             dtype: TensorDtype::Bf16,
-            shape: vec![384, 7_168],
-            byte_len: 5_505_024,
+            shape: vec![spec.routed_experts as u64, spec.hidden as u64],
+            byte_len: u64::try_from(
+                spec.routed_experts * spec.hidden * std::mem::size_of::<u16>(),
+            )?,
         },
         LayerTensorContract {
             name: format!("{prefix}.ffn.experts.{expert_id}.w1.weight"),
             dtype: TensorDtype::Fp4E2M1x2,
-            shape: vec![3_072, 3_584],
-            byte_len: 11_010_048,
+            shape: vec![spec.moe_intermediate as u64, (spec.hidden / 2) as u64],
+            byte_len: u64::try_from(spec.moe_intermediate * spec.hidden / 2)?,
         },
     ];
-    if ratio == CompressionRatio::Csa4 {
+    if ratio != 0 {
+        let compressor_width = if ratio == 4 {
+            2 * spec.q_head_dim
+        } else {
+            spec.q_head_dim
+        };
+        tensors.extend([
+            LayerTensorContract {
+                name: format!("{prefix}.attn.compressor.ape"),
+                dtype: TensorDtype::F32,
+                shape: vec![ratio as u64, compressor_width as u64],
+                byte_len: u64::try_from(ratio * compressor_width * std::mem::size_of::<f32>())?,
+            },
+            LayerTensorContract {
+                name: format!("{prefix}.attn.compressor.wkv.weight"),
+                dtype: TensorDtype::Bf16,
+                shape: vec![compressor_width as u64, spec.hidden as u64],
+                byte_len: u64::try_from(
+                    compressor_width * spec.hidden * std::mem::size_of::<u16>(),
+                )?,
+            },
+            LayerTensorContract {
+                name: format!("{prefix}.attn.compressor.wgate.weight"),
+                dtype: TensorDtype::Bf16,
+                shape: vec![compressor_width as u64, spec.hidden as u64],
+                byte_len: u64::try_from(
+                    compressor_width * spec.hidden * std::mem::size_of::<u16>(),
+                )?,
+            },
+            LayerTensorContract {
+                name: format!("{prefix}.attn.compressor.norm.weight"),
+                dtype: TensorDtype::Bf16,
+                shape: vec![spec.q_head_dim as u64],
+                byte_len: u64::try_from(spec.q_head_dim * std::mem::size_of::<u16>())?,
+            },
+        ]);
+    }
+    if ratio == 4 {
         tensors.extend([
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.wq_b.weight"),
                 dtype: TensorDtype::F8E4M3,
-                shape: vec![8_192, 1_536],
-                byte_len: 12_582_912,
+                shape: vec![8_192, spec.q_lora_rank as u64],
+                byte_len: u64::try_from(8_192 * spec.q_lora_rank)?,
             },
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.wq_b.scale"),
                 dtype: TensorDtype::F8E8M0,
-                shape: vec![64, 12],
-                byte_len: 768,
+                shape: vec![64, (spec.q_lora_rank / FP8_BLOCK) as u64],
+                byte_len: u64::try_from(64 * (spec.q_lora_rank / FP8_BLOCK))?,
             },
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.weights_proj.weight"),
                 dtype: TensorDtype::Bf16,
-                shape: vec![64, 7_168],
-                byte_len: 917_504,
+                shape: vec![64, spec.hidden as u64],
+                byte_len: u64::try_from(64 * spec.hidden * std::mem::size_of::<u16>())?,
             },
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.compressor.ape"),
@@ -485,14 +510,14 @@ pub fn layer_tensor_manifest(
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.compressor.wkv.weight"),
                 dtype: TensorDtype::Bf16,
-                shape: vec![256, 7_168],
-                byte_len: 3_670_016,
+                shape: vec![256, spec.hidden as u64],
+                byte_len: u64::try_from(256 * spec.hidden * std::mem::size_of::<u16>())?,
             },
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.compressor.wgate.weight"),
                 dtype: TensorDtype::Bf16,
-                shape: vec![256, 7_168],
-                byte_len: 3_670_016,
+                shape: vec![256, spec.hidden as u64],
+                byte_len: u64::try_from(256 * spec.hidden * std::mem::size_of::<u16>())?,
             },
             LayerTensorContract {
                 name: format!("{prefix}.attn.indexer.compressor.norm.weight"),
@@ -502,19 +527,21 @@ pub fn layer_tensor_manifest(
             },
         ]);
     }
-    if layer < 3 {
+    if layer < spec.hash_layers {
         tensors.push(LayerTensorContract {
             name: format!("{prefix}.ffn.gate.tid2eid"),
             dtype: TensorDtype::I64,
-            shape: vec![129_280, 6],
-            byte_len: 6_205_440,
+            shape: vec![spec.vocab as u64, spec.experts_per_token as u64],
+            byte_len: u64::try_from(
+                spec.vocab * spec.experts_per_token * std::mem::size_of::<i64>(),
+            )?,
         });
     } else {
         tensors.push(LayerTensorContract {
             name: format!("{prefix}.ffn.gate.bias"),
             dtype: TensorDtype::F32,
-            shape: vec![384],
-            byte_len: 1_536,
+            shape: vec![spec.routed_experts as u64],
+            byte_len: u64::try_from(spec.routed_experts * std::mem::size_of::<f32>())?,
         });
     }
     Ok(tensors)
@@ -523,13 +550,36 @@ pub fn layer_tensor_manifest(
 pub fn serial_layer_manifests(
     expert_id: u16,
 ) -> Result<Vec<LayerExecutionManifest>, Box<dyn Error>> {
-    (0..V4_LAYER_COUNT)
+    base_layer_manifests(&PRO, expert_id)?
+        .into_iter()
         .map(|layer| {
-            let tensors = layer_tensor_manifest(layer, expert_id)?;
+            let compression_ratio = match layer.compression_ratio {
+                4 => CompressionRatio::Csa4,
+                128 => CompressionRatio::Hca128,
+                ratio => return Err(format!("Pro serial path cannot execute ratio {ratio}").into()),
+            };
             Ok(LayerExecutionManifest {
+                layer: layer.layer,
+                compression_ratio,
+                shard: layer.shard,
+                contract_range_bytes: layer.contract_range_bytes,
+                tensors: layer.tensors,
+            })
+        })
+        .collect()
+}
+
+pub fn base_layer_manifests(
+    spec: &V4Spec,
+    expert_id: u16,
+) -> Result<Vec<BaseLayerExecutionManifest>, Box<dyn Error>> {
+    (0..spec.layers)
+        .map(|layer| {
+            let tensors = base_layer_tensor_manifest(spec, layer, expert_id)?;
+            Ok(BaseLayerExecutionManifest {
                 layer,
-                compression_ratio: compression_ratio_for_layer(layer)?,
-                shard: format!("model-{:05}-of-00064.safetensors", layer + 2),
+                compression_ratio: spec.compression_ratio(layer)?,
+                shard: spec.shard_name(layer + 2)?,
                 contract_range_bytes: tensors.iter().map(|tensor| tensor.byte_len).sum(),
                 tensors,
             })
@@ -576,12 +626,22 @@ where
 }
 
 pub fn indexed_model(model_dir: &Path) -> Result<IndexedSafetensors, Box<dyn Error>> {
-    validate_model_dir(model_dir)?;
-    let shards = (1..=64).map(|number| {
-        let name = format!("model-{number:05}-of-00064.safetensors");
+    base_indexed_model(&PRO, model_dir)
+}
+
+pub fn base_indexed_model(
+    spec: &V4Spec,
+    model_dir: &Path,
+) -> Result<IndexedSafetensors, Box<dyn Error>> {
+    let config = std::fs::read(model_dir.join("config.json"))?;
+    spec.validate_config_bytes(&config)
+        .map_err(|error| format!("validate {} config.json: {error}", spec.name))?;
+    validate_model_dir_for(spec, model_dir)?;
+    let shards = (1..=spec.shard_count).map(|number| {
+        let name = spec.shard_name(number).expect("validated shard range");
         (name.clone(), model_dir.join(name))
     });
-    let manifest = SourceManifest::new(REVISION, shards);
+    let manifest = SourceManifest::new(spec.revision, shards);
     Ok(IndexedSafetensors::from_index_reader(
         manifest,
         std::fs::File::open(model_dir.join("model.safetensors.index.json"))?,
@@ -607,6 +667,119 @@ pub fn resolve_layer_tensor_range(
         return Err(format!("{} pinned tensor range contract mismatch", tensor.name).into());
     }
     Ok(resolved)
+}
+
+/// A deliberately small, static contract for Flash-0731's three DSpark
+/// stages.  The index can validate placement without opening a shard; the
+/// header validator below additionally pins the shapes when local weights are
+/// present.  It is not a substitute for an executable MTP graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkTensorContract {
+    pub name: String,
+    pub shape: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkStageIndexContract {
+    pub stage: usize,
+    pub shard: String,
+    pub tensors: Vec<DsparkTensorContract>,
+}
+
+pub const DSPARK_STAGES: usize = 3;
+
+fn dspark_tensor(name: String, shape: &[u64]) -> DsparkTensorContract {
+    DsparkTensorContract {
+        name,
+        shape: shape.to_vec(),
+    }
+}
+
+/// Key tensor names and physical shapes from the pinned 0731 checkpoint.
+/// Expert FP4 shapes are the packed safetensor shapes, hence `hidden / 2`.
+pub fn flash_0731_dspark_stage_contract(
+    stage: usize,
+) -> Result<DsparkStageIndexContract, Box<dyn Error>> {
+    if stage >= DSPARK_STAGES {
+        return Err(format!("DSpark stage {stage} is outside 0..{DSPARK_STAGES}").into());
+    }
+    let prefix = format!("mtp.{stage}");
+    let mut tensors = vec![
+        dspark_tensor(format!("{prefix}.attn.wq_a.weight"), &[1_024, 4_096]),
+        dspark_tensor(format!("{prefix}.attn.wq_b.weight"), &[32_768, 1_024]),
+        dspark_tensor(format!("{prefix}.attn.wkv.weight"), &[512, 4_096]),
+        dspark_tensor(format!("{prefix}.attn.wo_a.weight"), &[8_192, 4_096]),
+        dspark_tensor(format!("{prefix}.attn.wo_b.weight"), &[4_096, 8_192]),
+        dspark_tensor(format!("{prefix}.ffn.gate.weight"), &[256, 4_096]),
+        dspark_tensor(format!("{prefix}.ffn.experts.0.w1.weight"), &[2_048, 2_048]),
+        dspark_tensor(format!("{prefix}.ffn.experts.0.w2.weight"), &[4_096, 1_024]),
+        dspark_tensor(format!("{prefix}.ffn.experts.0.w3.weight"), &[2_048, 2_048]),
+    ];
+    if stage == 0 {
+        tensors.extend([
+            dspark_tensor("mtp.0.main_proj.weight".into(), &[4_096, 12_288]),
+            dspark_tensor("mtp.0.main_proj.scale".into(), &[32, 96]),
+            dspark_tensor("mtp.0.main_norm.weight".into(), &[4_096]),
+        ]);
+    }
+    if stage == 2 {
+        tensors.extend([
+            dspark_tensor("mtp.2.norm.weight".into(), &[4_096]),
+            dspark_tensor("mtp.2.markov_head.markov_w1.weight".into(), &[129_280, 256]),
+            dspark_tensor("mtp.2.markov_head.markov_w2.weight".into(), &[129_280, 256]),
+            dspark_tensor("mtp.2.confidence_head.proj.weight".into(), &[1, 4_352]),
+        ]);
+    }
+    Ok(DsparkStageIndexContract {
+        stage,
+        // Official index maps stages 0, 1 and 2 to shards 46, 47 and 48.
+        shard: crate::v4_spec::FLASH_0731.shard_name(46 + stage)?,
+        tensors,
+    })
+}
+
+/// Check that the pinned index maps every required DSpark key to its official
+/// stage shard. This opens no weight shard.
+pub fn validate_flash_0731_dspark_index(index: &IndexedSafetensors) -> Result<(), Box<dyn Error>> {
+    if index.revision() != crate::v4_spec::FLASH_0731.revision {
+        return Err("DSpark index revision is not Flash-0731".into());
+    }
+    for stage in 0..DSPARK_STAGES {
+        let contract = flash_0731_dspark_stage_contract(stage)?;
+        for tensor in contract.tensors {
+            let location = index.resolve_tensor(&tensor.name)?;
+            if location.shard != contract.shard {
+                return Err(format!(
+                    "{} is in {}, expected {}",
+                    tensor.name, location.shard, contract.shard
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Local-weight gate for the shapes above. Kept separate from index checking
+/// so a checkpoint index can be audited without reading 1.6T of weights.
+pub fn validate_flash_0731_dspark_headers(
+    index: &IndexedSafetensors,
+) -> Result<(), Box<dyn Error>> {
+    validate_flash_0731_dspark_index(index)?;
+    for stage in 0..DSPARK_STAGES {
+        for tensor in flash_0731_dspark_stage_contract(stage)?.tensors {
+            let range = index.resolve_tensor_range(&tensor.name)?;
+            if range.info.shape != tensor.shape {
+                return Err(format!("{} has an unexpected DSpark shape", tensor.name).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_flash_0731_dspark_model_dir(model_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let index = base_indexed_model(&crate::v4_spec::FLASH_0731, model_dir)?;
+    validate_flash_0731_dspark_headers(&index)
 }
 
 fn validate_layer_locations(
@@ -861,6 +1034,7 @@ pub enum LayerRouterWeights {
 }
 
 pub struct LayerStateWeights {
+    pub spec: &'static V4Spec,
     pub layer: usize,
     pub compression_ratio: CompressionRatio,
     pub hc_fn: Vec<f32>,
@@ -1070,6 +1244,27 @@ pub struct MtpDraftPrefixWeights {
     pub wkv: Fp8Projection,
 }
 
+pub struct DsparkStageWeights {
+    pub stage: usize,
+    pub shard: ShardFile,
+    pub state: LayerStateWeights,
+    pub projections: L0Fp8Projections,
+    pub tail: L0TailWeights,
+    pub main_proj: Option<Fp8Matrix>,
+    pub main_norm: Option<Vec<u16>>,
+    pub head: Option<DsparkHeadWeights>,
+}
+
+pub struct DsparkHeadWeights {
+    pub norm: Vec<u16>,
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: Vec<f32>,
+    pub markov_w1: Vec<u16>,
+    pub markov_w2: Vec<u16>,
+    pub confidence: Vec<u16>,
+}
+
 pub struct QuantizedFp8Activation {
     pub values: Vec<u8>,
     pub scales: Vec<u8>,
@@ -1154,6 +1349,7 @@ pub struct FinalHeadOutput {
 }
 
 pub struct FinalHeadWeights {
+    spec: &'static V4Spec,
     shard: ShardFile,
     pub hc_fn_f32: Vec<f32>,
     pub hc_base_f32: Vec<f32>,
@@ -1169,11 +1365,17 @@ pub struct FinalHeadCpuRun {
     pub wall_ns: u64,
 }
 
+pub struct NormalizedHeadCpuRun {
+    pub logits_f32: Vec<f32>,
+    pub read_ns: u64,
+    pub streamed_source_bytes: usize,
+}
+
 /// Canonical final-head row reduction.  Strict `>` at the caller preserves
 /// the lowest token ID on exact ties.
 pub fn canonical_final_head_row_dot(normalized_bf16: &[u16], row_bf16: &[u16]) -> f32 {
-    assert_eq!(normalized_bf16.len(), HIDDEN);
-    assert_eq!(row_bf16.len(), HIDDEN);
+    assert!(!normalized_bf16.is_empty());
+    assert_eq!(normalized_bf16.len(), row_bf16.len());
     normalized_bf16
         .iter()
         .zip(row_bf16)
@@ -1194,10 +1396,10 @@ impl FinalHeadWeights {
         output: &mut [u8],
     ) -> Result<(), Box<dyn Error>> {
         let elements = token_rows
-            .checked_mul(HIDDEN)
+            .checked_mul(self.spec.hidden)
             .ok_or("V4 final head chunk element overflow")?;
-        if token_start > VOCAB
-            || token_rows > VOCAB.saturating_sub(token_start)
+        if token_start > self.spec.vocab
+            || token_rows > self.spec.vocab.saturating_sub(token_start)
             || output.len() != elements * 2
         {
             return Err("V4 final head chunk contract mismatch".into());
@@ -1206,7 +1408,7 @@ impl FinalHeadWeights {
             "head.weight",
             u64::try_from(
                 token_start
-                    .checked_mul(HIDDEN * 2)
+                    .checked_mul(self.spec.hidden * 2)
                     .ok_or("V4 final head chunk byte offset overflow")?,
             )?,
             output,
@@ -1215,9 +1417,16 @@ impl FinalHeadWeights {
 }
 
 pub fn load_final_head(model_dir: &Path) -> Result<FinalHeadWeights, Box<dyn Error>> {
-    validate_model_dir(model_dir)?;
-    let index = indexed_model(model_dir)?;
-    let expected_shard = "model-00063-of-00064.safetensors";
+    load_final_head_for(&PRO, model_dir)
+}
+
+pub fn load_final_head_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+) -> Result<FinalHeadWeights, Box<dyn Error>> {
+    validate_model_dir_for(spec, model_dir)?;
+    let index = base_indexed_model(spec, model_dir)?;
+    let expected_shard = spec.shard_name(spec.layers + 2)?;
     for name in [
         "hc_head_fn",
         "hc_head_base",
@@ -1234,20 +1443,20 @@ pub fn load_final_head(model_dir: &Path) -> Result<FinalHeadWeights, Box<dyn Err
             .into());
         }
     }
-    let shard = ShardFile::open(model_dir.join(expected_shard))?;
+    let shard = ShardFile::open(model_dir.join(&expected_shard))?;
     for (name, dtype, shape) in [
         (
             "hc_head_fn",
             TensorDtype::F32,
-            vec![HC as u64, (HC * HIDDEN) as u64],
+            vec![HC as u64, (HC * spec.hidden) as u64],
         ),
         ("hc_head_base", TensorDtype::F32, vec![HC as u64]),
         ("hc_head_scale", TensorDtype::F32, vec![1]),
-        ("norm.weight", TensorDtype::Bf16, vec![HIDDEN as u64]),
+        ("norm.weight", TensorDtype::Bf16, vec![spec.hidden as u64]),
         (
             "head.weight",
             TensorDtype::Bf16,
-            vec![129_280, HIDDEN as u64],
+            vec![spec.vocab as u64, spec.hidden as u64],
         ),
     ] {
         let tensor = shard.tensor(name)?;
@@ -1255,16 +1464,17 @@ pub fn load_final_head(model_dir: &Path) -> Result<FinalHeadWeights, Box<dyn Err
             return Err(format!("V4 final {name} tensor contract mismatch").into());
         }
     }
-    let hc_fn_f32 = read_f32(&shard, "hc_head_fn", &[HC, HC * HIDDEN])?;
+    let hc_fn_f32 = read_f32(&shard, "hc_head_fn", &[HC, HC * spec.hidden])?;
     let hc_base_f32 = read_f32(&shard, "hc_head_base", &[HC])?;
     let hc_scale_f32 = read_f32(&shard, "hc_head_scale", &[1])?;
-    let norm_bf16 = read_bf16(&shard, "norm.weight", &[HIDDEN])?;
+    let norm_bf16 = read_bf16(&shard, "norm.weight", &[spec.hidden])?;
     let loader_source_bytes = std::mem::size_of_val(hc_fn_f32.as_slice())
         .checked_add(std::mem::size_of_val(hc_base_f32.as_slice()))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(hc_scale_f32.as_slice())))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(norm_bf16.as_slice())))
         .ok_or("V4 final head loader source byte counter overflow")?;
     Ok(FinalHeadWeights {
+        spec,
         hc_fn_f32,
         hc_base_f32,
         hc_scale_f32: hc_scale_f32[0],
@@ -1423,7 +1633,7 @@ pub fn final_checkpoint_head_cpu_timed(
         hc_hidden_bf16,
         rows,
         HC,
-        HIDDEN,
+        weights.spec.hidden,
         &weights.hc_fn_f32,
         weights.hc_scale_f32,
         &weights.hc_base_f32,
@@ -1432,26 +1642,26 @@ pub fn final_checkpoint_head_cpu_timed(
         hc_hidden_bf16,
         rows,
         HC,
-        HIDDEN,
+        weights.spec.hidden,
         &pre,
         &weights
             .norm_bf16
             .iter()
             .map(|&bits| bf16_to_f32(bits))
             .collect::<Vec<_>>(),
-        &vec![0.0; HIDDEN],
+        &vec![0.0; weights.spec.hidden],
         1,
     )?;
     const CHUNK_ROWS: usize = 256;
-    base.logits_f32 = vec![0.0; rows * VOCAB];
+    base.logits_f32 = vec![0.0; rows * weights.spec.vocab];
     base.argmax.fill(0);
-    let mut bytes = vec![0_u8; CHUNK_ROWS * HIDDEN * 2];
-    let mut row_bf16 = vec![0_u16; HIDDEN];
+    let mut bytes = vec![0_u8; CHUNK_ROWS * weights.spec.hidden * 2];
+    let mut row_bf16 = vec![0_u16; weights.spec.hidden];
     let mut read_ns = 0_u64;
     let mut streamed_source_bytes = 0_usize;
-    for token_start in (0..VOCAB).step_by(CHUNK_ROWS) {
-        let chunk_rows = (VOCAB - token_start).min(CHUNK_ROWS);
-        let chunk_bytes = chunk_rows * HIDDEN * 2;
+    for token_start in (0..weights.spec.vocab).step_by(CHUNK_ROWS) {
+        let chunk_rows = (weights.spec.vocab - token_start).min(CHUNK_ROWS);
+        let chunk_bytes = chunk_rows * weights.spec.hidden * 2;
         let read_started = std::time::Instant::now();
         weights.read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])?;
         streamed_source_bytes = streamed_source_bytes
@@ -1461,20 +1671,22 @@ pub fn final_checkpoint_head_cpu_timed(
             .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         for row in 0..rows {
             for token_offset in 0..chunk_rows {
-                let weight_start = token_offset * HIDDEN * 2;
-                for (weight, bytes) in row_bf16
-                    .iter_mut()
-                    .zip(bytes[weight_start..weight_start + HIDDEN * 2].chunks_exact(2))
-                {
+                let weight_start = token_offset * weights.spec.hidden * 2;
+                for (weight, bytes) in row_bf16.iter_mut().zip(
+                    bytes[weight_start..weight_start + weights.spec.hidden * 2].chunks_exact(2),
+                ) {
                     *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
                 }
                 let logit = canonical_final_head_row_dot(
-                    &base.normalized_bf16[row * HIDDEN..(row + 1) * HIDDEN],
+                    &base.normalized_bf16
+                        [row * weights.spec.hidden..(row + 1) * weights.spec.hidden],
                     &row_bf16,
                 );
                 let token = token_start + token_offset;
-                base.logits_f32[row * VOCAB + token] = logit;
-                if token == 0 || logit > base.logits_f32[row * VOCAB + base.argmax[row]] {
+                base.logits_f32[row * weights.spec.vocab + token] = logit;
+                if token == 0
+                    || logit > base.logits_f32[row * weights.spec.vocab + base.argmax[row]]
+                {
                     base.argmax[row] = token;
                 }
             }
@@ -1485,6 +1697,54 @@ pub fn final_checkpoint_head_cpu_timed(
         read_ns,
         streamed_source_bytes,
         wall_ns: u64::try_from(wall_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    })
+}
+
+pub fn final_checkpoint_logits_from_normalized_cpu(
+    weights: &FinalHeadWeights,
+    normalized_bf16: &[u16],
+    rows: usize,
+) -> Result<NormalizedHeadCpuRun, Box<dyn Error>> {
+    if rows == 0 || normalized_bf16.len() != rows * weights.spec.hidden {
+        return Err("normalized streamed head row contract mismatch".into());
+    }
+    const CHUNK_ROWS: usize = 256;
+    let mut logits_f32 = vec![0.0; rows * weights.spec.vocab];
+    let mut bytes = vec![0_u8; CHUNK_ROWS * weights.spec.hidden * 2];
+    let mut row_bf16 = vec![0_u16; weights.spec.hidden];
+    let mut read_ns = 0_u64;
+    let mut streamed_source_bytes = 0_usize;
+    for token_start in (0..weights.spec.vocab).step_by(CHUNK_ROWS) {
+        let chunk_rows = (weights.spec.vocab - token_start).min(CHUNK_ROWS);
+        let chunk_bytes = chunk_rows * weights.spec.hidden * 2;
+        let read_started = std::time::Instant::now();
+        weights.read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])?;
+        read_ns = read_ns
+            .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        streamed_source_bytes = streamed_source_bytes
+            .checked_add(chunk_bytes)
+            .ok_or("normalized head source byte count overflow")?;
+        for token_offset in 0..chunk_rows {
+            let weight_start = token_offset * weights.spec.hidden * 2;
+            for (weight, bytes) in row_bf16
+                .iter_mut()
+                .zip(bytes[weight_start..weight_start + weights.spec.hidden * 2].chunks_exact(2))
+            {
+                *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
+            }
+            let token = token_start + token_offset;
+            for row in 0..rows {
+                logits_f32[row * weights.spec.vocab + token] = canonical_final_head_row_dot(
+                    &normalized_bf16[row * weights.spec.hidden..(row + 1) * weights.spec.hidden],
+                    &row_bf16,
+                );
+            }
+        }
+    }
+    Ok(NormalizedHeadCpuRun {
+        logits_f32,
+        read_ns,
+        streamed_source_bytes,
     })
 }
 
@@ -1513,7 +1773,9 @@ pub struct V4LayerPersistentState {
     indexer: Option<V4CompressorState>,
 }
 
+#[derive(Clone)]
 pub struct V4SerialPersistentState {
+    spec: &'static V4Spec,
     max_context: usize,
     plan: LayerStationaryRequestPlan,
     token_scratch: LayerStationaryTokenScratch,
@@ -1522,7 +1784,15 @@ pub struct V4SerialPersistentState {
 
 impl V4LayerPersistentState {
     fn new(layer: usize, plan: LayerStationaryRequestPlan) -> Result<Self, Box<dyn Error>> {
-        let compression_ratio = compression_ratio_for_layer(layer)?;
+        Self::new_for(&PRO, layer, plan)
+    }
+
+    fn new_for(
+        spec: &'static V4Spec,
+        layer: usize,
+        plan: LayerStationaryRequestPlan,
+    ) -> Result<Self, Box<dyn Error>> {
+        let compression_ratio = compression_ratio_for_spec_layer(spec, layer)?;
         let ratio = compression_ratio.get();
         let compressed_capacity_rows = plan.compressed_rows(compression_ratio);
         Ok(Self {
@@ -1542,6 +1812,17 @@ impl V4LayerPersistentState {
         })
     }
 
+    pub fn new_flash_dspark(stage: usize, context_rows: usize) -> Result<Self, Box<dyn Error>> {
+        if stage >= DSPARK_STAGES {
+            return Err(format!("DSpark stage {stage} is outside 0..{DSPARK_STAGES}").into());
+        }
+        Self::new_for(
+            &crate::v4_spec::FLASH_0731,
+            crate::v4_spec::FLASH_0731.layers + stage,
+            LayerStationaryRequestPlan::for_context(context_rows, 1, context_rows)?,
+        )
+    }
+
     pub fn layer(&self) -> usize {
         self.layer
     }
@@ -1552,6 +1833,14 @@ impl V4LayerPersistentState {
 
     pub fn kv_bf16(&self) -> &[u16] {
         &self.kv_bf16
+    }
+
+    /// The populated physical prefix of the raw sliding KV ring.  Layer
+    /// digests use this scope because the official Flash oracle reports only
+    /// active rows, rather than the zero-filled capacity of the ring.
+    pub fn active_kv_bf16(&self) -> &[u16] {
+        let rows = self.committed_kv_rows.min(self.raw_kv_rows);
+        &self.kv_bf16[..rows * Q_HEAD_DIM]
     }
 
     pub fn compressed_kv_bf16(&self) -> &[u16] {
@@ -1581,6 +1870,35 @@ impl V4LayerPersistentState {
 
     pub fn indexer(&self) -> Option<&V4CompressorState> {
         self.indexer.as_ref()
+    }
+
+    pub fn semantic_digest(&self) -> u64 {
+        fn mix(mut hash: u64, bytes: &[u8]) -> u64 {
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        }
+        let mut hash = 0xcbf29ce484222325;
+        for value in [self.layer, self.max_context, self.committed_kv_rows] {
+            hash = mix(hash, &value.to_le_bytes());
+        }
+        for &value in &self.kv_bf16 {
+            hash = mix(hash, &value.to_le_bytes());
+        }
+        for &value in &self.compressed_kv_bf16 {
+            hash = mix(hash, &value.to_le_bytes());
+        }
+        for &value in &self.indexer_kv_bf16 {
+            hash = mix(hash, &value.to_le_bytes());
+        }
+        for compressor in std::iter::once(&self.compressor).chain(self.indexer.iter()) {
+            for &value in compressor.kv.iter().chain(&compressor.score) {
+                hash = mix(hash, &value.to_bits().to_le_bytes());
+            }
+        }
+        hash
     }
 
     pub fn append_kv_row(
@@ -1741,12 +2059,31 @@ impl V4SerialPersistentState {
         )?)
     }
 
+    pub fn new_for_spec(
+        spec: &'static V4Spec,
+        prompt_rows: usize,
+        max_new_tokens: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::with_plan_for(
+            spec,
+            LayerStationaryRequestPlan::new(prompt_rows, max_new_tokens)?,
+        )
+    }
+
     fn with_plan(plan: LayerStationaryRequestPlan) -> Result<Self, Box<dyn Error>> {
+        Self::with_plan_for(&PRO, plan)
+    }
+
+    fn with_plan_for(
+        spec: &'static V4Spec,
+        plan: LayerStationaryRequestPlan,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
+            spec,
             max_context: plan.context_rows,
             plan,
             token_scratch: LayerStationaryTokenScratch::new(),
-            layers: (0..V4_LAYER_COUNT).map(|_| None).collect(),
+            layers: (0..spec.layers).map(|_| None).collect(),
         })
     }
 
@@ -1770,6 +2107,18 @@ impl V4SerialPersistentState {
         self.layers.get(layer).and_then(Option::as_ref)
     }
 
+    pub fn semantic_digest(&self) -> u64 {
+        self.layers
+            .iter()
+            .enumerate()
+            .fold(0xcbf29ce484222325, |hash, (layer, state)| {
+                let value = state
+                    .as_ref()
+                    .map_or(layer as u64, |state| state.semantic_digest());
+                (hash ^ value).wrapping_mul(0x100000001b3)
+            })
+    }
+
     pub fn transaction(
         &mut self,
         layer: usize,
@@ -1783,7 +2132,7 @@ impl V4SerialPersistentState {
         // production must instead commit a bounded prepared delta.
         let mut scratch = match slot {
             Some(state) => state.clone(),
-            None => V4LayerPersistentState::new(layer, self.plan)?,
+            None => V4LayerPersistentState::new_for(self.spec, layer, self.plan)?,
         };
         apply(&mut scratch)?;
         self.layers[layer] = Some(scratch);
@@ -1958,6 +2307,288 @@ impl<T: Clone> K2Validated<T> {
     }
 }
 
+/// Flash-0731 DSpark always drafts five tokens.  The target validates six
+/// inputs: the pending anchor followed by those five draft tokens.
+pub const DSPARK_B5_DRAFT_TOKENS: usize = 5;
+pub const DSPARK_B5_VALIDATED_INPUTS: usize = DSPARK_B5_DRAFT_TOKENS + 1;
+
+/// The only authority for cache positions.  Scratch suffixes are intentionally
+/// absent from this ledger until the transaction commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsparkB5CacheLedger {
+    next_input_position: usize,
+}
+
+impl DsparkB5CacheLedger {
+    pub fn new(next_input_position: usize) -> Self {
+        Self {
+            next_input_position,
+        }
+    }
+
+    pub fn next_input_position(self) -> usize {
+        self.next_input_position
+    }
+
+    pub fn contains(self, position: usize) -> bool {
+        position < self.next_input_position
+    }
+
+    fn after_commit(self, committed_inputs: usize) -> Result<Self, DsparkB5ContractError> {
+        Ok(Self::new(
+            self.next_input_position
+                .checked_add(committed_inputs)
+                .ok_or(DsparkB5ContractError::PositionOverflow)?,
+        ))
+    }
+}
+
+/// The mutable state that must move together: base KV plus all three DSpark
+/// sliding-window KV caches. The generic payload keeps this transaction useful
+/// before CUDA state is wired, without pretending those kernels already exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DsparkB5PersistentState<B, M> {
+    pub base: B,
+    pub mtp_swa: [M; DSPARK_STAGES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DsparkB5GreedyDecision {
+    /// Number of draft tokens whose greedy token matches the target, 0..=5.
+    pub accepted_drafts: usize,
+    /// Inputs atomically committed into all four cache families: anchor + a.
+    pub committed_inputs: usize,
+    /// Target's next greedy token. It is deliberately pending, not committed.
+    pub pending_anchor: u32,
+}
+
+/// Observational output from the confidence head. It is retained for telemetry
+/// only and has no path into `DsparkB5GreedyDecision`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DsparkB5Observation {
+    pub confidence: [f32; DSPARK_B5_DRAFT_TOKENS],
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum DsparkB5ContractError {
+    PrefixEquivalence,
+    DirtyAuthoritativeState,
+    DirtyAuthoritativeLedger,
+    NonFiniteConfidence,
+    PositionOverflow,
+}
+
+impl std::fmt::Display for DsparkB5ContractError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for DsparkB5ContractError {}
+
+/// Six independently addressable prefix snapshots.  Prefix `a` contains the
+/// anchor and exactly `a` accepted draft tokens, so it is the only legal state
+/// to commit after a greedy acceptance length of `a`.
+pub struct DsparkB5Prepared<B, M> {
+    base: DsparkB5PersistentState<B, M>,
+    base_ledger: DsparkB5CacheLedger,
+    prefixes: [DsparkB5PersistentState<B, M>; DSPARK_B5_VALIDATED_INPUTS],
+}
+
+pub struct DsparkB5Validated<B, M> {
+    prepared: DsparkB5Prepared<B, M>,
+    decision: DsparkB5GreedyDecision,
+    observation: DsparkB5Observation,
+}
+
+impl<B: Clone, M: Clone> DsparkB5Prepared<B, M> {
+    pub fn from_prefixes(
+        base: &DsparkB5PersistentState<B, M>,
+        base_ledger: DsparkB5CacheLedger,
+        prefixes: [DsparkB5PersistentState<B, M>; DSPARK_B5_VALIDATED_INPUTS],
+    ) -> Self {
+        Self {
+            base: base.clone(),
+            base_ledger,
+            prefixes,
+        }
+    }
+
+    /// Populate scratch prefixes in causal order. `apply_input` receives the
+    /// absolute position from the cache ledger, never a locally guessed row.
+    pub fn prepare(
+        base: &DsparkB5PersistentState<B, M>,
+        base_ledger: DsparkB5CacheLedger,
+        mut apply_input: impl FnMut(
+            &mut DsparkB5PersistentState<B, M>,
+            usize,
+        ) -> Result<(), Box<dyn Error>>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let position = base_ledger.next_input_position();
+        let mut p0 = base.clone();
+        apply_input(&mut p0, position)?;
+        let mut p1 = p0.clone();
+        apply_input(
+            &mut p1,
+            position.checked_add(1).ok_or("DSpark position overflow")?,
+        )?;
+        let mut p2 = p1.clone();
+        apply_input(
+            &mut p2,
+            position.checked_add(2).ok_or("DSpark position overflow")?,
+        )?;
+        let mut p3 = p2.clone();
+        apply_input(
+            &mut p3,
+            position.checked_add(3).ok_or("DSpark position overflow")?,
+        )?;
+        let mut p4 = p3.clone();
+        apply_input(
+            &mut p4,
+            position.checked_add(4).ok_or("DSpark position overflow")?,
+        )?;
+        let mut p5 = p4.clone();
+        apply_input(
+            &mut p5,
+            position.checked_add(5).ok_or("DSpark position overflow")?,
+        )?;
+        Ok(Self {
+            base: base.clone(),
+            base_ledger,
+            prefixes: [p0, p1, p2, p3, p4, p5],
+        })
+    }
+
+    /// Greedy verifier: accept the longest matching prefix.  `target[5]` is
+    /// the all-accepted bonus anchor; it is never used as an input cache row.
+    pub fn validate_greedy(
+        self,
+        sequential: [&DsparkB5PersistentState<B, M>; DSPARK_B5_VALIDATED_INPUTS],
+        proposed: [u32; DSPARK_B5_DRAFT_TOKENS],
+        target: [u32; DSPARK_B5_VALIDATED_INPUTS],
+        observation: DsparkB5Observation,
+        exact: impl Fn(&DsparkB5PersistentState<B, M>, &DsparkB5PersistentState<B, M>) -> bool,
+    ) -> Result<DsparkB5Validated<B, M>, DsparkB5ContractError> {
+        if observation
+            .confidence
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(DsparkB5ContractError::NonFiniteConfidence);
+        }
+        if self
+            .prefixes
+            .iter()
+            .zip(sequential)
+            .any(|(scratch, serial)| !exact(scratch, serial))
+        {
+            return Err(DsparkB5ContractError::PrefixEquivalence);
+        }
+        let accepted_drafts = proposed
+            .iter()
+            .zip(target)
+            .take_while(|(draft, target)| *draft == target)
+            .count();
+        Ok(DsparkB5Validated {
+            prepared: self,
+            decision: DsparkB5GreedyDecision {
+                accepted_drafts,
+                committed_inputs: accepted_drafts + 1,
+                pending_anchor: target[accepted_drafts],
+            },
+            observation,
+        })
+    }
+
+    pub fn validate_greedy_target(
+        self,
+        proposed: [u32; DSPARK_B5_DRAFT_TOKENS],
+        target: [u32; DSPARK_B5_VALIDATED_INPUTS],
+        observation: DsparkB5Observation,
+    ) -> Result<DsparkB5Validated<B, M>, DsparkB5ContractError> {
+        self.validate_greedy_target_bounded(
+            proposed,
+            target,
+            observation,
+            DSPARK_B5_VALIDATED_INPUTS,
+        )
+    }
+
+    pub fn validate_greedy_target_bounded(
+        self,
+        proposed: [u32; DSPARK_B5_DRAFT_TOKENS],
+        target: [u32; DSPARK_B5_VALIDATED_INPUTS],
+        observation: DsparkB5Observation,
+        max_committed_inputs: usize,
+    ) -> Result<DsparkB5Validated<B, M>, DsparkB5ContractError> {
+        if observation
+            .confidence
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(DsparkB5ContractError::NonFiniteConfidence);
+        }
+        if !(1..=DSPARK_B5_VALIDATED_INPUTS).contains(&max_committed_inputs) {
+            return Err(DsparkB5ContractError::PositionOverflow);
+        }
+        let accepted_drafts = proposed
+            .iter()
+            .zip(target)
+            .take_while(|(draft, target)| *draft == target)
+            .count()
+            .min(max_committed_inputs - 1);
+        Ok(DsparkB5Validated {
+            prepared: self,
+            decision: DsparkB5GreedyDecision {
+                accepted_drafts,
+                committed_inputs: accepted_drafts + 1,
+                pending_anchor: target[accepted_drafts],
+            },
+            observation,
+        })
+    }
+
+    /// Scratch-only rollback: no authoritative state or cache ledger has been
+    /// touched, and all rejected suffixes become unreachable on drop.
+    pub fn rollback(self) -> DsparkB5PersistentState<B, M> {
+        self.base
+    }
+}
+
+impl<B: Clone, M: Clone> DsparkB5Validated<B, M> {
+    pub fn decision(&self) -> DsparkB5GreedyDecision {
+        self.decision
+    }
+
+    pub fn observation(&self) -> DsparkB5Observation {
+        self.observation
+    }
+
+    /// Atomically publish exactly the anchor plus accepted prefix to base and
+    /// all three MTP SWA states. The bonus/resample token remains pending.
+    pub fn commit_prefix(
+        &self,
+        authoritative: &mut DsparkB5PersistentState<B, M>,
+        ledger: &mut DsparkB5CacheLedger,
+        exact: impl Fn(&DsparkB5PersistentState<B, M>, &DsparkB5PersistentState<B, M>) -> bool,
+    ) -> Result<(), DsparkB5ContractError> {
+        if !exact(authoritative, &self.prepared.base) {
+            return Err(DsparkB5ContractError::DirtyAuthoritativeState);
+        }
+        if *ledger != self.prepared.base_ledger {
+            return Err(DsparkB5ContractError::DirtyAuthoritativeLedger);
+        }
+        let next_ledger = ledger.after_commit(self.decision.committed_inputs)?;
+        authoritative.clone_from(&self.prepared.prefixes[self.decision.accepted_drafts]);
+        *ledger = next_ledger;
+        Ok(())
+    }
+
+    pub fn rollback(self) -> DsparkB5PersistentState<B, M> {
+        self.prepared.base
+    }
+}
+
 pub const K2_MIN_GATE_SAMPLES: u64 = 100;
 
 #[derive(Clone, Copy, Debug)]
@@ -2042,47 +2673,45 @@ pub struct FixtureStages {
 }
 
 pub fn load(model_dir: &Path, ids: &[i64]) -> Result<L0State, Box<dyn Error>> {
-    validate_ids(ids)?;
-    validate_model_dir(model_dir)?;
-    let embed = ShardFile::open(model_dir.join("model-00001-of-00064.safetensors"))?;
-    let l0 = ShardFile::open(model_dir.join("model-00002-of-00064.safetensors"))?;
-    for contract in C {
-        let file = if contract.shard.starts_with("model-00001") {
-            &embed
-        } else {
-            &l0
-        };
-        let tensor = file.tensor(contract.name)?;
-        if tensor.dtype != contract.dtype
-            || tensor.shape != contract.shape
-            || tensor.byte_len != contract.bytes
-        {
-            return Err(format!("{} pinned contract mismatch", contract.name).into());
-        }
-    }
+    load_for(&PRO, model_dir, ids)
+}
+
+pub fn load_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+    ids: &[i64],
+) -> Result<L0State, Box<dyn Error>> {
+    validate_ids_for(spec, ids)?;
+    validate_model_dir_for(spec, model_dir)?;
+    let embed_name = spec.shard_name(1)?;
+    let l0_name = spec.shard_name(2)?;
+    let embed = ShardFile::open(model_dir.join(embed_name))?;
+    let l0 = ShardFile::open(model_dir.join(l0_name))?;
     checked(
         &embed,
         "embed.weight",
         TensorDtype::Bf16,
-        &[129_280, HIDDEN],
+        &[spec.vocab, spec.hidden],
     )?;
-    let mut embedding = vec![0_u16; ids.len() * HIDDEN];
+    let mut embedding = vec![0_u16; ids.len() * spec.hidden];
     for (row, &id) in ids.iter().enumerate() {
         let offset = usize::try_from(id)?
-            .checked_mul(HIDDEN * 2)
+            .checked_mul(spec.hidden * 2)
             .ok_or("embedding offset overflow")?;
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(
-                embedding[row * HIDDEN..][..HIDDEN].as_mut_ptr().cast(),
-                HIDDEN * 2,
+                embedding[row * spec.hidden..][..spec.hidden]
+                    .as_mut_ptr()
+                    .cast(),
+                spec.hidden * 2,
             )
         };
         embed.read_at("embed.weight", u64::try_from(offset)?, bytes)?;
     }
-    let hc_fn = read_f32(&l0, "layers.0.hc_attn_fn", &[MIX, HC * HIDDEN])?;
+    let hc_fn = read_f32(&l0, "layers.0.hc_attn_fn", &[MIX, HC * spec.hidden])?;
     let hc_base = read_f32(&l0, "layers.0.hc_attn_base", &[MIX])?;
     let hc_scale = read_f32(&l0, "layers.0.hc_attn_scale", &[3])?;
-    let attn_norm = read_bf16(&l0, "layers.0.attn_norm.weight", &[HIDDEN])?;
+    let attn_norm = read_bf16(&l0, "layers.0.attn_norm.weight", &[spec.hidden])?;
     let range_bytes = std::mem::size_of_val(embedding.as_slice())
         .checked_add(std::mem::size_of_val(hc_fn.as_slice()))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of_val(hc_base.as_slice())))
@@ -2100,7 +2729,11 @@ pub fn load(model_dir: &Path, ids: &[i64]) -> Result<L0State, Box<dyn Error>> {
 }
 
 pub fn validate_ids(ids: &[i64]) -> Result<(), Box<dyn Error>> {
-    let vocab = i64::try_from(VOCAB)?;
+    validate_ids_for(&PRO, ids)
+}
+
+pub fn validate_ids_for(spec: &V4Spec, ids: &[i64]) -> Result<(), Box<dyn Error>> {
+    let vocab = i64::try_from(spec.vocab)?;
     if ids.is_empty() || ids.iter().any(|id| !(0..vocab).contains(id)) {
         Err("V4 state requires nonempty in-range token ids".into())
     } else {
@@ -2113,13 +2746,22 @@ pub fn load_layer_state_weights(
     layer: usize,
     ids: &[i64],
 ) -> Result<LayerStateWeights, Box<dyn Error>> {
+    load_layer_state_weights_for(&PRO, model_dir, layer, ids)
+}
+
+pub fn load_layer_state_weights_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+    layer: usize,
+    ids: &[i64],
+) -> Result<LayerStateWeights, Box<dyn Error>> {
     if !ids.is_empty() {
-        validate_ids(ids)?;
+        validate_ids_for(spec, ids)?;
     }
-    let compression_ratio = compression_ratio_for_layer(layer)?;
-    let contracts = layer_tensor_manifest(layer, 0)?;
-    let index = indexed_model(model_dir)?;
-    let expected_shard = format!("model-{:05}-of-00064.safetensors", layer + 2);
+    let compression_ratio = compression_ratio_for_spec_layer(spec, layer)?;
+    let contracts = base_layer_tensor_manifest(spec, layer, 0)?;
+    let index = base_indexed_model(spec, model_dir)?;
+    let expected_shard = spec.shard_name(layer + 2)?;
     validate_layer_locations(&index, &contracts, &expected_shard)?;
     let shard = ShardFile::open(model_dir.join(&expected_shard))?;
     for contract in &contracts {
@@ -2134,37 +2776,47 @@ pub fn load_layer_state_weights(
 
     let prefix = format!("layers.{layer}");
     let compressor_width = match compression_ratio {
+        CompressionRatio::WindowOnly => 0,
         CompressionRatio::Csa4 => 1_024,
         CompressionRatio::Hca128 => 512,
     };
-    let compressor = LayerCompressorWeights {
-        wkv_bf16: read_bf16(
-            &shard,
-            &format!("{prefix}.attn.compressor.wkv.weight"),
-            &[compressor_width, HIDDEN],
-        )?,
-        wgate_bf16: read_bf16(
-            &shard,
-            &format!("{prefix}.attn.compressor.wgate.weight"),
-            &[compressor_width, HIDDEN],
-        )?,
-        ape_f32: read_f32(
-            &shard,
-            &format!("{prefix}.attn.compressor.ape"),
-            &[
-                compression_ratio.get(),
-                if compression_ratio == CompressionRatio::Csa4 {
-                    1_024
-                } else {
-                    512
-                },
-            ],
-        )?,
-        norm_bf16: read_bf16(
-            &shard,
-            &format!("{prefix}.attn.compressor.norm.weight"),
-            &[Q_HEAD_DIM],
-        )?,
+    let compressor = if compression_ratio == CompressionRatio::WindowOnly {
+        LayerCompressorWeights {
+            wkv_bf16: Vec::new(),
+            wgate_bf16: Vec::new(),
+            ape_f32: Vec::new(),
+            norm_bf16: Vec::new(),
+        }
+    } else {
+        LayerCompressorWeights {
+            wkv_bf16: read_bf16(
+                &shard,
+                &format!("{prefix}.attn.compressor.wkv.weight"),
+                &[compressor_width, spec.hidden],
+            )?,
+            wgate_bf16: read_bf16(
+                &shard,
+                &format!("{prefix}.attn.compressor.wgate.weight"),
+                &[compressor_width, spec.hidden],
+            )?,
+            ape_f32: read_f32(
+                &shard,
+                &format!("{prefix}.attn.compressor.ape"),
+                &[
+                    compression_ratio.get(),
+                    if compression_ratio == CompressionRatio::Csa4 {
+                        1_024
+                    } else {
+                        512
+                    },
+                ],
+            )?,
+            norm_bf16: read_bf16(
+                &shard,
+                &format!("{prefix}.attn.compressor.norm.weight"),
+                &[Q_HEAD_DIM],
+            )?,
+        }
     };
     let indexer = if compression_ratio == CompressionRatio::Csa4 {
         Some(CsaIndexerWeights {
@@ -2172,24 +2824,24 @@ pub fn load_layer_state_weights(
                 &shard,
                 &format!("{prefix}.attn.indexer.wq_b.weight"),
                 &format!("{prefix}.attn.indexer.wq_b.scale"),
-                1_536,
+                spec.q_lora_rank,
                 8_192,
             )?,
             weights_proj_bf16: read_bf16(
                 &shard,
                 &format!("{prefix}.attn.indexer.weights_proj.weight"),
-                &[64, HIDDEN],
+                &[64, spec.hidden],
             )?,
             compressor: LayerCompressorWeights {
                 wkv_bf16: read_bf16(
                     &shard,
                     &format!("{prefix}.attn.indexer.compressor.wkv.weight"),
-                    &[256, HIDDEN],
+                    &[256, spec.hidden],
                 )?,
                 wgate_bf16: read_bf16(
                     &shard,
                     &format!("{prefix}.attn.indexer.compressor.wgate.weight"),
-                    &[256, HIDDEN],
+                    &[256, spec.hidden],
                 )?,
                 ape_f32: read_f32(
                     &shard,
@@ -2206,7 +2858,7 @@ pub fn load_layer_state_weights(
     } else {
         None
     };
-    let router = if layer < 3 {
+    let router = if layer < spec.hash_layers {
         LayerRouterWeights::Hash {
             ids: if ids.is_empty() {
                 Vec::new()
@@ -2215,7 +2867,7 @@ pub fn load_layer_state_weights(
                     &shard,
                     &format!("{prefix}.ffn.gate.tid2eid"),
                     ids,
-                    crate::v4_router::V4_TOPK,
+                    spec.experts_per_token,
                 )?
             },
         }
@@ -2224,24 +2876,33 @@ pub fn load_layer_state_weights(
             bias: read_f32(
                 &shard,
                 &format!("{prefix}.ffn.gate.bias"),
-                &[crate::v4_router::V4_ROUTED_EXPERTS],
+                &[spec.routed_experts],
             )?,
         }
     };
     Ok(LayerStateWeights {
+        spec,
         layer,
         compression_ratio,
-        hc_fn: read_f32(&shard, &format!("{prefix}.hc_attn_fn"), &[MIX, HC * HIDDEN])?,
+        hc_fn: read_f32(
+            &shard,
+            &format!("{prefix}.hc_attn_fn"),
+            &[MIX, HC * spec.hidden],
+        )?,
         hc_base: read_f32(&shard, &format!("{prefix}.hc_attn_base"), &[MIX])?,
         hc_scale: read_f32(&shard, &format!("{prefix}.hc_attn_scale"), &[3])?,
-        attn_norm: read_bf16(&shard, &format!("{prefix}.attn_norm.weight"), &[HIDDEN])?,
+        attn_norm: read_bf16(
+            &shard,
+            &format!("{prefix}.attn_norm.weight"),
+            &[spec.hidden],
+        )?,
         compressor,
         indexer,
-        ffn_norm: read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[HIDDEN])?,
+        ffn_norm: read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[spec.hidden])?,
         gate: read_bf16(
             &shard,
             &format!("{prefix}.ffn.gate.weight"),
-            &[crate::v4_router::V4_ROUTED_EXPERTS, HIDDEN],
+            &[spec.routed_experts, spec.hidden],
         )?,
         router,
     })
@@ -2251,11 +2912,16 @@ pub fn route_layer_cpu(
     weights: &LayerStateWeights,
     input: &[u16],
 ) -> Result<crate::v4_router::RouterSelection, Box<dyn Error>> {
-    let normalized = rmsnorm_bf16(input, &weights.ffn_norm)?;
-    let logits = crate::v4_router::project_gate_logits(&normalized, &weights.gate)?;
+    let normalized = rmsnorm_bf16_width(input, &weights.ffn_norm, weights.spec.hidden)?;
+    let logits =
+        crate::v4_router::project_gate_logits_for(weights.spec, &normalized, &weights.gate)?;
     Ok(match &weights.router {
-        LayerRouterWeights::Hash { ids } => crate::v4_router::select_hash(&logits, ids)?,
-        LayerRouterWeights::Learned { bias } => crate::v4_router::select_learned(&logits, bias)?,
+        LayerRouterWeights::Hash { ids } => {
+            crate::v4_router::select_hash_for(weights.spec, &logits, ids)?
+        }
+        LayerRouterWeights::Learned { bias } => {
+            crate::v4_router::select_learned_for(weights.spec, &logits, bias)?
+        }
     })
 }
 
@@ -2373,6 +3039,29 @@ fn e2m1_even(value: f32) -> bool {
         value.abs().to_bits(),
         0 | 0x3f80_0000 | 0x4000_0000 | 0x4080_0000
     )
+}
+
+fn window_rope_freqs(position: usize) -> Vec<f32> {
+    const DIM: usize = Q_ROPE_DIM;
+    const BASE: f32 = 10_000.0;
+    (0..DIM / 2)
+        .flat_map(|pair| {
+            let frequency = 1.0 / BASE.powf((pair * 2) as f32 / DIM as f32);
+            let angle = position as f32 * frequency;
+            [angle.cos(), angle.sin()]
+        })
+        .collect()
+}
+
+pub fn attention_rope_freqs(
+    spec: &V4Spec,
+    layer: usize,
+    position: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    Ok(match compression_ratio_for_spec_layer(spec, layer)? {
+        CompressionRatio::WindowOnly => window_rope_freqs(position),
+        CompressionRatio::Csa4 | CompressionRatio::Hca128 => compressed_rope_freqs(position),
+    })
 }
 
 pub fn compressed_rope_freqs(position: usize) -> Vec<f32> {
@@ -2612,6 +3301,26 @@ pub fn build_hca_sparse_topk(
     ))
 }
 
+pub fn flash_dspark_b5_topk(start_pos: usize) -> Result<SparseTopk, Box<dyn Error>> {
+    if start_pos == 0 {
+        return Err("Flash-0731 DSpark decode top-k requires start_pos > 0".into());
+    }
+    let rows = DSPARK_B5_DRAFT_TOKENS;
+    let context_keys = (start_pos + 1).min(KV_WINDOW);
+    let per_row = context_keys + rows;
+    let one_row = (0..context_keys)
+        .chain(KV_WINDOW..KV_WINDOW + rows)
+        .map(i32::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SparseTopk {
+        indices: (0..rows).flat_map(|_| one_row.iter().copied()).collect(),
+        rows,
+        per_row,
+        window_per_row: per_row,
+        compressed_per_row: 0,
+    })
+}
+
 pub fn build_csa_sparse_topk(
     scores: &[f32],
     rows: usize,
@@ -2642,31 +3351,40 @@ pub fn load_layer_fp8_projections(
     model_dir: &Path,
     layer: usize,
 ) -> Result<L0Fp8Projections, Box<dyn Error>> {
-    validate_model_dir(model_dir)?;
-    compression_ratio_for_layer(layer)?;
-    let shard =
-        ShardFile::open(model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)))?;
+    load_layer_fp8_projections_for(&PRO, model_dir, layer)
+}
+
+pub fn load_layer_fp8_projections_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+    layer: usize,
+) -> Result<L0Fp8Projections, Box<dyn Error>> {
+    validate_model_dir_for(spec, model_dir)?;
+    compression_ratio_for_spec_layer(spec, layer)?;
+    let shard = ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?;
     let prefix = format!("layers.{layer}.attn");
     let wq_a = read_projection(
         &shard,
         &format!("{prefix}.wq_a.weight"),
         &format!("{prefix}.wq_a.scale"),
         &format!("{prefix}.q_norm.weight"),
-        1_536,
+        spec.hidden,
+        spec.q_lora_rank,
     )?;
     let wq_b = read_matrix(
         &shard,
         &format!("{prefix}.wq_b.weight"),
         &format!("{prefix}.wq_b.scale"),
-        1_536,
-        65_536,
+        spec.q_lora_rank,
+        spec.q_heads * spec.q_head_dim,
     )?;
     let wkv = read_projection(
         &shard,
         &format!("{prefix}.wkv.weight"),
         &format!("{prefix}.wkv.scale"),
         &format!("{prefix}.kv_norm.weight"),
-        512,
+        spec.hidden,
+        spec.q_head_dim,
     )?;
     let range_bytes = wq_a.matrix.weight.len()
         + wq_a.matrix.scale.len()
@@ -2704,19 +3422,236 @@ fn load_layer_tail_inner(
     layer: usize,
     retain_raw_wo_a: bool,
 ) -> Result<L0TailWeights, Box<dyn Error>> {
+    load_layer_tail_inner_for(&PRO, model_dir, layer, retain_raw_wo_a)
+}
+
+pub fn load_layer_tail_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+    layer: usize,
+    retain_raw_wo_a: bool,
+) -> Result<L0TailWeights, Box<dyn Error>> {
+    load_layer_tail_inner_for(spec, model_dir, layer, retain_raw_wo_a)
+}
+
+pub fn load_flash_dspark_stage(
+    model_dir: &Path,
+    stage: usize,
+) -> Result<DsparkStageWeights, Box<dyn Error>> {
+    let spec = &crate::v4_spec::FLASH_0731;
+    validate_model_dir_for(spec, model_dir)?;
+    let contract = flash_0731_dspark_stage_contract(stage)?;
+    let index = base_indexed_model(spec, model_dir)?;
+    for tensor in &contract.tensors {
+        let location = index.resolve_tensor(&tensor.name)?;
+        if location.shard != contract.shard {
+            return Err(format!("{} is not in {}", tensor.name, contract.shard).into());
+        }
+    }
+    let shard = ShardFile::open(model_dir.join(&contract.shard))?;
+    let prefix = format!("mtp.{stage}");
+    let empty_compressor = LayerCompressorWeights {
+        wkv_bf16: Vec::new(),
+        wgate_bf16: Vec::new(),
+        ape_f32: Vec::new(),
+        norm_bf16: Vec::new(),
+    };
+    let state = LayerStateWeights {
+        spec,
+        layer: spec.layers + stage,
+        compression_ratio: CompressionRatio::WindowOnly,
+        hc_fn: read_f32(
+            &shard,
+            &format!("{prefix}.hc_attn_fn"),
+            &[MIX, HC * spec.hidden],
+        )?,
+        hc_base: read_f32(&shard, &format!("{prefix}.hc_attn_base"), &[MIX])?,
+        hc_scale: read_f32(&shard, &format!("{prefix}.hc_attn_scale"), &[3])?,
+        attn_norm: read_bf16(
+            &shard,
+            &format!("{prefix}.attn_norm.weight"),
+            &[spec.hidden],
+        )?,
+        compressor: empty_compressor,
+        indexer: None,
+        ffn_norm: read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[spec.hidden])?,
+        gate: read_bf16(
+            &shard,
+            &format!("{prefix}.ffn.gate.weight"),
+            &[spec.routed_experts, spec.hidden],
+        )?,
+        router: LayerRouterWeights::Learned {
+            bias: read_f32(
+                &shard,
+                &format!("{prefix}.ffn.gate.bias"),
+                &[spec.routed_experts],
+            )?,
+        },
+    };
+    let attn = format!("{prefix}.attn");
+    let projections = L0Fp8Projections {
+        wq_a: read_projection(
+            &shard,
+            &format!("{attn}.wq_a.weight"),
+            &format!("{attn}.wq_a.scale"),
+            &format!("{attn}.q_norm.weight"),
+            spec.hidden,
+            spec.q_lora_rank,
+        )?,
+        wq_b: read_matrix(
+            &shard,
+            &format!("{attn}.wq_b.weight"),
+            &format!("{attn}.wq_b.scale"),
+            spec.q_lora_rank,
+            spec.q_heads * spec.q_head_dim,
+        )?,
+        wkv: read_projection(
+            &shard,
+            &format!("{attn}.wkv.weight"),
+            &format!("{attn}.wkv.scale"),
+            &format!("{attn}.kv_norm.weight"),
+            spec.hidden,
+            spec.q_head_dim,
+        )?,
+        range_bytes: 0,
+    };
+    let wo_a = read_matrix(
+        &shard,
+        &format!("{attn}.wo_a.weight"),
+        &format!("{attn}.wo_a.scale"),
+        spec.q_heads * spec.q_head_dim / spec.o_groups,
+        spec.q_heads * spec.o_lora_rank / spec.o_groups,
+    )?;
+    let wo_a_bf16 = wo_a
+        .weight
+        .iter()
+        .map(|&value| f32_to_bf16_rne(E4M3Fn(value).decode()))
+        .collect::<Vec<_>>();
+    let shared = L0SharedExpert {
+        w1: read_matrix(
+            &shard,
+            &format!("{prefix}.ffn.shared_experts.w1.weight"),
+            &format!("{prefix}.ffn.shared_experts.w1.scale"),
+            spec.hidden,
+            spec.moe_intermediate,
+        )?,
+        w2: read_matrix(
+            &shard,
+            &format!("{prefix}.ffn.shared_experts.w2.weight"),
+            &format!("{prefix}.ffn.shared_experts.w2.scale"),
+            spec.moe_intermediate,
+            spec.hidden,
+        )?,
+        w3: read_matrix(
+            &shard,
+            &format!("{prefix}.ffn.shared_experts.w3.weight"),
+            &format!("{prefix}.ffn.shared_experts.w3.scale"),
+            spec.hidden,
+            spec.moe_intermediate,
+        )?,
+    };
+    let tail = L0TailWeights {
+        attn_sink: read_f32(&shard, &format!("{attn}.attn_sink"), &[spec.q_heads])?,
+        wo_a_bf16,
+        wo_a_raw: None,
+        wo_b: read_matrix(
+            &shard,
+            &format!("{attn}.wo_b.weight"),
+            &format!("{attn}.wo_b.scale"),
+            spec.o_groups * spec.o_lora_rank,
+            spec.hidden,
+        )?,
+        hc_ffn_fn: read_f32(
+            &shard,
+            &format!("{prefix}.hc_ffn_fn"),
+            &[MIX, HC * spec.hidden],
+        )?,
+        hc_ffn_base: read_f32(&shard, &format!("{prefix}.hc_ffn_base"), &[MIX])?,
+        hc_ffn_scale: read_f32(&shard, &format!("{prefix}.hc_ffn_scale"), &[3])?,
+        ffn_norm: read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[spec.hidden])?,
+        gate: read_bf16(
+            &shard,
+            &format!("{prefix}.ffn.gate.weight"),
+            &[spec.routed_experts, spec.hidden],
+        )?,
+        shared,
+        source_range_bytes: 0,
+        load_elapsed_ms: 0.0,
+        wo_a_decode_ms: 0.0,
+    };
+    let (main_proj, main_norm) = if stage == 0 {
+        (
+            Some(read_matrix(
+                &shard,
+                "mtp.0.main_proj.weight",
+                "mtp.0.main_proj.scale",
+                3 * spec.hidden,
+                spec.hidden,
+            )?),
+            Some(read_bf16(&shard, "mtp.0.main_norm.weight", &[spec.hidden])?),
+        )
+    } else {
+        (None, None)
+    };
+    let head = (stage + 1 == DSPARK_STAGES)
+        .then(|| {
+            Ok::<_, Box<dyn Error>>(DsparkHeadWeights {
+                norm: read_bf16(&shard, &format!("{prefix}.norm.weight"), &[spec.hidden])?,
+                hc_head_fn: read_f32(
+                    &shard,
+                    &format!("{prefix}.hc_head_fn"),
+                    &[HC, HC * spec.hidden],
+                )?,
+                hc_head_base: read_f32(&shard, &format!("{prefix}.hc_head_base"), &[HC])?,
+                hc_head_scale: read_f32(&shard, &format!("{prefix}.hc_head_scale"), &[1])?,
+                markov_w1: read_bf16(
+                    &shard,
+                    &format!("{prefix}.markov_head.markov_w1.weight"),
+                    &[spec.vocab, 256],
+                )?,
+                markov_w2: read_bf16(
+                    &shard,
+                    &format!("{prefix}.markov_head.markov_w2.weight"),
+                    &[spec.vocab, 256],
+                )?,
+                confidence: read_bf16(
+                    &shard,
+                    &format!("{prefix}.confidence_head.proj.weight"),
+                    &[1, spec.hidden + 256],
+                )?,
+            })
+        })
+        .transpose()?;
+    Ok(DsparkStageWeights {
+        stage,
+        shard,
+        state,
+        projections,
+        tail,
+        main_proj,
+        main_norm,
+        head,
+    })
+}
+
+fn load_layer_tail_inner_for(
+    spec: &'static V4Spec,
+    model_dir: &Path,
+    layer: usize,
+    retain_raw_wo_a: bool,
+) -> Result<L0TailWeights, Box<dyn Error>> {
     let load_started = std::time::Instant::now();
-    validate_model_dir(model_dir)?;
-    compression_ratio_for_layer(layer)?;
-    let shard =
-        ShardFile::open(model_dir.join(format!("model-{:05}-of-00064.safetensors", layer + 2)))?;
+    validate_model_dir_for(spec, model_dir)?;
+    compression_ratio_for_spec_layer(spec, layer)?;
+    let shard = ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?;
     let prefix = format!("layers.{layer}");
-    let attn_sink = read_f32(&shard, &format!("{prefix}.attn.attn_sink"), &[Q_HEADS])?;
+    let attn_sink = read_f32(&shard, &format!("{prefix}.attn.attn_sink"), &[spec.q_heads])?;
     let wo_a = read_matrix(
         &shard,
         &format!("{prefix}.attn.wo_a.weight"),
         &format!("{prefix}.attn.wo_a.scale"),
-        Q_HEADS * Q_HEAD_DIM / O_GROUPS,
-        O_GROUPS * O_LORA_RANK,
+        spec.q_heads * spec.q_head_dim / spec.o_groups,
+        spec.o_groups * spec.o_lora_rank,
     )?;
     let wo_a_weight_len = wo_a.weight.len();
     let wo_a_scale_len = wo_a.scale.len();
@@ -2740,39 +3675,43 @@ fn load_layer_tail_inner(
         &shard,
         &format!("{prefix}.attn.wo_b.weight"),
         &format!("{prefix}.attn.wo_b.scale"),
-        O_GROUPS * O_LORA_RANK,
-        HIDDEN,
+        spec.o_groups * spec.o_lora_rank,
+        spec.hidden,
     )?;
-    let hc_ffn_fn = read_f32(&shard, &format!("{prefix}.hc_ffn_fn"), &[MIX, HC * HIDDEN])?;
+    let hc_ffn_fn = read_f32(
+        &shard,
+        &format!("{prefix}.hc_ffn_fn"),
+        &[MIX, HC * spec.hidden],
+    )?;
     let hc_ffn_base = read_f32(&shard, &format!("{prefix}.hc_ffn_base"), &[MIX])?;
     let hc_ffn_scale = read_f32(&shard, &format!("{prefix}.hc_ffn_scale"), &[3])?;
-    let ffn_norm = read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[HIDDEN])?;
+    let ffn_norm = read_bf16(&shard, &format!("{prefix}.ffn_norm.weight"), &[spec.hidden])?;
     let gate = read_bf16(
         &shard,
         &format!("{prefix}.ffn.gate.weight"),
-        &[crate::v4_router::V4_ROUTED_EXPERTS, HIDDEN],
+        &[spec.routed_experts, spec.hidden],
     )?;
     let shared = L0SharedExpert {
         w1: read_matrix(
             &shard,
             &format!("{prefix}.ffn.shared_experts.w1.weight"),
             &format!("{prefix}.ffn.shared_experts.w1.scale"),
-            HIDDEN,
-            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
+            spec.hidden,
+            spec.moe_intermediate,
         )?,
         w2: read_matrix(
             &shard,
             &format!("{prefix}.ffn.shared_experts.w2.weight"),
             &format!("{prefix}.ffn.shared_experts.w2.scale"),
-            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
-            HIDDEN,
+            spec.moe_intermediate,
+            spec.hidden,
         )?,
         w3: read_matrix(
             &shard,
             &format!("{prefix}.ffn.shared_experts.w3.weight"),
             &format!("{prefix}.ffn.shared_experts.w3.scale"),
-            HIDDEN,
-            crate::v4_expert::V4_EXPERT_INTERMEDIATE,
+            spec.hidden,
+            spec.moe_intermediate,
         )?,
     };
     let source_range_bytes = attn_sink.len() * 4
@@ -2887,6 +3826,7 @@ pub fn load_mtp_draft_weights(model_dir: &Path) -> Result<MtpDraftWeights, Box<d
         "mtp.0.attn.wq_a.weight",
         "mtp.0.attn.wq_a.scale",
         "mtp.0.attn.q_norm.weight",
+        HIDDEN,
         1_536,
     )?;
     let wq_b = read_matrix(
@@ -2901,6 +3841,7 @@ pub fn load_mtp_draft_weights(model_dir: &Path) -> Result<MtpDraftWeights, Box<d
         "mtp.0.attn.wkv.weight",
         "mtp.0.attn.wkv.scale",
         "mtp.0.attn.kv_norm.weight",
+        HIDDEN,
         Q_HEAD_DIM,
     )?;
     let wo_a = read_matrix(
@@ -3001,6 +3942,7 @@ pub fn load_mtp_draft_prefix_weights(
             "mtp.0.attn.wkv.weight",
             "mtp.0.attn.wkv.scale",
             "mtp.0.attn.kv_norm.weight",
+            HIDDEN,
             Q_HEAD_DIM,
         )?,
         shard,
@@ -3481,8 +4423,18 @@ impl V4CompressorState {
     }
 
     pub fn new_decode(compress_ratio: usize, head_dim: usize) -> Result<Self, Box<dyn Error>> {
-        if !matches!(compress_ratio, 4 | 128) || head_dim == 0 {
+        if !matches!(compress_ratio, 0 | 4 | 128) || head_dim == 0 {
             return Err("V4 decode compressor geometry is invalid".into());
+        }
+        if compress_ratio == 0 {
+            return Ok(Self {
+                kv: Vec::new(),
+                score: Vec::new(),
+                compress_ratio,
+                head_dim,
+                overlap: false,
+                committed: false,
+            });
         }
         let overlap = compress_ratio == 4;
         let coefficient = 1 + usize::from(overlap);
@@ -3796,8 +4748,12 @@ pub fn preflight_kv_cache_commit(
 }
 
 pub fn validate_model_dir(model_dir: &Path) -> Result<(), Box<dyn Error>> {
+    validate_model_dir_for(&PRO, model_dir)
+}
+
+pub fn validate_model_dir_for(spec: &V4Spec, model_dir: &Path) -> Result<(), Box<dyn Error>> {
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let source = validate_model_dir_with(model_dir, &mountinfo, PINNED_SHARD_BYTES)?;
+    let source = validate_model_dir_with(spec, model_dir, &mountinfo)?;
     if !std::fs::metadata(&source)?.file_type().is_block_device() {
         return Err(format!("V4 model ext4 source {source} is not a block device").into());
     }
@@ -3805,9 +4761,9 @@ pub fn validate_model_dir(model_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn validate_model_dir_with(
+    spec: &V4Spec,
     model_dir: &Path,
     mountinfo: &str,
-    expected_shard_bytes: u64,
 ) -> Result<String, Box<dyn Error>> {
     if model_dir.starts_with("/mnt/c") || model_dir.starts_with("/mnt/d") {
         return Err("V4 model storage on DrvFS is forbidden".into());
@@ -3817,9 +4773,7 @@ fn validate_model_dir_with(
         return Err("V4 model directory must be a regular directory, not a symlink".into());
     }
     let canonical = model_dir.canonicalize()?;
-    if canonical.file_name().and_then(|name| name.to_str())
-        != Some(&format!("deepseek-v4-pro-{REVISION}"))
-    {
+    if canonical.file_name().and_then(|name| name.to_str()) != Some(&spec.model_dir_name()) {
         return Err("V4 state model directory is not the pinned revision".into());
     }
     let mut best: Option<(&str, &str, usize)> = None;
@@ -3850,9 +4804,10 @@ fn validate_model_dir_with(
 
     let root_device = canonical.metadata()?.dev();
     let mut shard_bytes = 0_u64;
-    for name in std::iter::once("model.safetensors.index.json".to_owned())
-        .chain((1..=64).map(|number| format!("model-{number:05}-of-00064.safetensors")))
-    {
+    for name in std::iter::once("model.safetensors.index.json".to_owned()).chain(
+        (1..=spec.shard_count)
+            .map(|number| spec.shard_name(number).expect("validated shard range")),
+    ) {
         let path = canonical.join(&name);
         let metadata = path
             .symlink_metadata()
@@ -3870,10 +4825,12 @@ fn validate_model_dir_with(
                 .ok_or("V4 pinned shard byte count overflow")?;
         }
     }
-    if shard_bytes != expected_shard_bytes {
-        return Err(
-            format!("V4 pinned shard bytes {shard_bytes} != {expected_shard_bytes}").into(),
-        );
+    if shard_bytes != spec.shard_bytes {
+        return Err(format!(
+            "V4 pinned shard bytes {shard_bytes} != {}",
+            spec.shard_bytes
+        )
+        .into());
     }
     Ok(source.to_owned())
 }
@@ -3883,9 +4840,10 @@ fn read_projection(
     weight_name: &str,
     scale_name: &str,
     norm_name: &str,
+    in_features: usize,
     out_features: usize,
 ) -> Result<Fp8Projection, Box<dyn Error>> {
-    let matrix = read_matrix(shard, weight_name, scale_name, HIDDEN, out_features)?;
+    let matrix = read_matrix(shard, weight_name, scale_name, in_features, out_features)?;
     Ok(Fp8Projection {
         matrix,
         norm: read_bf16(shard, norm_name, &[out_features])?,
@@ -4262,11 +5220,119 @@ fn read_i64_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v4_spec::FLASH_0731;
     const JSON: &str = include_str!("../fixtures/v4_state_pytorch_oracle.json");
     const BIN: &[u8] = include_bytes!("../fixtures/v4_state_pytorch_oracle.bin");
     const FP8_JSON: &str = include_str!("../fixtures/v4_fp8_projection_pytorch_oracle.json");
     const FP8_BIN: &[u8] = include_bytes!("../fixtures/v4_fp8_projection_pytorch_oracle.bin");
     const MINI_SERIAL_JSON: &str = include_str!("../fixtures/v4_mini_serial_oracle_v1.json");
+
+    #[test]
+    fn flash_0731_base_manifest_validates_schedule_index_and_header() {
+        let manifests = base_layer_manifests(&FLASH_0731, 7).unwrap();
+        assert_eq!(manifests.len(), 43);
+        assert_eq!(manifests[0].compression_ratio, 0);
+        assert_eq!(manifests[2].compression_ratio, 4);
+        assert_eq!(manifests[3].compression_ratio, 128);
+        assert_eq!(manifests[42].compression_ratio, 4);
+        assert_eq!(manifests[42].shard, "model-00044-of-00048.safetensors");
+        assert!(
+            manifests[0]
+                .tensors
+                .iter()
+                .all(|tensor| !tensor.name.contains(".compressor."))
+        );
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("colibri-flash-static-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let shard_name = FLASH_0731.shard_name(2).unwrap();
+        let contracts = base_layer_tensor_manifest(&FLASH_0731, 0, 7).unwrap();
+        let mut offset = 0_u64;
+        let mut header = serde_json::Map::new();
+        let mut weight_map = serde_json::Map::new();
+        for contract in &contracts {
+            let dtype = match contract.dtype {
+                TensorDtype::Bf16 => "BF16",
+                TensorDtype::F32 => "F32",
+                TensorDtype::I64 => "I64",
+                TensorDtype::Fp4E2M1x2 => "I8",
+                TensorDtype::F8E4M3 => "F8_E4M3",
+                TensorDtype::F8E8M0 => "F8_E8M0",
+                _ => unreachable!("Flash fixture uses only official V4 dtypes"),
+            };
+            let end = offset + contract.byte_len;
+            header.insert(
+                contract.name.clone(),
+                serde_json::json!({"dtype": dtype, "shape": contract.shape, "data_offsets": [offset, end]}),
+            );
+            weight_map.insert(contract.name.clone(), serde_json::json!(shard_name));
+            offset = end;
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(&header);
+        shard.resize(shard.len() + usize::try_from(offset).unwrap(), 0);
+        std::fs::write(root.join(&shard_name), shard).unwrap();
+        let index =
+            serde_json::json!({"metadata": {"total_size": offset}, "weight_map": weight_map});
+        let manifest = SourceManifest::new(
+            FLASH_0731.revision,
+            [(shard_name.clone(), root.join(&shard_name))],
+        );
+        let indexed =
+            IndexedSafetensors::from_index_reader(manifest, index.to_string().as_bytes()).unwrap();
+        for contract in &contracts {
+            let resolved = resolve_layer_tensor_range(&indexed, contract).unwrap();
+            assert_eq!(resolved.location.shard, shard_name);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flash_0731_dspark_contract_pins_three_stage_index() {
+        let stages = (0..DSPARK_STAGES)
+            .map(flash_0731_dspark_stage_contract)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stages[0].shard, "model-00046-of-00048.safetensors");
+        assert_eq!(stages[1].shard, "model-00047-of-00048.safetensors");
+        assert_eq!(stages[2].shard, "model-00048-of-00048.safetensors");
+        assert!(stages[0].tensors.iter().any(
+            |tensor| tensor.name == "mtp.0.main_proj.weight" && tensor.shape == [4_096, 12_288]
+        ));
+        assert!(
+            stages
+                .iter()
+                .all(|stage| stage.tensors.iter().any(|tensor| {
+                    tensor.name == format!("mtp.{}.attn.wo_a.weight", stage.stage)
+                        && tensor.shape == [8_192, 4_096]
+                }))
+        );
+        assert!(stages[2].tensors.iter().any(|tensor| {
+            tensor.name == "mtp.2.markov_head.markov_w2.weight" && tensor.shape == [129_280, 256]
+        }));
+
+        let mut weight_map = serde_json::Map::new();
+        let mut shards = Vec::new();
+        for stage in &stages {
+            shards.push((stage.shard.clone(), Path::new(".").join(&stage.shard)));
+            for tensor in &stage.tensors {
+                weight_map.insert(tensor.name.clone(), serde_json::json!(stage.shard));
+            }
+        }
+        let index = serde_json::json!({"weight_map": weight_map});
+        let indexed = IndexedSafetensors::from_index_reader(
+            SourceManifest::new(FLASH_0731.revision, shards),
+            index.to_string().as_bytes(),
+        )
+        .unwrap();
+        validate_flash_0731_dspark_index(&indexed).unwrap();
+        assert!(flash_0731_dspark_stage_contract(3).is_err());
+    }
 
     #[test]
     fn mtp1_ratio_zero_sliding_kv_plan_is_exact() {
@@ -4336,13 +5402,13 @@ mod tests {
     fn model_preflight_rejects_symlink_shard_and_drvfs_mount() {
         let root = fake_pinned_model();
         let ext4 = format!("1 0 0:1 / {} rw - ext4 /dev/sde rw", root.display());
-        validate_model_dir_with(&root, &ext4, 64).unwrap();
+        validate_model_dir_with(&PRO, &root, &ext4).unwrap();
 
         let shard = root.join("model-00064-of-00064.safetensors");
         std::fs::remove_file(&shard).unwrap();
         std::os::unix::fs::symlink(root.join("model-00063-of-00064.safetensors"), &shard).unwrap();
         assert!(
-            validate_model_dir_with(&root, &ext4, 64)
+            validate_model_dir_with(&PRO, &root, &ext4)
                 .unwrap_err()
                 .to_string()
                 .contains("non-symlink")
@@ -4352,7 +5418,7 @@ mod tests {
         std::fs::write(&shard, [64_u8]).unwrap();
         let drvfs = format!("1 0 0:1 / {} rw - 9p drvfs rw", root.display());
         assert!(
-            validate_model_dir_with(&root, &drvfs, 64)
+            validate_model_dir_with(&PRO, &root, &drvfs)
                 .unwrap_err()
                 .to_string()
                 .contains("block-backed ext4")
@@ -4568,6 +5634,7 @@ mod tests {
             norm_bf16: Vec::new(),
         };
         let hash = LayerStateWeights {
+            spec: &PRO,
             layer: 2,
             compression_ratio: CompressionRatio::Csa4,
             hc_fn: Vec::new(),
@@ -4590,6 +5657,7 @@ mod tests {
         let mut bias = vec![0.0; crate::v4_router::V4_ROUTED_EXPERTS];
         bias[1] = 100.0;
         let learned = LayerStateWeights {
+            spec: &PRO,
             layer: 3,
             compression_ratio: CompressionRatio::Hca128,
             hc_fn: Vec::new(),
@@ -4869,6 +5937,46 @@ mod tests {
     }
 
     #[test]
+    fn attention_rope_schedule_matches_window_and_compressed_formulas() {
+        let window_zero = attention_rope_freqs(&crate::v4_spec::FLASH_0731, 0, 0).unwrap();
+        let compressed_zero = attention_rope_freqs(&crate::v4_spec::FLASH_0731, 2, 0).unwrap();
+        assert_eq!(window_zero, compressed_zero);
+        assert!(
+            window_zero
+                .chunks_exact(2)
+                .all(|pair| pair[0].to_bits() == 1.0_f32.to_bits() && pair[1].to_bits() == 0)
+        );
+
+        let layer0 = attention_rope_freqs(&crate::v4_spec::FLASH_0731, 0, 1).unwrap();
+        let layer1 = attention_rope_freqs(&crate::v4_spec::FLASH_0731, 1, 1).unwrap();
+        let compressed = attention_rope_freqs(&crate::v4_spec::FLASH_0731, 2, 1).unwrap();
+        assert_eq!(layer0, layer1);
+        assert_eq!(compressed, compressed_rope_freqs(1));
+        assert_ne!(layer0[2].to_bits(), compressed[2].to_bits());
+        for (actual, expected) in layer0.iter().zip([
+            0.540_302_3_f32,
+            0.841_470_96,
+            0.731_761,
+            0.681_561_35,
+            0.846_009_14,
+            0.533_168_44,
+            0.912_395_83,
+            0.409_308_94,
+        ]) {
+            assert!((actual - expected).abs() <= 2e-6);
+        }
+
+        assert_eq!(
+            attention_rope_freqs(&crate::v4_spec::PRO, 0, 1).unwrap(),
+            compressed_rope_freqs(1)
+        );
+        assert_eq!(
+            attention_rope_freqs(&crate::v4_spec::PRO, crate::v4_spec::PRO.layers, 1).unwrap(),
+            layer0
+        );
+    }
+
+    #[test]
     fn csa_boundary_commits_main_and_indexer_cache_in_one_transaction() {
         let mut serial = V4SerialPersistentState::new(4).unwrap();
         for position in 0..4 {
@@ -5142,6 +6250,33 @@ mod tests {
     }
 
     #[test]
+    fn flash_0731_serial_state_supports_window_only_base_layers() {
+        let mut state = V4SerialPersistentState::new_for_spec(&FLASH_0731, 1, 1).unwrap();
+        assert_eq!(state.allocated_layers(), 0);
+        let kv_row = vec![f32_to_bf16_rne(1.0); Q_HEAD_DIM];
+        state
+            .transaction(0, |layer| {
+                assert_eq!(layer.layer(), 0);
+                assert!(layer.indexer().is_none());
+                assert!(layer.compressor().kv().is_empty());
+                layer.append_kv_row(0, &kv_row)
+            })
+            .unwrap();
+        let layer = state.layer(0).unwrap();
+        assert_eq!(layer.committed_kv_rows(), 1);
+        assert_eq!(layer.active_kv_bf16(), kv_row.as_slice());
+        assert!(layer.compressed_kv_bf16().is_empty());
+        assert_eq!(layer.attention_cache_bf16().len(), KV_WINDOW * Q_HEAD_DIM);
+        state
+            .transaction(FLASH_0731.layers - 1, |layer| {
+                assert_eq!(layer.layer(), FLASH_0731.layers - 1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(state.transaction(FLASH_0731.layers, |_| Ok(())).is_err());
+    }
+
+    #[test]
     fn transactional_serial_runner_commits_each_layer_and_reports_cpu_indexer_time() {
         let manifests = serial_layer_manifests(0).unwrap();
         let slice = &manifests[1..=2];
@@ -5153,6 +6288,7 @@ mod tests {
             |manifest, input, layer_state| {
                 layer_state.append_kv_row(0, &vec![f32_to_bf16_rne(2.0); Q_HEAD_DIM])?;
                 let width = match manifest.compression_ratio {
+                    CompressionRatio::WindowOnly => unreachable!(),
                     CompressionRatio::Hca128 => Q_HEAD_DIM,
                     CompressionRatio::Csa4 => 2 * Q_HEAD_DIM,
                 };
@@ -5210,6 +6346,7 @@ mod tests {
             run_serial_layer_slice(initial.clone(), slice, |manifest, hidden| {
                 received.push(hidden.to_vec());
                 let increment = match manifest.compression_ratio {
+                    CompressionRatio::WindowOnly => unreachable!(),
                     CompressionRatio::Hca128 => 3.0,
                     CompressionRatio::Csa4 => {
                         let scores = indexer_scores_cpu(
@@ -5399,6 +6536,161 @@ mod tests {
     fn k2_prefix_commit_is_exact_at_ratio4_pos3_and_ratio128_pos127() {
         exercise_k2_boundary(4, 3);
         exercise_k2_boundary(128, 127);
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct DsparkB5TestCache {
+        rows: std::collections::BTreeMap<usize, u32>,
+    }
+
+    fn dspark_b5_test_state() -> DsparkB5PersistentState<DsparkB5TestCache, DsparkB5TestCache> {
+        let mut base = DsparkB5TestCache {
+            rows: std::collections::BTreeMap::new(),
+        };
+        base.rows.insert(0, 7);
+        base.rows.insert(1, 9);
+        DsparkB5PersistentState {
+            base: base.clone(),
+            mtp_swa: [base.clone(), base.clone(), base],
+        }
+    }
+
+    fn advance_dspark_b5_test_state(
+        state: &mut DsparkB5PersistentState<DsparkB5TestCache, DsparkB5TestCache>,
+        position: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let marker = u32::try_from(position)?
+            .checked_mul(17)
+            .ok_or("marker overflow")?;
+        state.base.rows.insert(position, marker);
+        for (stage, cache) in state.mtp_swa.iter_mut().enumerate() {
+            cache.rows.insert(
+                position,
+                marker
+                    .checked_add(u32::try_from(stage + 1)?)
+                    .ok_or("stage marker overflow")?,
+            );
+        }
+        Ok(())
+    }
+
+    fn dspark_b5_summary(
+        state: &DsparkB5PersistentState<DsparkB5TestCache, DsparkB5TestCache>,
+    ) -> [u64; 4] {
+        fn digest(cache: &DsparkB5TestCache) -> u64 {
+            cache
+                .rows
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, (pos, value)| {
+                    let hash = hash ^ u64::try_from(*pos).unwrap();
+                    (hash ^ u64::from(*value)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+        }
+        [
+            digest(&state.base),
+            digest(&state.mtp_swa[0]),
+            digest(&state.mtp_swa[1]),
+            digest(&state.mtp_swa[2]),
+        ]
+    }
+
+    #[test]
+    fn dspark_b5_greedy_commit_matches_serial_prefix_for_all_accept_lengths() {
+        let proposals = [10, 11, 12, 13, 14];
+        for accepted in 0..=DSPARK_B5_DRAFT_TOKENS {
+            let initial = dspark_b5_test_state();
+            let ledger = DsparkB5CacheLedger::new(2);
+            let mut serial = initial.clone();
+            let mut serial_prefixes = Vec::with_capacity(DSPARK_B5_VALIDATED_INPUTS);
+            for position in ledger.next_input_position()
+                ..ledger.next_input_position() + DSPARK_B5_VALIDATED_INPUTS
+            {
+                advance_dspark_b5_test_state(&mut serial, position).unwrap();
+                serial_prefixes.push(serial.clone());
+            }
+            let sequential = [
+                &serial_prefixes[0],
+                &serial_prefixes[1],
+                &serial_prefixes[2],
+                &serial_prefixes[3],
+                &serial_prefixes[4],
+                &serial_prefixes[5],
+            ];
+            let mut target = [0; DSPARK_B5_VALIDATED_INPUTS];
+            for row in 0..accepted {
+                target[row] = proposals[row];
+            }
+            if accepted < DSPARK_B5_DRAFT_TOKENS {
+                target[accepted] = proposals[accepted] + 100;
+            } else {
+                target[DSPARK_B5_DRAFT_TOKENS] = 99;
+            }
+            let observation = DsparkB5Observation {
+                confidence: [accepted as f32; DSPARK_B5_DRAFT_TOKENS],
+            };
+            let rolled_back =
+                DsparkB5Prepared::prepare(&initial, ledger, advance_dspark_b5_test_state)
+                    .unwrap()
+                    .rollback();
+            assert_eq!(
+                dspark_b5_summary(&rolled_back),
+                dspark_b5_summary(&initial),
+                "a={accepted}: scratch rollback must leave all four cache families unchanged"
+            );
+            let validated =
+                DsparkB5Prepared::prepare(&initial, ledger, advance_dspark_b5_test_state)
+                    .unwrap()
+                    .validate_greedy(sequential, proposals, target, observation, |left, right| {
+                        left == right
+                    })
+                    .unwrap();
+            assert_eq!(validated.decision().accepted_drafts, accepted);
+            assert_eq!(validated.decision().committed_inputs, accepted + 1);
+            assert_eq!(validated.decision().pending_anchor, target[accepted]);
+            assert_eq!(validated.observation(), observation);
+
+            let mut committed = initial.clone();
+            let mut committed_ledger = ledger;
+            validated
+                .commit_prefix(&mut committed, &mut committed_ledger, |left, right| {
+                    left == right
+                })
+                .unwrap();
+            assert_eq!(
+                dspark_b5_summary(&committed),
+                dspark_b5_summary(&serial_prefixes[accepted]),
+                "a={accepted}: base and all three MTP SWA summaries must equal serial"
+            );
+            assert_eq!(committed_ledger.next_input_position(), 3 + accepted);
+            if accepted < DSPARK_B5_DRAFT_TOKENS {
+                let first_rejected = committed_ledger.next_input_position();
+                assert!(!committed_ledger.contains(first_rejected));
+                assert!(!committed.base.rows.contains_key(&first_rejected));
+                assert!(
+                    committed
+                        .mtp_swa
+                        .iter()
+                        .all(|cache| !cache.rows.contains_key(&first_rejected))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flash_dspark_b5_topk_is_five_row_noncausal_union() {
+        let topk = flash_dspark_b5_topk(7).unwrap();
+        assert_eq!((topk.rows, topk.per_row), (5, 13));
+        let expected = (0..8)
+            .chain(KV_WINDOW..KV_WINDOW + 5)
+            .map(|value| value as i32)
+            .collect::<Vec<_>>();
+        for row in topk.indices.chunks_exact(topk.per_row) {
+            assert_eq!(row, expected);
+        }
+        let full = flash_dspark_b5_topk(256).unwrap();
+        assert_eq!((full.rows, full.per_row), (5, 133));
+        assert_eq!(&full.indices[128..133], &[128, 129, 130, 131, 132]);
+        assert!(flash_dspark_b5_topk(0).is_err());
     }
 
     #[test]

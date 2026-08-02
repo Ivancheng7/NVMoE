@@ -54,6 +54,8 @@ stats*.txt
 /target/
 /colibri_engine.egg-info/
 /graphify-out/
+/rust/colibri-cuda/results/
+/rust/colibri-cuda/.source-identity.*
 
 # script di ricerca stadio-0 (esperimenti locali, non parte del motore)
 /engine.py

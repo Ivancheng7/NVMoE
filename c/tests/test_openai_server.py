@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import os
 import socket
 import tempfile
 import threading
@@ -113,12 +114,61 @@ class TemplateTest(unittest.TestCase):
 
 class ProtocolTest(unittest.TestCase):
     def test_reads_payload_and_extended_status(self):
-        stream = io.BytesIO(b"hello" + END + b"STAT 2 3.5 44 1.2 7 1\n")
+        stream = io.BytesIO(b"hello" + END + b"STAT 2 3.5 44 1.2 7 1 120.5 8.25 max_new_tokens ids=41,42\n")
         chunks = []
         stats = read_engine_turn(stream, END, chunks.append)
         self.assertEqual(b"".join(chunks), b"hello")
         self.assertEqual(stats["prompt_tokens"], 7)
         self.assertTrue(stats["length_limited"])
+        self.assertEqual(stats["ttft_ms"], 120.5)
+        self.assertEqual(stats["itl_ms"], 8.25)
+        self.assertEqual(stats["stop_reason"], "max_new_tokens")
+        self.assertEqual(stats["generated_ids"], [41, 42])
+        self.assertEqual(APIHandler.usage(stats)["colibri"]["tokens_per_second"], 3.5)
+
+    def test_flash_request_passes_official_messages_json_and_forces_greedy(self):
+        body, prompt = APIHandler.flash_request(
+            {"messages": [{"role": "user", "content": "你好"}]},
+            [{"role": "user", "content": "你好"}],
+        )
+        self.assertEqual(body["temperature"], 0)
+        self.assertEqual(body["top_p"], 1)
+        self.assertEqual(prompt, '[{"role":"user","content":"你好"}]')
+        with self.assertRaisesRegex(APIError, "temperature"):
+            APIHandler.flash_request(
+                {"temperature": 0.1}, [{"role": "user", "content": "x"}]
+            )
+
+    def test_flash_serve_child_needs_no_artifact_paths(self):
+        captured = {}
+
+        class CapturingEngine:
+            def __init__(self, executable, model, cap, max_tokens, env, kv_slots):
+                captured.update(env)
+
+            def close(self):
+                pass
+
+        capture_vars = {
+            "COLIBRI_V4_RESULT_JSONL": "/ambient/result.jsonl",
+            "COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR": "/ambient/dump",
+        }
+        for child_env in ({}, capture_vars):
+            captured.clear()
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            listener.close()
+            with patch.dict(os.environ, capture_vars, clear=True), \
+                 patch("openai_server.Engine", CapturingEngine), \
+                 patch.object(APIServer, "serve_forever", side_effect=RuntimeError("stop")):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    serve("/native/flash", engine="flash-engine", env=child_env,
+                          flash_base=True, max_tokens=64, port=port)
+            self.assertEqual(captured["COLIBRI_V4_FLASH_SERVE"], "1")
+            self.assertEqual(captured["COLIBRI_DSV4_MODEL_DIR"], "/native/flash")
+            self.assertNotIn("COLIBRI_V4_RESULT_JSONL", captured)
+            self.assertNotIn("COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR", captured)
 
     def test_rejects_invalid_kv_pool_before_engine_start(self):
         with self.assertRaisesRegex(ValueError, "kv_slots"):
@@ -403,6 +453,24 @@ class DispatcherTest(unittest.TestCase):
         engine.generate("hello", 4, 0.7, 0.9, chunks.append)
         engine.close()
         self.assertEqual(chunks, ["é"])
+        self.assertEqual(len(process.writes), 1)
+        self.assertEqual(process.writes[0].split()[0], b"SUBMIT")
+
+    def test_first_data_disarms_the_first_token_deadline(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 1\nx\n")
+            threading.Timer(0.03, lambda: process.stdout.feed(
+                b"DONE " + request_id + b" STAT 1 1 0 0 1 0\n")).start()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        output = []
+        engine.generate("hello", 4, 0, 1, output.append, timeout=0.01)
+        engine.close()
+        self.assertEqual(output, ["x"])
+        self.assertEqual([frame.split()[0] for frame in process.writes], [b"SUBMIT"])
 
     def test_records_profile_snapshots_from_prof_lines(self):
         def respond(process, frame):
@@ -445,6 +513,54 @@ class DispatcherTest(unittest.TestCase):
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
+    def test_cancels_if_deadline_expires_before_first_data(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, timeout=0.01)
+        engine.close()
+        self.assertEqual([frame.split()[0] for frame in process.writes], [b"SUBMIT", b"CANCEL"])
+
+    def test_cancelled_request_does_not_pollute_the_next_request(self):
+        first_id = None
+
+        def respond(process, frame):
+            nonlocal first_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT" and first_id is None:
+                first_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+            elif fields[0] == b"SUBMIT":
+                request_id = fields[1]
+                process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+                process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 0 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaises(ClientCancelled):
+            engine.generate("first", 8, 0, 1, lambda _: None, timeout=0.01)
+        output = []
+        stats = engine.generate("second", 8, 0, 1, output.append)
+        engine.close()
+        self.assertEqual(output, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual([frame.split()[0] for frame in process.writes],
+                         [b"SUBMIT", b"CANCEL", b"SUBMIT"])
 
 
 class HTTPTest(unittest.TestCase):

@@ -86,6 +86,9 @@ def _engine_error(fields, message):
                         f"messages resulted in at least {used} tokens. Please shorten the "
                         f"conversation, or restart the server with a larger CTX.",
                         "messages", "context_length_exceeded")
+    if fields and fields[0] == "TEMPERATURE_MUST_BE_0":
+        return APIError(400, "DeepSeek V4 Flash-0731 local serving currently requires `temperature` to be 0.",
+                        "temperature", "unsupported_value")
     return RuntimeError(message)
 
 
@@ -744,7 +747,7 @@ def read_engine_turn(stream, sentinel, on_bytes):
     fields = stream.readline().decode("utf-8", "replace").strip().split()
     if len(fields) < 5 or fields[0] != "STAT":
         raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
-    return {
+    stats = {
         "completion_tokens": int(fields[1]),
         "tokens_per_second": float(fields[2]),
         "cache_hit_percent": float(fields[3]),
@@ -752,6 +755,12 @@ def read_engine_turn(stream, sentinel, on_bytes):
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
     }
+    if len(fields) > 7: stats["ttft_ms"] = float(fields[7])
+    if len(fields) > 8: stats["itl_ms"] = float(fields[8])
+    if len(fields) > 9: stats["stop_reason"] = fields[9]
+    if len(fields) > 10 and fields[10].startswith("ids="):
+        stats["generated_ids"] = [int(value) for value in fields[10][4:].split(",") if value]
+    return stats
 
 
 class Engine:
@@ -785,7 +794,7 @@ class Engine:
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
             raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
-        return {
+        stats = {
             "completion_tokens": int(fields[1]),
             "tokens_per_second": float(fields[2]),
             "cache_hit_percent": float(fields[3]),
@@ -793,6 +802,12 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         }
+        if len(fields) > 7: stats["ttft_ms"] = float(fields[7])
+        if len(fields) > 8: stats["itl_ms"] = float(fields[8])
+        if len(fields) > 9: stats["stop_reason"] = fields[9]
+        if len(fields) > 10 and fields[10].startswith("ids="):
+            stats["generated_ids"] = [int(value) for value in fields[10][4:].split(",") if value]
+        return stats
 
     def _fail_pending(self, error):
         with self.pending_lock:
@@ -886,7 +901,7 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None):
+                 cancelled=None, grammar=None, timeout=120):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -928,25 +943,35 @@ class Engine:
             raise
 
         cancel_sent = False
+        received_data = False
+        deadline = time.monotonic() + timeout
         while True:
-            kind, value = events.get()
+            # ponytail: this bounds gateway-side cancellation detection only. The current
+            # Rust engine consumes CANCEL between generated tokens, not during cold prefill.
+            try:
+                wait = 0.25 if received_data else max(0, min(0.25, deadline - time.monotonic()))
+                kind, value = events.get(timeout=wait)
+            except queue.Empty:
+                kind = value = None
             if kind == "data":
+                received_data = True
                 if not cancel_sent:
                     decode(value)
-                    if cancelled and cancelled():
-                        cancel_sent = True
-                        with self.write_lock:
-                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
-                            self.process.stdin.flush()
             elif kind == "done":
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
                 return value
-            elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
-                raise ClientCancelled()
-            else:
+            elif kind == "error":
+                if cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
+                    raise ClientCancelled()
                 raise value
+            first_token_timed_out = not received_data and time.monotonic() >= deadline
+            if not cancel_sent and ((cancelled and cancelled()) or first_token_timed_out):
+                cancel_sent = True
+                with self.write_lock:
+                    self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                    self.process.stdin.flush()
 
     def close(self):
         with self.pending_lock:
@@ -974,7 +999,7 @@ class APIServer(ThreadingHTTPServer):
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
-                 kv_slots=1):
+                 kv_slots=1, flash_base=False):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -982,6 +1007,7 @@ class APIServer(ThreadingHTTPServer):
         self.max_tokens = max_tokens
         self.scheduler = GenerationScheduler(max_queue, queue_timeout, kv_slots)
         self.kv_slots = kv_slots
+        self.flash_base = flash_base
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
 
@@ -1407,10 +1433,20 @@ class APIHandler(BaseHTTPRequestHandler):
     def usage(stats):
         prompt = stats["prompt_tokens"]
         completion = stats["completion_tokens"]
-        return {"prompt_tokens": prompt, "completion_tokens": completion,
-                "total_tokens": prompt + completion}
+        usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+                 "total_tokens": prompt + completion}
+        metrics = {key: stats[key] for key in (
+            "generated_ids", "ttft_ms", "itl_ms", "tokens_per_second", "stop_reason"
+        ) if key in stats}
+        if metrics:
+            usage["colibri"] = metrics
+        return usage
 
     def chat_completion(self, body, request_id):
+        if self.server.flash_base:
+            body, prompt = self.flash_request(body, body.get("messages"))
+            self.generation(body, prompt, request_id, True)
+            return
         reasoning_effort = body.get("reasoning_effort")
         efforts = (None, "none", "minimal", "low", "medium", "high", "xhigh")
         if reasoning_effort not in efforts:
@@ -1431,6 +1467,33 @@ class APIHandler(BaseHTTPRequestHandler):
                              tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice)
 
+    @staticmethod
+    def flash_request(body, messages):
+        if not isinstance(messages, list) or not messages:
+            raise APIError(400, "`messages` must be a non-empty array.", "messages")
+        if body.get("dspark") not in (None, False):
+            raise APIError(400, "Per-request DSpark is deferred for the base-only 0731 service.",
+                           "dspark", "unsupported_value")
+        for key in ("tools", "functions", "response_format"):
+            if body.get(key) not in (None, [], {}):
+                raise APIError(400, f"`{key}` is not supported by the base-only 0731 service yet.",
+                               key, "unsupported_value")
+        if body.get("enable_thinking") not in (None, False):
+            raise APIError(400, "Thinking mode is not enabled by the base-only 0731 service.",
+                           "enable_thinking", "unsupported_value")
+        if body.get("reasoning_effort") not in (None, "none"):
+            raise APIError(400, "Reasoning effort is not enabled by the base-only 0731 service.",
+                           "reasoning_effort", "unsupported_value")
+        temperature = body.get("temperature")
+        if temperature is not None and (isinstance(temperature, bool) or temperature != 0):
+            raise APIError(400, "DeepSeek V4 Flash-0731 local serving currently requires `temperature` to be 0.",
+                           "temperature", "unsupported_value")
+        body = dict(body)
+        body["temperature"] = 0
+        if body.get("top_p") is None:
+            body["top_p"] = 1
+        return body, json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
@@ -1441,6 +1504,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
                                unsupported, "unsupported_value")
         messages = anthropic_to_openai(body)
+        if self.server.flash_base:
+            translated = dict(body)
+            translated["messages"] = messages
+            translated, prompt = self.flash_request(translated, messages)
+            self.anthropic_generation(translated, prompt, request_id, None)
+            return
         tools, tool_choice = anthropic_tools(body)
         thinking = body.get("thinking")
         if thinking is not None and not isinstance(thinking, dict):
@@ -1620,12 +1689,14 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
+        if self.server.flash_base:
+            body, prompt = self.flash_request(body, [{"role": "user", "content": prompt}])
         self.generation(body, prompt, request_id, False)
 
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1):
+          max_queue=8, queue_timeout=300, kv_slots=1, flash_base=False):
     if engine is None:
         engine = default_engine()
     if not 1 <= max_tokens:
@@ -1638,6 +1709,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
+    if flash_base and kv_slots != 1:
+        raise ValueError("DeepSeek V4 Flash-0731 local serving requires kv_slots=1")
+    if flash_base and max_tokens > 64:
+        raise ValueError("DeepSeek V4 Flash-0731 local serving currently supports at most 64 output tokens")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
         # a compute-heavy API to the network. Refuse unless explicitly overridden.
@@ -1652,11 +1727,17 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
-                       max_queue, queue_timeout, kv_slots)
+                       max_queue, queue_timeout, kv_slots, flash_base)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        child_env = dict(os.environ if env is None else env)
+        if flash_base:
+            child_env.pop("COLIBRI_V4_RESULT_JSONL", None)
+            child_env.pop("COLIBRI_V4_FLASH_FINAL_HEAD_DUMP_DIR", None)
+            child_env["COLIBRI_V4_FLASH_SERVE"] = "1"
+            child_env["COLIBRI_DSV4_MODEL_DIR"] = str(model)
+        runtime = Engine(engine,model,cap,max_tokens,child_env,kv_slots)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -1680,15 +1761,19 @@ def main():
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
     parser.add_argument("--cap", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))
     parser.add_argument("--kv-slots", type=int, default=int(os.environ.get("COLI_KV_SLOTS", "1")))
+    parser.add_argument("--flash-base", action="store_true",
+                        help="serve pinned DeepSeek-V4-Flash-0731 base weights (greedy, one slot)")
     args = parser.parse_args()
+    max_tokens = args.max_tokens if args.max_tokens is not None else (64 if args.flash_base else 1024)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
-          args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
-          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
+          args.cap,max_tokens,args.engine,cors_origins=args.cors_origin,
+          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
+          flash_base=args.flash_base)
 
 
 if __name__ == "__main__":
