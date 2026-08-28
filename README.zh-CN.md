@@ -66,21 +66,21 @@ DSpark结果台账与certified-base台账具有逐字节相同的SHA-256`34734f�
 
 ## 运行
 
-Flash路径面向WSL2/Linux、CUDA12.4、Ada`sm_89`，模型目录必须位于WSL原生ext4块设备。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
+Flash路径面向WSL2/Linux、CUDA13.1、Blackwell`sm_120`，模型目录必须位于WSL原生ext4块设备。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13.2.1.1
 export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
-./run-identified.sh build --arch sm_89 -- --release -p colibri-cuda
+./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
-运行经过认证的单token Flash base路径：
+在`sm_120`上运行真实的单token Flash base路径：
 
 ```bash
 env \
@@ -98,7 +98,7 @@ env \
   "$PWD/target/release/colibri-cuda"
 ```
 
-检查`flash-result.jsonl`里的`layers: 43`、final`status: PASS`、argmax`33832`及上方3个digest。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
+检查`flash-result.jsonl`里的`layers: 43`和final`status: PASS`。当前0731 ModelScope运行已在`sm_120`上完成runtime验证；上面的`33832`和digest仍是独立oracle gate，必须重新生成匹配的full-43 oracle后才能宣称通过。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
 
 ## 灵感
 

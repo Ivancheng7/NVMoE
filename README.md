@@ -66,21 +66,21 @@ The estimates use `0.0761837tok/s`, multiplied by the earlier capacity-model ban
 
 ## Run it
 
-The Flash path targets WSL2/Linux, CUDA 12.4, Ada `sm_89`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
+The Flash path targets WSL2/Linux, CUDA 13.1, Blackwell `sm_120`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.12.4.5.8
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13.2.1.1
 export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
-./run-identified.sh build --arch sm_89 -- --release -p colibri-cuda
+./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
-Run the certified one-token Flash base path:
+Run the real one-token Flash base path on `sm_120`:
 
 ```bash
 env \
@@ -98,7 +98,7 @@ env \
   "$PWD/target/release/colibri-cuda"
 ```
 
-Inspect `flash-result.jsonl` for `layers: 43`, final `status: PASS`, argmax `33832`, and the three digests above. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
+Inspect `flash-result.jsonl` for `layers: 43` and final `status: PASS`. The current 0731 ModelScope run is runtime-validated on `sm_120`; the historical `33832`/digest values above remain an independent oracle gate and must not be treated as passed until a matching full-43 oracle is regenerated. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
 
 ## Inspiration
 

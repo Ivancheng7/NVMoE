@@ -27,7 +27,7 @@ export COLIBRI_SOURCE_IDENTITY_MANIFEST="$manifest"
 
 cd -- "$rust_root"
 if (($# == 0)); then
-  set -- run --arch sm_89
+  set -- run --arch "${COLIBRI_CUDA_ARCH:-sm_120}"
 fi
 # CUDA-Oxide uses a fixed LLVM artifact name for bin and test codegen.
 if [[ ${1:-} == test ]]; then

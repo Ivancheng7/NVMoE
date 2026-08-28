@@ -3652,7 +3652,7 @@ fn write_final_head_replay_trace(
     output.commit()
 }
 
-fn flash_final_head_candidate_sm89() -> Result<String, Box<dyn Error>> {
+fn flash_final_head_candidate_sm120() -> Result<String, Box<dyn Error>> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader,nounits"])
         .output()?;
@@ -3660,9 +3660,9 @@ fn flash_final_head_candidate_sm89() -> Result<String, Box<dyn Error>> {
         return Err("Flash final-head GPU candidate requires nvidia-smi compute_cap".into());
     }
     let capability = std::str::from_utf8(&output.stdout)?.trim();
-    if capability != "8.9" {
+    if capability != "12.0" {
         return Err(
-            format!("Flash final-head GPU candidate requires SM 8.9, got {capability}").into(),
+            format!("Flash final-head GPU candidate requires SM 12.0, got {capability}").into(),
         );
     }
     Ok(capability.into())
@@ -3822,7 +3822,7 @@ fn run_flash_final_head_gpu_exact(
     if let Some(manifest) = verification_manifest {
         validate_flash_final_head_candidate_config(manifest)?;
     }
-    let sm = flash_final_head_candidate_sm89()?;
+    let sm = flash_final_head_candidate_sm120()?;
     if hidden.len() != v4_state::HC * v4_spec::FLASH_0731.hidden
         || weights.hc_fn_f32.len() != v4_state::HC * hidden.len()
         || weights.hc_base_f32.len() != v4_state::HC
@@ -4465,7 +4465,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
                     "scope":if official.is_some() { "head_only_replay_with_official_comparison" } else { "runtime_gpu_exact_without_per_input_oracle" },
                     "arm":"gpu_exact",
                     "input_hidden_fnv1a64":format!("{:016x}", fnv1a_u16(hidden)),
-                    "sm":flash_final_head_candidate_sm89()?,
+                    "sm":flash_final_head_candidate_sm120()?,
                     "binary":{"path":std::env::current_exe()?.canonicalize()?, "sha256":sha256_file(&std::env::current_exe()?)?},
                     "cublas":{"sha256":provenance.actual_sha256, "version":provenance.version, "math_mode":"CUBLAS_DEFAULT_MATH", "tf32":"off", "gate":{"m":4,"n":1,"k":16384}, "head":{"m":129280,"n":1,"k":4096}},
                     "config":verification_manifest.map(|manifest| manifest["config"].clone()).unwrap_or(serde_json::Value::Null),
@@ -22603,12 +22603,17 @@ fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             (workspace.run_runtime(&state.hidden)?, None)
                         } else {
                             let output_dir = flash_final_head_gpu_production_dir()?;
+                            // Production execution must not require an unrelated
+                            // capture directory. Set the official directory when
+                            // an independent parity comparison is available.
+                            let verification_manifest = std::env::var_os(
+                                "COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR",
+                            )
+                            .map(|_| serde_json::json!({"config": final_head_capture_config()}));
                             (
                                 run_flash_final_head_gpu_exact(
                                     &output_dir,
-                                    Some(
-                                        &serde_json::json!({"config": final_head_capture_config()}),
-                                    ),
+                                    verification_manifest.as_ref(),
                                     &state.hidden,
                                     final_weights,
                                 )?,
@@ -22841,6 +22846,17 @@ fn run_real_v4_flash_base(
         .is_none()
         .then(|| v4_state::load_final_head_for(spec, &model_dir))
         .transpose()?;
+    // Reuse one GPU final-head workspace across all greedy steps.  The
+    // production path must not recreate trace artifacts for every token;
+    // multi-token generation is a real serving path, not a one-shot probe.
+    let flash_final_head_gpu = match final_head_arm {
+        FlashFinalHeadArm::Cpu => None,
+        FlashFinalHeadArm::GpuExact => Some(FlashDsparkFinalHeadGpuWorkspace::new(
+            final_weights
+                .as_ref()
+                .ok_or("Flash GPU exact final head requires final-head weights")?,
+        )?),
+    };
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
     let wo_a_elements = spec.q_heads * spec.q_head_dim * spec.o_lora_rank;
     let mut scratch = DeviceBuffer::<u16>::zeroed(stream, wo_a_elements)?;
@@ -22852,7 +22868,7 @@ fn run_real_v4_flash_base(
         flash_cublas.as_ref(),
         &model_dir,
         final_weights.as_ref(),
-        None,
+        flash_final_head_gpu.as_ref(),
         &mut lanes,
         &mut scratch,
         prompts,

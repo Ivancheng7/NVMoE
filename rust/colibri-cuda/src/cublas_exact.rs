@@ -2,8 +2,10 @@ use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
-pub const LIBRARY_SHA256: &str = "4cc45526449a95d3985389785e985b7832460ea3db178bc9e9963be2111fbee8";
-pub const EXPECTED_VERSION: i32 = 120_405;
+// Blackwell target baseline: CUDA 13.1 ships this concrete cuBLAS build.
+// Keep the file hash pinned so exact paths cannot silently load another ABI.
+pub const LIBRARY_SHA256: &str = "f88d93a46abe3f03805c310b4d820d17398a90067080dd54acfd3a21d1415799";
+pub const EXPECTED_VERSION: i32 = 130_201;
 pub const WORKSPACE_BYTES: usize = 8_519_680;
 
 const RTLD_LOCAL: c_int = 0;
