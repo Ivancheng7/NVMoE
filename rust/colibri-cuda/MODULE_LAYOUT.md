@@ -46,14 +46,16 @@
 ## 验证门槛（本机环境）
 
 ```bash
-cd /srv/localmoe/build/localmoe-clean-cuda128/rust
+cd <源码目录>/rust          # 例如 /srv/localmoe/build/localmoe-clean-git/rust
 RUSTC_WRAPPER=$PWD/rustc-human-wrapper.sh \
 CARGO_TARGET_DIR=/srv/localmoe/targets/<新目录> \
-cargo check --locked -p colibri-cuda            # 需要跑 --tests 才算覆盖测试模块
+cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖测试模块
+# 走 run-identified.sh 时它会自己 export RUSTC_WRAPPER：
+./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
 - 直接跑 `cargo check` 会在钉住的 nightly 上触发编译器 ICE，**未改动的原始树同样如此**；
-  必须套 `rustc-human-wrapper.sh`。
+  必须套 `rustc-human-wrapper.sh`，它把 `--error-format=json` 换成 `short`，绕开那条渲染路径。
 - 编译警告数必须保持 59（bin）/ 22（test），这是搬运未改变语义的旁证。
 - `cargo fmt --check` 在 HEAD 上本来就不通过（main.rs 有两处 rustfmt 想重排的位置），
   所以门槛是「不新增格式差异」：新文件保持 fmt-clean，main.rs 的可重排位置集合不变。
