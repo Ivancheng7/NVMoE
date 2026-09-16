@@ -24,9 +24,27 @@ ORACLE = _load_oracle_helper()
 RUST_SCHEMA = "colibri-deepseek-v4-flash-0731-base-v1"
 ORDERED_SCHEMA = "colibri-v4-b2-ordered-layer-digest-v1"
 EXPECTED_LAYERS = 43
-EXPECTED_ARGMAX = 33832
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+
+# The expected token is a property of the machine the reference was captured on,
+# not of the model: the sealed sm_89 certificate answers 33832, the sm_120
+# block32 baseline answers 55222.  Naming the reference keeps both answers on
+# record instead of leaving one of them behind as an editable constant.
+PROFILES = {
+    "sm_89-certified": {
+        "argmax": 33832,
+        "official_tilelang": "0.1.8",
+        "rust_fp4_accum": None,
+        "note": "2026-08 sealed 43/43 certificate on a 12GB RTX 4080 Laptop",
+    },
+    "sm_120-block32": {
+        "argmax": 55222,
+        "official_tilelang": "0.1.14",
+        "rust_fp4_accum": "block32",
+        "note": "RTX 5060 Ti sm_120, tilelang 0.1.14 reference, block32 FP4 accumulation",
+    },
+}
 
 
 class ComparisonError(RuntimeError):
@@ -102,7 +120,13 @@ def ordered_digest(layers):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def compare(official_path, rust_path, release_binary, official_sha256, release_sha256):
+def compare(official_path, rust_path, release_binary, official_sha256, release_sha256, profile_name):
+    profile = PROFILES.get(profile_name)
+    require(
+        profile is not None,
+        f"unknown reference profile {profile_name!r}; known profiles: {', '.join(sorted(PROFILES))}",
+    )
+    argmax = profile["argmax"]
     require(HEX64.fullmatch(official_sha256 or ""), "expected official SHA256 must be 64 lowercase hex digits")
     require(HEX64.fullmatch(release_sha256 or ""), "expected release SHA256 must be 64 lowercase hex digits")
     actual_official_sha256 = file_sha256(official_path)
@@ -125,6 +149,13 @@ def compare(official_path, rust_path, release_binary, official_sha256, release_s
     require(run.get("executed_layers") == EXPECTED_LAYERS, "official: executed layer count mismatch")
     require(run.get("full43_oracle") is True and run.get("final_head") is True, "official: incomplete full43/head scope")
     require(run.get("layers") == plan, "official: execution plan mismatch")
+    if profile["official_tilelang"] is not None:
+        actual_tilelang = run.get("resources", {}).get("tilelang")
+        require(
+            actual_tilelang == profile["official_tilelang"],
+            f"official: reference profile {profile_name} expects tilelang"
+            f" {profile['official_tilelang']}, record says {actual_tilelang!r}",
+        )
     require(len(official_layers) == EXPECTED_LAYERS, "official: expected 43 layer events")
     require([layer.get("layer") for layer in official_layers] == list(range(EXPECTED_LAYERS)), "official: layer order mismatch")
     require(len(releases) == EXPECTED_LAYERS, "official: expected 43 release events")
@@ -132,8 +163,8 @@ def compare(official_path, rust_path, release_binary, official_sha256, release_s
     require(final.get("status") == "PASS", "official: final status is not PASS")
     require(final.get("executed_layers") == EXPECTED_LAYERS, "official: final layer count mismatch")
     require(final.get("full43_oracle") is True and final.get("final_head") is True, "official: final scope mismatch")
-    require(final_head.get("argmax_token_id") == EXPECTED_ARGMAX, "official: final-head argmax mismatch")
-    require(final.get("final_head_argmax_token_id") == EXPECTED_ARGMAX, "official: final argmax mismatch")
+    require(final_head.get("argmax_token_id") == argmax, "official: final-head argmax mismatch")
+    require(final.get("final_head_argmax_token_id") == argmax, "official: final argmax mismatch")
 
     rust_records = load_jsonl(rust_path)
     require(len(rust_records) == 1, f"rust: expected one result record, got {len(rust_records)}")
@@ -149,6 +180,12 @@ def compare(official_path, rust_path, release_binary, official_sha256, release_s
     require(rust.get("base_only_no_speculation") is True, "rust: speculation must be disabled")
     require(rust.get("dspark") == "disabled", "rust: dspark must be disabled")
     require(rust.get("final_head") == "canonical_cpu_streamed_bf16", "rust: final head mismatch")
+    if profile["rust_fp4_accum"] is not None:
+        require(
+            rust.get("fp4_accum") == profile["rust_fp4_accum"],
+            f"rust: reference profile {profile_name} expects fp4_accum"
+            f" {profile['rust_fp4_accum']}, record says {rust.get('fp4_accum')!r}",
+        )
 
     requests = rust.get("requests")
     require(isinstance(requests, list) and len(requests) == 1, "rust: expected one request")
@@ -196,17 +233,18 @@ def compare(official_path, rust_path, release_binary, official_sha256, release_s
     require(rust_final.get("collapsed_bf16_digest") == fnv(final_head["hc_collapsed_bf16"], "official collapsed hidden", "BF16"), "rust: collapsed hidden digest mismatch")
     require(rust_final.get("normalized_bf16_digest") == fnv(final_head["norm_hidden_bf16"], "official normalized hidden", "BF16"), "rust: normalized hidden digest mismatch")
     require(rust_final.get("logits_f32_digest") == fnv(final_head["logits_f32"], "official logits", "F32"), "rust: logits digest mismatch")
-    require(rust_final.get("argmax") == EXPECTED_ARGMAX, "rust: argmax mismatch")
-    require(request.get("generated_ids") == [EXPECTED_ARGMAX], "rust: generated IDs mismatch")
+    require(rust_final.get("argmax") == argmax, "rust: argmax mismatch")
+    require(request.get("generated_ids") == [argmax], "rust: generated IDs mismatch")
 
     return {
         "status": "PASS_EXACT",
+        "profile": profile_name,
         "model_revision": ORACLE.REVISION,
         "official_sha256": actual_official_sha256,
         "release_sha256": actual_release_sha256,
         "layers": EXPECTED_LAYERS,
         "ordered_layer_digest_sha256": expected_ordered,
-        "argmax": EXPECTED_ARGMAX,
+        "argmax": argmax,
     }
 
 
@@ -215,6 +253,12 @@ def main(argv=None):
     parser.add_argument("--official", required=True, type=Path)
     parser.add_argument("--rust-result", required=True, type=Path)
     parser.add_argument("--release-binary", required=True, type=Path)
+    parser.add_argument(
+        "--profile",
+        required=True,
+        choices=sorted(PROFILES),
+        help="named reference the two runs are expected to reproduce",
+    )
     parser.add_argument(
         "--expected-oracle-sha256",
         required=True,
@@ -225,7 +269,7 @@ def main(argv=None):
     try:
         result = compare(
             args.official, args.rust_result, args.release_binary,
-            args.expected_oracle_sha256, args.release_sha256,
+            args.expected_oracle_sha256, args.release_sha256, args.profile,
         )
     except (ComparisonError, OSError) as error:
         print(f"FAIL: {error}", file=sys.stderr)

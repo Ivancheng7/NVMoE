@@ -14,6 +14,9 @@ SPEC = importlib.util.spec_from_file_location("compare_v4_flash_0731_full43", SC
 COMPARE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(COMPARE)
 
+PROFILE = "sm_89-certified"
+ARGMAX = COMPARE.PROFILES[PROFILE]["argmax"]
+
 
 def digest(value, dtype):
     return {"dtype": dtype, "shape": [], "fnv1a64": f"{value:016x}"}
@@ -55,16 +58,17 @@ def fixture():
         "implementation": "official-python-streaming", "token_id": 0,
         "start_pos": 0, "executed_layers": 43, "full43_oracle": True,
         "final_head": True, "layers": plan,
+        "resources": {"tilelang": COMPARE.PROFILES[PROFILE]["official_tilelang"]},
     }]
     for layer in official_layers:
         official_records.extend((layer, {"event": "release", "layer": layer["layer"]}))
     official_records.extend(({
         "event": "final_head", "hc_collapsed_bf16": collapsed,
         "norm_hidden_bf16": normalized, "logits_f32": logits,
-        "argmax_token_id": COMPARE.EXPECTED_ARGMAX,
+        "argmax_token_id": ARGMAX,
     }, {
         "event": "final", "executed_layers": 43, "full43_oracle": True,
-        "final_head": True, "final_head_argmax_token_id": COMPARE.EXPECTED_ARGMAX,
+        "final_head": True, "final_head_argmax_token_id": ARGMAX,
         "final_hidden_bf16": final_hidden, "status": "PASS",
     }))
     rust = {
@@ -75,7 +79,7 @@ def fixture():
         "base_only_no_speculation": True, "dspark": "disabled",
         "final_head": "canonical_cpu_streamed_bf16",
         "requests": [{
-            "prompt_ids": [0], "generated_ids": [COMPARE.EXPECTED_ARGMAX],
+            "prompt_ids": [0], "generated_ids": [ARGMAX],
             "stop_reason": "max_new_tokens",
             "tokens": [{
                 "token_position": 0, "input_id": 0, "input_kind": "prompt",
@@ -89,7 +93,7 @@ def fixture():
                 "collapsed_bf16_digest": collapsed["fnv1a64"],
                 "normalized_bf16_digest": normalized["fnv1a64"],
                 "logits_f32_digest": logits["fnv1a64"],
-                "argmax": COMPARE.EXPECTED_ARGMAX,
+                "argmax": ARGMAX,
                 "decision": "emit_and_stop_max_new_tokens", "status": "PASS",
             }],
         }],
@@ -113,7 +117,7 @@ class Full43ComparatorTest(unittest.TestCase):
             paths = self.write_fixture(Path(directory), official, rust)
             result = COMPARE.compare(
                 *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
-                hashlib.sha256(paths[2].read_bytes()).hexdigest(),
+                hashlib.sha256(paths[2].read_bytes()).hexdigest(), PROFILE,
             )
         self.assertEqual(result["status"], "PASS_EXACT")
         self.assertEqual(result["argmax"], 33832)
@@ -127,7 +131,7 @@ class Full43ComparatorTest(unittest.TestCase):
             with self.assertRaisesRegex(COMPARE.ComparisonError, "layer 17: route_weight_bits mismatch"):
                 COMPARE.compare(
                     *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
-                    hashlib.sha256(paths[2].read_bytes()).hexdigest(),
+                    hashlib.sha256(paths[2].read_bytes()).hexdigest(), PROFILE,
                 )
 
     def test_layer_difference_precedes_generated_id_difference(self):
@@ -140,7 +144,48 @@ class Full43ComparatorTest(unittest.TestCase):
             with self.assertRaisesRegex(COMPARE.ComparisonError, "layer 4: hidden_digest mismatch"):
                 COMPARE.compare(
                     *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
-                    hashlib.sha256(paths[2].read_bytes()).hexdigest(),
+                    hashlib.sha256(paths[2].read_bytes()).hexdigest(), PROFILE,
+                )
+
+
+    def test_unknown_reference_profile_is_rejected(self):
+        official, rust = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.write_fixture(Path(directory), official, rust)
+            with self.assertRaisesRegex(COMPARE.ComparisonError, "unknown reference profile"):
+                COMPARE.compare(
+                    *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+                    hashlib.sha256(paths[2].read_bytes()).hexdigest(), "sm_120",
+                )
+
+    def test_profile_rejects_a_reference_from_another_environment(self):
+        official, rust = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.write_fixture(Path(directory), official, rust)
+            with self.assertRaisesRegex(COMPARE.ComparisonError, "expects tilelang 0.1.14"):
+                COMPARE.compare(
+                    *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+                    hashlib.sha256(paths[2].read_bytes()).hexdigest(), "sm_120-block32",
+                )
+
+    def test_profile_rejects_a_rust_run_with_a_different_fp4_arm(self):
+        official, rust = fixture()
+        official = copy.deepcopy(official)
+        sm120_argmax = COMPARE.PROFILES["sm_120-block32"]["argmax"]
+        official[0]["resources"]["tilelang"] = "0.1.14"
+        for record in official:
+            if "argmax_token_id" in record:
+                record["argmax_token_id"] = sm120_argmax
+            if "final_head_argmax_token_id" in record:
+                record["final_head_argmax_token_id"] = sm120_argmax
+        rust["requests"][0]["generated_ids"] = [sm120_argmax]
+        rust["requests"][0]["finals"][0]["argmax"] = sm120_argmax
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.write_fixture(Path(directory), official, rust)
+            with self.assertRaisesRegex(COMPARE.ComparisonError, "expects fp4_accum block32"):
+                COMPARE.compare(
+                    *paths, hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+                    hashlib.sha256(paths[2].read_bytes()).hexdigest(), "sm_120-block32",
                 )
 
 
