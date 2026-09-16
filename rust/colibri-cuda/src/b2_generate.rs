@@ -567,6 +567,13 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
                 "h2d_ns": fixed.fixed_h2d_ns,
                 "source_bytes": fixed.fixed_source_bytes,
                 "h2d_bytes": fixed.fixed_h2d_bytes,
+                "window": {
+                    "join_ns": fixed.window_join_ns,
+                    "spawn_ns": fixed.window_spawn_ns,
+                    "residual_ns": fixed.window_residual_ns,
+                    "worker_ns": fixed.window_worker_ns,
+                    "worker_ready_before_consume": fixed.window_worker_ready,
+                },
             },
             "wo_a_decode_gpu_sync": {"wall_ns": wo_a_decode_sync_ns},
             "attention": {"wall_ns": attention_wall_ns, "execution_ns": stage.attention_ns, "commit_ns": stage.commit_ns},

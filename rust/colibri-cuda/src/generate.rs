@@ -418,10 +418,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 let layer_started = std::time::Instant::now();
                 let mut loaded = if let Some(task) = prefetched_next.take() {
                     let scheduled_layer = task.layer;
+                    let join_entered_ns = timeline_elapsed_ns(request_started);
                     let prefetched = task
                         .worker
                         .join()
                         .map_err(|_| "Flash B1 fixed prefetch worker panicked")?;
+                    let window_join_ns =
+                        timeline_elapsed_ns(request_started).saturating_sub(join_entered_ns);
                     let prefetched =
                         flash_b1_prefetch_worker_result(layer, scheduled_layer, prefetched)?;
                     if prefetched.layer != layer {
@@ -429,6 +432,10 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             "Flash B1 fixed prefetch worker returned the wrong layer".into()
                         );
                     }
+                    let window_worker_ns = prefetched
+                        .worker_end_ns
+                        .saturating_sub(prefetched.worker_start_ns);
+                    let window_worker_ready = prefetched.worker_end_ns <= join_entered_ns;
                     let mut loaded = load_b2_raw_runtime_from_host_for(
                         spec,
                         model_dir,
@@ -438,6 +445,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         stream,
                     )?;
                     loaded.fixed.cache_status = "prefetched_host";
+                    loaded.fixed.window_join_ns = window_join_ns;
+                    loaded.fixed.window_worker_ns = window_worker_ns;
+                    loaded.fixed.window_worker_ready = window_worker_ready;
                     loaded
                 } else {
                     load_b2_raw_runtime_for(spec, model_dir, layer, stream)?
@@ -446,6 +456,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                     if let Some(next_layer) = flash_b1_prefetch_next_layer(layer, layer_count)? {
                         let worker_root = model_dir.to_owned();
                         let worker_started = timeline_elapsed_ns(request_started);
+                        let spawn_started_ns = timeline_elapsed_ns(request_started);
                         let worker = scope.spawn(move || {
                             let (host, telemetry) = load_layer_host_inner_for(
                                 spec,
@@ -470,10 +481,18 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             transition: None,
                             worker,
                         });
+                        loaded.fixed.window_spawn_ns = timeline_elapsed_ns(request_started)
+                            .saturating_sub(spawn_started_ns);
                     }
                 }
                 let fixed_prepare_ns =
                     u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if loaded.fixed.cache_status == "prefetched_host" {
+                    loaded.fixed.window_residual_ns = fixed_prepare_ns
+                        .saturating_sub(loaded.fixed.window_join_ns)
+                        .saturating_sub(loaded.fixed.fixed_h2d_ns)
+                        .saturating_sub(loaded.fixed.window_spawn_ns);
+                }
                 let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &token_ids)?;
                 let router_rows = active_requests
                     .iter()
