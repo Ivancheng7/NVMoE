@@ -21,6 +21,10 @@
 两个改动是**超可加**的：单独加线程 0 收益；单独开常驻省 18–21 s；两个一起省 40–43 s。
 换成每 token：交付记录是 `8.2 s/token`（`outer` 190.8 ms/层），这组是 `5.5–5.9 s/token`。
 
+**两个都已合进交付分支**（`0cb430e` + `f4f1beb` + `bb3976b`，并行读默认 6、常驻默认关），
+合并后在交付树上重验：单步四个钉死值全同、八步默认配置 `71.66 s`、
+常驻开 `48.84 s`——数字见下面"已合进交付分支"那节。
+
 抢核不是问题：六条读线程合计只占 **2.4 个核**（`0.63 CPU-秒/GB`，几乎全在内核拷贝路径），
 6 核机器上主线程和固定参数 worker 还有余量。
 
@@ -124,17 +128,44 @@ python3 check_digests.py "/srv/localmoe/targets/resident-*-8step-*.jsonl"
    再按原顺序拼回 `Vec<(u16, RoutedExpert)>`"。默认 1 线程时只有一个 chunk，行为与交付一致。
 
 没有改读取方式（仍是 buffered `pread` 到 `vec![0; N]`）、没有改数值路径、没有插桩。
-两个分支都还没合并，交付分支 `codex/business-restart` 上没有这个改动。
+
+### 已合进交付分支（2026-09-16 晚）
+
+- `0cb430e` merge `exp/fixed-host-reuse`（`29009b9`，默认 `COLIBRI_V4_FIXED_HOST_RESIDENT_GIB=0` = 关；
+  它下面两个 `probe:` 提交是纯计时字段、无行为改动，就是量出那些数字的那份二进制，所以一起合）
+- `f4f1beb` merge `exp/routed-read-threads`（`646c07d`）
+- `bb3976b` 把并行读的**默认值改成 6**（= 一个专家一条流）。常驻关时它中性
+  （八步 `91.9` vs `91.4 s`，在漂移带内），所以默认可开；`COLIBRI_V4_ROUTED_READ_THREADS=1` 回到旧形状。
+
+合并后在交付树上重验（`59` 条警告的二进制，结果文件见下）：
+
+| 检查 | 结果 |
+| --- | --- |
+| 单步 `requests[0].tokens[0].hidden_bf16_digest` | `5ed8bf88beae3cfe` = 参考 `post-merge-1step.jsonl` |
+| 单步 `argmax` / `layers` / 峰值显存 | `55222` / `43` / `1466499072`，全同 |
+| 单步 `collapsed_bf16_digest` / `normalized_bf16_digest` / `logits_f32_digest` | `7933f6f28bc01f11` / `c56dcc4ba9ef0b03` / `0488954427e4468e`，全同 |
+| 单步第 0 层 `route_ids` | `[254, 222, 245, 200, 53, 35]`，全同 |
+| 八步（默认配置：并行读 6、常驻关） | `71.66 s`，八个 digest 与记录那组逐个相同 |
+| 八步（`COLIBRI_V4_FIXED_HOST_RESIDENT_GIB=7`） | **`48.84 s`**，八个 digest 逐个相同 |
+
+八步两跑的每层平均：默认配置 `outer 192.1`（`shared 15.0` / `fixed 98.0` / `attention 31.1`），
+常驻开 `outer 121.6`（`shared 16.8` / `fixed 35.7` / `attention 22.3`），
+固定参数进盘 `53.67 GB → 6.71 GB`。结果文件：
+`/srv/localmoe/targets/postmerge-routed-threads-1step.jsonl`、
+`postmerge-routed-threads-8step.jsonl`、`postmerge-resident-on-8step.jsonl`。
+
+**交付分支现在的数字**：默认 `71.66 s`（同一天同一状态下的对照是 `91.4–94.3 s` 的常驻关单线程，
+以及记录里的 `70.06 s`——后者是热缓存状态，别直接相减）；把常驻打开是 `48.84 s`。
 
 ## 未决事项
 
-1. **合并决定**：单看任何一个改动都不划算（并行读单独 0 收益，常驻单独省 18–21 s），
-   两个一起才是 40–43 s。如果只合并行读、常驻留默认关，那等于白改。
-   建议一起合，并且**默认值要一起定**：并行读默认 6、常驻默认 0（部署时再开），
-   或者干脆两个都默认开（要吃下 RSS ~7 GB）。
-2. 常驻打开后 `attention` 窗口从 `~31` 掉到 `~20 ms/层`，原因没查。别当 GPU 变快。
+1. **常驻默认还是关的**：`48.84 s` 要显式设 `COLIBRI_V4_FIXED_HOST_RESIDENT_GIB=7` 才有。
+   要不要把默认也打开，是一个"吃 6.5 GB 内存换 32% 速度"的部署决定；没定之前别把 48.84 当交付数字。
+2. 常驻打开后 `attention` 窗口从 `~31` 掉到 `~22 ms/层`，原因没查。别当 GPU 变快。
 3. 并行读在 3 线程时略差于 1/6（`253–259` vs `248–250 ms/层`），只有 6 线程稳定最好；
    6 线程占 2.4 核，还留有余量，但没有试过 5 线程。
-4. 页缓存命中率仍然没有字段（上一份 `2026-09-16-sm120-disk-ceiling.md` 的未决事项 3）。
-   这次常驻开+并行读是冷启动 51.2 s，交付记录 70.06 s 是热状态，两个数不能直接相减。
+4. 页缓存命中率仍然没有字段（`2026-09-16-sm120-disk-ceiling.md` 的未决事项 3）。
+   这次常驻开+并行读是冷启动 `48.84 s`，记录里的 `70.06 s` 是热状态，两个数不能直接相减。
 5. 常驻那个 `923 ms` 的 H2D 异常仍未解释（`2026-09-16-sm120-fixed-host-residency.md` 里记的）。
+6. 回放的专家 id 可以换成真实轨迹了（`tokens[].layers[].route_ids`，见
+   `2026-09-16-sm120-disk-ceiling.md` 里那条更正）。
