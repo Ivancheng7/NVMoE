@@ -755,6 +755,7 @@ pub(crate) fn run_qd4_stationary_gate_arm(
                 true,
                 None,
                 None,
+            None,
             )?;
             let audit = run
                 .routed_audit

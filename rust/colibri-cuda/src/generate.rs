@@ -60,6 +60,7 @@ pub(crate) fn run_b2_serial_request(
             token_id,
             0,
             &mut persistent,
+        None,
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         let (next, digest, stage) = run?;
@@ -230,6 +231,7 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 token_ids[request],
                 0,
                 &mut state[request],
+            None,
             ) {
                 Ok((next, digest, stage)) => {
                     physical.routed_source_bytes += stage.routed_source_bytes;
@@ -429,6 +431,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let host_cache = std::sync::Arc::new(std::sync::Mutex::new(
         fixed_host_cache::FixedHostCache::from_env(spec.layers)?,
     ));
+    // Same scope argument for the routed expert slot: page-locking its staging
+    // costs 17 ms, so it lives as long as the run instead of one layer.
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -599,6 +604,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             token_id,
                             state.position,
                             &mut state.persistent,
+                            Some(&mut routed_slot_scratch),
                         )?;
                         physical.routed_source_bytes += stage.routed_source_bytes;
                         physical.routed_h2d_bytes += stage.routed_h2d_bytes;
@@ -1377,6 +1383,9 @@ pub(crate) fn run_flash_base_input(
     let mut hidden = prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?.0;
     let mut captures = Vec::with_capacity(3 * spec.hidden);
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    // One routed slot for the whole forward pass: the page-lock inside it costs
+    // 17 ms, so it belongs to the request, not to each of the 43 layers.
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     for layer in 0..spec.layers {
         let mut loaded = load_b2_raw_runtime_for(spec, model_dir, layer, stream)?;
         let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &[token_id])?;
@@ -1395,6 +1404,7 @@ pub(crate) fn run_flash_base_input(
             token_id,
             position,
             persistent,
+            Some(&mut routed_slot_scratch),
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         hidden = result?.0;

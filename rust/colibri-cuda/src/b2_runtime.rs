@@ -151,9 +151,9 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_for(
     })
 }
 
-pub(crate) fn run_b2_layer(
+pub(crate) fn run_b2_layer<'module>(
     context: &std::sync::Arc<CudaContext>,
-    module: &kernels::LoadedModule,
+    module: &'module kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
     flash_cublas: Option<&FlashCublasSession>,
     runtime: &LoadedLayerRuntime,
@@ -163,6 +163,7 @@ pub(crate) fn run_b2_layer(
     token_id: i64,
     token_position: usize,
     persistent: &mut v4_state::V4SerialPersistentState,
+    routed_slot_scratch: Option<&mut RoutedSlotScratch<'module>>,
 ) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
     let layer = runtime.weights.layer;
     let spec = runtime.weights.spec;
@@ -189,6 +190,7 @@ pub(crate) fn run_b2_layer(
             false,
             None,
             None,
+            routed_slot_scratch,
         )?;
         let main = state.compressor();
         let indexer = state.indexer();
@@ -252,6 +254,7 @@ pub(crate) fn prepare_b2_prefix(
                     false,
                     None,
                     None,
+                None,
                 )?
                 .output,
             );
@@ -346,6 +349,7 @@ pub(crate) fn prepare_two_token_prefix(
                         false,
                         None,
                         None,
+                    None,
                     )?
                     .output,
                 );

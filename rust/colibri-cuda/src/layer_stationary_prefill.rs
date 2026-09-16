@@ -746,6 +746,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             false,
                             Some((state, scratch, audit_expected_compressed_prefix)),
                             None,
+                        None,
                         );
                         let run = match run {
                             Ok(run) => run,
@@ -778,6 +779,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             false,
                             None,
                             None,
+                        None,
                         )?);
                     } else {
                         persistent
@@ -841,6 +843,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 false,
                                 None,
                                 strict_scratch.as_mut(),
+                            None,
                             )?;
                             if let Some((expected_output, expected_topk, expected_state, oracle_ns)) =
                                 expected_attention
@@ -1807,6 +1810,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                     false,
                                     Some((state, scratch, audit_expected_compressed_prefix)),
                                     None,
+                                None,
                                 )
                             };
                             let mut run = match run {
@@ -2437,6 +2441,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                         true,
                                         None,
                                         strict_scratch.as_mut(),
+                                    None,
                                     )?;
                                     oracle = Some((run, host_persistent_state_audit(host_state)));
                                     Ok(())
@@ -2479,6 +2484,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             device_attention_audit,
                             None,
                             None,
+                        None,
                         )?;
                         if phase_profile {
                             run.stage.layer_prepare_ns = layer_prepare_ns;
