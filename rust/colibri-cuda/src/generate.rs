@@ -374,7 +374,18 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let request_started = std::time::Instant::now();
     let flash_b1_profile = spec == &v4_spec::FLASH_0731 && REQUESTS == 1;
     let final_head_arm = flash_final_head_arm(spec)?;
-    let flash_b1_prefetch = flash_b1_prefetch_enabled(spec, REQUESTS)?;
+    // Opt-in device residency for the per-layer fixed tensors.  They are 156 MB
+    // per layer and never change during a request, so a request that has read
+    // them once may serve every later token from VRAM instead of the source
+    // volume.  Zero (the default) leaves the streaming path exactly as it was.
+    let resident_budget_bytes = parse_gib_budget("COLIBRI_V4_FIXED_RESIDENT_GIB")?;
+    let mut resident: Vec<Option<B2RawRuntime>> = (0..spec.layers).map(|_| None).collect();
+    let mut resident_bytes = 0usize;
+    let mut resident_hits = 0usize;
+    // A resident layer has nothing to prefetch, and the prefetch worker's host
+    // slot must be consumed on the next iteration, so the two do not mix.
+    let flash_b1_prefetch =
+        resident_budget_bytes == 0 && flash_b1_prefetch_enabled(spec, REQUESTS)?;
     let layer_count = parity_stop_after_layer
         .map(|stop| {
             stop.layer
@@ -416,7 +427,23 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
             let mut prefetched_next: Option<FixedPrefetchTask<'_>> = None;
             for layer in 0..layer_count {
                 let layer_started = std::time::Instant::now();
-                let mut loaded = if let Some(task) = prefetched_next.take() {
+                let mut from_resident = false;
+                let mut loaded = if resident_budget_bytes > 0 && resident[layer].is_some() {
+                    from_resident = true;
+                    resident_hits += 1;
+                    let mut entry = resident[layer]
+                        .take()
+                        .ok_or("resident fixed layer disappeared")?;
+                    // This layer was neither read nor copied now, and the fill
+                    // pass already charged those bytes to the ledger.
+                    entry.fixed_source_bytes = 0;
+                    entry.fixed_h2d_bytes = 0;
+                    entry.fixed = FixedLoadTelemetry {
+                        cache_status: "resident_hit",
+                        ..FixedLoadTelemetry::default()
+                    };
+                    entry
+                } else if let Some(task) = prefetched_next.take() {
                     let scheduled_layer = task.layer;
                     let prefetched = task
                         .worker
@@ -550,6 +577,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         .checked_add(layer_outer_ns)
                         .ok_or("Flash B1 layer outer timing overflow")?;
                     timing.layers.push(profile);
+                }
+                if resident_budget_bytes > 0 && !from_resident {
+                    let bytes = loaded.raw.resident_bytes;
+                    if resident_bytes.saturating_add(bytes) <= resident_budget_bytes {
+                        resident_bytes += bytes;
+                        resident[layer] = Some(loaded);
+                    }
                 }
             }
             if prefetched_next.is_some() {
@@ -740,6 +774,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
         return Err("B2 greedy generation ended without a stop reason".into());
     }
     let duration_ns = u64::try_from(request_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if resident_budget_bytes > 0 {
+        let layers_resident = resident.iter().filter(|slot| slot.is_some()).count();
+        eprintln!(
+            "fixed residency: {layers_resident} layers resident ({resident_bytes} bytes), \
+             {resident_hits} layer-visits served from VRAM"
+        );
+    }
     Ok(B2GenerateArm {
         requests: requests
             .try_into()
