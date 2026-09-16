@@ -33,4 +33,10 @@ fi
 if [[ ${1:-} == test ]]; then
   export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
 fi
+# The pinned nightly panics inside the diagnostic renderer on a span the
+# cuda-oxide backend emits, which replaces the real diagnostic with an ICE.
+# The wrapper keeps the compiler invocation identical but asks for the short
+# renderer, so errors stay visible. Absolute path because cargo resolves a
+# wrapper relative to its working directory.
+export RUSTC_WRAPPER="$rust_root/rustc-human-wrapper.sh"
 exec cargo oxide "$@"
