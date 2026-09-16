@@ -299,6 +299,21 @@ pub(crate) fn run_b2_batch_pair(
     )
 }
 
+/// Positions one layer pass executes for this request.
+///
+/// With the opt-in prompt chunk a request that is still inside its prompt hands
+/// its whole remaining prompt to a single layer pass, so one layer load serves
+/// every one of those positions. Without it — and for every generated token,
+/// which cannot start before its predecessor's argmax exists — this is 1 and
+/// the pass is exactly the pre-existing single-position one.
+fn b2_prompt_chunk_span(chunk_enabled: bool, request: &B2GenerateRequest) -> usize {
+    if chunk_enabled && request.position < request.prompt_ids.len() {
+        request.prompt_ids.len() - request.position
+    } else {
+        1
+    }
+}
+
 pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     spec: &'static v4_spec::V4Spec,
     context: &std::sync::Arc<CudaContext>,
@@ -375,6 +390,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let flash_b1_profile = spec == &v4_spec::FLASH_0731 && REQUESTS == 1;
     let final_head_arm = flash_final_head_arm(spec)?;
     let flash_b1_prefetch = flash_b1_prefetch_enabled(spec, REQUESTS)?;
+    let flash_b1_prompt_chunk = flash_b1_prompt_chunk_enabled(spec, REQUESTS)?;
     let layer_count = parity_stop_after_layer
         .map(|stop| {
             stop.layer
@@ -389,28 +405,79 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
-        let token_ids = active_requests
+        let rows = active_requests.len();
+        // Positions this pass executes per request. Without the opt-in chunk
+        // this is 1 everywhere and the loop is byte-for-byte the old one; with
+        // it, a request still inside its prompt hands its whole remaining
+        // prompt to a single layer pass, so one layer load serves every one of
+        // those positions instead of one load per position.
+        let spans = active_requests
             .iter()
-            .map(|&request| {
-                requests[request]
-                    .input_ids
-                    .get(requests[request].position)
-                    .copied()
-                    .ok_or("B2 request has no input token at its active position")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
-            let (hidden, initial_state_source_bytes) =
-                prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?;
-            requests[request]
-                .physical
-                .record_initial_state_source_bytes(initial_state_source_bytes)?;
-            physical.record_initial_state_source_bytes(initial_state_source_bytes)?;
-            requests[request].hidden = hidden;
+            .map(|&request| b2_prompt_chunk_span(flash_b1_prompt_chunk, &requests[request]))
+            .collect::<Vec<_>>();
+        let chunk = *spans
+            .first()
+            .ok_or("B2 generation pass has no active request")?;
+        if spans.iter().any(|&span| span != chunk) {
+            return Err("B2 prompt chunk spans differ across active requests".into());
         }
-        let mut layers = (0..REQUESTS)
-            .map(|_| Vec::with_capacity(spec.layers))
-            .collect::<Vec<Vec<B2LayerDigest>>>();
+        if parity_stop_after_layer.is_some() && chunk != 1 {
+            return Err("Flash parity stop requires one position per layer pass".into());
+        }
+        let token_ids = (0..rows)
+            .map(|row| {
+                let state = &requests[active_requests[row]];
+                (0..chunk)
+                    .map(|offset| {
+                        let absolute = state
+                            .position
+                            .checked_add(offset)
+                            .ok_or("B2 token position overflow")?;
+                        state
+                            .input_ids
+                            .get(absolute)
+                            .copied()
+                            .ok_or_else(|| {
+                                "B2 request has no input token at its active position".into()
+                            })
+                    })
+                    .collect::<Result<Vec<i64>, Box<dyn Error>>>()
+            })
+            .collect::<Result<Vec<Vec<i64>>, Box<dyn Error>>>()?;
+        let mut hidden_rows: Vec<Vec<Vec<u16>>> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let request = active_requests[row];
+            let mut per_offset = Vec::with_capacity(chunk);
+            for offset in 0..chunk {
+                let (hidden, initial_state_source_bytes) =
+                    prepare_b2_initial_hidden_with_source_bytes_for(
+                        spec,
+                        model_dir,
+                        token_ids[row][offset],
+                    )?;
+                requests[request]
+                    .physical
+                    .record_initial_state_source_bytes(initial_state_source_bytes)?;
+                physical.record_initial_state_source_bytes(initial_state_source_bytes)?;
+                per_offset.push(hidden);
+            }
+            hidden_rows.push(per_offset);
+        }
+        // Flat position-major input order keeps one index space for the hash
+        // router metadata rows and the digests: row = offset * rows + row.
+        let mut flat_ids = Vec::with_capacity(rows * chunk);
+        for offset in 0..chunk {
+            for row in 0..rows {
+                flat_ids.push(token_ids[row][offset]);
+            }
+        }
+        let mut digests: Vec<Vec<Vec<B2LayerDigest>>> = (0..rows)
+            .map(|_| {
+                (0..chunk)
+                    .map(|_| Vec::with_capacity(spec.layers))
+                    .collect::<Vec<Vec<B2LayerDigest>>>()
+            })
+            .collect();
         let token_started = std::time::Instant::now();
         std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
             let mut prefetched_next: Option<FixedPrefetchTask<'_>> = None;
@@ -474,19 +541,18 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 }
                 let fixed_prepare_ns =
                     u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &token_ids)?;
-                let router_rows = active_requests
-                    .iter()
-                    .enumerate()
-                    .map(|(row, _)| {
+                let metadata_rows = rows * chunk;
+                let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &flat_ids)?;
+                let router_rows = (0..metadata_rows)
+                    .map(|row| {
                         b2_router_metadata_row(
                             loaded.raw.runtime.weights.hash_router,
                             &hash_ids,
                             row,
-                            active_requests.len(),
+                            metadata_rows,
                         )
                     })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
                 physical.fixed_source_bytes += loaded.fixed_source_bytes;
                 physical.fixed_h2d_bytes += loaded.fixed_h2d_bytes;
                 for row in &router_rows {
@@ -504,36 +570,48 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
                 let mut flash_stage = None;
                 let layer_run = (|| -> Result<(), Box<dyn Error>> {
-                    for ((row, &request), &token_id) in
-                        active_requests.iter().enumerate().zip(&token_ids)
-                    {
-                        let state = &mut requests[request];
-                        let (next, digest, stage) = run_b2_layer(
-                            context,
-                            module,
-                            stream,
-                            flash_cublas,
-                            &loaded.raw.runtime,
-                            lanes,
-                            router_rows[row],
-                            &state.hidden,
-                            token_id,
-                            state.position,
-                            &mut state.persistent,
-                        )?;
-                        physical.routed_source_bytes += stage.routed_source_bytes;
-                        physical.routed_h2d_bytes += stage.routed_h2d_bytes;
-                        state.hidden = next;
-                        layers[request].push(digest);
-                        if flash_b1_profile {
-                            flash_stage = Some(stage);
+                    // Layer-outer, position-inner. Each layer commits its own
+                    // rows in strictly increasing order, so position p sees
+                    // exactly the rows the single-position loop would have
+                    // committed before it.
+                    for offset in 0..chunk {
+                        for row in 0..rows {
+                            let request = active_requests[row];
+                            let state = &mut requests[request];
+                            let absolute = state
+                                .position
+                                .checked_add(offset)
+                                .ok_or("B2 token position overflow")?;
+                            let (next, digest, stage) = run_b2_layer(
+                                context,
+                                module,
+                                stream,
+                                flash_cublas,
+                                &loaded.raw.runtime,
+                                lanes,
+                                router_rows[offset * rows + row],
+                                &hidden_rows[row][offset],
+                                token_ids[row][offset],
+                                absolute,
+                                &mut state.persistent,
+                            )?;
+                            physical.routed_source_bytes += stage.routed_source_bytes;
+                            physical.routed_h2d_bytes += stage.routed_h2d_bytes;
+                            hidden_rows[row][offset] = next;
+                            digests[row][offset].push(digest);
+                            if flash_b1_profile {
+                                match flash_stage.as_mut() {
+                                    Some(accumulated) => *accumulated += stage,
+                                    None => flash_stage = Some(stage),
+                                }
+                            }
                         }
                     }
                     Ok(())
                 })();
                 std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, &mut scratch);
                 layer_run?;
-                if let Some(stage) = flash_stage {
+                if let Some(stage) = flash_stage.as_ref() {
                     let layer_outer_ns =
                         u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                     let profile = flash_b1_layer_phase_profile_json(
@@ -542,7 +620,8 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         fixed_prepare_ns,
                         &loaded.fixed,
                         wo_a_decode_sync_ns,
-                        &stage,
+                        stage,
+                        chunk,
                     )?;
                     let timing = &mut requests[0].flash_b1_phase;
                     timing.layer_outer_ns = timing
@@ -567,173 +646,178 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                     flash_b1_request_phase_profile_json(&requests[0].flash_b1_phase, elapsed_ns)
                 })
                 .transpose()?;
-            let path = write_flash_parity_stop(stop, spec, &layers[0], phase_profile.as_ref())?;
+            let path = write_flash_parity_stop(stop, spec, &digests[0][0], phase_profile.as_ref())?;
             return Err(Box::new(FlashParityStopped { path }));
         }
         let elapsed_ns = u64::try_from(token_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        for (&request, &token_id) in active_requests.iter().zip(&token_ids) {
-            let state = &mut requests[request];
-            if layers[request].len() != spec.layers {
-                return Err(format!(
-                    "{} row-set request committed fewer than {} layers",
-                    spec.name, spec.layers
-                )
-                .into());
-            }
-            let input_kind = if state.position < state.prompt_ids.len() {
-                "prompt"
-            } else {
-                "generated"
-            };
-            let ordered_layer_digest_sha256 =
-                B2LayerDigest::ordered_chain_sha256(&layers[request])?;
-            state.tokens.push(serde_json::json!({
-                "token_position": state.position,
-                "input_id": token_id,
-                "input_kind": input_kind,
-                "e2e_ns": elapsed_ns,
-                "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&state.hidden)),
-                "ordered_layer_digest_sha256": ordered_layer_digest_sha256,
-                "layers": if capture_layer_trace { layers[request].iter().map(B2LayerDigest::json).collect::<Vec<_>>() } else { Vec::new() },
-            }));
-            if b1_needs_final_head(state.prompt_ids.len(), state.position) {
-                let final_head_started = std::time::Instant::now();
-                let final_weights =
-                    final_weights.ok_or("row-set generation needs final head weights")?;
-                let final_head_dump = final_head_dump_dir()?;
-                if let Some(directory) = final_head_dump.as_deref() {
-                    write_final_head_input(directory, &state.hidden)?;
+        for row in 0..rows {
+            let request = active_requests[row];
+            for offset in 0..chunk {
+                let state = &mut requests[request];
+                let token_id = token_ids[row][offset];
+                if digests[row][offset].len() != spec.layers {
+                    return Err(format!(
+                        "{} row-set request committed fewer than {} layers",
+                        spec.name, spec.layers
+                    )
+                    .into());
                 }
-                let mut gpu_exact_telemetry = None;
-                let cpu = match final_head_arm {
-                    FlashFinalHeadArm::Cpu => {
-                        v4_state::final_checkpoint_head_cpu_timed(final_weights, &state.hidden, 1)?
-                    }
-                    FlashFinalHeadArm::GpuExact => {
-                        let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu {
-                            (workspace.run_runtime(&state.hidden)?, None)
-                        } else {
-                            let output_dir = flash_final_head_gpu_production_dir()?;
-                            // Production execution must not require an unrelated
-                            // capture directory. Set the official directory when
-                            // an independent parity comparison is available.
-                            let verification_manifest = std::env::var_os(
-                                "COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR",
-                            )
-                            .map(|_| serde_json::json!({"config": final_head_capture_config()}));
-                            (
-                                run_flash_final_head_gpu_exact(
-                                    &output_dir,
-                                    verification_manifest.as_ref(),
-                                    &state.hidden,
-                                    final_weights,
-                                )?,
-                                Some(output_dir),
-                            )
-                        };
-                        let wall_ns = (gpu.timing["total"].as_f64().unwrap_or(f64::INFINITY)
-                            * 1_000_000.0) as u64;
-                        gpu_exact_telemetry = Some(serde_json::json!({
-                            "timing_ms":gpu.timing, "memory_bytes":gpu.memory,
-                            "artifact_dir":artifact_dir,
-                        }));
-                        v4_state::FinalHeadCpuRun {
-                            output: gpu.output,
-                            read_ns: 0,
-                            streamed_source_bytes: gpu.source_bytes,
-                            wall_ns,
-                        }
-                    }
+                let input_kind = if state.position < state.prompt_ids.len() {
+                    "prompt"
+                } else {
+                    "generated"
                 };
-                if let Some(directory) = final_head_dump.as_deref() {
-                    write_final_head_output(directory, &state.hidden, &cpu, "base_capture")?;
-                }
-                let final_head_wall_ns =
-                    u64::try_from(final_head_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                if cpu.wall_ns > final_head_wall_ns {
-                    return Err("Flash B1 final-head timing exceeds its outer scope".into());
-                }
-                if flash_b1_profile {
-                    state.flash_b1_phase.final_head_outer_ns = state
-                        .flash_b1_phase
-                        .final_head_outer_ns
-                        .checked_add(final_head_wall_ns)
-                        .ok_or("Flash B1 final-head timing overflow")?;
-                    state.flash_b1_phase.final_heads.push(serde_json::json!({
-                        "token_position": state.position,
-                        "outer": {"wall_ns": final_head_wall_ns},
-                        "top_level": {
-                            "cpu_streamed_final_head": {
-                                "wall_ns": cpu.wall_ns,
-                                "streamed_weight_read_ns": cpu.read_ns,
-                                "source_bytes": cpu.streamed_source_bytes,
-                            },
-                        },
-                        "unattributed_gap_ns": final_head_wall_ns.saturating_sub(cpu.wall_ns),
-                        "closure": {
-                            "equation": "cpu_streamed_final_head.wall_ns + unattributed_gap_ns == outer.wall_ns",
-                            "exact": true,
-                        },
-                    }));
-                }
-                state
-                    .physical
-                    .record_final_head_source_bytes(cpu.streamed_source_bytes)?;
-                physical.record_final_head_source_bytes(cpu.streamed_source_bytes)?;
-                let next_id = i64::try_from(cpu.output.argmax[0])?;
-                let decision = greedy_argmax_decision(
-                    state.prompt_ids.len(),
-                    state.position,
-                    state.generated_ids.len(),
-                    greedy_steps,
-                    next_id,
-                );
-                let decision_name = match decision {
-                    GreedyDecision::IgnorePrompt => "ignore_prompt",
-                    GreedyDecision::EmitAndContinue => "emit_and_continue",
-                    GreedyDecision::EmitAndStop(GreedyStopReason::Eos) => "emit_and_stop_eos",
-                    GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens) => {
-                        "emit_and_stop_max_new_tokens"
-                    }
-                };
-                state.finals.push(serde_json::json!({
+                let ordered_layer_digest_sha256 =
+                    B2LayerDigest::ordered_chain_sha256(&digests[row][offset])?;
+                state.hidden = std::mem::take(&mut hidden_rows[row][offset]);
+                state.tokens.push(serde_json::json!({
                     "token_position": state.position,
                     "input_id": token_id,
                     "input_kind": input_kind,
-                    "head": match final_head_arm { FlashFinalHeadArm::Cpu => "canonical_cpu_streamed_bf16", FlashFinalHeadArm::GpuExact => "gpu_exact" },
-                    "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
-                    "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
-                    "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
-                    "argmax": cpu.output.argmax[0],
-                    "gpu_exact": gpu_exact_telemetry,
-                    "decision": decision_name,
-                    "status": "PASS",
+                    "e2e_ns": elapsed_ns,
+                    "hidden_bf16_digest": format!("{:016x}", fnv1a_u16(&state.hidden)),
+                    "ordered_layer_digest_sha256": ordered_layer_digest_sha256,
+                    "layers": if capture_layer_trace { digests[row][offset].iter().map(B2LayerDigest::json).collect::<Vec<_>>() } else { Vec::new() },
                 }));
-                match decision {
-                    GreedyDecision::IgnorePrompt => {}
-                    GreedyDecision::EmitAndContinue => on_generated(request, next_id, None)?,
-                    GreedyDecision::EmitAndStop(reason) => {
-                        on_generated(request, next_id, Some(reason))?
+                if b1_needs_final_head(state.prompt_ids.len(), state.position) {
+                    let final_head_started = std::time::Instant::now();
+                    let final_weights =
+                        final_weights.ok_or("row-set generation needs final head weights")?;
+                    let final_head_dump = final_head_dump_dir()?;
+                    if let Some(directory) = final_head_dump.as_deref() {
+                        write_final_head_input(directory, &state.hidden)?;
+                    }
+                    let mut gpu_exact_telemetry = None;
+                    let cpu = match final_head_arm {
+                        FlashFinalHeadArm::Cpu => {
+                            v4_state::final_checkpoint_head_cpu_timed(final_weights, &state.hidden, 1)?
+                        }
+                        FlashFinalHeadArm::GpuExact => {
+                            let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu {
+                                (workspace.run_runtime(&state.hidden)?, None)
+                            } else {
+                                let output_dir = flash_final_head_gpu_production_dir()?;
+                                // Production execution must not require an unrelated
+                                // capture directory. Set the official directory when
+                                // an independent parity comparison is available.
+                                let verification_manifest = std::env::var_os(
+                                    "COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR",
+                                )
+                                .map(|_| serde_json::json!({"config": final_head_capture_config()}));
+                                (
+                                    run_flash_final_head_gpu_exact(
+                                        &output_dir,
+                                        verification_manifest.as_ref(),
+                                        &state.hidden,
+                                        final_weights,
+                                    )?,
+                                    Some(output_dir),
+                                )
+                            };
+                            let wall_ns = (gpu.timing["total"].as_f64().unwrap_or(f64::INFINITY)
+                                * 1_000_000.0) as u64;
+                            gpu_exact_telemetry = Some(serde_json::json!({
+                                "timing_ms":gpu.timing, "memory_bytes":gpu.memory,
+                                "artifact_dir":artifact_dir,
+                            }));
+                            v4_state::FinalHeadCpuRun {
+                                output: gpu.output,
+                                read_ns: 0,
+                                streamed_source_bytes: gpu.source_bytes,
+                                wall_ns,
+                            }
+                        }
+                    };
+                    if let Some(directory) = final_head_dump.as_deref() {
+                        write_final_head_output(directory, &state.hidden, &cpu, "base_capture")?;
+                    }
+                    let final_head_wall_ns =
+                        u64::try_from(final_head_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    if cpu.wall_ns > final_head_wall_ns {
+                        return Err("Flash B1 final-head timing exceeds its outer scope".into());
+                    }
+                    if flash_b1_profile {
+                        state.flash_b1_phase.final_head_outer_ns = state
+                            .flash_b1_phase
+                            .final_head_outer_ns
+                            .checked_add(final_head_wall_ns)
+                            .ok_or("Flash B1 final-head timing overflow")?;
+                        state.flash_b1_phase.final_heads.push(serde_json::json!({
+                            "token_position": state.position,
+                            "outer": {"wall_ns": final_head_wall_ns},
+                            "top_level": {
+                                "cpu_streamed_final_head": {
+                                    "wall_ns": cpu.wall_ns,
+                                    "streamed_weight_read_ns": cpu.read_ns,
+                                    "source_bytes": cpu.streamed_source_bytes,
+                                },
+                            },
+                            "unattributed_gap_ns": final_head_wall_ns.saturating_sub(cpu.wall_ns),
+                            "closure": {
+                                "equation": "cpu_streamed_final_head.wall_ns + unattributed_gap_ns == outer.wall_ns",
+                                "exact": true,
+                            },
+                        }));
+                    }
+                    state
+                        .physical
+                        .record_final_head_source_bytes(cpu.streamed_source_bytes)?;
+                    physical.record_final_head_source_bytes(cpu.streamed_source_bytes)?;
+                    let next_id = i64::try_from(cpu.output.argmax[0])?;
+                    let decision = greedy_argmax_decision(
+                        state.prompt_ids.len(),
+                        state.position,
+                        state.generated_ids.len(),
+                        greedy_steps,
+                        next_id,
+                    );
+                    let decision_name = match decision {
+                        GreedyDecision::IgnorePrompt => "ignore_prompt",
+                        GreedyDecision::EmitAndContinue => "emit_and_continue",
+                        GreedyDecision::EmitAndStop(GreedyStopReason::Eos) => "emit_and_stop_eos",
+                        GreedyDecision::EmitAndStop(GreedyStopReason::MaxNewTokens) => {
+                            "emit_and_stop_max_new_tokens"
+                        }
+                    };
+                    state.finals.push(serde_json::json!({
+                        "token_position": state.position,
+                        "input_id": token_id,
+                        "input_kind": input_kind,
+                        "head": match final_head_arm { FlashFinalHeadArm::Cpu => "canonical_cpu_streamed_bf16", FlashFinalHeadArm::GpuExact => "gpu_exact" },
+                        "collapsed_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.collapsed_bf16)),
+                        "normalized_bf16_digest": format!("{:016x}", fnv1a_u16(&cpu.output.normalized_bf16)),
+                        "logits_f32_digest": format!("{:016x}", fnv1a_f32(&cpu.output.logits_f32)),
+                        "argmax": cpu.output.argmax[0],
+                        "gpu_exact": gpu_exact_telemetry,
+                        "decision": decision_name,
+                        "status": "PASS",
+                    }));
+                    match decision {
+                        GreedyDecision::IgnorePrompt => {}
+                        GreedyDecision::EmitAndContinue => on_generated(request, next_id, None)?,
+                        GreedyDecision::EmitAndStop(reason) => {
+                            on_generated(request, next_id, Some(reason))?
+                        }
+                    }
+                    match decision {
+                        GreedyDecision::IgnorePrompt => {}
+                        GreedyDecision::EmitAndContinue => {
+                            state.generated_ids.push(next_id);
+                            state.input_ids.push(next_id);
+                        }
+                        GreedyDecision::EmitAndStop(reason) => {
+                            state.generated_ids.push(next_id);
+                            state.input_ids.push(next_id);
+                            state.stop_reason = Some(reason);
+                            active[request] = false;
+                        }
                     }
                 }
-                match decision {
-                    GreedyDecision::IgnorePrompt => {}
-                    GreedyDecision::EmitAndContinue => {
-                        state.generated_ids.push(next_id);
-                        state.input_ids.push(next_id);
-                    }
-                    GreedyDecision::EmitAndStop(reason) => {
-                        state.generated_ids.push(next_id);
-                        state.input_ids.push(next_id);
-                        state.stop_reason = Some(reason);
-                        active[request] = false;
-                    }
-                }
+                state.position = state
+                    .position
+                    .checked_add(1)
+                    .ok_or("B2 token position overflow")?;
             }
-            state.position = state
-                .position
-                .checked_add(1)
-                .ok_or("B2 token position overflow")?;
         }
     }
     if requests.iter().any(|request| request.stop_reason.is_none()) {

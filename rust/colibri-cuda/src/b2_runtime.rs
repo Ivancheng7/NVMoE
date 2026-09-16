@@ -21,6 +21,26 @@ pub(crate) fn flash_b1_prefetch_enabled(
     optional_one_flag("COLIBRI_V4_FLASH_PREFETCH")
 }
 
+pub(crate) fn flash_b1_prompt_chunk_enabled(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<bool, Box<dyn Error>> {
+    // Confined to the two delivery Flash surfaces so the restructured loop is
+    // exercised where it is measured. Pro, QD4, DSpark and every multi-row row
+    // set keep one position per layer pass.
+    if spec != &v4_spec::FLASH_0731 || requests != 1 {
+        return Ok(false);
+    }
+    let base =
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let serve =
+        std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !base && !serve {
+        return Ok(false);
+    }
+    optional_one_flag("COLIBRI_V4_FLASH_PROMPT_CHUNK")
+}
+
 pub(crate) fn flash_b1_prefetch_next_layer(
     current_layer: usize,
     layer_count: usize,
