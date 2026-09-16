@@ -35,7 +35,7 @@ The server follows the same rule. Its `gpu_exact` final head initializes from th
 
 ## Exact Flash-0731 execution
 
-The exact path fixes the numerical work that controls routes and state: FP8 MMA accumulation, ordered reductions, RMSNorm behavior, cuBLAS compressor calls, KV updates, and the GPU final head. For token ID `0` with one greedy step, all `43/43` layers matched the captured official reference at the declared comparison fields. The final argmax is `33832` and the checked digests are:
+The exact path pins the numerical work that controls routes and state: FP8 MMA accumulation, ordered reductions, RMSNorm behavior, cuBLAS compressor calls, KV updates, and the GPU final head. On the 12GB RTX 4080 Laptop (`sm_89`), for token ID `0` with one greedy step, all `43/43` layers matched the captured official reference at the declared comparison fields. The final argmax is `33832` and the checked digests are:
 
 ```
 collapsed BF16   5e9764a6e105a3d6
@@ -43,13 +43,15 @@ normalized BF16  91495daa576afcb3
 logits FP32      e9d90c64a1441d20
 ```
 
-This certificate covers the pinned Flash-0731 revision, one prompt token, one greedy step, and the captured reference fields. Long contexts, sampling quality, sustained multi-user throughput, and other prompts each need their own evidence.
+This certificate is pinned to the Flash-0731 revision, one prompt token, one greedy step, the captured reference fields, and the `sm_89` machine it was measured on. Long contexts, sampling quality, sustained multi-user throughput, and other prompts each need their own evidence.
+
+On the `sm_120` target the official TileLang FP4 kernel does not reproduce, so no equivalent claim is made there yet. The reproducible `sm_120` result is token `55222` on the `block32` arm; see the [sm_120 adaptation record](docs/experiments/2026-08-28-sm120-flash-0731-adaptation.md).
 
 ## DSpark commits a verified prefix
 
 DSpark proposes a block, evaluates the base targets, then commits the accepted prefix. Its state transaction carries the base and three MTP state digests until commit. The recorded B regression run passed in `161.55s` with `1.124GiB` maxRSS. It completed eight base-equivalence counts across two prompt and six validated inputs, generated `[33832]`, accepted `0` proposals, committed one input, retained pending token `120159`, and recorded all four state digests.
 
-The DSpark result ledger and the certified-base ledger have byte-identical SHA-256 `34734f…e553`. The retained artifact set contains the transaction record and four state digests. `exact-vs-certified-base` describes this evidence boundary. An independent official DSpark oracle remains future validation work.
+The DSpark result ledger behind that run is not stored in this repository, so the numbers above cannot be re-derived from tracked files. An independent official DSpark oracle remains future validation work.
 
 ## From gaming laptop to desktop platform
 
@@ -66,15 +68,15 @@ The estimates use `0.0761837tok/s`, multiplied by the earlier capacity-model ban
 
 ## Run it
 
-The Flash path targets WSL2/Linux, CUDA 13.1, Blackwell `sm_120`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
+The Flash path targets WSL2/Linux, CUDA 12.8, Blackwell `sm_120`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13.2.1.1
-export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
 ./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
@@ -92,13 +94,13 @@ env \
   COLIBRI_V4_FLASH_MHC_LINEAR_ARM=cublas \
   COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM=cublas \
   COLIBRI_V4_FLASH_ROUTER_SCORE_ARM=libdevice \
-  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=fp8_mma \
+  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=block32 \
   COLIBRI_V4_FLASH_FINAL_HEAD_ARM=gpu_exact \
   COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-Inspect `flash-result.jsonl` for `layers: 43` and final `status: PASS`. The current 0731 ModelScope run is runtime-validated on `sm_120`; the historical `33832`/digest values above remain an independent oracle gate and must not be treated as passed until a matching full-43 oracle is regenerated. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
+Inspect `flash-result.jsonl` for `layers: 43` and final `status: PASS`. That status means the 43-layer run completed, not that the oracle gate passed. On `sm_120` the run reproduces token `55222`; the `33832` gate above is an `sm_89` result and must not be treated as passed on `sm_120` until a matching full-43 oracle is regenerated there. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
 
 ## Inspiration
 

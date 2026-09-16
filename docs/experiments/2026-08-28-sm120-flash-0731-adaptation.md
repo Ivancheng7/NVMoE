@@ -4,7 +4,7 @@
 
 新下载的 ModelScope `deepseek-ai/DeepSeek-V4-Flash-0731` 已能在 RTX 5060 Ti（`sm_120`）上完成 43 层真实 base-only 推理，并执行 CUDA 12.8/cuBLAS GPU exact final-head。`localmoe-clean` 现已把 Flash-0731 的默认 FP4 专家臂切到确定性的 `block32` 路径；同一环境连续两次完整运行均得到 token `55222`，hidden digest 均为 `5ed8bf88beae3cfe`。
 
-官方 TileLang FP4 核在当前 `sm_120` 环境并非稳定 oracle：已保存的官方 full-43 运行分别出现 token `67900`（v4）、`55222`（v5）和 token `0`（r9），对应 hidden SHA-256 也不同。官方 L0 routed FP4 中间量重复运行同样发生漂移。因此不能把单次 `67900` 或某个随机中间快照当成唯一数值真值；当前可复现业务基线是 Rust `block32` 路径，尚未宣称 FP4 逐元素 `PASS_EXACT`。
+官方 TileLang FP4 核在当前 `sm_120` 环境不是稳定 oracle：已保存的官方 full-43 运行分别出现 token `67900`（v4）、`55222`（v5）和 token `0`（r9），对应 hidden SHA-256 也不同。官方 L0 routed FP4 中间量重复运行同样发生漂移。因此不能把单次 `67900` 或某个随机中间快照当成唯一数值真值；当前可复现的基线是 Rust `block32` 路径，尚未声称 FP4 逐元素 `PASS_EXACT`。
 
 ## 固定输入与模型
 
@@ -43,8 +43,8 @@
 - `sm_120` final-head capability gate、默认构建架构和 CUDA/cuBLAS 运行说明已同步。
 - 官方 final-head 比对仍需显式设置 `COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR` 才开启；没有稳定独立 oracle 时只报告 runtime GPU exact，不伪造 exact parity。
 
-## 未决事项
+## 还没做完的
 
-1. 修复或替换 `sm_120` 上不稳定的官方 TileLang FP4 参考核，先得到可重复的 FP4 专家 oracle；在此之前不做 routed FP4 逐元素精确声明。
-2. 在稳定 oracle 之上，再按层比较首个分歧点；当前已确认 mHC/router 的 CUDA 12.8 cuBLAS 路径和 layer 0 非 FP4 边界可复现，剩余业务差异集中在 routed FP4 GEMM。
+1. 修复或替换 `sm_120` 上不稳定的官方 TileLang FP4 参考核，先拿到可重复的 FP4 专家 oracle；在此之前不做 routed FP4 逐元素精确声明。
+2. 在稳定 oracle 之上，再按层比较首个分歧点；当前已确认 mHC/router 的 CUDA 12.8 cuBLAS 路径和 layer 0 非 FP4 边界可复现，剩余差异集中在 routed FP4 GEMM。
 3. 完成真实 serve 协议的多请求/取消/持续吞吐测试后，再更新性能结论。

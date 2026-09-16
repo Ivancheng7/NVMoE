@@ -35,7 +35,7 @@ server遵循同样的规则。它的`gpu_exact` final head在`READY`时从活跃
 
 ## exact Flash-0731执行
 
-exact路径固定了控制路由和状态的数值工作：FP8MMA累积、有序归约、RMSNorm行为、cuBLAS compressor调用、KV更新以及GPU final head。对token ID`0`的一步greedy路径，`43/43`层在声明的比较字段上匹配捕获的官方reference。最终argmax为`33832`，已检查digest如下：
+exact路径固定了控制路由和状态的数值工作：FP8MMA累积、有序归约、RMSNorm行为、cuBLAS compressor调用、KV更新以及GPU final head。在12GB显存RTX4080Laptop（`sm_89`）上，对token ID`0`的一步greedy路径，`43/43`层在声明的比较字段上匹配捕获的官方reference。最终argmax为`33832`，已检查digest如下：
 
 ```
 collapsed BF16   5e9764a6e105a3d6
@@ -43,13 +43,15 @@ normalized BF16  91495daa576afcb3
 logits FP32      e9d90c64a1441d20
 ```
 
-该证书覆盖固定Flash-0731revision、一个prompt token、一步greedy路径与捕获reference字段。长上下文行为、sampling质量、持续多用户吞吐和其他prompt都需要各自的证据。
+该证书固定于Flash-0731 revision、一个prompt token、一步greedy路径、捕获的reference字段，以及测出它的那台`sm_89`机器。长上下文行为、sampling质量、持续多用户吞吐和其他prompt都需要各自的证据。
+
+在`sm_120`目标上，官方TileLang FP4核不可复现，因此暂时不做等价声明。`sm_120`上可复现的结果是`block32`臂的token`55222`，见[sm_120适配记录](docs/experiments/2026-08-28-sm120-flash-0731-adaptation.md)。
 
 ## DSpark提交经过验证的前缀
 
 DSpark先提出一个block，再计算base target，随后提交被接受的前缀。状态transaction在提交前携带base和3个MTP状态digest。已记录的B regression运行在`161.55s`内通过，maxRSS为`1.124GiB`。它完成8个base等价计数，覆盖2个prompt与6个validated input，生成`[33832]`，接受`0`个proposal，提交1个input，保留pending token`120159`，并记录4个状态digest。
 
-DSpark结果台账与certified-base台账具有逐字节相同的SHA-256`34734f…e553`。保留的artifact集合包含transaction记录与4个状态digest。`exact-vs-certified-base`定义这份证据的边界。独立官方DSpark oracle属于后续验证工作。
+那次运行的DSpark结果台账不在本仓库中，因此上面的数字无法从受版本控制的文件重新推导。独立官方DSpark oracle属于后续验证工作。
 
 ## 从游戏本走向桌面平台
 
@@ -66,15 +68,15 @@ DSpark结果台账与certified-base台账具有逐字节相同的SHA-256`34734f�
 
 ## 运行
 
-Flash路径面向WSL2/Linux、CUDA13.1、Blackwell`sm_120`，模型目录必须位于WSL原生ext4块设备。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
+Flash路径面向WSL2/Linux、CUDA12.8、Blackwell`sm_120`，模型目录必须位于WSL原生ext4块设备。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
 cd localMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13.2.1.1
-export LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
+export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}
 
 cargo oxide doctor
 ./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
@@ -92,13 +94,13 @@ env \
   COLIBRI_V4_FLASH_MHC_LINEAR_ARM=cublas \
   COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM=cublas \
   COLIBRI_V4_FLASH_ROUTER_SCORE_ARM=libdevice \
-  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=fp8_mma \
+  COLIBRI_V4_FLASH_FP4_ACCUM_ARM=block32 \
   COLIBRI_V4_FLASH_FINAL_HEAD_ARM=gpu_exact \
   COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" \
   "$PWD/target/release/colibri-cuda"
 ```
 
-检查`flash-result.jsonl`里的`layers: 43`和final`status: PASS`。当前0731 ModelScope运行已在`sm_120`上完成runtime验证；上面的`33832`和digest仍是独立oracle gate，必须重新生成匹配的full-43 oracle后才能宣称通过。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
+检查`flash-result.jsonl`里的`layers: 43`和final`status: PASS`。该状态表示43层运行跑完，不表示oracle gate通过。`sm_120`上可复现的是token`55222`；上面的`33832`是`sm_89`结果，在`sm_120`上重新生成匹配的full-43 oracle之前不得宣称通过。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
 
 ## 灵感
 
