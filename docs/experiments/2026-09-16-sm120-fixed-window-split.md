@@ -161,6 +161,12 @@
    预期 worker 掉到 `78–98 ms`、`join` 与 `release` 归零、`fixed` 的墙只剩 `23.4 ms`
    （`≈1.6–1.8 s/token`）。改完用四条复核：`release` 是否归零、`join` 是否变小、
    8 个 digest 是否逐个不变、峰值显存。
+   > **这条已经做完了**，但用的是另一种形态：不是两个槽位轮转，而是**每层解出的负载跨 token 常驻**
+   > （`exp/fixed-host-reuse`，`COLIBRI_V4_FIXED_HOST_RESIDENT_GIB`）。原因见
+   > `docs/experiments/2026-09-16-sm120-fixed-host-residency.md`：填进已有缓冲要改整套 loader
+   > （`DecodedLayerHost` 30 个字段），而保留整份负载不用改 loader，还顺带省掉每 token 重读的 5.9 GB。
+   > 实测 `release` 归零、预取线程 `162 → 25–34 ms`、8 步 `−7.6% / −11.3%`，代价是 RSS +6.5 GB。
+   > 上面那句"`≈1.6–1.8 s/token`"是按**被探针加了一次写的**那轮数字估的，实测是 `0.7–1.2 s/token`。
 2. **`other` 那 58 ms 值得单独看一眼，而且和复用正交。** 里面已知有三样：
    `read_matrix` 对全量 137 MB 做 `any()` 找 NaN（这只是读一遍内存，量级约十几毫秒）、
    每层重新解析 `model.safetensors.index.json`（`base_indexed_model` 在三个 loader 里各调一次）、
