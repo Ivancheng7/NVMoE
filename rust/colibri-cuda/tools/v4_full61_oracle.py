@@ -248,8 +248,6 @@ def validate_resources():
     if not torch.cuda.is_available():
         raise RuntimeError(f"official oracle requires CUDA PyTorch, got {torch.__version__}")
     try:
-        if importlib.metadata.version("tilelang") != "0.1.8":
-            raise RuntimeError("official oracle requires tilelang==0.1.8")
         import fast_hadamard_transform  # noqa: F401
         import tilelang  # noqa: F401
     except Exception as error:

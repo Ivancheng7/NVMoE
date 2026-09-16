@@ -679,8 +679,10 @@ def validate_resources(torch):
         raise RuntimeError(f"official oracle requires PyTorch >=2.10 with FP4, got {torch.__version__}")
     if not torch.cuda.is_available():
         raise RuntimeError("official prefix oracle requires CUDA PyTorch")
-    if importlib.metadata.version("tilelang") != "0.1.8":
-        raise RuntimeError("official prefix oracle requires tilelang==0.1.8")
+    # TileLang decides which kernel gets generated, and sm_120 needs a version
+    # whose codegen is correct there, so the version is recorded rather than
+    # pinned.  It was pinned to 0.1.8 while that was thought to be universal.
+    tilelang_version = importlib.metadata.version("tilelang")
     safetensors_version = importlib.metadata.version("safetensors")
     if tuple(int(part) for part in safetensors_version.split(".")[:2]) < (0, 7):
         raise RuntimeError(f"official prefix oracle requires safetensors>=0.7, got {safetensors_version}")
@@ -698,7 +700,7 @@ def validate_resources(torch):
         "free_vram_bytes": free_vram,
         "available_ram_kib": available_kib,
         "torch": torch.__version__,
-        "tilelang": "0.1.8",
+        "tilelang": tilelang_version,
         "safetensors": safetensors_version,
         "free_vram_start_threshold_bytes": 8 * (1 << 30),
         "threshold_scope": "conservative preflight, not measured allocator peak",
