@@ -1383,7 +1383,7 @@ pub(crate) fn run_flash_base_input(
     let mut hidden = prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?.0;
     let mut captures = Vec::with_capacity(3 * spec.hidden);
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
-    // One routed slot for the whole forward pass: the page-lock inside it is
+    // One routed slot for the whole forward pass: the page-lock inside it costs
     // 17 ms, so it belongs to the request, not to each of the 43 layers.
     let mut routed_slot_scratch = RoutedSlotScratch::new();
     for layer in 0..spec.layers {

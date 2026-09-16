@@ -45,7 +45,7 @@ pub(crate) struct ExpertSlot<'a> {
 /// Building a slot page-locks 12.75 MiB of staging through `cuMemHostAlloc`
 /// (measured at 17.4 ms per call, plus 3.9 ms for the slot's device buffers),
 /// which is 21 ms of every layer while the slot dies at the end of that layer.
-/// The owner of this scratch keeps it in whatever scope spans the layer loop.
+/// Whoever owns this scratch keeps it in the scope that spans the layer loop.
 pub(crate) struct RoutedSlotScratch<'a> {
     slot: Option<ExpertSlot<'a>>,
 }

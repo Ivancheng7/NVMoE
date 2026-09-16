@@ -1109,9 +1109,9 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             stage.routed_prefetched = true;
             // The experts this layer visits all share one shape, so keep one
             // slot and restage it instead of page-locking six sets of staging
-            // buffers. A request-scoped scratch keeps that one slot across
-            // layers too: the page-lock is 17 ms and would otherwise be paid
-            // once per layer instead of once per request.
+            // buffers. A request-scoped scratch keeps that slot across layers
+            // too: the page-lock is 17 ms and would otherwise be paid once per
+            // layer instead of once per request.
             let mut recycled_slot = match routed_slot_scratch.as_deref_mut() {
                 Some(scratch) => scratch.take_slot(),
                 None => None,
