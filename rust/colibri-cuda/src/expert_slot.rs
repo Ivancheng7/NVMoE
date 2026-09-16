@@ -40,6 +40,32 @@ pub(crate) struct ExpertSlot<'a> {
     pub(crate) complete: cuda_core::CudaEvent,
 }
 
+/// One routed expert slot held for a whole request instead of one layer.
+///
+/// Building a slot page-locks 12.75 MiB of staging through `cuMemHostAlloc`
+/// (measured at 17.4 ms per call, plus 3.9 ms for the slot's device buffers),
+/// which is 21 ms of every layer while the slot dies at the end of that layer.
+/// The owner of this scratch keeps it in whatever scope spans the layer loop.
+pub(crate) struct RoutedSlotScratch<'a> {
+    slot: Option<ExpertSlot<'a>>,
+}
+
+impl<'a> RoutedSlotScratch<'a> {
+    pub(crate) fn new() -> Self {
+        Self { slot: None }
+    }
+
+    /// Hands the slot to the layer being run, leaving the scratch empty.
+    pub(crate) fn take_slot(&mut self) -> Option<ExpertSlot<'a>> {
+        self.slot.take()
+    }
+
+    /// Takes the layer's last slot back so the next layer can restage into it.
+    pub(crate) fn put_slot(&mut self, slot: ExpertSlot<'a>) {
+        self.slot = Some(slot);
+    }
+}
+
 impl<'a> ExpertSlot<'a> {
     pub(crate) fn new(
         context: &std::sync::Arc<CudaContext>,

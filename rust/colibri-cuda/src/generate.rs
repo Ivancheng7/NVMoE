@@ -1377,6 +1377,9 @@ pub(crate) fn run_flash_base_input(
     let mut hidden = prepare_b2_initial_hidden_with_source_bytes_for(spec, model_dir, token_id)?.0;
     let mut captures = Vec::with_capacity(3 * spec.hidden);
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    // One routed slot for the whole forward pass: the page-lock inside it is
+    // 17 ms, so it belongs to the request, not to each of the 43 layers.
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     for layer in 0..spec.layers {
         let mut loaded = load_b2_raw_runtime_for(spec, model_dir, layer, stream)?;
         let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &[token_id])?;
@@ -1395,6 +1398,7 @@ pub(crate) fn run_flash_base_input(
             token_id,
             position,
             persistent,
+            Some(&mut routed_slot_scratch),
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         hidden = result?.0;
