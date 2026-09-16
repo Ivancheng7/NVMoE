@@ -142,11 +142,53 @@
 `COLIBRI_V4_STATIONARY_RAW_DEVICE_RETENTION_GIB` 等，见 `fixed_layer_cache.rs`），
 它们默认全 0，`resident_on2` 那次也没有设——**别把它们和实验开关搞混**。
 
+## 追加：那 14 ms 里到底是什么（同日实测）
+
+`nsys` 在这台 WSL2 上抓不到 CUDA 数据（`does not contain CUDA trace data`），所以改成在
+`ExpertSlot::new` 里插 10 个 `Instant` 段（脚本 `.zcode/slot_probe_patch.py`，打在 WSL 那份源码上，
+测完立刻还原；因为是插桩构建，警告数 60 而不是 59，**这份二进制不是基线**）。
+结果文件 `/srv/localmoe/targets/slot-probe-1step-c.jsonl`，日志 `slot-probe-1step-c.log`，
+四个钉死值照旧复现。1 步共 258 次调用（43 层 × 6 专家）：
+
+| 段 | 每次调用 | 占 |
+| --- | --- | --- |
+| **8 块 pinned 主机缓冲（构造）** | **`12.96 ms`** | **90.0%** |
+| ├ 其中 `w1` 一块（4.4 MB） | `3.66 ms` | |
+| ├ 其中 `w2` + `w3` + 3 个 scale（约 9 MB） | `9.29 ms` | |
+| └ 其中 `input_host` + `output_host`（各 16 KB） | `0.0079 ms`（每块 `3.9 µs`） | |
+| 权重 H2D + stream 同步 | `1.16 ms` | 8.0% |
+| 7 块设备缓冲 | `0.10 ms` | 0.7% |
+| 3 个 event + `complete.record` + `complete.synchronize` | `0.10 ms` | 0.7% |
+| fp8 缓冲块 | `0.065 ms` | 0.5% |
+| fp4 臂查询 + tilelang 检查 | `0.008 ms` | 0.1% |
+| **合计** | **`14.40 ms`** | |
+
+258 × 14.40 ms = `3.71 s`（一次 1 步运行），与 8 步稳态的 `84.3 ms/层` × 43 = `3.62 s` 对得上。
+
+三条结论：
+
+- **开销跟字节数成正比，不跟调用次数。** 4.4 MB 一块 `3.66 ms`（约 `0.83 ms/MB`），
+  16 KB 一块只要 `3.9 µs`。所以问题不是"调用太频繁"，是"每次都重新锁 13.4 MB 的页再拷一遍"。
+- **设备缓冲、event、两次 stream 同步加起来不到 `0.3 ms`。** 之前在记录里担心的"两次同步"
+  不是问题，那部分不用动。
+- 依赖里 `PinnedHostBuffer::from_slice` = `cuMemHostAlloc` + `copy_nonoverlapping`，
+  析构走 `cuMemFreeHost`（cuda-oxide 的 `crates/cuda-core/src/pinned_host_buffer.rs`）。
+  依赖改不了，但它是同一个进程里的普通调用——**只要我们自己不重复创建就行**。
+
+**没分开的部分**：这 `0.83 ms/MB` 里，页锁定（`get_user_pages`，在 WSL2 上还要跨虚拟机边界）
+和那次 memcpy 各占多少，**没有测**。判决实验很小：把缓冲改成复用、memcpy 保留，
+如果每专家的时间掉到 `0.3 ms` 量级，说明页锁定是主项；如果几乎没掉，说明是拷贝。
+上限收益是 `12.96 ms` × 258 = `3.34 s/token`（约占稳态 12.5 s 的 27%），实际拿到多少取决于这个拆分。
+
 ## 未决事项
 
-1. **`ExpertSlot::new` 每次重建整套工作区（每 token 258 次，`3.62 s`）。** 先加一次测量，
-   把 14 ms 拆成"分配 / 建 event / 两次 stream 同步 / 其余"，再决定改成每层复用还是池化。
-   这个数是本地测出来的，动它之前要先把 `bench` 那套遥测接上 `shared` 和 `routed` 的槽位路径。
+1. **`ExpertSlot::new` 每次重建 8 块 pinned 缓冲（每 token 258 次，实测 `3.71 s`）。**
+   上面那张表已经把 14 ms 拆开了：90% 是 pinned 缓冲的构造，其中 8 成跟字节数走。
+   下一步不是继续测，是改：槽位复用时 pinned 缓冲只建一次，之后每个专家往
+   `as_mut_slice()` 里 memcpy（依赖已提供该接口）。改动限定在 `expert_slot.rs` 和调用它的
+   那个专家循环里，实验放 `exp/*` 分支，用四个钉死值 + 8 步计时验证。
+   注意 H2D 之前必须先确保上一轮的拷贝已完成——现有代码在 `new` 内部和结尾各有一次
+   stream 同步，复用时这条约束不能丢。
 2. **`shared` 那段 `68.9 ms/层` 没有内部计时。** `LayerStageTelemetry` 里 shared 只有 `shared_ns`
    一个字段，既分不出"shared 自己的计算"也分不出"等 worker 的 join"。要能答"常驻之后
    还剩 64 ms 是什么"，必须先加子项。
