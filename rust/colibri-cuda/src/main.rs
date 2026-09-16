@@ -67,6 +67,7 @@ mod env_flags;
 mod expert_slices;
 mod expert_slot;
 mod final_head;
+mod fixed_host_cache;
 mod fixed_layer_cache;
 mod fixed_layer_planning;
 mod fixed_prefetch;

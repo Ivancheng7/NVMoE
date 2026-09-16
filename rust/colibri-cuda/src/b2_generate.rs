@@ -562,6 +562,8 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
             "fixed": {
                 "wall_ns": fixed_prepare_ns,
                 "host_prefetched": fixed.cache_status == "prefetched_host",
+                "cache_status": fixed.cache_status,
+                "host_resident": fixed.cache_status == "host_resident_hit",
                 "read_alloc_ns": fixed.fixed_read_alloc_ns,
                 "decode_ns": fixed.fixed_decode_ns,
                 "h2d_ns": fixed.fixed_h2d_ns,
