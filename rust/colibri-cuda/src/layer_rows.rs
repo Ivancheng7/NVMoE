@@ -1,14 +1,19 @@
 use super::*;
 
 /// How many threads the Flash B1 routed prefetch uses to read this layer's
-/// experts. One expert per thread is the point; the default of 1 reproduces the
-/// committed single-worker behaviour exactly.
+/// experts: one per routed expert, which is the shape the disk serves well
+/// (3.7 GB/s against 1.35 GB/s single-threaded, 2026-09-16 measurements).
+///
+/// This is only worth having next to the resident fixed payload. Without it the
+/// fixed stream takes back whatever the routed read gives up and the wall does
+/// not move (91.4 s against 91.9 s for eight steps); with it the same change is
+/// 73.1 s against 51.2 s.
 pub(crate) fn routed_read_threads() -> usize {
     std::env::var("COLIBRI_V4_ROUTED_READ_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|threads| (1..=16).contains(threads))
-        .unwrap_or(1)
+        .unwrap_or(6)
 }
 
 #[allow(clippy::too_many_arguments)]
