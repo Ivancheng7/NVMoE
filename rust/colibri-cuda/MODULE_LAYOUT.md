@@ -43,7 +43,7 @@
 4. 在 main.rs 的声明块里加 `mod X;` 与 `use X::*;`。
 5. 校验：`rustc` 的 token 流比对（去掉空白与尾随逗号后应完全一致）能证明搬运没有改语义。
 
-## 验证门槛（本机环境）
+## 怎么验证（本机环境）
 
 ```bash
 cd <源码目录>/rust          # 例如 /srv/localmoe/build/localmoe-clean-git/rust
@@ -58,7 +58,7 @@ cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖
   必须套 `rustc-human-wrapper.sh`，它把 `--error-format=json` 换成 `short`，绕开那条渲染路径。
 - 编译警告数必须保持 59（bin）/ 22（test），这是搬运未改变语义的旁证。
 - `cargo fmt --check` 在 HEAD 上本来就不通过（main.rs 有两处 rustfmt 想重排的位置），
-  所以门槛是「不新增格式差异」：新文件保持 fmt-clean，main.rs 的可重排位置集合不变。
+  所以判据是「不新增格式差异」：新文件保持 fmt-clean，main.rs 的可重排位置集合不变。
 - 真机验证：跑一次 Flash base 单步推理，要求 `argmax=55222`、`hidden_digest` 含
   `5ed8bf88beae3cfe`，且全部 257 个 digest 字段与基线一致。
 - `./run-identified.sh test --arch sm_120` 有 8 个失败是既有环境问题（4 个缺
