@@ -168,6 +168,87 @@ impl<'a> ExpertSlot<'a> {
         })
     }
 
+    /// Builds a slot for `weights`, restaging `recycled`'s pinned staging
+    /// buffers when the shapes match and falling back to [`Self::new`] when they
+    /// do not.
+    ///
+    /// Page-locking those six buffers is the whole cost of building a slot
+    /// (measured: 12.96 ms of the 14.40 ms each expert costs in a 1-step run),
+    /// and the routed experts a layer visits all have the same shape, so a layer
+    /// loop can keep one slot and restage it instead of rebuilding. The caller
+    /// must pass the same context/module/stream the recycled slot was built
+    /// with; the restaged buffers are the source of the weight H2D copies either
+    /// way, so the lifetime rule from `new` still holds.
+    pub(crate) fn new_or_restage(
+        recycled: Option<Self>,
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+        stream: &std::sync::Arc<CudaStream>,
+        weights: &v4_expert::RoutedExpert,
+    ) -> Result<Self, Box<dyn Error>> {
+        match recycled {
+            Some(mut slot) if slot.staging_shapes_match(weights) => {
+                slot.restage_weights(weights)?;
+                Ok(slot)
+            }
+            _ => Self::new(context, module, stream, weights),
+        }
+    }
+
+    fn staging_shapes_match(&self, weights: &v4_expert::RoutedExpert) -> bool {
+        self.w1_host.len() == weights.w1.len()
+            && self.w1_scale_host.len() == weights.w1_scale.len()
+            && self.w2_host.len() == weights.w2.len()
+            && self.w2_scale_host.len() == weights.w2_scale.len()
+            && self.w3_host.len() == weights.w3.len()
+            && self.w3_scale_host.len() == weights.w3_scale.len()
+    }
+
+    /// Copies `weights` into this slot's existing pinned buffers and re-uploads
+    /// them to the device, replacing both the device-side weights and
+    /// `weight_h2d_ms`. Mirrors what `load_range_execute_into` does for the QD4
+    /// lane path, which never rebuilds a slot per expert.
+    pub(crate) fn restage_weights(
+        &mut self,
+        weights: &v4_expert::RoutedExpert,
+    ) -> Result<(), Box<dyn Error>> {
+        self.w1_host.as_mut_slice().copy_from_slice(&weights.w1);
+        self.w1_scale_host
+            .as_mut_slice()
+            .copy_from_slice(&weights.w1_scale);
+        self.w2_host.as_mut_slice().copy_from_slice(&weights.w2);
+        self.w2_scale_host
+            .as_mut_slice()
+            .copy_from_slice(&weights.w2_scale);
+        self.w3_host.as_mut_slice().copy_from_slice(&weights.w3);
+        self.w3_scale_host
+            .as_mut_slice()
+            .copy_from_slice(&weights.w3_scale);
+        self.weight_start.record(&self.stream)?;
+        // SAFETY: the pinned sources outlive the synchronized completion event
+        // below, same as in `new`. Overwriting the device weights is ordered
+        // after the previous expert's kernels because `execute_into`
+        // synchronizes its own completion event before returning.
+        unsafe {
+            self.w1_device
+                .copy_from_pinned_host_async(&self.stream, &self.w1_host)?;
+            self.w1_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w1_scale_host)?;
+            self.w2_device
+                .copy_from_pinned_host_async(&self.stream, &self.w2_host)?;
+            self.w2_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w2_scale_host)?;
+            self.w3_device
+                .copy_from_pinned_host_async(&self.stream, &self.w3_host)?;
+            self.w3_scale_device
+                .copy_from_pinned_host_async(&self.stream, &self.w3_scale_host)?;
+        }
+        self.weight_end.record(&self.stream)?;
+        self.weight_end.synchronize()?;
+        self.weight_h2d_ms = self.weight_start.elapsed_ms(&self.weight_end)? as f64;
+        Ok(())
+    }
+
     pub(crate) fn new_empty(
         context: &std::sync::Arc<CudaContext>,
         module: &'a kernels::LoadedModule,

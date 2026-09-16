@@ -1076,6 +1076,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 return Err("Flash B1 routed prefetch returned an incomplete route row".into());
             }
             stage.routed_prefetched = true;
+            // The experts this layer visits all share one shape, so keep one
+            // slot and restage it instead of page-locking six sets of staging
+            // buffers.
+            let mut recycled_slot = None;
             for (route_slot, (expert_id, expert)) in experts.into_iter().enumerate() {
                 if routes.ids[route_slot] != i32::from(expert_id) {
                     return Err("Flash B1 routed prefetch changed canonical route order".into());
@@ -1090,7 +1094,13 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     stage.routed_source_bytes.saturating_add(expert.h2d_bytes());
                 stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
                 let setup_started = std::time::Instant::now();
-                let mut slot = ExpertSlot::new(context, module, stream, &expert)?;
+                let mut slot = ExpertSlot::new_or_restage(
+                    recycled_slot.take(),
+                    context,
+                    module,
+                    stream,
+                    &expert,
+                )?;
                 stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(
                     u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 );
@@ -1112,6 +1122,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 if let Some(traces) = flash_traces.as_mut() {
                     traces[route_slot] = trace;
                 }
+                recycled_slot = Some(slot);
             }
         } else {
             let mut expert_union = routes
