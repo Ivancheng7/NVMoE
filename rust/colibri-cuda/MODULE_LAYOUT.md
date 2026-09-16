@@ -1,85 +1,117 @@
-# Rust 侧模块划分（2026-09-16 拆分记录）
+# Rust 侧模块划分（2026-09-16 拆分完成记录）
 
 ## 现状
 
-`rust/colibri-cuda/src/main.rs` 原来是一个 45,540 行的单文件。已按「只搬文件、不动函数体」
-的方式拆到 14,708 行，搬出的代码放在同目录的独立文件里：
+`rust/colibri-cuda/src/main.rs` 原来是一个 45,540 行的单文件，现在 **559 行**：只剩 crate 属性、
+顶层 `use`、LUT 常量、两个 `const fn`、`tilelang_sum4` 宏、40 行模块声明块、`include!` 一行和
+`fn main()`（391 行）。业务代码全部搬进同目录的独立文件（下表按行数降序）：
 
 | 文件 | 内容 | 行数 |
 | --- | --- | --- |
 | `tests.rs` / `tests_continued.rs` | 两个 `#[cfg(test)]` 模块（124 个测试） | 4,539 / 456 |
 | `layer_stationary_prefill.rs` | `run_real_v4_layer_stationary_prefill`（原 3,361 行单函数） | 3,363 |
 | `device_attention.rs` | device 侧 attention/state 行执行与请求 scratch | 3,078 |
+| `kernels_module.rs` | 设备侧 `#[cuda_module] mod kernels`（由 main.rs `include!` 粘回） | 2,853 |
 | `layer_ops.rs` | 单层算子：mHC pre、RMSNorm、RoPE、compressor、sparse attention、router、shared expert | 2,848 |
 | `generate.rs` | B2/B4 生成、Flash base/serve/dspark、stationary 基准入口 | 2,518 |
 | `attention_gates.rs` | attention 门禁与审计入口：topk sweep、wavefront、device token-state 门禁、cache-off | 2,279 |
-| `slice_checks.rs` | 各格式原语自检入口（`run_real_v4_*_slice_if_available`） | 1,328 |
 | `mtp1_l0.rs` | mtp1 容量预检/草稿候选，L0 行与 compressor 检查 | 1,605 |
 | `layer_rows.rs` | `run_real_layer_rows` 与 `run_real_layer_attention_rows` | 1,417 |
+| `slice_checks.rs` | 各格式原语自检入口（`run_real_v4_*_slice_if_available`） | 1,328 |
 | `qd4.rs` | QD4 常驻缓存、routed 复放与 stationary 门禁 | 1,284 |
 | `fixed_layer_cache.rs` | `FixedLayerCache` 结构体与两个 impl（residency、raw 快照、访问路径） | 1,264 |
+| `fixed_layer_planning.rs` | 预算解析、promotion 计划、层选择、capacity plan、bounded readahead | 1,154 |
 | `final_head.rs` | Flash final-head 采集、候选门禁、GPU exact workspace | 1,145 |
 | `v4_loopback.rs` | 双 worker loopback、副本恢复、恢复端点与认证客户端 | 1,105 |
 | `full61_b1.rs` | `run_real_v4_full61_b1` 单步入口 | 991 |
+| `state_audit.rs` | 持久状态/attention 审计、逐级 bit 对比与诊断输出 | 908 |
+| `loopback_wire.rs` | loopback/recovery 的帧、样本、重放与 wire 统计 | 778 |
 | `expert_slot.rs` | `ExpertSlot` 结构体与其 impl | 752 |
+| `argmax_records.rs` | final-head 基准、certified argmax 与 id-only 记录 | 732 |
+| `device_geometry.rs` | device 侧字节台账常量、scratch 几何与 device state 结构体 | 655 |
+| `b2_generate.rs` | B2 生成请求解析、parity stop、B2 physical 与 JSON 记录 | 640 |
+| `mtp1_resources.rs` | MTP1 草稿字节常量、容量探针与 scratch 预检 | 606 |
+| `flash_arms.rs` | mHC/router/FP4 各 arm 的解析、cuBLAS 会话与 provenance | 593 |
 | `artifacts.rs` | 结果文件/provenance 工具，含 `sha256_file` | 508 |
+| `fixed_prefetch.rs` | 固定权重的预取任务、租约与 promotion residency | 447 |
+| `run_records.rs` | 运行记录结构体、critical-path 时间线与 telemetry | 425 |
+| `stationary_lifecycle.rs` | 常驻生命周期记账、贪婪决策与三个静态检查 | 418 |
+| `layer_loading.rs` | 层运行时装载与上传（含 pinned raw 上传） | 414 |
+| `phase_profiles.rs` | 双路记账与 stationary 各相位 profile JSON | 402 |
+| `device_weights.rs` | `LayerDeviceWeights` 与其 impl、draft 权重上传、dspark 阶段装载 | 401 |
+| `l0_bench.rs` | L0 摘要与 buffer 统计、三个 FP8/KV benchmark | 395 |
+| `launch_wrappers.rs` | `launch_v4_*` kernel 启动包装与 expert 误差断言 | 363 |
 | `env_flags.rs` | 环境变量解析、校验、full61 preflight | 357 |
+| `expert_slices.rs` | expert-0 slice 与 block certificate 实验入口 | 347 |
+| `b2_runtime.rs` | B2 raw runtime 装载、单层执行与双 token 前缀准备 | 338 |
+| `qd4_gates.rs` | QD4 lane 预留校验与 stationary/immutable-cache 门禁 | 329 |
+| `mtp1_draft.rs` | MTP1 草稿状态推进、对齐与 QD4 lane 借用 | 309 |
+| `dspark.rs` | device attention 行执行与 Flash DSpark 各阶段 | 289 |
+| `qd4_routed.rs` | routed 复放/时间线结构体与序列化 | 225 |
+| `host_provenance.rs` | 内存快照、挂载来源与 cache-off 基准 | 202 |
 
-## 三条必须遵守的约定
+（`v4_chat.rs`、`v4_expert.rs`、`v4_federated.rs`、`v4_state.rs`、`safetensors.rs`、
+`cublas_exact.rs` 等 `v4_*` 文件在这次拆分之前就存在，没有动过。）
 
-1. **`mod kernels` 必须留在 main.rs 内联。** cuda-oxide 的 `#[cuda_module]` 明确拒绝
-   `mod foo;` 这种独立文件模块（报错 `cuda_module requires an inline module so kernel
-   signatures are visible`），设备代码搬不走。
+## 四条必须遵守的约定
+
+1. **设备模块用 `include!` 粘回 main.rs。** cuda-oxide 的 `#[cuda_module]` 只接受内联模块
+   （报错 `cuda_module requires an inline module so kernel signatures are visible`），
+   但 `include!("kernels_module.rs");` 里的 token 在属性宏展开前就已经展开成内联模块，
+   所以 2,853 行的设备代码可以放在独立文件里。2026-09-16 实测：编译 0 error、59 条警告，
+   真机 261 个 digest 与基线全同。被包含的文件**不能有 `use super::*;` 文件头**，它是被粘贴的
+   片段，不是模块。
 
 2. **新模块的 `mod` 声明要写在 `tilelang_sum4` 宏之后。** `macro_rules!` 是文本作用域，
    声明在宏之前的模块看不到它。所以 main.rs 里专门有一段声明块，位于宏定义下方。
 
-3. **搬出的模块用 `use X::*;` 重新导入，调用点保持原样。** 这些簇有上百个调用点，逐个改成
+3. **搬出的模块用 `use X::*;` 重新导入，调用点保持原样。** 这些簇有几百个调用点，逐个改成
    `X::foo(...)` 会把改动撒进各个函数体；改为在 main.rs 加一行 glob 之后，调用点与重构前
    逐字节相同。代价是搬出的项需要 `pub(crate)`（否则父模块看不见子模块的私有项）。
-   唯一例外是 `layer_stationary_prefill`：只有一处调用，glob 会触发 unused 警告，所以由
-   glob 提供非限定名，调用点维持原文。
+
+4. **切口必须互不重叠。** 删除是按行号从后往前做的，如果两段区间重叠，同一段会被抽进两个文件
+   （报 `ambiguous name`），而且第二次删除会错位、多删一段。脚本里加
+   `assert` 校验区间互不重叠后再动手。
 
 ## 再拆一批的做法
 
 1. 用 `python3 -c` 或脚本按行号整块切出，**切口必须落在顶层项的边界上，且不能把属性行
-   （`#[derive]`/`#[allow]`）与其项拆开**——这是唯一踩过的坑，拆开会导致整段解析失败。
-   一个文件可以装多个不相邻的块：`fixed_layer_cache.rs` 是「结构体 + 跨 1,000 行的两个
-   impl」，`qd4.rs`、`attention_gates.rs` 都是把分散的入口函数收进同一个文件。
+   （`#[derive]`/`#[allow]`）与其项拆开**——拆开会导致整段解析失败。
+   一个文件可以装多个不相邻的块：`device_geometry.rs`（字节台账 + scratch 几何）、
+   `qd4_gates.rs`（lane 校验 + 门禁）都是这种。
 2. 新文件头加 `use super::*;`，内容原样保留（这些代码本来就在第 0 列，不需要重新缩进）。
 3. 给搬出的顶层项、固有 impl 方法、结构体字段加 `pub(crate)`；
-   trait impl 的方法和 enum 变体不能加（编译错误）。
-   注意 `unsafe fn`、`const fn`、`extern "C" fn` 这些声明形式。
+   trait impl 的方法和 enum 变体不能加（编译错误）。注意 `unsafe fn`、`const fn`、
+   `extern "C" fn` 这些声明形式。
 4. 在 main.rs 的声明块里加 `mod X;` 与 `use X::*;`（按字母序插进现有列表）。
-5. 校验：除了 `rustc` 的 token 流比对（去掉空白与尾随逗号后应完全一致），
-   还可以做更强的**字符级恒等式**——把搬走的块去掉文件头和注入的 `pub(crate)` 之后，
-   加上新 main.rs 应等于原文件「逐字节」相等（`cut_batch*.py` 里的比对就是这条，
-   它同时能抓住被误删的空行和逗号）。
+5. 校验：除了 `rustc` 的 token 流比对（去掉空白与尾随逗号后应完全一致），还做更强的
+   **字符级恒等式**——把搬走的块去掉文件头和注入的 `pub(crate)` 之后，加上新 main.rs 应等于
+   原文件「逐字节」相等；声明块本身按设计被重写，所以要把它排除在外再比。
+   最后一条用 `difflib` 独立实现，要求所有差异只能是空行（接缝处会少一个空行）。
 
 ## 怎么验证（本机环境）
 
 ```bash
 cd <源码目录>/rust          # 例如 /srv/localmoe/build/localmoe-clean-git/rust
 RUSTC_WRAPPER=$PWD/rustc-human-wrapper.sh \
-CARGO_TARGET_DIR=/srv/localmoe/targets/<新目录> \
+CARGO_TARGET_DIR=/srv/localmoe/targets/<目录> \
 cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖测试模块
-# 走 run-identified.sh 时它会自己 export RUSTC_WRAPPER：
 ./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
 - 直接跑 `cargo check` 会在钉住的 nightly 上触发编译器 ICE，**未改动的原始树同样如此**；
-  必须套 `rustc-human-wrapper.sh`，它把 `--error-format=json` 换成 `short`，绕开那条渲染路径。
+  必须套 `rustc-human-wrapper.sh`。`run-identified.sh` 已经自己设好，但 `cargo check`
+  不会自动带上，要手动写。
+- **`wsl.exe -e bash -c` 里没有 `cargo`**：跑构建要用 `-lc`，否则报 `exit=127 command not found`。
 - 编译警告数必须保持 59（bin）/ 22（test）。搬走的死代码会让警告「换文件」——例如
   `run_real_l0_rows` 那条从 `main.rs` 挪到 `mtp1_l0.rs`——所以判据是**警告集合去掉行号后
   逐条相同**，不只是总数相同。
-- `cargo fmt --check` 在 HEAD 上本来就不通过，而且偏差多数是原码自带的：搬走的代码会把它们
-  原样带走。2026-09-16 用 `rustfmt --edition 2021 --check` 逐文件量，整棵树 54 处
-  （`v4_state.rs` 19、`tests.rs` 13、`layer_ops.rs` 4 等），**main.rs 反而是 0 处**——
-  原来「main.rs 有两处想重排的位置」就在被搬走的代码里。所以判据是「不新增格式差异」：
-  新文件里的每一处偏差都要能在搬运前的原文里找到。唯一已知的例外是 `pub(crate)` 注入——
-  它会把个别接近 100 列的签名顶过线（当时 1 处，`fixed_layer_cache.rs` 的
-  `validate_stationary_key`），不改语义，可以接受；要消掉就得动签名行，那会破坏
-  「原文逐字节」这条更强的保证，不值得。
+- `cargo fmt --check` 在 HEAD 上本来就不通过，偏差多数是原码自带的。2026-09-16 逐文件量，
+  整棵树 95 处（`v4_state.rs` 19、`tests.rs` 13、`mtp1_resources.rs` 8、`b2_generate.rs` 7、
+  `state_audit.rs` 7 等），**main.rs 是 0 处**。判据是「不新增格式差异」：新文件里的偏差要么
+  能在搬运前的原文里找到，要么来自 `pub(crate)` 注入把接近 100 列的签名顶过线，
+  要么来自单独成文件后 rustfmt 换了排版判断（`kernels_module.rs` 有 1 处这种，
+  一行 `if cond { a } else { b }` 被要求展开）。都不改语义。
 - 真机验证：跑一次 Flash base 单步推理，要求 `argmax=55222`、`hidden_digest` 含
   `5ed8bf88beae3cfe`，且结果 JSON 里全部 261 个 16 位十六进制 digest 字段与
   `/srv/localmoe/targets/0731-sm120-clean-cuda128-default-block32-r2.jsonl` 逐一相同
@@ -88,19 +120,8 @@ cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖
   `rust/colibri-cuda/results/...` 的 cutpoint 产物、2 个缺 `COLIBRI_CUBLAS_EXACT_LIB`、
   2 个是 `v4_state.rs` 里 V4-Pro 时代的过期断言）。判据是失败集合与改动前一致，而不是全绿。
 
-## 还没搬的
+## 还剩什么
 
-大块已经搬完了，剩下三类：
-
-- **搬不动的**：`mod kernels`（约 2,850 行、52 个 kernel）和 `fn main()`（391 行）。
-  想让 kernels 离开 main.rs 只能试 `include!` 把整个内联模块文本粘进来——**没验证过**，
-  要做得先做 spike（搬完跑 cargo check + 一次真机推理对比 digest）。
-- **还能按「整块搬一个函数」处理的中等块**（每个 110–330 行，合计约 1,900 行）：
-  `run_real_v4_expert0_slice_if_available`、`run_v4_block_certificate_experiment`、
-  `impl LayerDeviceWeights`、`pinned_h2d_service_gate`、`upload_pinned_layer_runtime_raw`、
-  `stationary_layer_phase_profile_json`、`impl DeviceRequestScratchGeometry`、
-  `run_real_v4_final_head_bench`、`run_streamed_lm_head_gpu_normalized`、
-  `run_certified_argmax_p0`、`flash_b1_layer_phase_profile_json`、`fixed_prepare_dual_accounting`。
-- **长尾**：剩下的约 6,000 行由几百个小于 110 行的项（结构体、类型别名、常量、小函数）构成。
-  再往下压行数就得按**主题聚类**搬（一组相关的小项凑够一个文件），而不是「一个函数一刀」；
-  每次聚类同样按上面的四条门槛验证。
+main.rs 里只剩 `fn main()`（391 行，二进制入口必须在 crate 根）和约 160 行的声明/常量底座。
+想再压只能动 `main()` 本身——那是拆函数，不是搬文件，得另立规矩（并且要重新设计验证口径，
+因为「逐字节相同」这条保证会被打破）。
