@@ -72,8 +72,14 @@ cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖
 - 编译警告数必须保持 59（bin）/ 22（test）。搬走的死代码会让警告「换文件」——例如
   `run_real_l0_rows` 那条从 `main.rs` 挪到 `mtp1_l0.rs`——所以判据是**警告集合去掉行号后
   逐条相同**，不只是总数相同。
-- `cargo fmt --check` 在 HEAD 上本来就不通过（main.rs 有两处 rustfmt 想重排的位置），
-  所以判据是「不新增格式差异」：新文件保持 fmt-clean，main.rs 的可重排位置集合不变。
+- `cargo fmt --check` 在 HEAD 上本来就不通过，而且偏差多数是原码自带的：搬走的代码会把它们
+  原样带走。2026-09-16 用 `rustfmt --edition 2021 --check` 逐文件量，整棵树 54 处
+  （`v4_state.rs` 19、`tests.rs` 13、`layer_ops.rs` 4 等），**main.rs 反而是 0 处**——
+  原来「main.rs 有两处想重排的位置」就在被搬走的代码里。所以判据是「不新增格式差异」：
+  新文件里的每一处偏差都要能在搬运前的原文里找到。唯一已知的例外是 `pub(crate)` 注入——
+  它会把个别接近 100 列的签名顶过线（当时 1 处，`fixed_layer_cache.rs` 的
+  `validate_stationary_key`），不改语义，可以接受；要消掉就得动签名行，那会破坏
+  「原文逐字节」这条更强的保证，不值得。
 - 真机验证：跑一次 Flash base 单步推理，要求 `argmax=55222`、`hidden_digest` 含
   `5ed8bf88beae3cfe`，且结果 JSON 里全部 261 个 16 位十六进制 digest 字段与
   `/srv/localmoe/targets/0731-sm120-clean-cuda128-default-block32-r2.jsonl` 逐一相同
