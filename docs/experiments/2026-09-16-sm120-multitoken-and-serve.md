@@ -12,15 +12,49 @@
 顺带纠正一条旧印象：2026-08-28 记录里"3 步峰值 3.72 GB"是那次用 `gpu_exact` final head 的开销，
 不是每步泄漏——默认 CPU final head 下 1 步和 8 步的峰值一模一样。
 
+### 12 秒去哪儿了：引擎自己记的账
+
+8 步那次运行的结果文件里有引擎自己的字节台账和逐相位计时，把它们加总（8 个迭代 = 1 个 prompt
+forward + 7 个生成 forward，344 次层访问）之后，一张 token 的成本是这样：
+
+| 项 | 每次迭代 | 说明 |
+| --- | --- | --- |
+| 从 SSD 读固定参数 | **6.71 GB** | 43 层 × 156 MB（attention + shared + 各类 norm），每个 token 重读一遍 |
+| 从 SSD 读 routed 专家 | **3.45 GB** | 每层 6 个专家 × 13.37 MB，只读被选中的 |
+| 从 SSD 读 final head | **1.06 GB** | `129280 × 4096` 的 bf16 head，每个 token 读一次，而且在 CPU 上算 |
+| 合计 | **11.2 GB/token** | 8 个迭代共 `89.75 GB`（`physical` 台账） |
+| 峰值显存 | 1.466 GB | 1 步和 8 步**逐字节相同**：权重不在显存里，KV/状态是预分配的 |
+| H2D 过 PCIe | ~10.2 GB/token | `fixed_h2d` 53.67 GB + `routed_h2d` 27.59 GB，与 SSD 读入字节数 1:1，没有复用 |
+
+**有效读取速率约 `0.83 GB/s`**（89.75 GB / 107.92 s）。分项看：固定参数那支
+`read_alloc_ns` 累计 55.96 s 读 53.67 GB（约 **0.96 GB/s**）；routed 那支整个 `wall` 49.88 s
+读 27.59 GB（约 **0.55 GB/s**，其中 `setup_ns` 29.18 s 是专家槽位准备，比真正读的 14.97 s 还大）。
+
+**计算不是瓶颈**：routed 专家的 kernel 全程 3.65 s（约 10.6 ms/层），attention 执行 10.47 s
+（约 30 ms/层）。显卡大部分时间在等数据。
+
+**同一台机器上顺序读能跑多快**：final head 那 1.06 GB，第一个 token 冷读用 642 ms（**1.65 GB/s**），
+之后的 token 只要 47 ms（**22.5 GB/s**，显然命中了页缓存）。所以盘本身不止 0.83 GB/s——
+**0.83 GB/s 是我们这条流式读路径跑出来的，不是盘的物理上限**。盘的上限还没测（仓库里有
+`c/iobench.c` 和 `c/tools/v4_io_matrix.py` 可以直接用）。
+
+**一个直接可动的杠杆**：固定参数总共 43 × 156 MB = **6.7 GB，16 GB 的卡装得下**。现在它们每个 token
+都重读一遍；钉进显存的话，每 token 的 SSD 流量从 11.2 GB 掉到约 4.5 GB。`fixed_layer_cache.rs` /
+`fixed_prefetch.rs` / QD4 那套机器就是干这个的，现在只有部分生效。
+
 **服务路径（stdio 协议）第一次真机端到端跑通。** 真实 prompt 文本进（`你好，你是谁？`），
 走 tokenizer + chat 模板 → 生成 8 个 token → 解码文本按 `DATA` 帧流式返回，最后 `DONE` 带统计。
 同一个进程里连着两次相同请求，返回的 token id 完全一致；另一个进程用同一 prompt 再跑，首 token 也一致。
 
-**但它慢，而且慢的地方不在显卡。** 第一个 token 要 95–157 s；`--max-tokens 1` 也要 95 s，
-说明和生成长度无关。真正的原因是**没有批量预填充**：耗时按 prompt 长度线性涨，约 19 s 一个 prompt token
-（四个数据点见下节），而一次完整的 43 层单步是 12–15 s。CLI 那条之所以看着"只是 13 s/步"，
-是因为它的 prompt 只有 1 个 token，看不见这一段。**13 s/步是这张卡 + 每步流 167 GB 权重的正常代价；
-"prompt 有几个 token 就先等几个 13 秒"是循环写法问题，两件事要分开算。**
+**但它慢，而且慢的地方在权重流，不在显卡也不在 KV cache。** 第一个 token 要 95–157 s；
+`--max-tokens 1` 也要 95 s，说明和生成长度无关。真正的原因是**没有批量预填充**：耗时按 prompt 长度
+线性涨，约 19 s 一个 prompt token（四个数据点见下节），而一次完整的 43 层单步是 12–15 s。
+CLI 那条之所以看着"只是 13 s/步"，是因为它的 prompt 只有 1 个 token，看不见这一段。
+
+单步的 12 秒也不是"读完 167 GB 权重"——引擎台账说每个 token 只读约 11.2 GB，
+**有效速率约 0.83 GB/s**，而同一台机器顺序读能跑 22.5 GB/s。也就是说：既不是显卡算得慢
+（routed 专家 kernel 全程 3.65 s），也不是 KV/状态爆显存（1 步和 8 步峰值逐字节相同），
+**是这条"SSD → host RAM → PCIe → 显存"的流式读路径本身慢**，而且 prompt 里的每个 token 都要再走一遍。
 
 没声称的部分：**没走 OpenAI HTTP 网关**（`c/openai_server.py` 的 `Engine` 类是给 C 引擎写的，
 按 `SNAP`/`SERVE`/`NGEN` 那套环境变量和额外握手行工作，能不能驱动 Rust 引擎没验证）；
@@ -121,16 +155,23 @@ python3 <repo>/rust/colibri-cuda/tools/flash_serve_client.py \
 
 ## 未决事项
 
-1. **没有批量预填充：prompt 每多一个 token 就多一整遍模型。** 证据在上面那节（四个数据点连成斜率
-   约 19 s/token 的直线，循环每迭代只吃一个 token）。后果是：5 个 token 的 prompt 忍得了，
-   200 个 token 的真实对话要在第一个字之前等约一小时。下一步不是"优化循环"，而是把 serve 路径接到
-   已有的预填充实现上——仓库里本来就有 `layer_stationary_prefill.rs` 那条路。
-2. **serve 每迭代比 CLI 贵约 1.75 倍（21.1 s vs 12.0 s），没解释。** 两个路径调的是同一个
+1. **没有批量预填充：prompt 每多一个 token 就多读约 11.2 GB。** 证据在上面两节（四个耗时数据点连成
+   斜率约 19 s/token 的直线；循环每迭代只吃一个 token）。后果：5 个 token 的 prompt 忍得了，
+   200 个 token 的真实对话要在第一个字之前等约 2.2 TB 的读。下一步不是"优化循环"，而是把 serve
+   路径接到已有的预填充实现上——仓库里本来就有 `layer_stationary_prefill.rs` 那条路。
+2. **读路径的有效速率（0.83 GB/s）和盘的上限差多少，没测。** 已知的锚点：同一份 final head
+   冷读 1.65 GB/s、页缓存命中 22.5 GB/s。要用 `c/iobench.c` / `c/tools/v4_io_matrix.py`
+   在模型目录上跑一次原始读，才知道 0.83 是"盘就这速度"还是"读法有问题"。
+3. **固定参数 6.7 GB 本可以常驻显存，现在是每个 token 重读。** 43 层 × 156 MB，16 GB 的卡装得下
+   （现在峰值只用 1.466 GB）。这一刀能把每 token 的 SSD 流量砍掉约 60%。
+4. **`routed.setup_ns` 29.18 s 是纯软件开销**（专家槽位准备，比真正读数据的 14.97 s 还大），
+   占整个 8 步运行的 27%。没有定位到具体是谁在花。
+5. **serve 每迭代比 CLI 贵约 1.75 倍（21.1 s vs 12.0 s），没解释。** 两个路径调的是同一个
    `run_v4_b2_generate_arm`，差别只有 prompt 长度和 `record_final_head_loader` /
    `capture_layer_trace` 两个臂参数（CLI 传 `true, true`，serve 传 `false, false`）。
-3. **OpenAI HTTP 网关能不能驱动 Rust 引擎，没验证。** `c/openai_server.py` 的 `Engine` 起的是 C 引擎、
+6. **OpenAI HTTP 网关能不能驱动 Rust 引擎，没验证。** `c/openai_server.py` 的 `Engine` 起的是 C 引擎、
    用 C 引擎的环境变量，还解析 `TIERS`/`hwinfo` 之类的握手行；要对上得先确认 Rust 侧发不发这些。
-4. **取消、并发、多请求没测。** 协议里有 `CANCEL`，`validate_submit` 只允许 `cache_slot=0`，
+7. **取消、并发、多请求没测。** 协议里有 `CANCEL`，`validate_submit` 只允许 `cache_slot=0`，
    也就是单槽串行。
-5. **多 token 的正确性只有第一颗锚住了**（与单步基线逐位相同），第 2–8 颗只做了同一运行内的自比对，
+8. **多 token 的正确性只有第一颗锚住了**（与单步基线逐位相同），第 2–8 颗只做了同一运行内的自比对，
    没有独立参考。
