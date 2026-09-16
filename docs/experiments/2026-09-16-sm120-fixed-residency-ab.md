@@ -59,6 +59,12 @@
 
 `rust/colibri-cuda/src/generate.rs` 的 b2 贪心循环里加了一个自选的常驻表（提交 `6f578cd`、`ba2b2a8`）：
 
+**代码不在交付分支上。** 这是一次实验，所以它放在 `exp/fixed-residency` 分支；`codex/business-restart`
+上用两笔 `git revert`（`5329f4a`、`76ed97e`）把它去掉了，历史是追加的，没有改写。
+要重新拿到这套改动：`git cherry-pick 6f578cd ba2b2a8`。
+
+细节：
+
 - `COLIBRI_V4_FIXED_RESIDENT_GIB` 为 0（默认）时行为完全不变；
 - 设了预算就按层捕获 `B2RawRuntime`，后续 token 直接取用，`fixed_source_bytes` / `fixed_h2d_bytes`
   在命中时记 0（填缓存那一遍已经记过），所以台账上能直接看出省了多少字节；
