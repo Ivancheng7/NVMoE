@@ -72,30 +72,52 @@ pub(crate) fn load_b2_raw_runtime_for(
     // Request-specific router metadata belongs to the request ledger, not the
     // immutable layer runtime. `load_layer_state_weights` accepts this empty
     // row set only to build the hash-router mode without reading a request row.
-    let (host, telemetry) = load_layer_host_inner_for(spec, model_dir, layer, &[], true)?;
-    load_b2_raw_runtime_from_host_for(spec, model_dir, layer, host, telemetry, stream)
-}
-
-pub(crate) fn load_b2_raw_runtime_from_host_for(
-    spec: &'static v4_spec::V4Spec,
-    model_dir: &std::path::Path,
-    layer: usize,
-    mut host: DecodedLayerHost,
-    telemetry: FixedLoadTelemetry,
-    stream: &CudaStream,
-) -> Result<B2RawRuntime, Box<dyn Error>> {
-    let raw_wo_a_host = host
+    let (mut host, telemetry) = load_layer_host_inner_for(spec, model_dir, layer, &[], true)?;
+    let raw_wo_a = host
         .tail
         .wo_a_raw
         .take()
         .ok_or("B2 raw layer host omitted wo_a")?;
+    load_b2_raw_runtime_from_host_ref_for(
+        spec,
+        model_dir,
+        layer,
+        &host,
+        &raw_wo_a,
+        telemetry,
+        stream,
+    )
+}
+
+/// Uploads a layer from a host payload the caller keeps.
+///
+/// The Flash B1 decode loop borrows the payload out of its retention cache here.
+/// Because the caller owns it, releasing it is the caller's step, and a retained
+/// payload outlives the layer instead of being rebuilt next token. Raw `wo_a`
+/// travels beside the host, never inside it: `new_layer` rejects a host that
+/// still carries it.
+pub(crate) fn load_b2_raw_runtime_from_host_ref_for(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    raw_wo_a_host: &[u8],
+    telemetry: FixedLoadTelemetry,
+    stream: &CudaStream,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
+    if host.tail.wo_a_raw.is_some() {
+        return Err("B2 raw layer host still owns its raw wo_a".into());
+    }
+    if raw_wo_a_host.is_empty() {
+        return Err("B2 raw layer host omitted wo_a".into());
+    }
     if !host.tail.wo_a_bf16.is_empty() {
         return Err("B2 raw layer host retained decoded wo_a".into());
     }
     let h2d_started = std::time::Instant::now();
-    let runtime = upload_layer_runtime_for(spec, model_dir, layer, &host, stream)?;
+    let runtime = upload_layer_runtime_for(spec, model_dir, layer, host, stream)?;
     let fixed_h2d_without_wo_a_bytes = runtime.weights.num_bytes();
-    let wo_a_raw = DeviceBuffer::from_host(stream, &raw_wo_a_host)?;
+    let wo_a_raw = DeviceBuffer::from_host(stream, raw_wo_a_host)?;
     stream.synchronize()?;
     let raw_h2d_bytes = wo_a_raw.num_bytes();
     let fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -118,7 +140,7 @@ pub(crate) fn load_b2_raw_runtime_from_host_for(
             fixed_h2d_ns,
             fixed_h2d_bytes,
             fixed_source_bytes,
-            cache_status: "miss",
+            cache_status: telemetry.cache_status,
             ..FixedLoadTelemetry::default()
         },
         raw: RawLoadedLayerRuntime {

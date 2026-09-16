@@ -299,6 +299,43 @@ pub(crate) fn run_b2_batch_pair(
     )
 }
 
+/// Uploads one fixed layer out of a host payload the caller owns.
+///
+/// When the payload is retained (the cache still holds a reference) nothing is
+/// freed here and the release costs nothing; when it is the last reference the
+/// release is timed, because that free used to land on the main thread inside
+/// the fixed window.
+fn load_flash_b1_layer_from_host(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: std::sync::Arc<fixed_host_cache::ResidentLayerHost>,
+    telemetry: FixedLoadTelemetry,
+    stream: &CudaStream,
+    request_started: std::time::Instant,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
+    let mut loaded = load_b2_raw_runtime_from_host_ref_for(
+        spec,
+        model_dir,
+        layer,
+        &host.host,
+        &host.wo_a_raw,
+        telemetry,
+        stream,
+    )?;
+    let released_bytes = if std::sync::Arc::strong_count(&host) == 1 {
+        host.bytes()
+    } else {
+        0
+    };
+    let release_started_ns = timeline_elapsed_ns(request_started);
+    drop(host);
+    loaded.fixed.window_release_ns =
+        timeline_elapsed_ns(request_started).saturating_sub(release_started_ns);
+    loaded.fixed.window_release_bytes = released_bytes;
+    Ok(loaded)
+}
+
 pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     spec: &'static v4_spec::V4Spec,
     context: &std::sync::Arc<CudaContext>,
@@ -386,6 +423,12 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     if layer_count == 0 || layer_count > spec.layers {
         return Err("Flash parity stop layer is outside the model depth".into());
     }
+    // One cache for the whole run: it has to outlive the token loop, otherwise
+    // every token misses and the retained bytes are rebuilt and thrown away 8
+    // times over instead of once.
+    let host_cache = std::sync::Arc::new(std::sync::Mutex::new(
+        fixed_host_cache::FixedHostCache::from_env(spec.layers)?,
+    ));
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -413,15 +456,20 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
             .collect::<Vec<Vec<B2LayerDigest>>>();
         let token_started = std::time::Instant::now();
         std::thread::scope(|scope| -> Result<(), Box<dyn Error>> {
-            let mut prefetched_next: Option<FixedPrefetchTask<'_>> = None;
+            let mut prefetched_next: Option<fixed_host_cache::ResidentPrefetch<'_>> = None;
             for layer in 0..layer_count {
                 let layer_started = std::time::Instant::now();
+                let mut from_prefetch = false;
                 let mut loaded = if let Some(task) = prefetched_next.take() {
+                    from_prefetch = true;
                     let scheduled_layer = task.layer;
+                    let join_entered_ns = timeline_elapsed_ns(request_started);
                     let prefetched = task
                         .worker
                         .join()
                         .map_err(|_| "Flash B1 fixed prefetch worker panicked")?;
+                    let window_join_ns =
+                        timeline_elapsed_ns(request_started).saturating_sub(join_entered_ns);
                     let prefetched =
                         flash_b1_prefetch_worker_result(layer, scheduled_layer, prefetched)?;
                     if prefetched.layer != layer {
@@ -429,51 +477,82 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             "Flash B1 fixed prefetch worker returned the wrong layer".into()
                         );
                     }
-                    let mut loaded = load_b2_raw_runtime_from_host_for(
+                    let window_worker_ns = prefetched
+                        .worker_end_ns
+                        .saturating_sub(prefetched.worker_start_ns);
+                    let window_worker_ready = prefetched.worker_end_ns <= join_entered_ns;
+                    let mut loaded = load_flash_b1_layer_from_host(
                         spec,
                         model_dir,
                         layer,
                         prefetched.host,
                         prefetched.telemetry,
                         stream,
+                        request_started,
                     )?;
-                    loaded.fixed.cache_status = "prefetched_host";
+                    if loaded.fixed.cache_status != "host_resident_hit" {
+                        loaded.fixed.cache_status = "prefetched_host";
+                    }
+                    loaded.fixed.window_join_ns = window_join_ns;
+                    loaded.fixed.window_worker_ns = window_worker_ns;
+                    loaded.fixed.window_worker_ready = window_worker_ready;
                     loaded
                 } else {
-                    load_b2_raw_runtime_for(spec, model_dir, layer, stream)?
+                    let (host, telemetry) = fixed_host_cache::resolve_host_layer(
+                        spec,
+                        model_dir,
+                        layer,
+                        host_cache.as_ref(),
+                    )?;
+                    load_flash_b1_layer_from_host(
+                        spec,
+                        model_dir,
+                        layer,
+                        host,
+                        telemetry,
+                        stream,
+                        request_started,
+                    )?
                 };
                 if flash_b1_prefetch {
                     if let Some(next_layer) = flash_b1_prefetch_next_layer(layer, layer_count)? {
                         let worker_root = model_dir.to_owned();
+                        let worker_cache = host_cache.clone();
                         let worker_started = timeline_elapsed_ns(request_started);
+                        let spawn_started_ns = timeline_elapsed_ns(request_started);
                         let worker = scope.spawn(move || {
-                            let (host, telemetry) = load_layer_host_inner_for(
+                            let (host, telemetry) = fixed_host_cache::resolve_host_layer(
                                 spec,
                                 &worker_root,
                                 next_layer,
-                                &[],
-                                true,
+                                worker_cache.as_ref(),
                             )
                             .map_err(|error| error.to_string())?;
                             let worker_ended = timeline_elapsed_ns(request_started);
-                            Ok(FixedPrefetchedHost {
+                            Ok(fixed_host_cache::ResidentPrefetched {
                                 layer: next_layer,
-                                host_bytes: host.num_bytes(),
                                 host,
                                 telemetry,
                                 worker_start_ns: worker_started,
                                 worker_end_ns: worker_ended,
                             })
                         });
-                        prefetched_next = Some(FixedPrefetchTask {
+                        prefetched_next = Some(fixed_host_cache::ResidentPrefetch {
                             layer: next_layer,
-                            transition: None,
                             worker,
                         });
+                        loaded.fixed.window_spawn_ns = timeline_elapsed_ns(request_started)
+                            .saturating_sub(spawn_started_ns);
                     }
                 }
                 let fixed_prepare_ns =
                     u64::try_from(layer_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if from_prefetch {
+                    loaded.fixed.window_residual_ns = fixed_prepare_ns
+                        .saturating_sub(loaded.fixed.window_join_ns)
+                        .saturating_sub(loaded.fixed.fixed_h2d_ns)
+                        .saturating_sub(loaded.fixed.window_spawn_ns);
+                }
                 let hash_ids = load_layer_hash_ids_for(spec, model_dir, layer, &token_ids)?;
                 let router_rows = active_requests
                     .iter()

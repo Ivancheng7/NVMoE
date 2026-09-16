@@ -162,6 +162,13 @@ pub(crate) struct FixedLoadTelemetry {
     pub(crate) raw_h2d_ns: u64,
     pub(crate) raw_h2d_bytes: usize,
     pub(crate) cache_status: &'static str,
+    pub(crate) window_join_ns: u64,
+    pub(crate) window_spawn_ns: u64,
+    pub(crate) window_residual_ns: u64,
+    pub(crate) window_worker_ns: u64,
+    pub(crate) window_worker_ready: bool,
+    pub(crate) window_release_ns: u64,
+    pub(crate) window_release_bytes: usize,
     pub(crate) bounded_readahead: Option<BoundedReadaheadTelemetry>,
 }
 
