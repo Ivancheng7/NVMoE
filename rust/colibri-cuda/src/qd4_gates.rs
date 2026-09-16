@@ -288,6 +288,7 @@ pub(crate) fn prepare_qd4_stationary_gate_inputs(
                         false,
                         None,
                         None,
+                    None,
                     )?
                     .output,
                 );

@@ -254,6 +254,7 @@ pub(crate) fn prepare_b2_prefix(
                     false,
                     None,
                     None,
+                None,
                 )?
                 .output,
             );
@@ -350,6 +351,7 @@ pub(crate) fn prepare_two_token_prefix(
                         None,
                     )?
                     .output,
+                None,
                 );
                 Ok(())
             })?;

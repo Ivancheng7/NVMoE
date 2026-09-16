@@ -60,6 +60,7 @@ pub(crate) fn run_b2_serial_request(
             token_id,
             0,
             &mut persistent,
+        None,
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         let (next, digest, stage) = run?;
@@ -230,6 +231,7 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 token_ids[request],
                 0,
                 &mut state[request],
+            None,
             ) {
                 Ok((next, digest, stage)) => {
                     physical.routed_source_bytes += stage.routed_source_bytes;
@@ -429,6 +431,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let host_cache = std::sync::Arc::new(std::sync::Mutex::new(
         fixed_host_cache::FixedHostCache::from_env(spec.layers)?,
     ));
+    // Same scope argument for the routed expert slot: page-locking its staging
+    // costs 17 ms, so it lives as long as the run instead of one layer.
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -599,6 +604,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                             token_id,
                             state.position,
                             &mut state.persistent,
+                            Some(&mut routed_slot_scratch),
                         )?;
                         physical.routed_source_bytes += stage.routed_source_bytes;
                         physical.routed_h2d_bytes += stage.routed_h2d_bytes;

@@ -746,6 +746,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             false,
                             Some((state, scratch, audit_expected_compressed_prefix)),
                             None,
+                        None,
                         );
                         let run = match run {
                             Ok(run) => run,
@@ -778,7 +779,8 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             false,
                             None,
                             None,
-                        )?);
+                        )?None,
+                        );
                     } else {
                         persistent
                         .as_mut()
@@ -841,6 +843,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 false,
                                 None,
                                 strict_scratch.as_mut(),
+                            None,
                             )?;
                             if let Some((expected_output, expected_topk, expected_state, oracle_ns)) =
                                 expected_attention
@@ -1781,7 +1784,8 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             lifecycle.acquire_lease();
                             let before = state.committed_rows;
                             let run = {
-                                let runtime = prepared.runtime();
+                                let runtime = prepared.runtime(None,
+                                );
                                 run_real_layer_rows(
                                     context,
                                     module,
@@ -2409,7 +2413,8 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                         let mut oracle = None;
                         if device_attention_audit {
                             persistent
-                                .as_mut()
+                                .as_mut(None,
+                                )
                                 .ok_or("short device decode audit lost its host persistent state")?
                                 .transaction(manifest.layer, |host_state| {
                                     let run = run_real_layer_rows(
@@ -2451,6 +2456,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                         if state.layer != manifest.layer || state.committed_rows != token_position {
                             return Err(
                                 "short device decode persistent-state continuity mismatch".into()
+                            None,
                             );
                         }
                         let kv_rows_before = state.committed_rows;
