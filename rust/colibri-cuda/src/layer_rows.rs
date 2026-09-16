@@ -1,5 +1,16 @@
 use super::*;
 
+/// How many threads the Flash B1 routed prefetch uses to read this layer's
+/// experts. One expert per thread is the point; the default of 1 reproduces the
+/// committed single-worker behaviour exactly.
+pub(crate) fn routed_read_threads() -> usize {
+    std::env::var("COLIBRI_V4_ROUTED_READ_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| (1..=16).contains(threads))
+        .unwrap_or(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_real_layer_attention_rows(
     module: &kernels::LoadedModule,
@@ -946,24 +957,33 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             return Err("Flash B1 routed prefetch requires exactly one route row".into());
         }
         let route_ids = routes.ids.clone();
+        let read_threads = routed_read_threads();
         let loaded = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
-            let worker = scope.spawn(|| {
-                route_ids
-                    .into_iter()
-                    .map(|expert_id| {
-                        let expert_id =
-                            u16::try_from(expert_id).map_err(|error| error.to_string())?;
-                        let expert = v4_expert::RoutedExpert::load_layer_for(
-                            spec,
-                            &runtime.expert_shard,
-                            weights.layer,
-                            expert_id,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        Ok::<_, String>((expert_id, expert))
+            // One worker per read thread; the chunk size keeps the experts in
+            // their original order when the chunks are concatenated back.
+            let chunk_size = route_ids.len().div_ceil(read_threads);
+            let workers = route_ids
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|expert_id| {
+                                let expert_id =
+                                    u16::try_from(*expert_id).map_err(|error| error.to_string())?;
+                                let expert = v4_expert::RoutedExpert::load_layer_for(
+                                    spec,
+                                    &runtime.expert_shard,
+                                    weights.layer,
+                                    expert_id,
+                                )
+                                .map_err(|error| error.to_string())?;
+                                Ok::<_, String>((expert_id, expert))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
                     })
-                    .collect::<Result<Vec<_>, _>>()
-            });
+                })
+                .collect::<Vec<_>>();
             let shared = if parity_dump.is_some() {
                 run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
             } else {
@@ -972,10 +992,15 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     Vec::new(),
                 )
             };
-            let experts = worker
-                .join()
-                .map_err(|_| "Flash B1 routed prefetch worker panicked")?
-                .map_err(|error| format!("Flash B1 routed prefetch worker failed: {error}"))?;
+            let mut experts = Vec::with_capacity(route_ids.len());
+            for worker in workers {
+                experts.extend(
+                    worker
+                        .join()
+                        .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                        .map_err(|error| format!("Flash B1 routed prefetch worker failed: {error}"))?,
+                );
+            }
             Ok((shared, experts))
         })?;
         prefetched_routed_experts = Some(loaded.1);
