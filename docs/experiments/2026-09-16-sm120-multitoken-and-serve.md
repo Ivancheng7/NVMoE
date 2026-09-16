@@ -12,6 +12,25 @@
 顺带纠正一条旧印象：2026-08-28 记录里"3 步峰值 3.72 GB"是那次用 `gpu_exact` final head 的开销，
 不是每步泄漏——默认 CPU final head 下 1 步和 8 步的峰值一模一样。
 
+### 和 README 招牌数字的关系
+
+README 的 12GB 笔记本成绩是 **`0.0762 tok/s`**，也就是 `13.126173804 s` 一个 one-token、43 层请求
+（`docs/assets/readme/flash-0731-abba.csv` 里八行的最终 F 臂：`12.93 s` / `13.33 s`，其余臂
+`31.5 / 32.5 / 34.3 / 34.9 / 93.2 / 93.5 s`）。
+
+和我们这次在 5060 Ti 上的实测**基本一致**：单步 `12.9 s`、8 步里每个 token `12.2–13.4 s`，
+即 `0.075–0.082 tok/s`。峰值显存也一致（他们最终 `1.35 GiB`，我们 `1.37 GiB`）。
+**换句话说：这台桌面卡并不比那台游戏本快，因为两边卡住的都是同一条权重流路径，不是显卡。**
+
+README 自己把范围写清楚了（第 46 行）：那份 43/43 证书pin在"one prompt token, one greedy step"上，
+long contexts / other prompts 需要各自的证据。它没说、也没有测的是：**成本是 prompt 长度的线性函数**——
+README 的运行命令用的是 `COLIBRI_V4_FLASH_TOKEN_IDS=0`，prompt 就是一个 token，正好落在看不见这个问题的区间。
+
+README 第 60–65 行还有一张标着"sizing estimates with no benchmark-run evidence yet"的表，
+给 16GB desktop 估 `0.209 to 0.440 tok/s`，假设是 `fixed-resident`。我们实测 `0.078 tok/s`，
+差 2.7–5.7 倍；差距的来源正是那条假设——**固定参数常驻显存**（见上面"12 秒去哪儿了"一节，
+现在没常驻，每 token 重读 6.71 GB）。
+
 ### 12 秒去哪儿了：引擎自己记的账
 
 8 步那次运行的结果文件里有引擎自己的字节台账和逐相位计时，把它们加总（8 个迭代 = 1 个 prompt
