@@ -167,6 +167,8 @@ pub(crate) struct FixedLoadTelemetry {
     pub(crate) window_residual_ns: u64,
     pub(crate) window_worker_ns: u64,
     pub(crate) window_worker_ready: bool,
+    pub(crate) window_release_ns: u64,
+    pub(crate) window_release_bytes: usize,
     pub(crate) bounded_readahead: Option<BoundedReadaheadTelemetry>,
 }
 

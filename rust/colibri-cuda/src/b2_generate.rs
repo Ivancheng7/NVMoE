@@ -571,6 +571,8 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
                     "join_ns": fixed.window_join_ns,
                     "spawn_ns": fixed.window_spawn_ns,
                     "residual_ns": fixed.window_residual_ns,
+                    "release_ns": fixed.window_release_ns,
+                    "release_bytes": fixed.window_release_bytes,
                     "worker_ns": fixed.window_worker_ns,
                     "worker_ready_before_consume": fixed.window_worker_ready,
                 },

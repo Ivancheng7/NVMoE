@@ -109,6 +109,14 @@ pub(crate) fn load_b2_raw_runtime_from_host_for(
         .num_bytes()
         .checked_add(wo_a_raw.num_bytes())
         .ok_or("B2 raw device resident byte overflow")?;
+    // Both host buffers are dropped here, after the H2D timer stopped: freeing the
+    // per-layer fixed host payload lands on the main thread inside the fixed window.
+    let release_started = std::time::Instant::now();
+    let released_host_bytes = host.num_bytes() + raw_wo_a_host.len();
+    drop(raw_wo_a_host);
+    drop(host);
+    let fixed_host_release_ns =
+        u64::try_from(release_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     Ok(B2RawRuntime {
         fixed_source_bytes,
         fixed_h2d_bytes,
@@ -119,6 +127,8 @@ pub(crate) fn load_b2_raw_runtime_from_host_for(
             fixed_h2d_bytes,
             fixed_source_bytes,
             cache_status: "miss",
+            window_release_ns: fixed_host_release_ns,
+            window_release_bytes: released_host_bytes,
             ..FixedLoadTelemetry::default()
         },
         raw: RawLoadedLayerRuntime {
