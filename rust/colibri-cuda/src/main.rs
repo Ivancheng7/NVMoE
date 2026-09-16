@@ -24632,7 +24632,10 @@ fn flash_fp4_accum_arm_for(
         return Ok(FlashFp4AccumArm::Current);
     }
     match value {
-        None => Ok(FlashFp4AccumArm::Current),
+        // sm_120 business baseline: keep the raw-FP8/block32 path as the
+        // reproducible default.  The WMMA and cached TileLang paths remain
+        // explicit experiments until they have stable target-GPU evidence.
+        None => Ok(FlashFp4AccumArm::Block32),
         Some(value) if value == "current" => Ok(FlashFp4AccumArm::Current),
         Some(value) if value == "block32" => Ok(FlashFp4AccumArm::Block32),
         Some(value) if value == "tilelang_ref" => Ok(FlashFp4AccumArm::TilelangRef),
@@ -37276,8 +37279,10 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
             .debug
             .as_ref()
             .ok_or("Flash parity dump did not retain GPU router debug buffers")?;
+        let has_learned_router_rmsnorm = !weights.hash_router;
         if debug.rmsnorm.len() != rows * 3
-            || debug.rmsnorm_squares.len() != rows * spec.hidden
+            || (has_learned_router_rmsnorm
+                && debug.rmsnorm_squares.len() != rows * spec.hidden)
             || debug.logits.len() != rows * spec.routed_experts
             || debug.softplus.len() != debug.logits.len()
             || debug.post_scores.len() != debug.logits.len()
@@ -37292,30 +37297,32 @@ fn run_real_layer_rows<'module, 'slots, 'lane>(
             &[rows, spec.hidden],
             &router.input,
         )?;
-        flash_parity_dump_f32(
-            dir,
-            "router_rmsnorm_square_f32",
-            &[rows, spec.hidden],
-            &debug.rmsnorm_squares,
-        )?;
-        flash_parity_dump_f32(
-            dir,
-            "router_rmsnorm_sum_sq_f32",
-            &[rows],
-            &debug.rmsnorm[0..rows],
-        )?;
-        flash_parity_dump_f32(
-            dir,
-            "router_rmsnorm_mean_f32",
-            &[rows],
-            &debug.rmsnorm[rows..rows * 2],
-        )?;
-        flash_parity_dump_f32(
-            dir,
-            "router_rmsnorm_inv_f32",
-            &[rows],
-            &debug.rmsnorm[rows * 2..rows * 3],
-        )?;
+        if has_learned_router_rmsnorm {
+            flash_parity_dump_f32(
+                dir,
+                "router_rmsnorm_square_f32",
+                &[rows, spec.hidden],
+                &debug.rmsnorm_squares,
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "router_rmsnorm_sum_sq_f32",
+                &[rows],
+                &debug.rmsnorm[0..rows],
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "router_rmsnorm_mean_f32",
+                &[rows],
+                &debug.rmsnorm[rows..rows * 2],
+            )?;
+            flash_parity_dump_f32(
+                dir,
+                "router_rmsnorm_inv_f32",
+                &[rows],
+                &debug.rmsnorm[rows * 2..rows * 3],
+            )?;
+        }
         flash_parity_dump_f32(
             dir,
             "router_gate_logits_f32",
@@ -40330,13 +40337,13 @@ mod tests {
     }
 
     #[test]
-    fn flash_fp4_accum_arms_are_flash_scoped_and_opt_in() {
+    fn flash_fp4_accum_arms_are_flash_scoped_with_reproducible_default() {
         let block32 = std::ffi::OsStr::new("block32");
         let tilelang_ref = std::ffi::OsStr::new("tilelang_ref");
         let fp8_mma = std::ffi::OsStr::new("fp8_mma");
         assert_eq!(
             flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, None).unwrap(),
-            FlashFp4AccumArm::Current
+            FlashFp4AccumArm::Block32
         );
         assert_eq!(
             flash_fp4_accum_arm_for(&v4_spec::FLASH_0731, Some(block32)).unwrap(),

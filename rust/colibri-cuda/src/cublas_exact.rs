@@ -2,10 +2,11 @@ use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 
-// Blackwell target baseline: CUDA 13.1 ships this concrete cuBLAS build.
-// Keep the file hash pinned so exact paths cannot silently load another ABI.
-pub const LIBRARY_SHA256: &str = "f88d93a46abe3f03805c310b4d820d17398a90067080dd54acfd3a21d1415799";
-pub const EXPECTED_VERSION: i32 = 130_201;
+// Blackwell sm_120 target baseline: CUDA 12.8 matches the pinned PyTorch
+// oracle environment. Keep the file hash pinned so exact paths cannot
+// silently load another ABI.
+pub const LIBRARY_SHA256: &str = "18a5df540d156e9aff0363776fefab7884b614f122847b51c3eb1da772048e5c";
+pub const EXPECTED_VERSION: i32 = 120_805;
 pub const WORKSPACE_BYTES: usize = 8_519_680;
 
 const RTLD_LOCAL: c_int = 0;

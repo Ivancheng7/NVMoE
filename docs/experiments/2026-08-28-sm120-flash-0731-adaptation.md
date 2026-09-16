@@ -2,9 +2,9 @@
 
 ## 结论
 
-新下载的 ModelScope `deepseek-ai/DeepSeek-V4-Flash-0731` 已能在 RTX 5060 Ti（`sm_120`）上完成 43 层真实 base-only 推理，并执行 CUDA 13.1/cuBLAS GPU exact final-head。连续 3 个 greedy step 可以稳定完成，说明适配已经越过“一次性 smoke”阶段。
+新下载的 ModelScope `deepseek-ai/DeepSeek-V4-Flash-0731` 已能在 RTX 5060 Ti（`sm_120`）上完成 43 层真实 base-only 推理，并执行 CUDA 12.8/cuBLAS GPU exact final-head。`localmoe-clean` 现已把 Flash-0731 的默认 FP4 专家臂切到确定性的 `block32` 路径；同一环境连续两次完整运行均得到 token `55222`，hidden digest 均为 `5ed8bf88beae3cfe`。
 
-本次结果尚不能宣称通过仓库原有的官方数值 gate：仓库 README 记录的 token `33832` 对 `token_ids=0` 的首步参考，与当前新模型首步 `55222` 不一致。模型元数据与官方 0731 固定文件哈希一致，因此需要单独重新生成/复核 0731 的 full-43 官方 oracle，不能把这次运行标记为 `PASS_EXACT`。
+官方 TileLang FP4 核在当前 `sm_120` 环境并非稳定 oracle：已保存的官方 full-43 运行分别出现 token `67900`（v4）、`55222`（v5）和 token `0`（r9），对应 hidden SHA-256 也不同。官方 L0 routed FP4 中间量重复运行同样发生漂移。因此不能把单次 `67900` 或某个随机中间快照当成唯一数值真值；当前可复现业务基线是 Rust `block32` 路径，尚未宣称 FP4 逐元素 `PASS_EXACT`。
 
 ## 固定输入与模型
 
@@ -18,7 +18,7 @@
 
 ## 运行证据
 
-构建使用 `cargo oxide build --arch sm_120 -- --release`，运行时使用 CUDA 13.1 的 `libcublas.so.13.2.1.1`，实际 `cublasGetVersion=130201`。
+构建使用 `cargo oxide build --arch sm_120 -- --release`，运行时固定使用 CUDA 12.8 的 `libcublas.so.12.8.5.5`，实际 `cublasGetVersion=120805`。
 
 单步 GPU exact 结果：
 
@@ -36,12 +36,15 @@
 
 ## 代码变更
 
-- `run_real_v4_flash_base` 现在在 GPU exact 模式下创建并复用一个 final-head workspace，避免多 token 时重复写同一路径的 trace artifact 而崩溃。
+- `cublas_exact.rs` 的 Flash-0731 ABI 身份已固定到 CUDA 12.8/cuBLAS 12.8.5.5，避免误加载 CUDA 13.x。
+- hash-router layer 0 的 parity 采集不再错误要求 learned-router RMSNorm trace，能够完整采集 routed expert 边界。
+- Flash-0731 未显式指定臂时默认使用 `block32`；`fp8_mma` 与 TileLang 缓存臂保留为显式实验项，待目标卡上有稳定证据后再进入性能结论。
+- `run_real_v4_flash_base` 在 GPU exact 模式下创建并复用 final-head workspace，避免多 token 时重复写同一路径的 trace artifact 而崩溃。
 - `sm_120` final-head capability gate、默认构建架构和 CUDA/cuBLAS 运行说明已同步。
-- 官方 final-head 比对改为显式设置 `COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR` 才开启；没有独立 oracle 时只报告 runtime GPU exact，不伪造 exact parity。
+- 官方 final-head 比对仍需显式设置 `COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR` 才开启；没有稳定独立 oracle 时只报告 runtime GPU exact，不伪造 exact parity。
 
 ## 未决事项
 
-1. 安装或提供与固定 0731 revision 匹配的 PyTorch/CUDA 环境，重新生成 full-43 官方 oracle。
-2. 用 oracle 按层比较首个分歧点，确认 `55222` 与 README 的 `33832` 是参考语义漂移还是实现数值差异。
+1. 修复或替换 `sm_120` 上不稳定的官方 TileLang FP4 参考核，先得到可重复的 FP4 专家 oracle；在此之前不做 routed FP4 逐元素精确声明。
+2. 在稳定 oracle 之上，再按层比较首个分歧点；当前已确认 mHC/router 的 CUDA 12.8 cuBLAS 路径和 layer 0 非 FP4 边界可复现，剩余业务差异集中在 routed FP4 GEMM。
 3. 完成真实 serve 协议的多请求/取消/持续吞吐测试后，再更新性能结论。
