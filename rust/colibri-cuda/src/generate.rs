@@ -578,15 +578,11 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         .ok_or("Flash B1 layer outer timing overflow")?;
                     timing.layers.push(profile);
                 }
-                if resident_budget_bytes > 0 {
-                    if from_resident {
+                if resident_budget_bytes > 0 && !from_resident {
+                    let bytes = loaded.raw.resident_bytes;
+                    if resident_bytes.saturating_add(bytes) <= resident_budget_bytes {
+                        resident_bytes += bytes;
                         resident[layer] = Some(loaded);
-                    } else {
-                        let bytes = loaded.raw.resident_bytes;
-                        if resident_bytes.saturating_add(bytes) <= resident_budget_bytes {
-                            resident_bytes += bytes;
-                            resident[layer] = Some(loaded);
-                        }
                     }
                 }
             }
