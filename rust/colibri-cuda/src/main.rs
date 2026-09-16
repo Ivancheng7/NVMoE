@@ -3400,3 +3400,9 @@ fn main() {
 
     println!("PASS: Rust CUDA primitives, V4 FP4/router, and routed expert-0 parity");
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod tests_continued;
