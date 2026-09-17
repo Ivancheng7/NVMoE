@@ -11,14 +11,31 @@ pub(crate) fn flash_b1_prefetch_enabled(
     spec: &'static v4_spec::V4Spec,
     requests: usize,
 ) -> Result<bool, Box<dyn Error>> {
-    // Keep the experimental worker confined to the standalone Flash B1 base
-    // runner. Serve, DSpark, Pro, QD4, and every multi-row execution retain
-    // their existing loading path.
-    if spec != &v4_spec::FLASH_0731 || requests != 1 || !optional_one_flag("COLIBRI_V4_FLASH_BASE")?
-    {
+    // Confined to the two delivery Flash surfaces, same as the prompt chunk:
+    // DSpark, Pro, QD4 and every multi-row execution keep their existing
+    // loading path.
+    if spec != &v4_spec::FLASH_0731 || requests != 1 {
         return Ok(false);
     }
-    optional_one_flag("COLIBRI_V4_FLASH_PREFETCH")
+    let base =
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let serve =
+        std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !base && !serve {
+        return Ok(false);
+    }
+    // On by default since the serve gate was widened: the worker is what keeps
+    // the per-layer fixed load and the parallel routed read off the critical
+    // path, and serve used to lose it because the gate only knew the base
+    // runner (`c/openai_server.py` never sets COLIBRI_V4_FLASH_PREFETCH).
+    // `=0` puts the serial loader back so runs recorded against it stay
+    // reproducible.
+    match std::env::var_os("COLIBRI_V4_FLASH_PREFETCH").as_deref() {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Err("COLIBRI_V4_FLASH_PREFETCH must be 1 or 0 when set".into()),
+    }
 }
 
 pub(crate) fn flash_b1_prompt_chunk_enabled(
