@@ -1045,18 +1045,19 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     }
     stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if shared_probe {
+        let window_us = u128::from(stage.shared_ns) / 1_000;
         eprintln!(
             "SHAREDPROBE layer={} rows={} prefetch={} window_us={} mlp_us={} workers={} \
              worker_sum_us={} worker_max_us={} join_wait_us={}",
             weights.layer,
             rows,
             flash_routed_prefetch,
-            stage.shared_ns / 1_000,
+            window_us,
             shared_probe_mlp_us,
             shared_probe_workers,
             shared_probe_worker_sum_us,
             shared_probe_worker_max_us,
-            stage.shared_ns / 1_000 - shared_probe_mlp_us,
+            window_us.saturating_sub(shared_probe_mlp_us),
         );
     }
     if let Some(timeline) = critical_path_timeline.as_mut() {
