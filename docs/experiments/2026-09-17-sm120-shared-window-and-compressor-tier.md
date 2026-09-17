@@ -43,6 +43,21 @@ attention `0.914 / 1.337 / 1.387 / 0.927 / 0.912 s`——**三快两慢，同一
 三种 layout 的增量都只落在这一段，而且**与权重元素数成正比**：`+1201 / +2409 / +4972 us`
 对应 `1.05M / 2.10M / 4.19M` 个元素，即约 `+1.15 ns/元素`。其余八段在两档之间平到 2% 以内。
 
+**第二遍独立跑把档位定到了两个循环上。** 第二批（`arena-fix-b`）的关池子臂三跑里，
+前两跑是慢档、第三跑是快档，而三跑之间只有这两个展开循环变：
+
+| `outputs=1024, ratio=4` 的段（`us`） | off-r1（慢） | off-r2（慢） | **off-r3（快）** | on-r1（池子开） |
+| --- | --- | --- | --- | --- |
+| `expand_wkv` | `5221.9` | `5252.3` | **`1189.0`** | `716.3` |
+| `expand_wgate` | `8062.8` | `7948.4` | **`1702.3`** | `799.4` |
+| `h2d_wkv` / `h2d_wgate` | `2246.9 / 2040.7` | `2272.1 / 2055.8` | `2306.5 / 2062.5` | `2918.9 / 2074` |
+| `row_loop` / `gemm1` / `gemm2` / `row_d2h` | `611 / 52 / 13 / 217` | `624 / 52 / 12 / 224` | `622 / 57 / 13 / 233` | `-` |
+| 同一跑的 attention 墙 | `1.341 s` | `1.344 s` | **`0.950 s`** | `0.784 s` |
+
+**H2D 三次跑完全一样（`2247/2272/2307`），变的是展开。** 所以档位不是 `DeviceBuffer::from_host`
+那一步（申请 + 上传），就是主机侧那两个 `u16 -> f32` 循环：同一份输入、同一段代码，
+一次 `2.9 ms`（`1189+1702`）另一次 `13.3 ms`（`5222+8063`），差 `10.4 ms` 正好是这一趟 attention 的差。
+
 **然后是这个改动真正的发现**：`7e07056` 加到交付分支的"压缩器复用池"（`COLIBRI_V4_FLASH_COMPRESSOR_ARENA`，
 默认开）**在交付帧里一次都没跑过**。分支探针（`b7da660`）打出来：
 
@@ -58,36 +73,43 @@ COMPPROBE_BRANCH outputs=512 ratio=128 strict=true scratch=true input_len=4096 a
 
 ### 三、把池子接上（`9efd662`）：attention `1.34 → 0.79 s/token`，两档没了
 
-交错跑 3 轮（`on r1, off r1, on r2, off r2, on r3, off r3`），两臂都开探针：
+交错跑 3 轮（`on r1, off r1, on r2, off r2, on r3, off r3`），两臂都开探针。**跑了两批**
+（`arena-fix`、`arena-fix-b`），下面两列都是各自批内的数：
 
-| | `attention`（后 4 token 均值） | 稳态 `outer` | 8 步整跑 |
-| --- | --- | --- | --- |
-| 池子**开** | **`0.789 / 0.792 / 0.810 s`** | `3.09–3.90 s` | `43.86 / 43.52 / 43.66 s` |
-| 池子**关**（= 修之前的行为） | `1.339 / 1.324 / 1.336 s` | `3.66–5.44 s` | `47.39 / 45.61 / 45.90 s` |
+| `attention`（后 4 token 均值） | 第一批 | 第二批 |
+| --- | --- | --- |
+| 池子**开** | `0.789 / 0.792 / 0.810 s` | `0.784 / 0.785 / 0.785 s` |
+| 池子**关**（= 修之前的行为） | `1.339 / 1.324 / 1.336 s` | `1.341 / 1.344 / 0.950 s`（第三跑撞上快档） |
+
+| 其余 | 第一批 | 第二批 |
+| --- | --- | --- |
+| 8 步整跑（开 / 关） | `43.86/43.52/43.66` 对 `47.39/45.61/45.90 s` | `43.54/43.30/45.32` 对 `44.72/45.34/44.46 s` |
+| `(1024,4)` 总的每调用（开 / 关） | `6407/6524/6644` 对 `19754/19075/18534 us` | `6391/6425/6539` 对 `18549/18531/8249 us` |
+| `(512,128)`（开 / 关） | `3484/3446/3645` 对 `6868/6683/7715` | `3431/3381/3585` 对 `6781/6749/4696` |
+| `(256,4)`（开 / 关） | `1967/2012/2037` 对 `2720/2782/2782` | `1975/1965/1964` 对 `2824/2849/2789` |
 
 - **`attention` 少 `0.55 s/token`（−41%）**，稳态 token 从 `3.76` 到 `3.21 s`（−15%）。
-- **两档消失**：开着那三跑离散 `2.7%`，关着那三跑 `1.1%`，而且开着的值比"快档"还低
-  （`0.79` 对 `0.91`）——池子连"快档"剩的那点每次分配也一起去掉了。
+- **两档消失**：开着那六跑离散 ≤`2.7%`（第二批 `0.13%`），而且开着的值比"快档"还低
+  （`0.79` 对 `0.95`）——池子连"快档"剩下的那点每次申请/首触也一起去掉了。
+- 关着那一臂的整跑墙只在撞上慢档时高（第一批 `+2.62 s`，第二批第三跑回到快档所以只有 `-0.86 s`），
+  说明整跑墙的差就是档位本身。
 - 其余相位（`fixed`/`routed`/`shared`/`router`）两臂逐 token 一样。
-- 逐段看：`(1024,4)` `6407/6524/6644 us`（开）对 `19754/19075/18534 us`（关）；
-  `(512,128)` `3484/3446/3645` 对 `6868/6683/7715`；`(256,4)` `1967/2012/2037` 对 `2720/2782/2782`。
 
-**数值**：8 个 `hidden_bf16_digest`、8 条 43 层摘要链、8 个 argmax 六个跑两两一致，
-比对只报 `peak device bytes`（那是代价不是数值）；1 步的四个钉死值复现。
+**数值**：两批各 6 个跑，8 个 `hidden_bf16_digest`、8 条 43 层摘要链、8 个 argmax 全部一致，
+比对只报 `peak device bytes`（代价不是数值）；1 步的四个钉死值两批都复现。
 显存峰值 `1869152256 → 1823014912`（**`-46 MB`**）——修之前是既付了池子的内存
 （`+153 MB`，`7e07056` 记录里那笔）又照旧每次申请。
 
 **没声称的部分（别照着脑补）**：
 
-- **"为什么同一份代码会 7.4 / 12.4 / 19.8 ms"没解释。** 只有一件事是测到的：这段活是纯主机
-  内存 + H2D，池子把它压平且压到比观测到的最快值还低。**"每次调用的缓冲落在新 mmap 的页上
-  所以要缺页"是假设，不是量到的事实**——关着那一臂里 `expand_wkv` 与 `expand_wgate`
-  有时差 9 倍（`341.9` 对 `3027.5 us`）、有时几乎相等（`157.2` 对 `165.5 us`），这个不对称
-  我没查。
+- **同一段展开代码为什么会是两档，只定位到段、没定位到原因。** 测到的是：只有那两个循环变，
+  `H2D`、`gemm`、`row_d2h`、`row_loop` 三跑全平；池子（复用那两块宿主缓冲）把它压到 `716/799 us`，
+  **比快档还低一半**。**"每次申请到的页是新的、首触要缺页"是假设**——它和这三条观测都吻合，
+  但没直接量过缺页计数。
 - **服务路径一次没跑。** 服务面同样吃这个修复（它走同一条交付路径），但这次只用命令行量过。
-- **没跑 `verify_delivery_arm.sh` 的换序那一遍。** 这次用的是交错 3 轮，`attention` 是稳态
+- **没跑 `verify_delivery_arm.sh` 的换序那一遍。** 这次用的是交错 3 轮、两批，`attention` 是稳态
   后 4 token 的均值，冷帧不进比较；整跑墙只有同批内可比。
-- **整请求墙不跨时段比。** `43.68` 对 `46.30 s` 只在这一次交错批里成立。
+- **整请求墙不跨时段比。** `43.68` 对 `46.30 s` 只在第一批里成立；两批之间不可比。
 - **routed 读盘那 `0.53 s` 没动**，它仍然是"每 token 必须从盘上搬 3.45 GB"的那部分。
 - 没走 `rust/run-identified.sh`，结果文件里**没有源码指纹**。
 
@@ -110,18 +132,26 @@ COMPPROBE_BRANCH outputs=512 ratio=128 strict=true scratch=true input_len=4096 a
 | shared 探针 | `41da6e1` | `74dfc3d64f8ef2fe838fe8400661665726d505053461b17d309f92db91f67989` | `/srv/localmoe/targets/sharedprobe-shared-probe-a` |
 | 分段探针（5 跑） | `bd313bc` | `3ab0a6fc1766806082d7e0ba6a3a247732117a31cf9e7e69d72a079a886e7f7d` | `/srv/localmoe/targets/compressorprobe-tier-a` |
 | 分支判定 + 逐行分段（2 跑） | `b7da660` | 同上一行（同一棵树增量构建） | `/srv/localmoe/targets/compressorprobe-tier-b` |
-| 池子 A/B（交错 3 轮） | `9efd662` | `af28cee73ac798d3452fd35e37bdc7aa45cf8743cf3dd81f6a95eaae1f42fa30` | `/srv/localmoe/targets/arenaab-arena-fix` |
+| 池子 A/B 第一批 | `9efd662` | `af28cee73ac798d3452fd35e37bdc7aa45cf8743cf3dd81f6a95eaae1f42fa30` | `/srv/localmoe/targets/arenaab-arena-fix` |
+| 池子 A/B 第二批 | `93d3154` | `af28cee73ac798d3452fd35e37bdc7aa45cf8743cf3dd81f6a95eaae1f42fa30`（**与第一批同一个二进制**） | `/srv/localmoe/targets/arenaab-arena-fix-b` |
+
+两批之间只差 `docs/` 与 `tools/` 的提交，所以第二批是**同一个二进制重新量一遍**。
 
 cuBLAS：`/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5`。
 
-每条命令都是"同步 + 构建 + 跑 + 事后统计"一次跑完的脚本（仓库外，`Desktop\localmoe-clean\.zcode\`）：
+驱动脚本都在仓库里（`rust/colibri-cuda/tools/`），每条都是"同步 + 构建 + 跑 + 事后统计"一次跑完：
 
 ```bash
-bash .zcode/run_shared_probe.sh 41da6e1 shared-probe-a
-bash .zcode/run_compressor_probe.sh bd313bc tier-a 5
-bash .zcode/run_compressor_probe.sh b7da660 tier-b 2
-bash .zcode/run_arena_ab.sh 9efd662 arena-fix 3
+bash rust/colibri-cuda/tools/run_shared_probe.sh 41da6e1 shared-probe-a
+bash rust/colibri-cuda/tools/run_compressor_probe.sh bd313bc tier-a 5
+bash rust/colibri-cuda/tools/run_compressor_probe.sh b7da660 tier-b 2
+bash rust/colibri-cuda/tools/run_arena_ab.sh 9efd662 arena-fix 3
+bash rust/colibri-cuda/tools/run_arena_ab.sh 93d3154 arena-fix-b 3
 ```
+
+（前三次跑的时候这三个脚本还在仓库外的 `.zcode/`，内容相同；第二批是从 `tools/` 里跑的，
+路径已经过。`verify_baseline.py` / `outputs_match.py` / `attention_share.py` 仍在 `.zcode/`，
+沿用 `verify_delivery_arm.sh` 的老约定。）
 
 判据是 `.zcode/verify_baseline.py`（钉死值）与 `.zcode/outputs_match.py`（8 digest + 8 摘要链 +
 8 argmax），两条都过了；没改它们。命令行配方用状态页第二节那套，**没有额外开关**，只多了两个探针：
@@ -153,17 +183,19 @@ COLIBRI_V4_BENCH_TELEMETRY=1  # 探针那次加 COLIBRI_V4_FLASH_SHARED_PROBE=1 
 
 ## 未决事项
 
-1. **为什么同一段代码会 `7.4 / 12.4 / 19.8 ms`**（三档，修之前）。现在池子把它盖住了，
-   但如果原因是"每次申请的缓冲落在未缺页的页上"，那么同样形状的每次申请还在别处
-   （`run_compressor_official_cublas_host` 的 `input`/`kv`/`score`、`run_layer_shared_expert` 的
-   三个 `DeviceBuffer::from_host`）。**下一步**：把池子里的 `expand_wkv/expand_wgate` 单独量一次
-   首触代价（`/proc/self/stat` 的 `majflt` 前后差），把假设变成事实或否掉。
-2. **服务路径的相位账**。服务现在是主要交付面，`4.81 s/字` 内部还没拆；这个修复在服务面上
-   应该同样生效，但没量。
-3. **`shared` 那一行的读法要改**：相位表把 `0.53 s/token` 的 routed 读盘记在 `shared` 名下。
+1. **为什么同一段展开循环会两档**（`2.9` 对 `13.3 ms`）。现在已经定位到段（那两个 `u16 -> f32` 循环）、
+   定位到"和分配有关"（复用缓冲的池子把它压到 `716/799 us`），但没量到机制。
+   **下一步**：把池子那两块宿主缓冲遮起来再量——在 `expand_wkv` 前后读 `/proc/self/stat` 的
+   `majflt`/`minflt`，把"首触缺页"这条假设变成事实或否掉。
+2. **同样形状的每次申请还在别处**：`run_compressor_official_cublas_host` 的 `input`/`kv`/`score`、
+   `run_layer_shared_expert` 的三个 `DeviceBuffer::from_host`、`row_upload`（现在是 `0.3 ms`，看着不像）。
+   1 做完之后再决定要不要一起处理。
+3. **服务路径的相位账**。服务现在是主要交付面，`4.81 s/字` 内部还没拆；这个修复在服务面上
+   应该同样生效（attention 少 `0.55 s/token`），但没量。
+4. **`shared` 那一行的读法要改**：相位表把 `0.53 s/token` 的 routed 读盘记在 `shared` 名下。
    要不要在 `phase_profiles.rs` 里把 shared 窗口的"读盘部分"标出来（新增一个诊断字段），
    让加法表自己不再误导。
-4. **routed 读盘 `0.53 s/token` 的余量**：worker 之间不平衡（快档均值 `11.4 ms`、最慢 `16.2 ms`），
-   理想均分大约是 `0.49 s/token`。要不要动，取决于 3 做完之后那 `0.53` 还算不算数。
-5. **`attention` 剩下 `0.79 s/token` 里还有什么**：`compressor` 已经掉到 `6.5 / 3.5 / 2.0 ms` 一次，
+5. **routed 读盘 `0.53 s/token` 的余量**：worker 之间不平衡（快档均值 `11.4 ms`、最慢 `16.2 ms`），
+   理想均分大约是 `0.49 s/token`。要不要动，取决于 4 做完之后那 `0.53` 还算不算数。
+6. **`attention` 剩下 `0.79 s/token` 里还有什么**：`compressor` 已经掉到 `6.5 / 3.4 / 2.0 ms` 一次，
    剩下的是 `q_*_projection`、`kv_*`、`mhc`、`wo_*` 那些步。
