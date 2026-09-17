@@ -19,6 +19,14 @@
 # 别改；改它们等于改判据）。
 set -uo pipefail
 
+# 两个会话同时跑引擎会毁掉双方的计时，这条是双向的；构建也一样会污染。
+# 所以先看机器空不空，别靠记性。
+if ps -eo comm | grep -qE '^(colibri-cuda|cargo)$'; then
+  echo "refusing to run: another colibri-cuda or cargo is on the machine"
+  ps -eo pid,etime,comm | grep -E 'colibri-cuda|cargo' | head -5
+  exit 9
+fi
+
 COMMIT=${1:?commit required}
 TAG=${2:-$COMMIT}
 Z=/mnt/c/Users/27236/Desktop/localmoe-clean/.zcode
@@ -31,7 +39,7 @@ OUT=/srv/localmoe/targets/fixed-slot-$TAG
 REF8=/srv/localmoe/targets/defaults-pc-8step.jsonl
 mkdir -p "$OUT"
 
-echo "################ 1/4 同步并构建 $COMMIT ################"
+echo "################ 1/4 sync and build $COMMIT ################"
 git -C "$TREE" fetch --quiet origin codex/business-restart || exit 1
 git -C "$TREE" checkout --quiet --detach "$COMMIT" || exit 1
 git -C "$TREE" log --oneline -1 | cat
@@ -75,15 +83,15 @@ run 1step-slot-on 1 0
 run 8step-slot-on 8 1
 run 8step-slot-off 8 1 COLIBRI_V4_FLASH_FIXED_SLOT=0
 
-echo "################ 2/4 钉死值（1 步）################"
+echo "################ 2/4 pinned values (1 step) ################"
 python3 "$Z/verify_baseline.py" "$OUT/1step-slot-on.jsonl" | tail -12
 
-echo "################ 3/4 8 步逐位比对（参照 $REF8）################"
+echo "################ 3/4 bit-exact comparison (reference $REF8) ################"
 python3 "$Z/outputs_match.py" "$REF8" "$OUT/8step-slot-on.jsonl" "$OUT/8step-slot-off.jsonl"
 python3 "$Z/verify_baseline.py" "$OUT/8step-slot-on.jsonl" | tail -12
 
-echo "################ 4/4 相位账：fixed 的墙，开 vs 关 ################"
+echo "################ 4/4 phase table: fixed wall, slot on vs off ################"
 python3 "$Z/attention_share.py" "$OUT/8step-slot-on.jsonl" "$OUT/8step-slot-off.jsonl"
 
-echo "################ 结果文件 ################"
+echo "################ result files ################"
 ls -l "$OUT"
