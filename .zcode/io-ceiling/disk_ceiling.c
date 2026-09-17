@@ -171,12 +171,16 @@ static void *worker(void *argument) {
 
     /* cuMemHostAlloc binds to the calling thread's current context, so every
      * worker adopts the one main created before the barrier. */
+    int context_ok = 1;
     if (g_mode == 3 && p_cuCtxSetCurrent(g_cu_ctx) != 0) {
         fprintf(stderr, "thread %d: cuCtxSetCurrent failed\n", index);
-        return NULL;
+        context_ok = 0;
     }
 
+    /* Join the barrier even on the failure path: every worker waits here, so
+     * bailing out early would hang the whole crew. */
     pthread_barrier_wait(&g_barrier);
+    if (!context_ok) return NULL;
     double wall_start = now_ns();
     long long layer_read_ns[128];
     for (int i = 0; i < 128; i++) layer_read_ns[i] = 0;
@@ -266,12 +270,6 @@ static void *worker(void *argument) {
         }
     }
 
-    /* The pinned cache is the one state the engine would keep across layers,
-     * so hold it until the thread's last read is done, then release. */
-    if (g_mode == 3) {
-        for (int k = 0; k < cache_n; k++) p_cuMemFreeHost(cache_ptr[k]);
-    }
-
     stat.wall_ns = (long long)(now_ns() - wall_start);
     struct rusage usage;
     if (getrusage(RUSAGE_THREAD, &usage) == 0) {
@@ -281,6 +279,11 @@ static void *worker(void *argument) {
     Stat *out = malloc(sizeof(Stat) + 128 * sizeof(long long));
     memcpy(out, &stat, sizeof(Stat));
     memcpy((char *)out + sizeof(Stat), layer_read_ns, 128 * sizeof(long long));
+    /* Release the pinned cache after every measurement: mode 0 never frees
+     * its cached mallocs inside the timed window either. */
+    if (g_mode == 3) {
+        for (int k = 0; k < cache_n; k++) p_cuMemFreeHost(cache_ptr[k]);
+    }
     return out;
 }
 
