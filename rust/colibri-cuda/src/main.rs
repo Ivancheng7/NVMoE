@@ -70,6 +70,7 @@ mod final_head;
 mod fixed_host_cache;
 mod fixed_layer_cache;
 mod fixed_layer_planning;
+mod fixed_layer_slot;
 mod fixed_prefetch;
 mod flash_arms;
 mod full61_b1;

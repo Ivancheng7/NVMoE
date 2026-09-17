@@ -399,3 +399,138 @@ pub(crate) fn drop_request_hash_ids_before_fixed_retention(
     ids.clear();
     Ok(removed_bytes)
 }
+
+/// 把宿主负载拷进已有的设备缓冲。长度不一致直接报错，不静默读旧数据——槽位是
+/// 跨层复用的，形状对不上就是层型配错了缓冲，必须炸。
+fn restage_copy<T: cuda_core::DeviceCopy>(
+    dst: &mut DeviceBuffer<T>,
+    stream: &CudaStream,
+    src: &[T],
+) -> Result<(), Box<dyn Error>> {
+    if dst.len() != src.len() {
+        return Err(format!(
+            "fixed layer restage length mismatch: {} != {}",
+            dst.len(),
+            src.len()
+        )
+        .into());
+    }
+    if dst.num_bytes() == 0 {
+        return Ok(());
+    }
+    // SAFETY: src 属于常驻的宿主负载，活过整个请求；写 dst 与后续读它的 kernel
+    // 在同一条 stream 上按序，所以这里不需要同步。
+    unsafe { dst.copy_from_host_async_unchecked(stream, src) }
+        .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+impl DeviceFp8Matrix {
+    pub(crate) fn restage_from(
+        &mut self,
+        stream: &CudaStream,
+        matrix: &v4_state::Fp8Matrix,
+    ) -> Result<(), Box<dyn Error>> {
+        restage_copy(&mut self.weight, stream, &matrix.weight)?;
+        restage_copy(&mut self.scale, stream, &matrix.scale)?;
+        self.in_features = matrix.in_features;
+        self.out_features = matrix.out_features;
+        Ok(())
+    }
+}
+
+impl DeviceLayerIndexer {
+    pub(crate) fn restage_from(
+        &mut self,
+        stream: &CudaStream,
+        indexer: &v4_state::CsaIndexerWeights,
+    ) -> Result<(), Box<dyn Error>> {
+        self.wq_b.restage_from(stream, &indexer.wq_b)?;
+        restage_copy(&mut self.weights_proj, stream, &indexer.weights_proj_bf16)?;
+        restage_copy(&mut self.compressor_wkv, stream, &indexer.compressor.wkv_bf16)?;
+        restage_copy(
+            &mut self.compressor_wgate,
+            stream,
+            &indexer.compressor.wgate_bf16,
+        )?;
+        restage_copy(&mut self.compressor_ape, stream, &indexer.compressor.ape_f32)?;
+        restage_copy(
+            &mut self.compressor_norm,
+            stream,
+            &indexer.compressor.norm_bf16,
+        )?;
+        Ok(())
+    }
+}
+
+impl LayerDeviceWeights {
+    /// 按 `new_layer_with_wo_a` 的字段表把这一层的负载拷进已有缓冲。
+    ///
+    /// 这张表必须和构造函数逐项对齐：漏一项就是这一层拿着上一层的旧权重跑，
+    /// 输出不会报错、只会悄悄变。`wo_a` 是唯一例外——raw 路径的 wo_a 由调用方
+    /// 另行解码后换进来（见 `generate.rs` 的 swap），这里只在宿主侧给了 bf16
+    /// 时才拷。
+    pub(crate) fn restage_from_host(
+        &mut self,
+        stream: &CudaStream,
+        state: &v4_state::LayerStateWeights,
+        projections: &v4_state::L0Fp8Projections,
+        tail: &v4_state::L0TailWeights,
+        spare_indexer: &mut Option<DeviceLayerIndexer>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.spec = state.spec;
+        self.layer = state.layer;
+        self.compression_ratio = state.compression_ratio;
+        restage_copy(&mut self.hc_attn_fn, stream, &state.hc_fn)?;
+        restage_copy(&mut self.hc_attn_base, stream, &state.hc_base)?;
+        restage_copy(&mut self.hc_attn_scale, stream, &state.hc_scale)?;
+        restage_copy(&mut self.attn_norm, stream, &state.attn_norm)?;
+        self.wq_a.restage_from(stream, &projections.wq_a.matrix)?;
+        restage_copy(&mut self.q_norm, stream, &projections.wq_a.norm)?;
+        self.wq_b.restage_from(stream, &projections.wq_b)?;
+        self.wkv.restage_from(stream, &projections.wkv.matrix)?;
+        restage_copy(&mut self.kv_norm, stream, &projections.wkv.norm)?;
+        restage_copy(&mut self.compressor_wkv, stream, &state.compressor.wkv_bf16)?;
+        restage_copy(
+            &mut self.compressor_wgate,
+            stream,
+            &state.compressor.wgate_bf16,
+        )?;
+        restage_copy(&mut self.compressor_ape, stream, &state.compressor.ape_f32)?;
+        restage_copy(&mut self.compressor_norm, stream, &state.compressor.norm_bf16)?;
+        // indexer 只在 Csa4 层存在，其余层型要把缓冲交出来存着：三个槽位里只有
+        // 一个带 indexer 缓冲，不存就会在层型交替时被丢掉。
+        if let Some(indexer) = state.indexer.as_ref() {
+            let mut device = self
+                .indexer
+                .take()
+                .or_else(|| spare_indexer.take())
+                .ok_or("fixed layer slot has no indexer buffers to restage into")?;
+            device.restage_from(stream, indexer)?;
+            self.indexer = Some(device);
+        } else if let Some(device) = self.indexer.take() {
+            *spare_indexer = Some(device);
+        }
+        restage_copy(&mut self.attn_sink, stream, &tail.attn_sink)?;
+        if !tail.wo_a_bf16.is_empty() {
+            restage_copy(&mut self.wo_a, stream, &tail.wo_a_bf16)?;
+        }
+        self.wo_b.restage_from(stream, &tail.wo_b)?;
+        restage_copy(&mut self.hc_ffn_fn, stream, &tail.hc_ffn_fn)?;
+        restage_copy(&mut self.hc_ffn_base, stream, &tail.hc_ffn_base)?;
+        restage_copy(&mut self.hc_ffn_scale, stream, &tail.hc_ffn_scale)?;
+        restage_copy(&mut self.ffn_norm, stream, &state.ffn_norm)?;
+        restage_copy(&mut self.gate, stream, &state.gate)?;
+        let (router_bias, hash_router) = match &state.router {
+            v4_state::LayerRouterWeights::Hash { .. } => {
+                (vec![0.0_f32; state.spec.routed_experts], true)
+            }
+            v4_state::LayerRouterWeights::Learned { bias } => (bias.clone(), false),
+        };
+        restage_copy(&mut self.router_bias, stream, &router_bias)?;
+        self.hash_router = hash_router;
+        self.shared_w1.restage_from(stream, &tail.shared.w1)?;
+        self.shared_w2.restage_from(stream, &tail.shared.w2)?;
+        self.shared_w3.restage_from(stream, &tail.shared.w3)?;
+        Ok(())
+    }
+}

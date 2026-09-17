@@ -315,8 +315,13 @@ fn load_flash_b1_layer_from_host(
     telemetry: FixedLoadTelemetry,
     stream: &CudaStream,
     request_started: std::time::Instant,
+    slot: Option<&mut fixed_layer_slot::FixedLayerSlot>,
 ) -> Result<B2RawRuntime, Box<dyn Error>> {
-    let mut loaded = load_b2_raw_runtime_from_host_ref_for(
+    let restaged = match slot {
+        Some(slot) => slot.take_restaged(stream, &host.host)?,
+        None => None,
+    };
+    let mut loaded = load_b2_raw_runtime_from_host_ref_with_weights(
         spec,
         model_dir,
         layer,
@@ -324,6 +329,7 @@ fn load_flash_b1_layer_from_host(
         &host.wo_a_raw,
         telemetry,
         stream,
+        restaged,
     )?;
     let released_bytes = if std::sync::Arc::strong_count(&host) == 1 {
         host.bytes()
@@ -430,6 +436,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let final_head_arm = flash_final_head_arm(spec)?;
     let flash_b1_prefetch = flash_b1_prefetch_enabled(spec, REQUESTS)?;
     let flash_b1_prompt_chunk = flash_b1_prompt_chunk_enabled(spec, REQUESTS)?;
+    let flash_b1_fixed_slot = flash_b1_fixed_slot_enabled(spec, REQUESTS)?;
     let layer_count = parity_stop_after_layer
         .map(|stop| {
             stop.layer
@@ -450,6 +457,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // Same scope argument for the routed expert slot: page-locking its staging
     // costs 17 ms, so it lives as long as the run instead of one layer.
     let mut routed_slot_scratch = RoutedSlotScratch::new();
+    // The fixed-layer slot gets the same lifetime as the host cache: one device
+    // slot per layer type, restaged every layer instead of rebuilt.
+    let mut fixed_layer_slot = fixed_layer_slot::FixedLayerSlot::new();
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -561,6 +571,11 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         prefetched.telemetry,
                         stream,
                         request_started,
+                        if flash_b1_fixed_slot {
+                            Some(&mut fixed_layer_slot)
+                        } else {
+                            None
+                        },
                     )?;
                     if loaded.fixed.cache_status != "host_resident_hit" {
                         loaded.fixed.cache_status = "prefetched_host";
@@ -584,6 +599,11 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         telemetry,
                         stream,
                         request_started,
+                        if flash_b1_fixed_slot {
+                            Some(&mut fixed_layer_slot)
+                        } else {
+                            None
+                        },
                     )?
                 };
                 if flash_b1_prefetch {
@@ -714,6 +734,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         .checked_add(layer_outer_ns)
                         .ok_or("Flash B1 layer outer timing overflow")?;
                     timing.layers.push(profile);
+                }
+                if flash_b1_fixed_slot {
+                    fixed_layer_slot.release(loaded.raw.runtime.weights);
                 }
             }
             if prefetched_next.is_some() {

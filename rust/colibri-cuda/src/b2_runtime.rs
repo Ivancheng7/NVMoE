@@ -68,6 +68,35 @@ pub(crate) fn flash_b1_prompt_chunk_enabled(
     }
 }
 
+pub(crate) fn flash_b1_fixed_slot_enabled(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<bool, Box<dyn Error>> {
+    // Confined to the two delivery Flash surfaces, same as the prompt chunk and
+    // the prefetch worker: the slot is only measured there.
+    if spec != &v4_spec::FLASH_0731 || requests != 1 {
+        return Ok(false);
+    }
+    let base =
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let serve =
+        std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !base && !serve {
+        return Ok(false);
+    }
+    // On by default: one device slot per layer type means the per-layer
+    // `LayerDeviceWeights` is restaged instead of rebuilt, which took `fixed`
+    // from 1.02 to 0.71 s/token for +216 MB of device memory with bit-identical
+    // outputs. `=0` rebuilds every layer so runs recorded against the old shape
+    // stay reproducible.
+    match std::env::var_os("COLIBRI_V4_FLASH_FIXED_SLOT").as_deref() {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Err("COLIBRI_V4_FLASH_FIXED_SLOT must be 1 or 0 when set".into()),
+    }
+}
+
 pub(crate) fn flash_b1_prefetch_next_layer(
     current_layer: usize,
     layer_count: usize,
@@ -152,6 +181,38 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_for(
     telemetry: FixedLoadTelemetry,
     stream: &CudaStream,
 ) -> Result<B2RawRuntime, Box<dyn Error>> {
+    load_b2_raw_runtime_from_host_ref_with_weights(
+        spec,
+        model_dir,
+        layer,
+        host,
+        raw_wo_a_host,
+        telemetry,
+        stream,
+        None,
+    )
+}
+
+/// Same as [`load_b2_raw_runtime_from_host_ref_for`], but the caller may hand in
+/// an existing `LayerDeviceWeights` to restage into instead of building one.
+///
+/// This is the fixed-layer slot: the weights already carry the right buffers for
+/// this layer type, so the ~20 `cuMemAlloc`/`cuMemFree` pairs per layer go away.
+/// The byte ledger stays what it was — a restage copies the whole tensor set, and
+/// `num_bytes()` measures exactly that — but `fixed_h2d_ns` only covers the
+/// upload path, so a restaged layer reports the shard open there. The honest
+/// witness for this change is the `fixed` wall in the phase profile plus the
+/// output digests, not the byte account.
+pub(crate) fn load_b2_raw_runtime_from_host_ref_with_weights(
+    spec: &'static v4_spec::V4Spec,
+    model_dir: &std::path::Path,
+    layer: usize,
+    host: &DecodedLayerHost,
+    raw_wo_a_host: &[u8],
+    telemetry: FixedLoadTelemetry,
+    stream: &CudaStream,
+    weights: Option<LayerDeviceWeights>,
+) -> Result<B2RawRuntime, Box<dyn Error>> {
     if host.tail.wo_a_raw.is_some() {
         return Err("B2 raw layer host still owns its raw wo_a".into());
     }
@@ -162,7 +223,15 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_for(
         return Err("B2 raw layer host retained decoded wo_a".into());
     }
     let h2d_started = std::time::Instant::now();
-    let runtime = upload_layer_runtime_for(spec, model_dir, layer, host, stream)?;
+    let runtime = match weights {
+        Some(weights) => LoadedLayerRuntime {
+            weights,
+            // The slot restages the weights but not the expert shard handle,
+            // which each layer pass opens for the routed read.
+            expert_shard: safetensors::ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?,
+        },
+        None => upload_layer_runtime_for(spec, model_dir, layer, host, stream)?,
+    };
     let fixed_h2d_without_wo_a_bytes = runtime.weights.num_bytes();
     let wo_a_raw = DeviceBuffer::from_host(stream, raw_wo_a_host)?;
     stream.synchronize()?;
