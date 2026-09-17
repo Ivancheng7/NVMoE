@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 固定层设备槽位的一条龙验证：同步、构建、三跑、逐位比对、相位账，一次跑完。
+# 全部输出同时写进结果目录（`$OUT/batch.log`）：/tmp 是 tmpfs，证据别只留在那儿。
 #
 #   usage: verify_fixed_slot.sh <commit-ish> [tag]
+#          ORDER=off-first verify_fixed_slot.sh <commit-ish> [tag]
 #
 #   顺序是可换的：`ORDER=off-first` 先跑关掉那臂。**冷帧（前两个 token）里先跑的那臂
 #   要付冷页缓存的 6.7 GB 固定权重读**，所以只跑一个顺序时前两个 token 的差是顺序的
@@ -42,6 +44,8 @@ CUBLAS=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
 OUT=/srv/localmoe/targets/fixed-slot-$TAG
 REF8=/srv/localmoe/targets/defaults-pc-8step.jsonl
 mkdir -p "$OUT"
+# 输出同时进控制台和结果目录：这份 log 是这次跑的判据的一部分，跟 jsonl 放一起。
+exec > >(tee "$OUT/batch.log") 2>&1
 
 echo "################ 1/4 sync and build $COMMIT ################"
 git -C "$TREE" fetch --quiet origin codex/business-restart || exit 1
