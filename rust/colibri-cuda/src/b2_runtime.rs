@@ -127,6 +127,18 @@ pub(crate) fn flash_b1_compressor_arena_enabled(
     }
 }
 
+/// Pure diagnostic, off by default: print the inside of the `shared` window.
+///
+/// The phase wall around `shared` covers both the shared MLP and the routed
+/// read it overlaps, so it cannot say which of the two bounds it. A run with
+/// this set times the MLP's own return and each read worker's own window, and
+/// prints one `SHAREDPROBE` line per layer. Numbers do not move; only stderr
+/// grows.
+pub(crate) fn flash_shared_probe_enabled() -> bool {
+    std::env::var_os("COLIBRI_V4_FLASH_SHARED_PROBE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+}
+
 pub(crate) fn flash_b1_prefetch_next_layer(
     current_layer: usize,
     layer_count: usize,

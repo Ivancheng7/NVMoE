@@ -957,6 +957,14 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     let flash_routed_prefetch =
         flash_b1_prefetch_enabled(spec, rows)? && qd4_lanes.is_none() && expert_slots.is_none();
     let mut prefetched_routed_experts = None;
+    // The shared window runs the shared MLP on this thread while the routed
+    // read workers fetch this layer's experts, so its wall is whichever of the
+    // two finishes last. Time both from the inside to tell them apart.
+    let shared_probe = flash_shared_probe_enabled();
+    let mut shared_probe_mlp_us = 0_u128;
+    let mut shared_probe_worker_sum_us = 0_u128;
+    let mut shared_probe_worker_max_us = 0_u128;
+    let mut shared_probe_workers = 0_usize;
     let shared_started = std::time::Instant::now();
     let (shared, shared_bf16) = if flash_routed_prefetch {
         if routes.ids.len() != spec.experts_per_token {
@@ -972,7 +980,8 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 .chunks(chunk_size)
                 .map(|chunk| {
                     scope.spawn(move || {
-                        chunk
+                        let worker_started = std::time::Instant::now();
+                        let experts = chunk
                             .iter()
                             .map(|expert_id| {
                                 let expert_id =
@@ -986,7 +995,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                                 .map_err(|error| error.to_string())?;
                                 Ok::<_, String>((expert_id, expert))
                             })
-                            .collect::<Result<Vec<_>, _>>()
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let worker_us =
+                            u128::try_from(worker_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        Ok::<_, String>((experts, worker_us))
                     })
                 })
                 .collect::<Vec<_>>();
@@ -998,33 +1010,55 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     Vec::new(),
                 )
             };
+            shared_probe_mlp_us =
+                u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
             let mut experts = Vec::with_capacity(route_ids.len());
             for worker in workers {
-                experts.extend(
-                    worker
-                        .join()
-                        .map_err(|_| "Flash B1 routed prefetch worker panicked")?
-                        .map_err(|error| format!("Flash B1 routed prefetch worker failed: {error}"))?,
-                );
+                let (loaded, worker_us) = worker
+                    .join()
+                    .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                    .map_err(|error| format!("Flash B1 routed prefetch worker failed: {error}"))?;
+                shared_probe_worker_sum_us = shared_probe_worker_sum_us.saturating_add(worker_us);
+                shared_probe_worker_max_us = shared_probe_worker_max_us.max(worker_us);
+                shared_probe_workers += 1;
+                experts.extend(loaded);
             }
             Ok((shared, experts))
         })?;
         prefetched_routed_experts = Some(loaded.1);
         loaded.0
     } else {
-        if parity_dump.is_some() {
+        let shared = if parity_dump.is_some() {
             run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
         } else {
             (
                 run_layer_shared_expert(module, stream, &ffn_input, weights)?,
                 Vec::new(),
             )
-        }
+        };
+        shared_probe_mlp_us =
+            u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+        shared
     };
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "shared_out_bf16", &[rows, spec.hidden], &shared_bf16)?;
     }
     stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if shared_probe {
+        eprintln!(
+            "SHAREDPROBE layer={} rows={} prefetch={} window_us={} mlp_us={} workers={} \
+             worker_sum_us={} worker_max_us={} join_wait_us={}",
+            weights.layer,
+            rows,
+            flash_routed_prefetch,
+            stage.shared_ns / 1_000,
+            shared_probe_mlp_us,
+            shared_probe_workers,
+            shared_probe_worker_sum_us,
+            shared_probe_worker_max_us,
+            stage.shared_ns / 1_000 - shared_probe_mlp_us,
+        );
+    }
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.shared_end_ns = timeline.now();
     }
