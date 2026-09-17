@@ -966,6 +966,19 @@ pub(crate) fn run_layer_compressor(
     {
         return Err("layer Compressor weight shape mismatch".into());
     }
+    let probe = flash_compressor_probe_enabled();
+    if probe {
+        eprintln!(
+            "COMPPROBE_BRANCH outputs={} ratio={} strict={} scratch={} input_len={} \
+             hidden={}",
+            outputs,
+            ratio,
+            strict_compressor_enabled(),
+            strict_scratch.is_some(),
+            input.len(),
+            v4_state::HIDDEN,
+        );
+    }
     if strict_compressor_enabled() {
         // The pool is sized for exactly one position (`v4_state::HIDDEN`); the
         // chunked prefill pass hands the compressor several positions at once, so
@@ -1434,18 +1447,32 @@ pub(crate) fn run_compressor_official_cublas_host(
             .map(|&bits| f32::from_bits(u32::from(bits) << 16))
             .collect::<Vec<_>>()
     };
+    let probe = flash_compressor_probe_enabled();
+    let mut probe_laps = [0_u128; 10];
+    let probe_start = std::time::Instant::now();
+    let mut probe_mark = probe_start;
     let wkv = DeviceBuffer::from_host(stream, &to_f32(wkv_bf16))?;
     let wgate = DeviceBuffer::from_host(stream, &to_f32(wgate_bf16))?;
+    probe_laps[0] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
     let workspace = DeviceBuffer::<u8>::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?;
     let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
     let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
     let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
     let mut kv_f32 = Vec::with_capacity(rows * outputs);
     let mut score_f32 = Vec::with_capacity(rows * outputs);
+    let mut probe_row_upload_ns = 0_u128;
+    let mut probe_row_alloc_ns = 0_u128;
+    let mut probe_gemm1_ns = 0_u128;
+    let mut probe_gemm2_ns = 0_u128;
+    let mut probe_row_d2h_ns = 0_u128;
     for input_bf16 in input_bf16.chunks_exact(hidden) {
+        let row_mark = std::time::Instant::now();
         let input = DeviceBuffer::from_host(stream, &to_f32(input_bf16))?;
         let kv = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
         let score = DeviceBuffer::<f32>::zeroed(stream, outputs)?;
+        probe_row_upload_ns += row_mark.elapsed().as_nanos();
+        let row_mark = std::time::Instant::now();
         cublas.sgemm_mn1(
             stream_pointer,
             device_mut(workspace.cu_deviceptr()),
@@ -1456,6 +1483,8 @@ pub(crate) fn run_compressor_official_cublas_host(
             outputs,
             hidden,
         )?;
+        probe_gemm1_ns += row_mark.elapsed().as_nanos();
+        let row_mark = std::time::Instant::now();
         cublas.sgemm_mn1(
             stream_pointer,
             device_mut(workspace.cu_deviceptr()),
@@ -1466,9 +1495,14 @@ pub(crate) fn run_compressor_official_cublas_host(
             outputs,
             hidden,
         )?;
+        probe_gemm2_ns += row_mark.elapsed().as_nanos();
+        let row_mark = std::time::Instant::now();
         kv_f32.extend(kv.to_host_vec(stream)?);
         score_f32.extend(score.to_host_vec(stream)?);
+        probe_row_d2h_ns += row_mark.elapsed().as_nanos();
     }
+    probe_laps[1] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
     let score_plus_ape_f32 = score_f32
         .chunks_exact(outputs)
         .flat_map(|scores| {
@@ -1485,6 +1519,25 @@ pub(crate) fn run_compressor_official_cublas_host(
         .any(|value| !value.is_finite())
     {
         return Err("official cuBLAS L0 Compressor produced non-finite output".into());
+    }
+    probe_laps[2] = probe_mark.elapsed().as_micros();
+    if probe {
+        eprintln!(
+            "COMPPROBE_HOST outputs={} ratio={} rows={} weights_f32_h2d={} row_loop={} \
+             tail={} row_upload={} row_alloc={} gemm1={} gemm2={} row_d2h={} total={}",
+            outputs,
+            ratio,
+            rows,
+            probe_laps[0],
+            probe_laps[1],
+            probe_laps[2],
+            probe_row_upload_ns / 1_000,
+            probe_row_alloc_ns / 1_000,
+            probe_gemm1_ns / 1_000,
+            probe_gemm2_ns / 1_000,
+            probe_row_d2h_ns / 1_000,
+            probe_start.elapsed().as_micros(),
+        );
     }
     Ok(v4_state::CompressorPrepared {
         kv_f32,
