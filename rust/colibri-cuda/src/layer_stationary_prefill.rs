@@ -166,7 +166,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
     let strict_audit_scratch_required =
         strict_compressor_enabled() && (!device_attention || device_attention_audit);
     let strict_audit_arena_bytes = strict_audit_scratch_required
-        .then(StrictCompressorScratch::host_bytes)
+        .then(|| StrictCompressorScratch::host_bytes(v4_state::HIDDEN))
         .transpose()?
         .unwrap_or(0);
     let device_attention_capacity = device_attention
@@ -286,7 +286,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
         .then(|| u64::try_from(device_rope_lut_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let mut strict_scratch = strict_audit_scratch_required
-        .then(|| StrictCompressorScratch::new(stream))
+        .then(|| StrictCompressorScratch::new(stream, v4_state::HIDDEN))
         .transpose()?;
     let mut hidden = token_ids
         .iter()

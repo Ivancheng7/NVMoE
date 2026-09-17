@@ -465,9 +465,11 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // Same lifetime again for the strict compressor's pools: three
     // geometry-sized sets of host and device buffers that the compressor
     // restages into instead of allocating (2x29 MB of host expansion per call
-    // for Csa4) on every layer.
+    // for Csa4) on every layer. The width is the spec's: built with the Pro
+    // constant, the pool never engaged on Flash, because the compressor handed
+    // it a 4096-wide input for a 7168-wide pool.
     let mut compressor_scratch = flash_b1_compressor_arena_enabled(spec, REQUESTS)?
-        .then(|| StrictCompressorScratch::new(stream))
+        .then(|| StrictCompressorScratch::new(stream, spec.hidden))
         .transpose()?;
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {

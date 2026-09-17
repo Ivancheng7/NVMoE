@@ -970,20 +970,26 @@ pub(crate) fn run_layer_compressor(
     if probe {
         eprintln!(
             "COMPPROBE_BRANCH outputs={} ratio={} strict={} scratch={} input_len={} \
-             hidden={}",
+             arena={} pool_reuse={}",
             outputs,
             ratio,
             strict_compressor_enabled(),
             strict_scratch.is_some(),
             input.len(),
-            v4_state::HIDDEN,
+            strict_scratch
+                .as_ref()
+                .map(|scratch| scratch.hidden())
+                .unwrap_or(0),
+            strict_scratch
+                .as_ref()
+                .is_some_and(|scratch| input.len() == scratch.hidden()),
         );
     }
     if strict_compressor_enabled() {
-        // The pool is sized for exactly one position (`v4_state::HIDDEN`); the
-        // chunked prefill pass hands the compressor several positions at once, so
-        // that pass keeps the per-row implementation below.
-        let scratch = strict_scratch.filter(|_| input.len() == v4_state::HIDDEN);
+        // The pool is sized for exactly one position (the width it was built
+        // with); the chunked prefill pass hands the compressor several positions
+        // at once, so that pass keeps the per-row implementation below.
+        let scratch = strict_scratch.filter(|scratch| input.len() == scratch.hidden());
         if let Some(scratch) = scratch {
             return scratch.run_from_device(
                 stream,
@@ -1100,6 +1106,7 @@ pub(crate) fn run_l0_compressor_official_cublas(
 }
 
 pub(crate) struct StrictCompressorArena {
+    pub(crate) hidden: usize,
     pub(crate) outputs: usize,
     pub(crate) ratio: usize,
     pub(crate) wkv_bf16: Vec<u16>,
@@ -1120,26 +1127,32 @@ pub(crate) struct StrictCompressorArena {
 }
 
 impl StrictCompressorArena {
-    pub(crate) fn new(stream: &CudaStream, outputs: usize, ratio: usize) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(
+        stream: &CudaStream,
+        hidden: usize,
+        outputs: usize,
+        ratio: usize,
+    ) -> Result<Self, Box<dyn Error>> {
         let weights = outputs
-            .checked_mul(v4_state::HIDDEN)
+            .checked_mul(hidden)
             .ok_or("strict Compressor arena weight size overflow")?;
         let ape = outputs
             .checked_mul(ratio)
             .ok_or("strict Compressor arena APE size overflow")?;
         Ok(Self {
+            hidden,
             outputs,
             ratio,
             wkv_bf16: vec![0; weights],
             wgate_bf16: vec![0; weights],
             ape_f32: vec![0.0; ape],
-            input_f32: vec![0.0; v4_state::HIDDEN],
+            input_f32: vec![0.0; hidden],
             wkv_f32: vec![0.0; weights],
             wgate_f32: vec![0.0; weights],
             kv_f32: vec![0.0; outputs],
             score_f32: vec![0.0; outputs],
             score_plus_ape_f32: vec![0.0; outputs],
-            input_device: DeviceBuffer::zeroed(stream, v4_state::HIDDEN)?,
+            input_device: DeviceBuffer::zeroed(stream, hidden)?,
             wkv_device: DeviceBuffer::zeroed(stream, weights)?,
             wgate_device: DeviceBuffer::zeroed(stream, weights)?,
             workspace: DeviceBuffer::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?,
@@ -1148,13 +1161,17 @@ impl StrictCompressorArena {
         })
     }
 
-    pub(crate) fn host_bytes_for(outputs: usize, ratio: usize) -> Result<usize, Box<dyn Error>> {
+    pub(crate) fn host_bytes_for(
+        hidden: usize,
+        outputs: usize,
+        ratio: usize,
+    ) -> Result<usize, Box<dyn Error>> {
         let weights = outputs
-            .checked_mul(v4_state::HIDDEN)
+            .checked_mul(hidden)
             .ok_or("strict Compressor host arena weight size overflow")?;
         weights
             .checked_mul(2 * std::mem::size_of::<u16>() + 2 * std::mem::size_of::<f32>())
-            .and_then(|bytes| bytes.checked_add(v4_state::HIDDEN * std::mem::size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_add(hidden * std::mem::size_of::<f32>()))
             .and_then(|bytes| bytes.checked_add(outputs * ratio * std::mem::size_of::<f32>()))
             .and_then(|bytes| bytes.checked_add(outputs * 3 * std::mem::size_of::<f32>()))
             .ok_or_else(|| "strict Compressor host arena size overflow".into())
@@ -1173,7 +1190,7 @@ impl StrictCompressorArena {
         ratio: usize,
         start_pos: usize,
     ) -> Result<v4_state::CompressorPrepared, Box<dyn Error>> {
-        if input_bf16.len() != v4_state::HIDDEN
+        if input_bf16.len() != self.hidden
             || outputs != self.outputs
             || ratio != self.ratio
             || wkv.len() != self.wkv_bf16.len()
@@ -1225,7 +1242,7 @@ impl StrictCompressorArena {
             device_const(self.input_device.cu_deviceptr()),
             device_mut(self.kv_device.cu_deviceptr()),
             outputs,
-            v4_state::HIDDEN,
+            self.hidden,
         )?;
         probe_laps[5] = probe_mark.elapsed().as_micros();
         probe_mark = std::time::Instant::now();
@@ -1237,7 +1254,7 @@ impl StrictCompressorArena {
             device_const(self.input_device.cu_deviceptr()),
             device_mut(self.score_device.cu_deviceptr()),
             outputs,
-            v4_state::HIDDEN,
+            self.hidden,
         )?;
         probe_laps[6] = probe_mark.elapsed().as_micros();
         probe_mark = std::time::Instant::now();
@@ -1303,25 +1320,32 @@ pub(crate) struct StrictCompressorScratch {
 }
 
 impl StrictCompressorScratch {
-    pub(crate) fn new(stream: &CudaStream) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(stream: &CudaStream, hidden: usize) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             hca_cublas: cublas_exact::CublasExact::load()?,
             csa_cublas: cublas_exact::CublasExact::load()?,
-            hca: StrictCompressorArena::new(stream, 512, 128)?,
-            csa: StrictCompressorArena::new(stream, 1_024, 4)?,
-            csa_indexer: StrictCompressorArena::new(stream, 256, 4)?,
+            hca: StrictCompressorArena::new(stream, hidden, 512, 128)?,
+            csa: StrictCompressorArena::new(stream, hidden, 1_024, 4)?,
+            csa_indexer: StrictCompressorArena::new(stream, hidden, 256, 4)?,
         })
     }
 
-    pub(crate) fn host_bytes() -> Result<usize, Box<dyn Error>> {
+    pub(crate) fn host_bytes(hidden: usize) -> Result<usize, Box<dyn Error>> {
         [
-            StrictCompressorArena::host_bytes_for(512, 128)?,
-            StrictCompressorArena::host_bytes_for(1_024, 4)?,
-            StrictCompressorArena::host_bytes_for(256, 4)?,
+            StrictCompressorArena::host_bytes_for(hidden, 512, 128)?,
+            StrictCompressorArena::host_bytes_for(hidden, 1_024, 4)?,
+            StrictCompressorArena::host_bytes_for(hidden, 256, 4)?,
         ]
         .into_iter()
         .try_fold(0_usize, |sum, bytes| sum.checked_add(bytes))
         .ok_or_else(|| "strict Compressor scratch host size overflow".into())
+    }
+
+    /// The width every one of the three pools is sized for. Callers compare
+    /// against this instead of a model constant, so the pool is used exactly
+    /// when the compressor hands it a geometry it was built for.
+    pub(crate) fn hidden(&self) -> usize {
+        self.hca.hidden
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1451,11 +1475,21 @@ pub(crate) fn run_compressor_official_cublas_host(
     let mut probe_laps = [0_u128; 10];
     let probe_start = std::time::Instant::now();
     let mut probe_mark = probe_start;
-    let wkv = DeviceBuffer::from_host(stream, &to_f32(wkv_bf16))?;
-    let wgate = DeviceBuffer::from_host(stream, &to_f32(wgate_bf16))?;
+    let wkv_f32_host = to_f32(wkv_bf16);
     probe_laps[0] = probe_mark.elapsed().as_micros();
     probe_mark = std::time::Instant::now();
+    let wgate_f32_host = to_f32(wgate_bf16);
+    probe_laps[1] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
+    let wkv = DeviceBuffer::from_host(stream, &wkv_f32_host)?;
+    probe_laps[2] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
+    let wgate = DeviceBuffer::from_host(stream, &wgate_f32_host)?;
+    probe_laps[3] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
     let workspace = DeviceBuffer::<u8>::zeroed(stream, cublas_exact::WORKSPACE_BYTES)?;
+    probe_laps[6] = probe_mark.elapsed().as_micros();
+    probe_mark = std::time::Instant::now();
     let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
     let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
     let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
@@ -1501,7 +1535,7 @@ pub(crate) fn run_compressor_official_cublas_host(
         score_f32.extend(score.to_host_vec(stream)?);
         probe_row_d2h_ns += row_mark.elapsed().as_nanos();
     }
-    probe_laps[1] = probe_mark.elapsed().as_micros();
+    probe_laps[4] = probe_mark.elapsed().as_micros();
     probe_mark = std::time::Instant::now();
     let score_plus_ape_f32 = score_f32
         .chunks_exact(outputs)
@@ -1520,17 +1554,22 @@ pub(crate) fn run_compressor_official_cublas_host(
     {
         return Err("official cuBLAS L0 Compressor produced non-finite output".into());
     }
-    probe_laps[2] = probe_mark.elapsed().as_micros();
+    probe_laps[5] = probe_mark.elapsed().as_micros();
     if probe {
         eprintln!(
-            "COMPPROBE_HOST outputs={} ratio={} rows={} weights_f32_h2d={} row_loop={} \
-             tail={} row_upload={} row_alloc={} gemm1={} gemm2={} row_d2h={} total={}",
+            "COMPPROBE_HOST outputs={} ratio={} rows={} expand_wkv={} expand_wgate={} \
+             h2d_wkv={} h2d_wgate={} workspace_alloc={} row_loop={} tail={} row_upload={} \
+             row_alloc={} gemm1={} gemm2={} row_d2h={} total={}",
             outputs,
             ratio,
             rows,
             probe_laps[0],
             probe_laps[1],
             probe_laps[2],
+            probe_laps[3],
+            probe_laps[6],
+            probe_laps[4],
+            probe_laps[5],
             probe_row_upload_ns / 1_000,
             probe_row_alloc_ns / 1_000,
             probe_gemm1_ns / 1_000,
@@ -1968,7 +2007,7 @@ pub(crate) fn run_csa_indexer_projections(
     let compressor = if strict_compressor_enabled() {
         // Single position only, same reason as the main compressor above: the
         // pool holds one row's worth of buffers.
-        let scratch = strict_scratch.filter(|_| attention_input.len() == v4_state::HIDDEN);
+        let scratch = strict_scratch.filter(|scratch| attention_input.len() == scratch.hidden());
         if let Some(scratch) = scratch {
             scratch.run_from_device(
                 stream,
