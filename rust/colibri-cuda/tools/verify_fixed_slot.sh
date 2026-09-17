@@ -3,6 +3,10 @@
 #
 #   usage: verify_fixed_slot.sh <commit-ish> [tag]
 #
+#   顺序是可换的：`ORDER=off-first` 先跑关掉那臂。**冷帧（前两个 token）里先跑的那臂
+#   要付冷页缓存的 6.7 GB 固定权重读**，所以只跑一个顺序时前两个 token 的差是顺序的
+#   差，不是改动的差。要判冷帧就得两个顺序各跑一次。
+#
 # 判据（跑完看最后四段输出）：
 #
 #   1. 四个钉死值 + 43 层 + block32/canonical 臂，1 步跑逐项 OK。
@@ -79,9 +83,15 @@ run() { # label steps telemetry [extra VAR=value ...]
   echo "exit=$?  $(grep -E 'Elapsed \(wall' "$OUT/$label.stderr" | head -1)"
 }
 
-run 1step-slot-on 1 0
-run 8step-slot-on 8 1
-run 8step-slot-off 8 1 COLIBRI_V4_FLASH_FIXED_SLOT=0
+if [ "${ORDER:-on-first}" = "off-first" ]; then
+  run 1step-slot-on 1 0
+  run 8step-slot-off 8 1 COLIBRI_V4_FLASH_FIXED_SLOT=0
+  run 8step-slot-on 8 1
+else
+  run 1step-slot-on 1 0
+  run 8step-slot-on 8 1
+  run 8step-slot-off 8 1 COLIBRI_V4_FLASH_FIXED_SLOT=0
+fi
 
 echo "################ 2/4 pinned values (1 step) ################"
 python3 "$Z/verify_baseline.py" "$OUT/1step-slot-on.jsonl" | tail -12
