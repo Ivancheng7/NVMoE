@@ -38,7 +38,17 @@ pub(crate) fn flash_b1_prompt_chunk_enabled(
     if !base && !serve {
         return Ok(false);
     }
-    optional_one_flag("COLIBRI_V4_FLASH_PROMPT_CHUNK")
+    // On by default since the merged-tree verification: same digests as the
+    // per-position sweep, fewer fixed-weight sweeps for the prompt. `=0` puts
+    // the pre-chunk loop back so runs recorded against it stay reproducible.
+    match std::env::var_os("COLIBRI_V4_FLASH_PROMPT_CHUNK").as_deref() {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => {
+            Err("COLIBRI_V4_FLASH_PROMPT_CHUNK must be 1 or 0 when set".into())
+        }
+    }
 }
 
 pub(crate) fn flash_b1_prefetch_next_layer(
