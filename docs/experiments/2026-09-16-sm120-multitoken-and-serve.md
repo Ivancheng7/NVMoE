@@ -188,6 +188,10 @@ python3 <repo>/rust/colibri-cuda/tools/flash_serve_client.py \
 5. **serve 每迭代比 CLI 贵约 1.75 倍（21.1 s vs 12.0 s），没解释。** 两个路径调的是同一个
    `run_v4_b2_generate_arm`，差别只有 prompt 长度和 `record_final_head_loader` /
    `capture_layer_trace` 两个臂参数（CLI 传 `true, true`，serve 传 `false, false`）。
+   **2026-09-17 更正：已定位。** 是固定参数的后台预取线程没在服务路径上开——
+   `flash_b1_prefetch_enabled` 要求 `COLIBRI_V4_FLASH_BASE`，而服务只设 `FLASH_SERVE`。
+   实测也设上 `FLASH_BASE` 之后，serve 每个字 `9.87 → 4.52 s`、首字 `79.9 → 27.1 s`。
+   见 `2026-09-16-sm120-prompt-chunk.md` 的"服务路径一直白白慢一倍"一节。
 6. **OpenAI HTTP 网关能不能驱动 Rust 引擎，没验证。** `c/openai_server.py` 的 `Engine` 起的是 C 引擎、
    用 C 引擎的环境变量，还解析 `TIERS`/`hwinfo` 之类的握手行；要对上得先确认 Rust 侧发不发这些。
 7. **取消、并发、多请求没测。** 协议里有 `CANCEL`，`validate_submit` 只允许 `cache_slot=0`，
