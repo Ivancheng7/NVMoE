@@ -139,6 +139,17 @@ pub(crate) fn flash_shared_probe_enabled() -> bool {
         == Some(std::ffi::OsStr::new("1"))
 }
 
+/// Pure diagnostic, off by default: print the inside of one Compressor call.
+///
+/// The phase table prices the compressor as one number per call and the bench
+/// block as one sync wall per step, neither of which says which segment carries
+/// the 10 ms / 19 ms tier. This splits the reusable-arena path into its nine
+/// segments. Numbers do not move; only stderr grows.
+pub(crate) fn flash_compressor_probe_enabled() -> bool {
+    std::env::var_os("COLIBRI_V4_FLASH_COMPRESSOR_PROBE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+}
+
 pub(crate) fn flash_b1_prefetch_next_layer(
     current_layer: usize,
     layer_count: usize,

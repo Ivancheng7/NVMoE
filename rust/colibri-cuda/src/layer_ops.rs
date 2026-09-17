@@ -1169,21 +1169,38 @@ impl StrictCompressorArena {
         {
             return Err("strict Compressor reusable arena geometry mismatch".into());
         }
+        // Segment timing for the compressor tier investigation. `Instant` is not
+        // a sync, and nine pairs of marks are ~0.6 us against a ~10 ms call, so
+        // this stays unconditional and only the print is gated: a probed and an
+        // unprobed run then share one code path.
+        let mut probe_laps = [0_u128; 9];
+        let probe_start = std::time::Instant::now();
+        let mut probe_mark = probe_start;
         wkv.copy_to_host(stream, &mut self.wkv_bf16)?;
         wgate.copy_to_host(stream, &mut self.wgate_bf16)?;
         ape.copy_to_host(stream, &mut self.ape_f32)?;
+        probe_laps[0] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         for (dst, &src) in self.input_f32.iter_mut().zip(input_bf16) {
             *dst = f32::from_bits(u32::from(src) << 16);
         }
+        probe_laps[1] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         for (dst, &src) in self.wkv_f32.iter_mut().zip(&self.wkv_bf16) {
             *dst = f32::from_bits(u32::from(src) << 16);
         }
+        probe_laps[2] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         for (dst, &src) in self.wgate_f32.iter_mut().zip(&self.wgate_bf16) {
             *dst = f32::from_bits(u32::from(src) << 16);
         }
+        probe_laps[3] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         self.input_device.copy_from_host(stream, &self.input_f32)?;
         self.wkv_device.copy_from_host(stream, &self.wkv_f32)?;
         self.wgate_device.copy_from_host(stream, &self.wgate_f32)?;
+        probe_laps[4] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         let device_const = |pointer| pointer as usize as *const std::ffi::c_void;
         let device_mut = |pointer| pointer as usize as *mut std::ffi::c_void;
         let stream_pointer = stream.cu_stream().cast::<std::ffi::c_void>();
@@ -1197,6 +1214,8 @@ impl StrictCompressorArena {
             outputs,
             v4_state::HIDDEN,
         )?;
+        probe_laps[5] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         cublas.sgemm_mn1(
             stream_pointer,
             device_mut(self.workspace.cu_deviceptr()),
@@ -1207,9 +1226,13 @@ impl StrictCompressorArena {
             outputs,
             v4_state::HIDDEN,
         )?;
+        probe_laps[6] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         self.kv_device.copy_to_host(stream, &mut self.kv_f32)?;
         self.score_device
             .copy_to_host(stream, &mut self.score_f32)?;
+        probe_laps[7] = probe_mark.elapsed().as_micros();
+        probe_mark = std::time::Instant::now();
         let ape_offset = start_pos
             .checked_rem(ratio)
             .and_then(|row| row.checked_mul(outputs))
@@ -1230,6 +1253,25 @@ impl StrictCompressorArena {
             .any(|value| !value.is_finite())
         {
             return Err("strict cuBLAS Compressor produced non-finite output".into());
+        }
+        probe_laps[8] = probe_mark.elapsed().as_micros();
+        if flash_compressor_probe_enabled() {
+            eprintln!(
+                "COMPPROBE outputs={} ratio={} d2h_w={} expand_in={} expand_wkv={} \
+                 expand_wgate={} h2d_w={} gemm1={} gemm2={} d2h_out={} tail={} total={}",
+                outputs,
+                ratio,
+                probe_laps[0],
+                probe_laps[1],
+                probe_laps[2],
+                probe_laps[3],
+                probe_laps[4],
+                probe_laps[5],
+                probe_laps[6],
+                probe_laps[7],
+                probe_laps[8],
+                probe_start.elapsed().as_micros(),
+            );
         }
         Ok(v4_state::CompressorPrepared {
             kv_f32: self.kv_f32.clone(),
