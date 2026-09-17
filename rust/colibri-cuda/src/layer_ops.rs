@@ -967,7 +967,11 @@ pub(crate) fn run_layer_compressor(
         return Err("layer Compressor weight shape mismatch".into());
     }
     if strict_compressor_enabled() {
-        if let Some(scratch) = strict_scratch {
+        // The pool is sized for exactly one position (`v4_state::HIDDEN`); the
+        // chunked prefill pass hands the compressor several positions at once, so
+        // that pass keeps the per-row implementation below.
+        let scratch = strict_scratch.filter(|_| input.len() == v4_state::HIDDEN);
+        if let Some(scratch) = scratch {
             return scratch.run_from_device(
                 stream,
                 input,
@@ -1867,7 +1871,10 @@ pub(crate) fn run_csa_indexer_projections(
         *weight *= scale;
     }
     let compressor = if strict_compressor_enabled() {
-        if let Some(scratch) = strict_scratch {
+        // Single position only, same reason as the main compressor above: the
+        // pool holds one row's worth of buffers.
+        let scratch = strict_scratch.filter(|_| attention_input.len() == v4_state::HIDDEN);
+        if let Some(scratch) = scratch {
             scratch.run_from_device(
                 stream,
                 attention_input,

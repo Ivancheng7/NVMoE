@@ -60,7 +60,8 @@ pub(crate) fn run_b2_serial_request(
             token_id,
             0,
             &mut persistent,
-        None,
+            None,
+            None,
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         let (next, digest, stage) = run?;
@@ -231,7 +232,8 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 token_ids[request],
                 0,
                 &mut state[request],
-            None,
+                None,
+                None,
             ) {
                 Ok((next, digest, stage)) => {
                     physical.routed_source_bytes += stage.routed_source_bytes;
@@ -460,6 +462,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // The fixed-layer slot gets the same lifetime as the host cache: one device
     // slot per layer type, restaged every layer instead of rebuilt.
     let mut fixed_layer_slot = fixed_layer_slot::FixedLayerSlot::new();
+    // Same lifetime again for the strict compressor's pools: three
+    // geometry-sized sets of host and device buffers that the compressor
+    // restages into instead of allocating (2x29 MB of host expansion per call
+    // for Csa4) on every layer.
+    let mut compressor_scratch = flash_b1_compressor_arena_enabled(spec, REQUESTS)?
+        .then(|| StrictCompressorScratch::new(stream))
+        .transpose()?;
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
         let active_requests = b2_generate_active_indices::<REQUESTS>(&active);
@@ -698,6 +707,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                                 token_ids[row][offset],
                                 absolute,
                                 &mut state.persistent,
+                                compressor_scratch.as_mut(),
                                 Some(&mut routed_slot_scratch),
                             )?;
                             physical.routed_source_bytes += stage.routed_source_bytes;
@@ -1511,6 +1521,7 @@ pub(crate) fn run_flash_base_input(
             token_id,
             position,
             persistent,
+            None,
             Some(&mut routed_slot_scratch),
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);

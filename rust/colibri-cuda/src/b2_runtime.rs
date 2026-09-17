@@ -97,6 +97,36 @@ pub(crate) fn flash_b1_fixed_slot_enabled(
     }
 }
 
+pub(crate) fn flash_b1_compressor_arena_enabled(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<bool, Box<dyn Error>> {
+    // Confined to the two delivery Flash surfaces, same as the prompt chunk, the
+    // prefetch worker and the fixed-layer slot.
+    if spec != &v4_spec::FLASH_0731 || requests != 1 {
+        return Ok(false);
+    }
+    let base =
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let serve =
+        std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !base && !serve {
+        return Ok(false);
+    }
+    // On by default: the compressor used to re-allocate every host expansion
+    // (2x29 MB for Csa4) and every device buffer on each call, which the probe
+    // instrumented at +15 ms per call in host expansion alone. The arena keeps
+    // them and the static check proves reuse does not reallocate.
+    // `=0` restores the per-call allocation so runs recorded against it stay
+    // reproducible.
+    match std::env::var_os("COLIBRI_V4_FLASH_COMPRESSOR_ARENA").as_deref() {
+        None => Ok(true),
+        Some(value) if value == "1" => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Err("COLIBRI_V4_FLASH_COMPRESSOR_ARENA must be 1 or 0 when set".into()),
+    }
+}
+
 pub(crate) fn flash_b1_prefetch_next_layer(
     current_layer: usize,
     layer_count: usize,
@@ -279,6 +309,7 @@ pub(crate) fn run_b2_layer<'module>(
     token_id: i64,
     token_position: usize,
     persistent: &mut v4_state::V4SerialPersistentState,
+    strict_scratch: Option<&mut StrictCompressorScratch>,
     routed_slot_scratch: Option<&mut RoutedSlotScratch<'module>>,
 ) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
     let layer = runtime.weights.layer;
@@ -305,7 +336,7 @@ pub(crate) fn run_b2_layer<'module>(
             None,
             false,
             None,
-            None,
+            strict_scratch,
             routed_slot_scratch,
         )?;
         let main = state.compressor();
