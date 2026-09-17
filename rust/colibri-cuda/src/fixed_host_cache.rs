@@ -2,6 +2,12 @@ use super::*;
 
 pub(crate) const FIXED_HOST_RESIDENT_GIB_ENV: &str = "COLIBRI_V4_FIXED_HOST_RESIDENT_GIB";
 
+/// Budget used when the env var is absent. 8 GiB is the configuration the
+/// residency A/B measured, and it holds the whole 5.6 GiB fixed model, so the
+/// default is full residency. `=0` turns the cache off; any other whole number
+/// keeps that many GiB of layers resident as a prefix.
+pub(crate) const FIXED_HOST_RESIDENT_DEFAULT_GIB: u64 = 8;
+
 /// Keeps the decoded fixed host payload of a layer alive between tokens.
 ///
 /// Without it every token rebuilds all 43 host payloads from the shards: 137 MB
@@ -17,7 +23,7 @@ pub(crate) struct FixedHostCache {
 impl FixedHostCache {
     pub(crate) fn from_env(layer_count: usize) -> Result<Self, Box<dyn Error>> {
         let budget_gib = match std::env::var_os(FIXED_HOST_RESIDENT_GIB_ENV) {
-            None => 0_u64,
+            None => FIXED_HOST_RESIDENT_DEFAULT_GIB,
             Some(raw) => raw
                 .to_string_lossy()
                 .trim()
