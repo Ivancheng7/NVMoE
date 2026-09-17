@@ -71,11 +71,13 @@ def cli_steady(path):
     if head_walls:
         first += head_walls[0]
     steady = (request - first) / (len(chunks) - 1)
-    body = [layer for index, layer in enumerate(layers) if index % PER_TOKEN != 0]
+    # Same token set as `steady`: every token after the first. The first token
+    # carries the cold page-cache read and would pull `fixed` up by more than 2x.
+    body = [layer for chunk in chunks[1:] for layer in chunk[1:]]
     phases = {}
     for name in ("fixed", "routed", "shared", "attention", "router"):
         phases[name] = statistics.mean(
-            layer["top_level"][name]["wall_ns"] for layer in body) / 1e9
+            layer["top_level"][name]["wall_ns"] for layer in body) / 1e9 * PER_TOKEN
     phases["head"] = statistics.mean(head_walls[1:]) if len(head_walls) > 1 else 0.0
     return steady, first, phases
 
