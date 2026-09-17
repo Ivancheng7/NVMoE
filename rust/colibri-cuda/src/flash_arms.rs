@@ -591,3 +591,87 @@ impl LayerStageTelemetry {
             .saturating_add(self.router_other_ns)
     }
 }
+
+impl std::ops::AddAssign for LayerStageTelemetry {
+    /// Folds one position's stage telemetry into a layer-pass accumulator. This
+    /// is what makes a chunked prompt pass report a wall that covers every
+    /// position it executed instead of only the last one. `routed_prefetched`
+    /// is the AND of its inputs: a pass that mixed prefetched and synchronous
+    /// routed loads reports "not prefetched" and fails the nested-scope guard
+    /// loudly rather than claiming a background read it did not have.
+    fn add_assign(&mut self, other: Self) {
+        macro_rules! fold {
+            ($($field:ident),* $(,)?) => {
+                $(self.$field = self.$field.saturating_add(other.$field);)*
+            };
+        }
+        fold!(
+            layer_prepare_ns,
+            layer_prepare_count,
+            attention_ns,
+            device_state_setup_ns,
+            device_state_setup_count,
+            device_state_reset_cuda_ns,
+            device_state_reset_calls,
+            attention_audit_oracle_ns,
+            attention_hidden_h2d_count,
+            attention_hidden_h2d_bytes,
+            attention_rope_lut_d2d_count,
+            attention_rope_lut_d2d_bytes,
+            attention_terminal_d2h_count,
+            attention_terminal_d2h_bytes,
+            attention_intermediate_or_audit_d2h_count,
+            attention_intermediate_or_audit_d2h_bytes,
+            attention_steady_device_temporary_alloc_count,
+            router_ns,
+            router_mhc_ns,
+            router_mhc_input_alloc_h2d_sync_ns,
+            router_mhc_workspace_alloc_sync_ns,
+            router_mhc_workspace_init_gpu_ns,
+            router_mhc_mixing_linear_sync_ns,
+            router_mhc_mixing_linear_gpu_ns,
+            router_mhc_sinkhorn_normalize_collapse_sync_ns,
+            router_mhc_sinkhorn_normalize_collapse_gpu_ns,
+            router_mhc_output_d2h_sync_ns,
+            router_mhc_other_ns,
+            router_host_prep_ns,
+            router_alloc_h2d_sync_ns,
+            router_workspace_alloc_ns,
+            router_kernel_select_sync_ns,
+            router_kernel_select_gpu_ns,
+            router_d2h_sync_ns,
+            router_other_ns,
+            shared_ns,
+            routed_ns,
+            routed_read_ns,
+            routed_alloc_ns,
+            routed_setup_ns,
+            routed_h2d_ns,
+            routed_kernel_ns,
+            commit_ns,
+            routed_source_bytes,
+            routed_h2d_bytes,
+            routed_expert_loads,
+        );
+        self.routed_prefetched = self.routed_prefetched && other.routed_prefetched;
+        if other.attention_profile.is_some() {
+            self.attention_profile = other.attention_profile;
+        }
+        self.routed_parallel_batch_wall_ns = fold_option_ns(
+            self.routed_parallel_batch_wall_ns,
+            other.routed_parallel_batch_wall_ns,
+        );
+        self.routed_parallel_read_horizon_ns = fold_option_ns(
+            self.routed_parallel_read_horizon_ns,
+            other.routed_parallel_read_horizon_ns,
+        );
+    }
+}
+
+fn fold_option_ns(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}

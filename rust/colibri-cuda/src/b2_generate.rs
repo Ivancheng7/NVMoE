@@ -487,6 +487,7 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
     fixed: &FixedLoadTelemetry,
     wo_a_decode_sync_ns: u64,
     stage: &LayerStageTelemetry,
+    chunk_positions: usize,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let fixed_service_ns = fixed
         .fixed_read_alloc_ns
@@ -557,6 +558,10 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
     }));
     Ok(serde_json::json!({
         "layer": layer,
+        // Positions this layer pass executed. 1 is the unmodified loop; a
+        // chunked prompt pass folds every position's stage telemetry into the
+        // buckets below, while `fixed` (the layer load) is counted once.
+        "chunk_positions": chunk_positions,
         "outer": {"wall_ns": outer_wall_ns},
         "top_level": {
             "fixed": {
