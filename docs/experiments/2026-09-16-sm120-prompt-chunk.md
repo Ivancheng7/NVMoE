@@ -167,6 +167,37 @@ compressor / routed 读全部原样，只是被调用的次数和顺序变了。
    解码路径按构造没被碰，而且"开"落在中间两跑、"关"落在最外两跑，跑次位置与开关共线，
    所以这个差**分不出是效应还是跑次**。没有把它当结论。
 
+## 合并进交付分支（2026-09-17）
+
+合并提交 `993a6a8`（`merge: serve a whole prompt with one layer pass instead of one per position`），
+父提交是交付分支的 `b0766ec`。**开关仍然默认关，所以合并本身不改交付行为**；
+把它打开是另一个决定（而且打开会让基线数字作废）。
+
+`generate.rs` 三处冲突，都在这儿解掉了。**带载荷的那一处**：交付分支在这期间合进了
+`exp/routed-read-threads` 和 `exp/routed-slot-resident`（`5a9e35c`），
+`run_b2_layer` 因此多了一个 `routed_slot_scratch` 参数——本分支的 chunk 循环已经改成同样传它。
+另两处是纯函数位置重合（隔壁新加的 `load_flash_b1_layer_from_host` 与本分支的
+`b2_prompt_chunk_span` 落在同一处；以及隔壁的 `from_prefetch` 遥测与本分支按位置展开的
+`metadata_rows`）。**另一个会话未提交的 `AGENTS.md` 刻意没有带进这次合并。**
+
+合并树在 WSL 侧单独建了 worktree（`/srv/localmoe/build/merged-prompt-chunk`，detached `993a6a8`），
+构建 `58.16 s`、exit 0、**59 条警告**（与合并前一致）。交付分支那个 WSL 仓库没动，
+仍然干净停在 `b0766ec`。
+
+**已在合并树上重验的：**
+
+| 项 | 结果 |
+| --- | --- |
+| 单步 `argmax` / `hidden_bf16_digest` / 层数 | `55222` / `5ed8bf88beae3cfe` / `43`，全同 |
+| 单步层摘要链 `ordered_layer_digest_sha256` | `53de221f…`，与本分支合并前一模一样 |
+| 8 步 8 个 `hidden_bf16_digest` | 逐个与钉死列表相同 |
+| 单步/8 步固定参数字节 | `6,708,949,192` / `53,671,593,536`，与合并前逐字节相同 |
+| 峰值显存 | `1500053504`——**这是隔壁 `routed-slot-resident` 记录过的新值**（`+32 MiB`，一个槽位的设备缓冲，真实峰值没变大、只是采样点挪了），不是这次合并带出来的回归 |
+
+**还没在合并树上验的：开关打开、chunk 长度大于 1 的那条路。** 合并前的 5 token A/B 是在旧树上跑的，
+而合并进来的那一刀改的正是同一个循环，所以"合并后 chunk>1 仍然逐位相同"需要一次新的
+5 token A/B（两次运行，约 5 分钟 GPU）。**这一条没做之前，别对外说合并树上的 chunk 路径已验证。**
+
 ## 未决事项
 
 1. **松开 `KV_WINDOW = 128` 的输入上限。** 交付这条路现在硬拒 `prompt + 生成 − 1 > 128`
@@ -175,9 +206,9 @@ compressor / routed 读全部原样，只是被调用的次数和顺序变了。
    松开会让位置超过 128，走进 128 行 KV 环的绕回 + 两级压缩缓存那个**从没跑过**的区间
    ——独立的下一步，有自己的风险等级。
 2. **121 token 的 prompt 实跑一次**，验证收益按公式外推成立，顺便压一下长 T 的边界。
-3. **要不要合并进交付分支。** 数值零变化（12 个 digest 做证）+ 账本逐字节可核，按
-   "交付分支只收验证过的东西"是可以进的；但和 `exp/slot-reuse` 一样，合并会让基线数字作废，
-   所以是显式决定。注意它和 `exp/routed-read-threads` 不冲突：那个改的是读的并发度，
+3. **把开关打开（`COLIBRI_V4_FLASH_PROMPT_CHUNK=1` 进交付跑的环境）。** 改动已合并（`993a6a8`），
+   但默认关着，所以现在没有任何实际收益。打开之前先补完上面那条"合并树上的 chunk 路径验证"，
+   并想清楚基线数字怎么处理。它和 `exp/routed-read-threads` 不冲突：那个改的是读的并发度，
    这个改的是读的次数。
 4. 多行（`REQUESTS > 1`）的 prompt chunk 没做；要做的话 span 对齐和
    `b2_router_metadata_row` 的行号布局都已经就位（`row = offset * rows + row`）。
