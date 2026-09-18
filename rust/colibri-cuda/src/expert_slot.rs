@@ -48,11 +48,15 @@ pub(crate) struct ExpertSlot<'a> {
 /// Whoever owns this scratch keeps it in the scope that spans the layer loop.
 pub(crate) struct RoutedSlotScratch<'a> {
     slot: Option<ExpertSlot<'a>>,
+    pool: Option<RoutedReadPool>,
 }
 
 impl<'a> RoutedSlotScratch<'a> {
     pub(crate) fn new() -> Self {
-        Self { slot: None }
+        Self {
+            slot: None,
+            pool: None,
+        }
     }
 
     /// Hands the slot to the layer being run, leaving the scratch empty.
@@ -63,6 +67,152 @@ impl<'a> RoutedSlotScratch<'a> {
     /// Takes the layer's last slot back so the next layer can restage into it.
     pub(crate) fn put_slot(&mut self, slot: ExpertSlot<'a>) {
         self.slot = Some(slot);
+    }
+
+    /// Hands the pinned read pool to the layer's prefetch, leaving it empty.
+    pub(crate) fn take_pool(&mut self) -> Option<RoutedReadPool> {
+        self.pool.take()
+    }
+
+    /// Takes the pool back after the layer's routed block drained it.
+    pub(crate) fn put_pool(&mut self, pool: RoutedReadPool) {
+        self.pool = Some(pool);
+    }
+}
+
+/// The page-locked staging sizes one routed expert occupies, in the same order
+/// the range plan reads them. Mirrors the arithmetic `new_empty_for` uses for
+/// the device side; a divergence fails loudly on the range plan's length check
+/// rather than quietly reading less than an expert.
+fn routed_lane_bytes(spec: &v4_spec::V4Spec) -> [usize; 6] {
+    let w1 = spec.moe_intermediate * spec.hidden / 2;
+    let w1_scale = spec.moe_intermediate * spec.hidden / 32;
+    let w2 = spec.hidden * spec.moe_intermediate / 2;
+    let w2_scale = spec.hidden * spec.moe_intermediate / 32;
+    [w1, w1_scale, w2, w2_scale, w1, w1_scale]
+}
+
+/// One routed slot's worth of page-locked staging, filled by a prefetch worker
+/// straight from disk and drained by the weight H2D.
+///
+/// This is the buffer `restage_weights` used to copy into. Reading into it
+/// directly removes the 12.75 MiB host-side `copy_from_slice` per expert and
+/// the fresh zeroed `Vec` the streamed reader allocated per tensor. The
+/// 2026-09-17 replay measured pinned staging reading at the reuse-buffer rate,
+/// not the fresh-buffer rate, so neither removal should cost read bandwidth.
+pub(crate) struct RoutedReadLane {
+    spec: &'static v4_spec::V4Spec,
+    w1_host: PinnedHostBuffer<u8>,
+    w1_scale_host: PinnedHostBuffer<u8>,
+    w2_host: PinnedHostBuffer<u8>,
+    w2_scale_host: PinnedHostBuffer<u8>,
+    w3_host: PinnedHostBuffer<u8>,
+    w3_scale_host: PinnedHostBuffer<u8>,
+    read_ns: u64,
+}
+
+impl RoutedReadLane {
+    fn new(
+        context: &std::sync::Arc<CudaContext>,
+        spec: &'static v4_spec::V4Spec,
+    ) -> Result<Self, Box<dyn Error>> {
+        let [w1, w1_scale, w2, w2_scale, w3, w3_scale] = routed_lane_bytes(spec);
+        Ok(Self {
+            spec,
+            w1_host: PinnedHostBuffer::zeroed(context, w1)?,
+            w1_scale_host: PinnedHostBuffer::zeroed(context, w1_scale)?,
+            w2_host: PinnedHostBuffer::zeroed(context, w2)?,
+            w2_scale_host: PinnedHostBuffer::zeroed(context, w2_scale)?,
+            w3_host: PinnedHostBuffer::zeroed(context, w3)?,
+            w3_scale_host: PinnedHostBuffer::zeroed(context, w3_scale)?,
+            read_ns: 0,
+        })
+    }
+
+    fn shapes_match(&self, spec: &v4_spec::V4Spec) -> bool {
+        let [w1, w1_scale, w2, w2_scale, w3, w3_scale] = routed_lane_bytes(spec);
+        self.w1_host.len() == w1
+            && self.w1_scale_host.len() == w1_scale
+            && self.w2_host.len() == w2
+            && self.w2_scale_host.len() == w2_scale
+            && self.w3_host.len() == w3
+            && self.w3_scale_host.len() == w3_scale
+    }
+
+    pub(crate) fn h2d_bytes(&self) -> usize {
+        self.w1_host.num_bytes()
+            + self.w1_scale_host.num_bytes()
+            + self.w2_host.num_bytes()
+            + self.w2_scale_host.num_bytes()
+            + self.w3_host.num_bytes()
+            + self.w3_scale_host.num_bytes()
+    }
+
+    pub(crate) fn read_ns(&self) -> u64 {
+        self.read_ns
+    }
+
+    /// Reads the layer's expert straight into this lane's page-locked staging.
+    /// The range plan enforces the same six-tensor shape and E8M0 scale check
+    /// the `RoutedExpert` load path performed, so the bytes are validated
+    /// identically before they reach the device.
+    pub(crate) fn read_into(
+        &mut self,
+        shard: &safetensors::ShardFile,
+        layer: usize,
+        expert_id: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        let plan = v4_expert::RoutedExpertRangePlan::new_for(self.spec, shard, layer, expert_id)?;
+        let started = std::time::Instant::now();
+        plan.read_into(
+            shard,
+            [
+                self.w1_host.as_mut_slice(),
+                self.w1_scale_host.as_mut_slice(),
+                self.w2_host.as_mut_slice(),
+                self.w2_scale_host.as_mut_slice(),
+                self.w3_host.as_mut_slice(),
+                self.w3_scale_host.as_mut_slice(),
+            ],
+        )?;
+        self.read_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Ok(())
+    }
+}
+
+/// The six page-locked read lanes a request-scoped scratch keeps, so the routed
+/// prefetch reads disk straight into the staging the H2D drains instead of into
+/// a `Vec` that is then copied across.
+///
+/// Six lanes because the six routed experts are read on six streams. The device
+/// side still owns exactly one execution slot, so this trades pinned host
+/// memory (12.75 MiB per lane) for the per-expert staging copy and per-read
+/// allocation, not for six sets of device buffers.
+pub(crate) struct RoutedReadPool {
+    lanes: Vec<RoutedReadLane>,
+}
+
+impl RoutedReadPool {
+    pub(crate) fn new(
+        context: &std::sync::Arc<CudaContext>,
+        spec: &'static v4_spec::V4Spec,
+    ) -> Result<Self, Box<dyn Error>> {
+        let lanes = (0..spec.experts_per_token)
+            .map(|_| RoutedReadLane::new(context, spec))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        Ok(Self { lanes })
+    }
+
+    pub(crate) fn shapes_match(&self, spec: &v4_spec::V4Spec) -> bool {
+        !self.lanes.is_empty() && self.lanes.iter().all(|lane| lane.shapes_match(spec))
+    }
+
+    pub(crate) fn lanes_mut(&mut self) -> &mut [RoutedReadLane] {
+        &mut self.lanes
+    }
+
+    pub(crate) fn lane(&self, index: usize) -> &RoutedReadLane {
+        &self.lanes[index]
     }
 }
 
@@ -268,6 +418,52 @@ impl<'a> ExpertSlot<'a> {
                 .copy_from_pinned_host_async(&self.stream, &self.w3_host)?;
             self.w3_scale_device
                 .copy_from_pinned_host_async(&self.stream, &self.w3_scale_host)?;
+        }
+        self.weight_end.record(&self.stream)?;
+        self.weight_end.synchronize()?;
+        self.weight_h2d_ms = self.weight_start.elapsed_ms(&self.weight_end)? as f64;
+        Ok(())
+    }
+
+    /// Uploads one already-read lane's pinned staging to this slot's device
+    /// weights and records the H2D time, without touching the slot's own pinned
+    /// staging at all.
+    ///
+    /// This is the read-straight-into-pinned path's counterpart to
+    /// [`Self::restage_weights`]: the bytes are already in the lane's
+    /// page-locked buffers, so the per-expert host-side copy disappears. The
+    /// slot's own `w*_host` staging is left idle on this path; it costs its
+    /// one-time page-lock either way, and the first expert of the first layer
+    /// builds the slot through [`Self::new_empty_for`] instead of [`Self::new`].
+    pub(crate) fn upload_lane(&mut self, lane: &RoutedReadLane) -> Result<(), Box<dyn Error>> {
+        if lane.w1_host.len() != self.w1_device.len()
+            || lane.w1_scale_host.len() != self.w1_scale_device.len()
+            || lane.w2_host.len() != self.w2_device.len()
+            || lane.w2_scale_host.len() != self.w2_scale_device.len()
+            || lane.w3_host.len() != self.w3_device.len()
+            || lane.w3_scale_host.len() != self.w3_scale_device.len()
+        {
+            return Err("pinned read lane does not match the execution slot geometry".into());
+        }
+        self.weight_start.record(&self.stream)?;
+        // SAFETY: the lane's pinned sources outlive the synchronized
+        // completion event below, and the device destinations have the exact
+        // matching allocation (checked above). Overwriting the device weights
+        // is ordered after the previous expert's kernels because `execute_into`
+        // synchronizes its own completion event before returning.
+        unsafe {
+            self.w1_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w1_host)?;
+            self.w1_scale_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w1_scale_host)?;
+            self.w2_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w2_host)?;
+            self.w2_scale_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w2_scale_host)?;
+            self.w3_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w3_host)?;
+            self.w3_scale_device
+                .copy_from_pinned_host_async(&self.stream, &lane.w3_scale_host)?;
         }
         self.weight_end.record(&self.stream)?;
         self.weight_end.synchronize()?;
