@@ -317,6 +317,7 @@ pub(crate) fn run_real_v4_full61_b1(
                             None,
                             None,
                         None,
+                        None, // attention device chain (not this path)
                         )
                     },
                 )?;

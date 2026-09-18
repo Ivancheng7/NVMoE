@@ -756,6 +756,7 @@ pub(crate) fn run_qd4_stationary_gate_arm(
                 None,
                 None,
             None,
+            None, // attention device chain (not this path)
             )?;
             let audit = run
                 .routed_audit

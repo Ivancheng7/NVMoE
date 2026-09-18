@@ -56,6 +56,7 @@ macro_rules! tilelang_sum4 {
 // tilelang_sum4 macro so its textual scope still covers them.
 mod argmax_records;
 mod artifacts;
+mod attention_device_chain;
 mod attention_gates;
 mod b2_generate;
 mod b2_runtime;
@@ -99,6 +100,7 @@ mod v4_loopback;
 // Keep the existing call sites in this file working after the moves.
 use argmax_records::*;
 use artifacts::*;
+use attention_device_chain::*;
 use attention_gates::*;
 use b2_generate::*;
 use b2_runtime::*;

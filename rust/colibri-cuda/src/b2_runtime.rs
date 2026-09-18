@@ -334,6 +334,7 @@ pub(crate) fn run_b2_layer<'module>(
     persistent: &mut v4_state::V4SerialPersistentState,
     strict_scratch: Option<&mut StrictCompressorScratch>,
     routed_slot_scratch: Option<&mut RoutedSlotScratch<'module>>,
+    attention_scratch: Option<&mut AttentionDeviceScratch>,
 ) -> Result<(Vec<u16>, B2LayerDigest, LayerStageTelemetry), Box<dyn Error>> {
     let layer = runtime.weights.layer;
     let spec = runtime.weights.spec;
@@ -361,6 +362,7 @@ pub(crate) fn run_b2_layer<'module>(
             None,
             strict_scratch,
             routed_slot_scratch,
+            attention_scratch,
         )?;
         let main = state.compressor();
         let indexer = state.indexer();
@@ -425,6 +427,7 @@ pub(crate) fn prepare_b2_prefix(
                     None,
                     None,
                 None,
+                None, // attention device chain (not this path)
                 )?
                 .output,
             );
@@ -520,6 +523,7 @@ pub(crate) fn prepare_two_token_prefix(
                         None,
                         None,
                     None,
+                    None, // attention device chain (not this path)
                     )?
                     .output,
                 );

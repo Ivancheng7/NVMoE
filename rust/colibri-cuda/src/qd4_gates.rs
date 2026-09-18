@@ -289,6 +289,7 @@ pub(crate) fn prepare_qd4_stationary_gate_inputs(
                         None,
                         None,
                     None,
+                    None, // attention device chain (not this path)
                     )?
                     .output,
                 );
