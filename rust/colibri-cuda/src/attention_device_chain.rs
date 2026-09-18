@@ -95,14 +95,8 @@ impl AttentionDeviceScratch {
             mixes: DeviceBuffer::zeroed(stream, rows * v4_state::MIX)?,
             pre: DeviceBuffer::zeroed(stream, rows * v4_state::HC)?,
             post: DeviceBuffer::zeroed(stream, rows * v4_state::HC)?,
-            comb: DeviceBuffer::zeroed(
-                stream,
-                rows * v4_state::HC * v4_state::HC,
-            )?,
-            trace: DeviceBuffer::zeroed(
-                stream,
-                rows * 41 * v4_state::HC * v4_state::HC,
-            )?,
+            comb: DeviceBuffer::zeroed(stream, rows * v4_state::HC * v4_state::HC)?,
+            trace: DeviceBuffer::zeroed(stream, rows * 41 * v4_state::HC * v4_state::HC)?,
             attn_norm_trace: DeviceBuffer::zeroed(stream, 0)?,
             collapsed: DeviceBuffer::zeroed(stream, rows * hidden)?,
             attn_input: DeviceBuffer::zeroed(stream, rows * hidden)?,
@@ -114,10 +108,7 @@ impl AttentionDeviceScratch {
                 rows * q_lora_rank / v4_state::FP8_BLOCK,
             )?,
             fp8_wob_in: DeviceBuffer::zeroed(stream, rows * wob_in)?,
-            fp8_wob_in_scales: DeviceBuffer::zeroed(
-                stream,
-                rows * wob_in / v4_state::FP8_BLOCK,
-            )?,
+            fp8_wob_in_scales: DeviceBuffer::zeroed(stream, rows * wob_in / v4_state::FP8_BLOCK)?,
             empty_u16: DeviceBuffer::zeroed(stream, 0)?,
             empty_u8: DeviceBuffer::zeroed(stream, 0)?,
             q_lora_f32: DeviceBuffer::zeroed(stream, rows * q_lora_rank)?,
@@ -251,8 +242,8 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
                 )?;
             }
         } else {
-            let session = cublas_session
-                .ok_or("Flash cuBLAS mHC session is missing for the device chain")?;
+            let session =
+                cublas_session.ok_or("Flash cuBLAS mHC session is missing for the device chain")?;
             run_flash_mhc_cublas_linear_device_into(
                 session,
                 self.module,
@@ -434,9 +425,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
         || std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").is_some()
         || std::env::var_os("COLIBRI_V4_AUDIT_LAYER").is_some()
     {
-        return Err(
-            "diagnostic dump paths require COLIBRI_V4_ATTENTION_DEVICE_CHAIN=0".into(),
-        );
+        return Err("diagnostic dump paths require COLIBRI_V4_ATTENTION_DEVICE_CHAIN=0".into());
     }
     let attention_started = std::time::Instant::now();
     let linear_arm = flash_mhc_linear_arm(spec)?;
@@ -467,7 +456,9 @@ pub(crate) fn run_real_layer_attention_rows_device(
     }
     // SAFETY: both slices are locals that stay alive until the D2H sync below.
     unsafe {
-        scratch.freqs.copy_from_host_async_unchecked(stream, &freqs)?;
+        scratch
+            .freqs
+            .copy_from_host_async_unchecked(stream, &freqs)?;
         scratch
             .inverse_freqs
             .copy_from_host_async_unchecked(stream, &inverse_freqs)?;

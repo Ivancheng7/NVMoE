@@ -62,7 +62,7 @@ pub(crate) fn run_b2_serial_request(
             &mut persistent,
             None,
             None,
-        None, // attention device chain (not this path)
+            None, // attention device chain (not this path)
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         let (next, digest, stage) = run?;
@@ -235,7 +235,7 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 &mut state[request],
                 None,
                 None,
-            None, // attention device chain (not this path)
+                None, // attention device chain (not this path)
             ) {
                 Ok((next, digest, stage)) => {
                     physical.routed_source_bytes += stage.routed_source_bytes;
@@ -1534,7 +1534,7 @@ pub(crate) fn run_flash_base_input(
             persistent,
             None,
             Some(&mut routed_slot_scratch),
-        None, // attention device chain (not this path)
+            None, // attention device chain (not this path)
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         hidden = result?.0;
