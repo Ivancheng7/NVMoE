@@ -667,6 +667,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     )>,
     strict_scratch: Option<&mut StrictCompressorScratch>,
     mut routed_slot_scratch: Option<&mut RoutedSlotScratch<'module>>,
+    mut attention_scratch: Option<&mut AttentionDeviceScratch>,
 ) -> Result<RealLayerRun, Box<dyn Error>> {
     let weights = &runtime.weights;
     let spec = weights.spec;
@@ -704,6 +705,8 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.attention_start_ns = timeline.now();
     }
+    let mut state = state;
+    let mut strict_scratch = strict_scratch;
     let mut generic_prepared = None;
     let attention = if let Some((state, scratch, audit_expected_compressed_prefix)) = generic_device
     {
@@ -730,6 +733,22 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             hc_hidden,
             start_pos,
             device_observe_topk,
+        )?
+    } else if let Some((state, attention_scratch)) = state
+        .as_mut()
+        .zip(attention_scratch.as_deref_mut())
+    {
+        run_real_layer_attention_rows_device(
+            module,
+            stream,
+            flash_cublas,
+            runtime,
+            hc_hidden,
+            start_pos,
+            state,
+            flash_cublas.map(|session| &session.cublas),
+            strict_scratch.as_deref_mut(),
+            attention_scratch,
         )?
     } else {
         run_real_layer_attention_rows(

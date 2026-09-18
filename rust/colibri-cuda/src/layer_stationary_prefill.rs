@@ -747,6 +747,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             Some((state, scratch, audit_expected_compressed_prefix)),
                             None,
                         None,
+                        None, // attention device chain (not this path)
                         );
                         let run = match run {
                             Ok(run) => run,
@@ -780,6 +781,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             None,
                             None,
                         None,
+                        None, // attention device chain (not this path)
                         )?);
                     } else {
                         persistent
@@ -844,6 +846,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 None,
                                 strict_scratch.as_mut(),
                             None,
+                            None, // attention device chain (not this path)
                             )?;
                             if let Some((expected_output, expected_topk, expected_state, oracle_ns)) =
                                 expected_attention
@@ -1811,6 +1814,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                     Some((state, scratch, audit_expected_compressed_prefix)),
                                     None,
                                 None,
+                                None, // attention device chain (not this path)
                                 )
                             };
                             let mut run = match run {
@@ -2442,6 +2446,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                         None,
                                         strict_scratch.as_mut(),
                                     None,
+                                    None, // attention device chain (not this path)
                                     )?;
                                     oracle = Some((run, host_persistent_state_audit(host_state)));
                                     Ok(())
@@ -2485,6 +2490,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             None,
                             None,
                         None,
+                        None, // attention device chain (not this path)
                         )?;
                         if phase_profile {
                             run.stage.layer_prepare_ns = layer_prepare_ns;

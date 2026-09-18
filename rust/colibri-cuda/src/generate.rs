@@ -62,6 +62,7 @@ pub(crate) fn run_b2_serial_request(
             &mut persistent,
             None,
             None,
+        None, // attention device chain (not this path)
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         let (next, digest, stage) = run?;
@@ -234,6 +235,7 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 &mut state[request],
                 None,
                 None,
+            None, // attention device chain (not this path)
             ) {
                 Ok((next, digest, stage)) => {
                     physical.routed_source_bytes += stage.routed_source_bytes;
@@ -470,6 +472,12 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // it a 4096-wide input for a 7168-wide pool.
     let mut compressor_scratch = flash_b1_compressor_arena_enabled(spec, REQUESTS)?
         .then(|| StrictCompressorScratch::new(stream, spec.hidden))
+        .transpose()?;
+    // The attention device chain's preallocated intermediates get the same
+    // lifetime as the compressor arena: one set of buffers for the whole run,
+    // shared serially by every layer and request. `=0` keeps the host path.
+    let mut attention_device_scratch = attention_device_chain_enabled()?
+        .then(|| AttentionDeviceScratch::new(stream, spec))
         .transpose()?;
 
     while !b2_generate_active_indices::<REQUESTS>(&active).is_empty() {
@@ -711,6 +719,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                                 &mut state.persistent,
                                 compressor_scratch.as_mut(),
                                 Some(&mut routed_slot_scratch),
+                                attention_device_scratch.as_mut(),
                             )?;
                             physical.routed_source_bytes += stage.routed_source_bytes;
                             physical.routed_h2d_bytes += stage.routed_h2d_bytes;
@@ -1525,6 +1534,7 @@ pub(crate) fn run_flash_base_input(
             persistent,
             None,
             Some(&mut routed_slot_scratch),
+        None, // attention device chain (not this path)
         );
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
         hidden = result?.0;
