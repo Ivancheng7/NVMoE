@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Interleaved A/B: pre-change baseline vs pinned-lane read, 8-step base path.
 # Each run drops caches so both arms see a cold disk, and the arms alternate so
-# drift hits both equally. Usage: pinned_ab.sh <rounds>
+# drift hits both equally. Fails loudly: an arm that exits nonzero or writes no
+# result file aborts the run instead of reporting "done" over the old file.
+# Usage: run_pinned_ab.sh <rounds> <tag>
 set -u
 ROUNDS="${1:-3}"
+TAG="${2:-pin}"
 BASE=/srv/localmoe/targets/localmoe-baseline-routed-target/release/colibri-cuda
 PIN=/srv/localmoe/targets/localmoe-pinned-target/release/colibri-cuda
 OUT=/srv/localmoe/targets/io-ceiling
@@ -27,8 +30,19 @@ for r in $(seq 1 "$ROUNDS"); do
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     env_for
     if [ "$arm" = baseline ]; then BIN="$BASE"; else BIN="$PIN"; fi
-    export COLIBRI_V4_RESULT_JSONL="$OUT/pinned-ab-${arm}-r${r}.jsonl"
-    "$BIN" >/dev/null 2>&1
-    echo "run $r $arm done -> $COLIBRI_V4_RESULT_JSONL"
+    RESULT="$OUT/pinned-${TAG}-${arm}-r${r}.jsonl"
+    rm -f "$RESULT"
+    export COLIBRI_V4_RESULT_JSONL="$RESULT"
+    if ! "$BIN" >"$OUT/pinned-${TAG}-${arm}-r${r}.stdout" 2>&1; then
+      echo "FAIL run $r $arm: binary exited nonzero; tail of stdout:"
+      tail -3 "$OUT/pinned-${TAG}-${arm}-r${r}.stdout"
+      exit 1
+    fi
+    if [ ! -s "$RESULT" ]; then
+      echo "FAIL run $r $arm: no result file written"
+      tail -3 "$OUT/pinned-${TAG}-${arm}-r${r}.stdout"
+      exit 1
+    fi
+    echo "run $r $arm ok -> $(basename "$RESULT")"
   done
 done
