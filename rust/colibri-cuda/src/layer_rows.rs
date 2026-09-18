@@ -993,16 +993,6 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             // One worker per read thread; the chunk size keeps the experts in
             // their original order when the chunks are concatenated back.
             let chunk_size = route_ids.len().div_ceil(read_threads);
-            let shared = if parity_dump.is_some() {
-                run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
-            } else {
-                (
-                    run_layer_shared_expert(module, stream, &ffn_input, weights)?,
-                    Vec::new(),
-                )
-            };
-            shared_probe_mlp_us =
-                u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
             if let Some(pool) = routed_read_pool.as_mut() {
                 // Read straight into the pinned lanes. The workers split both
                 // the route slots and the lanes into equal chunks, so each
@@ -1028,14 +1018,26 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                                 .map_err(|error| error.to_string())?;
                             reads.push((expert_id, lane.read_ns()));
                         }
-                        let worker_us =
-                            u128::try_from(worker_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        let worker_us = u128::try_from(worker_started.elapsed().as_micros())
+                            .unwrap_or(u128::MAX);
                         Ok::<_, String>((reads, worker_us))
                     }));
                 }
                 if lanes.next().is_some() {
                     return Err("routed read pool has unused lanes for the route row".into());
                 }
+                // Run the shared MLP on this thread only after the readers are
+                // running, so its wall and theirs overlap instead of stacking.
+                let shared = if parity_dump.is_some() {
+                    run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                } else {
+                    (
+                        run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                        Vec::new(),
+                    )
+                };
+                shared_probe_mlp_us =
+                    u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
                 let mut reads = Vec::with_capacity(route_ids.len());
                 for worker in workers {
                     let (loaded, worker_us) = worker
@@ -1051,6 +1053,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     reads.extend(loaded);
                 }
                 prefetched_routed_lane_reads = Some(reads);
+                Ok(shared)
             } else {
                 let workers = route_ids
                     .chunks(chunk_size)
@@ -1078,6 +1081,16 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                         })
                     })
                     .collect::<Vec<_>>();
+                let shared = if parity_dump.is_some() {
+                    run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                } else {
+                    (
+                        run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                        Vec::new(),
+                    )
+                };
+                shared_probe_mlp_us =
+                    u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
                 let mut experts = Vec::with_capacity(route_ids.len());
                 for worker in workers {
                     let (loaded, worker_us) = worker
@@ -1093,8 +1106,8 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     experts.extend(loaded);
                 }
                 prefetched_routed_experts = Some(experts);
+                Ok(shared)
             }
-            Ok(shared)
         })?;
         loaded
     } else {
