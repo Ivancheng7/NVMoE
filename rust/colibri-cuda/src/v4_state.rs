@@ -1623,6 +1623,28 @@ pub fn final_hc_head_cpu(
     })
 }
 
+/// How many worker threads the streamed CPU final head splits the vocab into.
+/// Each worker owns a contiguous span of weight chunks and reads them with its
+/// own pread calls; `ShardFile` keeps no shared read cursor, so spans never
+/// alias.
+pub fn final_head_threads() -> usize {
+    std::env::var("COLIBRI_V4_FINAL_HEAD_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| (1..=16).contains(threads))
+        .unwrap_or(6)
+}
+
+/// One worker's share of the streamed final head: the logits it produced for
+/// its contiguous token span, plus its read telemetry. `read_ns` is thread-time
+/// (per-chunk walls summed inside the worker), not a wall clock.
+struct FinalHeadSegmentRun {
+    first_token: usize,
+    logits: Vec<f32>,
+    read_ns: u64,
+    source_bytes: usize,
+}
+
 pub fn final_checkpoint_head_cpu_timed(
     weights: &FinalHeadWeights,
     hc_hidden_bf16: &[u16],
@@ -1655,42 +1677,111 @@ pub fn final_checkpoint_head_cpu_timed(
     const CHUNK_ROWS: usize = 256;
     base.logits_f32 = vec![0.0; rows * weights.spec.vocab];
     base.argmax.fill(0);
-    let mut bytes = vec![0_u8; CHUNK_ROWS * weights.spec.hidden * 2];
-    let mut row_bf16 = vec![0_u16; weights.spec.hidden];
+
+    // Output neurons are independent and each `canonical_final_head_row_dot`
+    // is its own ordered fold, so splitting the vocab into per-thread chunk
+    // spans keeps every dot bit-identical to the serial scan.
+    let normalized = &base.normalized_bf16;
+    let chunk_count = weights.spec.vocab.div_ceil(CHUNK_ROWS);
+    let thread_count = final_head_threads().min(chunk_count);
+    let chunks_per_worker = chunk_count.div_ceil(thread_count);
+    let results: Vec<Result<FinalHeadSegmentRun, String>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(thread_count);
+        for worker in 0..thread_count {
+            let first_chunk = worker * chunks_per_worker;
+            if first_chunk >= chunk_count {
+                break;
+            }
+            let last_chunk = ((worker + 1) * chunks_per_worker).min(chunk_count) - 1;
+            handles.push(scope.spawn(move || -> Result<FinalHeadSegmentRun, String> {
+                let first_token = first_chunk * CHUNK_ROWS;
+                let span_tokens =
+                    (weights.spec.vocab - first_token).min((last_chunk + 1 - first_chunk) * CHUNK_ROWS);
+                let mut logits = vec![0.0_f32; rows * span_tokens];
+                let mut bytes = vec![0_u8; CHUNK_ROWS * weights.spec.hidden * 2];
+                let mut row_bf16 = vec![0_u16; weights.spec.hidden];
+                let mut read_ns = 0_u64;
+                let mut source_bytes = 0_usize;
+                for chunk_index in first_chunk..=last_chunk {
+                    let token_start = chunk_index * CHUNK_ROWS;
+                    let chunk_rows = (weights.spec.vocab - token_start).min(CHUNK_ROWS);
+                    let chunk_bytes = chunk_rows * weights.spec.hidden * 2;
+                    let read_started = std::time::Instant::now();
+                    weights
+                        .read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])
+                        .map_err(|error| error.to_string())?;
+                    source_bytes = source_bytes
+                        .checked_add(chunk_bytes)
+                        .ok_or("V4 final head streamed source byte counter overflow")?;
+                    read_ns = read_ns.saturating_add(
+                        u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                    for row in 0..rows {
+                        for token_offset in 0..chunk_rows {
+                            let weight_start = token_offset * weights.spec.hidden * 2;
+                            for (weight, bytes) in row_bf16.iter_mut().zip(
+                                bytes[weight_start..weight_start + weights.spec.hidden * 2]
+                                    .chunks_exact(2),
+                            ) {
+                                *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
+                            }
+                            let logit = canonical_final_head_row_dot(
+                                &normalized[row * weights.spec.hidden
+                                    ..(row + 1) * weights.spec.hidden],
+                                &row_bf16,
+                            );
+                            logits[row * span_tokens + (token_start + token_offset - first_token)] =
+                                logit;
+                        }
+                    }
+                }
+                Ok(FinalHeadSegmentRun {
+                    first_token,
+                    logits,
+                    read_ns,
+                    source_bytes,
+                })
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "V4 final head worker panicked".to_owned())
+                    .and_then(|result| result)
+            })
+            .collect()
+    });
+
     let mut read_ns = 0_u64;
     let mut streamed_source_bytes = 0_usize;
-    for token_start in (0..weights.spec.vocab).step_by(CHUNK_ROWS) {
-        let chunk_rows = (weights.spec.vocab - token_start).min(CHUNK_ROWS);
-        let chunk_bytes = chunk_rows * weights.spec.hidden * 2;
-        let read_started = std::time::Instant::now();
-        weights.read_head_weight_bytes(token_start, chunk_rows, &mut bytes[..chunk_bytes])?;
-        streamed_source_bytes = streamed_source_bytes
-            .checked_add(chunk_bytes)
-            .ok_or("V4 final head streamed source byte counter overflow")?;
-        read_ns = read_ns
-            .saturating_add(u64::try_from(read_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    for result in results {
+        let run = result.map_err(|message| -> Box<dyn Error> { message.into() })?;
+        let span_tokens = run.logits.len() / rows;
         for row in 0..rows {
-            for token_offset in 0..chunk_rows {
-                let weight_start = token_offset * weights.spec.hidden * 2;
-                for (weight, bytes) in row_bf16.iter_mut().zip(
-                    bytes[weight_start..weight_start + weights.spec.hidden * 2].chunks_exact(2),
-                ) {
-                    *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
-                }
-                let logit = canonical_final_head_row_dot(
-                    &base.normalized_bf16
-                        [row * weights.spec.hidden..(row + 1) * weights.spec.hidden],
-                    &row_bf16,
-                );
-                let token = token_start + token_offset;
-                base.logits_f32[row * weights.spec.vocab + token] = logit;
-                if token == 0
-                    || logit > base.logits_f32[row * weights.spec.vocab + base.argmax[row]]
-                {
-                    base.argmax[row] = token;
-                }
+            let destination = row * weights.spec.vocab + run.first_token;
+            base.logits_f32[destination..destination + span_tokens]
+                .copy_from_slice(&run.logits[row * span_tokens..(row + 1) * span_tokens]);
+        }
+        read_ns = read_ns.saturating_add(run.read_ns);
+        streamed_source_bytes = streamed_source_bytes
+            .checked_add(run.source_bytes)
+            .ok_or("V4 final head streamed source byte counter overflow")?;
+    }
+
+    // Same ascending strict-`>` scan the serial loop ran inline; done once over
+    // the stitched logits it keeps the lowest-token-id tie behavior verbatim.
+    for row in 0..rows {
+        let mut best = 0_usize;
+        for token in 1..weights.spec.vocab {
+            if base.logits_f32[row * weights.spec.vocab + token]
+                > base.logits_f32[row * weights.spec.vocab + best]
+            {
+                best = token;
             }
         }
+        base.argmax[row] = best;
     }
     Ok(FinalHeadCpuRun {
         output: base,
