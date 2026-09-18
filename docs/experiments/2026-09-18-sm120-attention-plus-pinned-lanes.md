@@ -86,6 +86,62 @@ attention 从 16.99 降到 13.33（−0.01 相对只 routed 那臂的 16.97）�
 （≈4.4 GB/s，已贴近这块盘的并发上限）。`shared`/`attention` 是计算，还没像 attention
 那 18 步一样往设备侧搬干净。
 
+## 瓶颈地图：每个相位的物理下限 vs 实际占用
+
+本节把"哪里到顶、哪里还能压"用**实测的硬件上限**标出来，不靠猜。三个上限现场量的：
+
+| 资源 | 实测 | 怎么量的 |
+| --- | --- | --- |
+| PCIe H2D（锁页→设备） | **14.27 GB/s** | `.zcode/io-ceiling/h2d_rate6g.py`（156 MB × 44 次）与 `h2d_probe.py` 两次独立一致；链路是 Gen4 **x8** |
+| 盘（routed 读） | **3.79 GB/s** | `2026-09-16-sm120-disk-ceiling.md`（6 线程隔离回放） |
+| 主机内存展开 | 9.4 GB/s | `bandwidth_probe.py`（compressor/indexer 用） |
+
+每层相位墙 vs 该相位必须过的字节所对应的链路下限（稳态 token 1–7）：
+
+| 相位 | 墙 ms/层 | 硬下限 ms/层 | 下限来源 | 判定 |
+| --- | --- | --- | --- | --- |
+| `fixed` | 16.87 | ~10.9 | H2D 156 MB @14.27 GB/s | **接近下限**，余量 ~6 ms（decode/记账） |
+| `routed` | 18.30 | ~5.6 | H2D 80 MB @14.27 | 读盘而非 H2D 才是主导 |
+| `shared` | 13.88 | 0（计算） | — | **窗口 ≈ routed 读墙（见下），不是计算** |
+| `attention` | 12.81 | 0（计算） | — | 纯计算，未搬干净 |
+
+**每 token 的 PCIe 总量是结构性下限**：`fixed` 6.71 GB + `routed` 3.45 GB = **10.16 GB**，
+@14.27 GB/s = **712 ms/token**。稳态 e2e 2847 ms/token，**传输已占 25% 且不可能更快**。
+剩下 75% 里，`shared`+`attention` 是计算、`routed` 是读盘。
+
+### 一个必须标注的异常：`fixed` 报的 H2D 速率不可信
+
+`host_resident_hit` 层报 `h2d_ns = 5.44 ms` 传 156 MB → **28.7 GB/s**，是链路实测
+14.27 的**两倍**，物理上不可能。对照：同一台机、相隔几分钟，`routed` 在引擎里的
+H2D 是 80 MB / 5.73 ms = **14.0 GB/s**（与探针吻合），探针独立复核也是 14.27。
+所以 `fixed.h2d_ns` 这条**要么字节数记成两倍、要么计时漏了一段**，本轮没查根因。
+
+**因此上面 fixed 那行用的是保守值**：按字节数 ÷ 实测链路算（156 MB → 10.9 ms），
+不采用引擎自报的 5.44 ms。要走"fixed H2D 到顶"这个结论，得先把这个记账 bug 查清。
+
+### 可压 vs 到顶
+
+**到顶（继续抠这里收益很小）：**
+
+- `routed` 的读盘：3.45 GB/token，6 线程隔离上限 3.79 GB/s，引擎里墙面已到 5+ GB/s
+  量级——**已经贴着这块盘**。再快只能**少读**（跨 token 复用专家），不能靠"读得更快"。
+- `routed` 的 H2D：80 MB/layer 在 14.0 GB/s 上，就是链路速度，没有余量。
+- `shared` 的 MLP 计算：共享窗口探针显示 `window 15.3 ms ≈ worker_max 14.9 ms`，
+  而 `mlp 只有 4.0 ms`——**共享窗口挂在 routed 读线程上，MLP 是被藏住的**。
+  优化 MLP 算力拿不到收益，除非 routed 读先变快。
+
+**还能压（按杠杆大小排）：**
+
+1. **`fixed` 6.71 GB/token 的 H2D → 设备常驻**：这是最大的一块。显存峰值现在
+   `3.96 GB`（卡 16 GB），装得下 5.6 GB 的 fixed 模型。做成后 PCIe 总量
+   10.16→3.45 GB/token，理论上限从 712 → 242 ms/token。代价是显存和一次性的常驻建立。
+2. **`routed` 跨 token 复用**：每 token 读同一层的 6 个专家，相邻 token 路由高度重叠。
+   加专家缓存能直接把 3.45 GB/token 往下压——这是"少读"而不是"读快"。
+3. **`attention` / compressor / indexer 的计算搬设备侧**：attention 18 步已经搬完
+   （16.99→13.33）；compressor/indexer 仍是主机实现（它们是那次记录里明说的"没动"），
+   是 attention 相位里下一个可动的块。
+4. **`fixed` 的 6 ms 余量**：查清上面那个 H2D 记账异常后，再决定那是真开销还是重复计数。
+
 ## 固定输入与模型
 
 - 模型：`/srv/localmoe/models/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb`，
