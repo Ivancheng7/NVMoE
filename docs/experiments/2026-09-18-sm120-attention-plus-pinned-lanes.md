@@ -92,7 +92,7 @@ attention 从 16.99 降到 13.33（−0.01 相对只 routed 那臂的 16.97）�
 
 | 资源 | 实测 | 怎么量的 |
 | --- | --- | --- |
-| PCIe H2D（锁页→设备） | **14.27 GB/s** | `.zcode/io-ceiling/h2d_rate6g.py`（156 MB × 44 次）与 `h2d_probe.py` 两次独立一致；链路是 Gen4 **x8** |
+| PCIe H2D（锁页→设备） | **14.27 GB/s** | `docs/assets/io-ceiling/h2d_rate6g.py`（156 MB × 44 次）与 `.zcode/h2d_probe.py`（未跟踪）两次独立一致；链路是 Gen4 **x8** |
 | 盘（routed 读） | **3.79 GB/s** | `2026-09-16-sm120-disk-ceiling.md`（6 线程隔离回放） |
 | 主机内存展开 | 9.4 GB/s | `bandwidth_probe.py`（compressor/indexer 用） |
 

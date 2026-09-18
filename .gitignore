@@ -80,3 +80,7 @@ olmoe_merged/
 olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
+
+# ZCode 客户端的工作目录：实验探针、临时补丁、交接 bundle。
+# 可复用的量测工具放 docs/assets/io-ceiling/，其余一律不入库。
+.zcode/

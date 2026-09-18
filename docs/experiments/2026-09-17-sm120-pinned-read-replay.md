@@ -55,10 +55,12 @@
 
 ## 运行证据
 
-- 工具：`.zcode/io-ceiling/disk_ceiling.c` 新增 `pinned` 模式（分支
+- 工具：`docs/assets/io-ceiling/disk_ceiling.c` 新增 `pinned` 模式（分支
   `exp/routed-pinned-replay`，提交 `07bbbeb` + `bd265ce`），`cuMemHostAlloc`/
-  `cuMemFreeHost` 走 dlopen，无 GPU 机器上其他模式不受影响
-- 编译：`gcc -O2 -Wall -Wextra -o disk_ceiling_pinned .zcode/io-ceiling/disk_ceiling.c -ldl -lpthread`，0 警告
+  `cuMemFreeHost` 走 dlopen，无 GPU 机器上其他模式不受影响。
+  2026-09-18 起这个文件从 `.zcode/io-ceiling/` 移到 `docs/assets/io-ceiling/` 入库
+  （`.zcode/` 是客户端工作区，探测脚本按惯例不入库）
+- 编译：`gcc -O2 -Wall -Wextra -o disk_ceiling_pinned docs/assets/io-ceiling/disk_ceiling.c -ldl -lpthread`，0 警告
 - 计划文件：`/srv/localmoe/targets/io-ceiling/plan-real-routed.tsv`（新建）
 - 结果文件：`/srv/localmoe/targets/io-ceiling/pinned-ab-0917.jsonl`（6 行，pinned/reuse 交错 × 3 轮）
 - 命令形态：每跑前 `sync; echo 3 > /proc/sys/vm/drop_caches`，然后
