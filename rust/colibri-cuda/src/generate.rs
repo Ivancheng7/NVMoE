@@ -449,13 +449,14 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let request_started = std::time::Instant::now();
     let flash_b1_profile = spec == &v4_spec::FLASH_0731 && REQUESTS == 1;
     let final_head_arm = flash_final_head_arm(spec)?;
-    // Opt-in whole-model device residency for the per-layer fixed tensors. They
-    // are ~156 MB per layer and never change during a request, so a request that
-    // has read them once may serve every later token from VRAM instead of
-    // re-uploading 6.71 GB/token over PCIe. Zero (the default) leaves the
-    // streaming path exactly as it was — this is the `+5.9 GB` trade from the
-    // 2026-09-16 residency A/B, re-applied against the current loop.
-    let resident_budget_bytes = parse_gib_budget("COLIBRI_V4_FIXED_RESIDENT_GIB")?;
+    // Whole-model device residency for the per-layer fixed tensors, on by default
+    // on the two delivery Flash surfaces. They are ~156 MB per layer and never
+    // change during a request, so a request that has read them once serves every
+    // later token from VRAM instead of re-uploading 6.71 GB/token over PCIe: the
+    // 2026-09-20 A/B measured 3.183 -> 2.305 s/token steady state for +6.35 GB of
+    // device memory, bit-identical outputs. `COLIBRI_V4_FIXED_RESIDENT_GIB=0`
+    // streams as before; the budget is preflighted against free device memory.
+    let resident_budget_bytes = flash_b1_resident_budget_bytes(spec, REQUESTS)?;
     let resident_enabled = resident_budget_bytes > 0;
     let mut resident: Vec<Option<B2RawRuntime>> = (0..spec.layers).map(|_| None).collect();
     let mut resident_bytes = 0usize;

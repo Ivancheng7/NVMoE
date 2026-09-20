@@ -127,6 +127,77 @@ pub(crate) fn flash_b1_compressor_arena_enabled(
     }
 }
 
+/// Budget in bytes for holding the whole per-layer fixed tensor set resident in
+/// device memory on the two delivery Flash surfaces.
+///
+/// On by default there: the fixed tensors never change during a request, so a
+/// request that has read a layer once can serve every later token from VRAM
+/// instead of re-uploading 6.71 GB/token over PCIe. Measured 2026-09-20 at
+/// `3.183 -> 2.305 s/token` steady state for `+6.35 GB` of device memory, with
+/// bit-identical outputs. `=0` puts the streaming path back so runs recorded
+/// against it stay reproducible; any other whole number of GiB becomes the
+/// budget. The result is clamped to what the card actually has free (minus
+/// headroom) by [`flash_b1_resident_budget_bytes`], so a small card keeps a
+/// prefix resident instead of failing to allocate.
+pub(crate) fn flash_b1_resident_enabled(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<bool, Box<dyn Error>> {
+    if spec != &v4_spec::FLASH_0731 || requests != 1 {
+        return Ok(false);
+    }
+    let base =
+        std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let serve =
+        std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if !base && !serve {
+        return Ok(false);
+    }
+    // The whole fixed model is 6.71 GB; 8 GiB holds every layer with room to
+    // spare, and the preflight below cuts it down on a card that is smaller.
+    match std::env::var_os("COLIBRI_V4_FIXED_RESIDENT_GIB").as_deref() {
+        None => Ok(true),
+        Some(value) if value == "0" => Ok(false),
+        Some(_) => Ok(true),
+    }
+}
+
+/// The residency budget in bytes for this run, or zero when residency is off.
+///
+/// The requested budget is clamped to the device's free memory minus the same
+/// headroom the fixed-layer cache preflight uses, so the resident set can never
+/// turn into an allocation failure on a smaller card. When the clamp bites, the
+/// capture loop stops once the budget is spent and the remaining layers keep
+/// streaming; the `CACHE_PREFLIGHT_FALLBACK` line says what it was cut to.
+pub(crate) fn flash_b1_resident_budget_bytes(
+    spec: &'static v4_spec::V4Spec,
+    requests: usize,
+) -> Result<usize, Box<dyn Error>> {
+    if !flash_b1_resident_enabled(spec, requests)? {
+        return Ok(0);
+    }
+    let requested = match std::env::var_os("COLIBRI_V4_FIXED_RESIDENT_GIB") {
+        None => 10 * 1024 * 1024 * 1024,
+        Some(value) => {
+            let value = value.to_string_lossy();
+            let gib = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| "COLIBRI_V4_FIXED_RESIDENT_GIB must be a GiB value")?;
+            if !gib.is_finite() || gib < 0.0 {
+                return Err("COLIBRI_V4_FIXED_RESIDENT_GIB must be finite and non-negative".into());
+            }
+            (gib * 1024.0 * 1024.0 * 1024.0) as usize
+        }
+    };
+    Ok(preflight_cache_budget(
+        requested,
+        device_available_bytes()?,
+        V4_DEVICE_CAPACITY_HEADROOM_BYTES,
+        "fixed_resident",
+    ))
+}
+
 /// Pure diagnostic, off by default: print the inside of the `shared` window.
 ///
 /// The phase wall around `shared` covers both the shared MLP and the routed
