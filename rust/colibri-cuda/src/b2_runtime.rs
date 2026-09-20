@@ -252,10 +252,12 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_for(
 /// This is the fixed-layer slot: the weights already carry the right buffers for
 /// this layer type, so the ~20 `cuMemAlloc`/`cuMemFree` pairs per layer go away.
 /// The byte ledger stays what it was — a restage copies the whole tensor set, and
-/// `num_bytes()` measures exactly that — but `fixed_h2d_ns` only covers the
-/// upload path, so a restaged layer reports the shard open there. The honest
-/// witness for this change is the `fixed` wall in the phase profile plus the
-/// output digests, not the byte account.
+/// `num_bytes()` measures exactly that. The restage itself runs in the caller
+/// (`FixedLayerSlot::take_restaged`), which starts its own timer before handing
+/// the slot in and overwrites `fixed_h2d_ns` with the whole span, so a restaged
+/// layer's time-to-device covers the restage and not just the small wo_a upload.
+/// The honest witness for this change is still the `fixed` wall in the phase
+/// profile plus the output digests, not the byte account.
 pub(crate) fn load_b2_raw_runtime_from_host_ref_with_weights(
     spec: &'static v4_spec::V4Spec,
     model_dir: &std::path::Path,

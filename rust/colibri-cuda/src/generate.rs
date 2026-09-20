@@ -321,6 +321,15 @@ fn load_flash_b1_layer_from_host(
     request_started: std::time::Instant,
     slot: Option<&mut fixed_layer_slot::FixedLayerSlot>,
 ) -> Result<B2RawRuntime, Box<dyn Error>> {
+    // The slot restage copies the whole fixed tensor set into the reused device
+    // buffers, but it runs *before* the loader starts its own H2D timer, so that
+    // timer only ever sees the small wo_a upload. Span both here: `fixed_h2d_ns`
+    // is meant to be time-to-device for the layer's fixed weights, and without
+    // the restage in it the restage time hides in the window residual while
+    // `h2d_ns` reads several times faster than the PCIe link can carry the
+    // bytes. `take_restaged` is a no-op (and this span then equals the loader's
+    // own value) whenever the slot has nothing to hand back.
+    let h2d_started = std::time::Instant::now();
     let restaged = match slot {
         Some(slot) => slot.take_restaged(stream, &host.host)?,
         None => None,
@@ -335,6 +344,8 @@ fn load_flash_b1_layer_from_host(
         stream,
         restaged,
     )?;
+    loaded.fixed.fixed_h2d_ns =
+        u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let released_bytes = if std::sync::Arc::strong_count(&host) == 1 {
         host.bytes()
     } else {
