@@ -1184,6 +1184,54 @@ impl std::fmt::Display for FlashServeCancelled {
 
 impl Error for FlashServeCancelled {}
 
+/// Opt-in per-request phase account for the Flash serve surface.
+///
+/// The serve path already collects the same per-layer `phase_profile` as the CLI
+/// (`flash_b1_profile` holds for FLASH_0731 with a single request), but the
+/// gateway deliberately clears `COLIBRI_V4_RESULT_JSONL` before it spawns the
+/// engine, so there was never a file for that profile to land in. Point
+/// `COLIBRI_V4_FLASH_SERVE_PHASE_JSONL` at a path and the engine appends one JSON
+/// record per completed request. Unset (the default) leaves the serve surface
+/// exactly as it was: no extra file, no protocol change. The file is opened for
+/// append and never truncated, so a batch script picks a fresh tag per run the
+/// same way the CLI result files do.
+struct ServePhaseSink {
+    file: Option<std::fs::File>,
+}
+
+impl ServePhaseSink {
+    fn from_env() -> Result<Self, Box<dyn Error>> {
+        let Some(path) = std::env::var_os("COLIBRI_V4_FLASH_SERVE_PHASE_JSONL") else {
+            return Ok(Self { file: None });
+        };
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(Self { file: Some(file) })
+    }
+
+    fn record(&mut self, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        serde_json::to_writer(&mut *file, value)?;
+        std::io::Write::write_all(file, b"\n")?;
+        std::io::Write::flush(file)?;
+        Ok(())
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.file.is_some()
+    }
+}
+
 pub(crate) fn run_real_v4_flash_serve(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
@@ -1232,6 +1280,7 @@ pub(crate) fn run_real_v4_flash_serve(
     let stdout = std::io::stdout();
     let mut output = BufWriter::new(stdout.lock());
     v4_serve::write_ready(&mut output)?;
+    let mut phase_sink = ServePhaseSink::from_env()?;
     let mut pending = VecDeque::new();
     loop {
         let command = if let Some(command) = pending.pop_front() {
@@ -1364,6 +1413,33 @@ pub(crate) fn run_real_v4_flash_serve(
         let stop = request
             .stop_reason
             .ok_or("Flash serve request lacked stop reason")?;
+        // One record per completed request, only when the operator pointed the
+        // sink at a file. Same evidence shape as the CLI result record so the
+        // existing phase readers work on it unchanged.
+        if phase_sink.is_enabled() {
+            let phase_profile = flash_b1_request_phase_profile_json(
+                &arm.requests[0].flash_b1_phase,
+                arm.duration_ns,
+            )?;
+            phase_sink.record(&serde_json::json!({
+                "event": "serve_request",
+                "schema": "colibri-deepseek-v4-flash-0731-base-v1",
+                "implementation": "rust-cuda",
+                "profile": spec.name,
+                "model_revision": spec.revision,
+                "model_dir": model_dir,
+                "request_id": &request_id,
+                "prompt_tokens": prompt_ids.len(),
+                "completion_tokens": completion_tokens,
+                "ttft_ms": ttft_ms,
+                "itl_ms": itl_ms,
+                "request_e2e_ns": arm.duration_ns,
+                "peak_device_used_bytes": arm.peak_device_bytes,
+                "phase_profile": phase_profile,
+                "physical": arm.physical.json(),
+                "requests": arm.requests.iter().enumerate().map(|(request, state)| b2_generate_request_json(request, state)).collect::<Vec<_>>(),
+            }))?;
+        }
         v4_serve::write_done(
             &mut output,
             &request_id,
