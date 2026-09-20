@@ -1,10 +1,11 @@
-# 整模型固定权重常驻显存：稳态省 0.88 s/token（−28%）（2026-09-20）
+# 整模型固定权重常驻显存：稳态省 0.88 s/token（−28%），已默认开（2026-09-20）
 
 ## 结论
 
 把 43 层的固定参数（每层约 156 MB，合计 **6.71 GB**）在第一次读到之后**钉在显存里**，后续每个
 token 直接用，不再每 token 重新 H2D 那 6.71 GB。开关 `COLIBRI_V4_FIXED_RESIDENT_GIB=<GiB>`，
-**默认 0 = 关，行为与现在逐字节相同**。
+**在 `FLASH_BASE` / `FLASH_SERVE` 两个交付面上默认开（2026-09-20 拍板，`b620ef7`），`=0` 回到
+流式、数值与原来逐位相同。**
 
 实测（同一二进制，只切这一个开关，8 步真实 token，每次跑前 `drop_caches`）。**先跑了一对定方向，
 再跑了一个 4 轮交错批（两臂各 4 跑、每对换先后顺序）定数**，下表用 4 轮批的均值：
@@ -146,12 +147,27 @@ token 直接用，不再每 token 重新 H2D 那 6.71 GB。开关 `COLIBRI_V4_FI
 这次实现沿用 `exp/fixed-residency` 分支的 `6f578cd` + `ba2b2a8` 两笔的思路，针对现在多了
 `FixedLayerSlot` 的循环做了适配。
 
+## 追补 2：已拍成默认开（同日，`b620ef7`）
+
+用户决定默认开。实现按交付面既有惯例收口：
+
+- gate 挪进 `b2_runtime.rs`（`flash_b1_resident_enabled`），和 prompt chunk / 固定层槽位 /
+  压缩器池同款：**只对 `FLASH_0731` 且单请求的 `FLASH_BASE` / `FLASH_SERVE` 两个面生效**，
+  `COLIBRI_V4_FIXED_RESIDENT_GIB` 不设或非 `0` 即开、`=0` 回退流式。
+- 预算由 `flash_b1_resident_budget_bytes` 给出：默认 `10 GiB`，**按当前空闲显存减 2 GiB headroom
+  夹一次**（复用 `preflight_cache_budget`，被夹时打 `CACHE_PREFLIGHT_FALLBACK fixed_resident`）。
+  所以小显存卡只会"少常驻几层"而不是分配失败——这条同时补掉了上面那条"没有预检"的未决项。
+- 验收（WSL `/srv/localmoe/targets/defaulton/`，**不设任何常驻环境变量**）：
+  1 步四个钉死值原样复现；stderr `43 layers resident (6708864200 bytes)`；
+  8 步 stderr `301 layer-visits served from VRAM`；8 步的 digest / 层链 / argmax 与显式常驻那臂
+  **IDENTICAL**、与流式那臂只差峰值显存；`=0` 那次没有常驻 stderr 行。
+- **单步峰值显存 `1825112064 → 8175288320`**（那 `+6.35 GB` 就是常驻的权重），`=0` 时仍是
+  `1825112064`。`现状.md` 的钉死值已按这个更新。
+
 ## 未决事项
 
-1. **要不要默认开**：+6.35 GB 换 `−0.879 s/token`（`−27.6%`）。是否把它设成默认，是 `现状.md`
-   第五节要拍的板；这条实现是默认关的。
-2. **服务面没测**：同一个循环，应该同样生效，但得跑一次 serve 确认首字与稳态。
-3. **预算没按空闲显存预检**：`COLIBRI_V4_FIXED_RESIDENT_GIB=10` 在 16 GB 卡上峰值 8.18 GB 安全；
-   小显存卡要自己调小，没有 `preflight_cache_budget` 那种保护。
-4. **e2e 的百分比会随机器漂**：两批同改动的 e2e 差 `−10.0%` / `−18.0%`（token 0 绝对值不同）。
+1. **服务面没测**：同一个循环、gate 也已覆盖 `FLASH_SERVE`，应该同样生效，但一次 serve 没跑
+   （首字与稳态都还没在服务面上确认）。
+2. **常驻之后服务面并发请求的显存预算没算**：16 GB 卡上单请求峰值 `8.18 GB`，只剩约 8 GB 空闲。
+3. **e2e 的百分比会随机器漂**：两批同改动的 e2e 差 `−10.0%` / `−18.0%`（token 0 绝对值不同）。
    报性能只报稳态 `s/token`。
