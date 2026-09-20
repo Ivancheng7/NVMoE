@@ -460,10 +460,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let mut resident: Vec<Option<B2RawRuntime>> = (0..spec.layers).map(|_| None).collect();
     let mut resident_bytes = 0usize;
     let mut resident_hits = 0usize;
-    // A resident layer has nothing to prefetch, and its captured buffer *is* the
-    // fixed-layer slot, so when residency is on both of those reuse mechanisms
-    // are off; mixing them would hand the same weights to two owners.
-    let flash_b1_prefetch = !resident_enabled && flash_b1_prefetch_enabled(spec, REQUESTS)?;
+    // A resident layer has nothing to preload, and its captured buffer *is* the
+    // fixed-layer slot, so residency displaces the slot. Prefetch stays on: the
+    // fill pass still has to cold-read all 43 host payloads, and overlapping
+    // them with compute is exactly what keeps that first token from paying for
+    // the whole 6.7 GB on the critical path. The spawn below simply skips layers
+    // that are already resident, so steady state starts no worker at all.
+    let flash_b1_prefetch = flash_b1_prefetch_enabled(spec, REQUESTS)?;
     let flash_b1_prompt_chunk = flash_b1_prompt_chunk_enabled(spec, REQUESTS)?;
     let flash_b1_fixed_slot = !resident_enabled && flash_b1_fixed_slot_enabled(spec, REQUESTS)?;
     let layer_count = parity_stop_after_layer
@@ -668,33 +671,40 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                 };
                 if flash_b1_prefetch {
                     if let Some(next_layer) = flash_b1_prefetch_next_layer(layer, layer_count)? {
-                        let worker_root = model_dir.to_owned();
-                        let worker_cache = host_cache.clone();
-                        let worker_started = timeline_elapsed_ns(request_started);
-                        let spawn_started_ns = timeline_elapsed_ns(request_started);
-                        let worker = scope.spawn(move || {
-                            let (host, telemetry) = fixed_host_cache::resolve_host_layer(
-                                spec,
-                                &worker_root,
-                                next_layer,
-                                worker_cache.as_ref(),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            let worker_ended = timeline_elapsed_ns(request_started);
-                            Ok(fixed_host_cache::ResidentPrefetched {
+                        // Residency already holds the next layer, so there is
+                        // nothing to read and no host slot to hand back; a
+                        // worker here would never be joined and would trip the
+                        // unconsumed-slot check at the end of the pass.
+                        let next_is_resident = resident_enabled && resident[next_layer].is_some();
+                        if !next_is_resident {
+                            let worker_root = model_dir.to_owned();
+                            let worker_cache = host_cache.clone();
+                            let worker_started = timeline_elapsed_ns(request_started);
+                            let spawn_started_ns = timeline_elapsed_ns(request_started);
+                            let worker = scope.spawn(move || {
+                                let (host, telemetry) = fixed_host_cache::resolve_host_layer(
+                                    spec,
+                                    &worker_root,
+                                    next_layer,
+                                    worker_cache.as_ref(),
+                                )
+                                .map_err(|error| error.to_string())?;
+                                let worker_ended = timeline_elapsed_ns(request_started);
+                                Ok(fixed_host_cache::ResidentPrefetched {
+                                    layer: next_layer,
+                                    host,
+                                    telemetry,
+                                    worker_start_ns: worker_started,
+                                    worker_end_ns: worker_ended,
+                                })
+                            });
+                            prefetched_next = Some(fixed_host_cache::ResidentPrefetch {
                                 layer: next_layer,
-                                host,
-                                telemetry,
-                                worker_start_ns: worker_started,
-                                worker_end_ns: worker_ended,
-                            })
-                        });
-                        prefetched_next = Some(fixed_host_cache::ResidentPrefetch {
-                            layer: next_layer,
-                            worker,
-                        });
-                        loaded.fixed.window_spawn_ns = timeline_elapsed_ns(request_started)
-                            .saturating_sub(spawn_started_ns);
+                                worker,
+                            });
+                            loaded.fixed.window_spawn_ns = timeline_elapsed_ns(request_started)
+                                .saturating_sub(spawn_started_ns);
+                        }
                     }
                 }
                 let fixed_prepare_ns =
