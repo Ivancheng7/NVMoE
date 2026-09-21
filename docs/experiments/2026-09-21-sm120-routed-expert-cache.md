@@ -115,8 +115,11 @@ CARGO_TARGET_DIR=/srv/localmoe/targets/deliver-merge-0918-target \
    （机器共 15 GiB）。**这是 A1 的前提**：只有先把读盘从 `shared` 窗口里挪到别处、让它不再被藏住，
    缓存的收益才会全额上墙——**A2 和 A1 应当一起判**。
    > **2026-09-21 已判，上面这个预期只对了一半，作废一半。** A1 落地（fan-out）后同批三臂交错：
-   > `off 1.943` / `fanout 1.619` / `fanout+cache258 1.549 s/token`，**A2 在 A1 之上只再省
-   > `0.07 s/token`**。磁盘流量确实降了（真 prompt 每层 `6.0 → 1.0` 次载入、`3.21 → 0.86 GiB/token`），
+   > 真 32 token prompt `off 1.943` / `fanout 1.619` / `fanout+cache258 1.549 s/token`，
+   > 单 token 形状 `2.193` / `1.791` / `1.715`——**A2 在 A1 之上只再省 `0.07–0.08 s/token`**，
+   > 而整条请求上（8 步）它基本没用：`fanout` 对 `fanout+cache` 的 e2e 是 `68.6` 对 `69.1 s`、
+   > `30.45` 对 `30.28 s`，稳态省下的刚好被它自己变慢的第一个 token 吃掉。
+   > 磁盘流量确实降了（真 prompt 每层 `6.0 → 1.0` 次载入、`3.21 → 0.86 GiB/token`），
    > 但"读盘不再被藏住"不等于"读盘变成墙"：fan-out 之后一层是**最慢那条 lane 的读→上传→内核**在收尾，
    > 缓存砍得掉其它五条（`lane_max 19.45 → 16.83`），砍不掉那条 miss 的 lane。省下的是六条并发读
    > 之间的竞争，不是读盘本身。数字以 `docs/experiments/2026-09-21-sm120-routed-fanout.md` 为准。
