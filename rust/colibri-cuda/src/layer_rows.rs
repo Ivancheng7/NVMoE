@@ -1146,6 +1146,15 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         flash_parity_dump_u16(dir, "shared_out_bf16", &[rows, spec.hidden], &shared_bf16)?;
     }
     stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // Carry the shared window's own breakdown so the phase table no longer has
+    // to attribute the routed read to `shared`: `main` is the shared MLP wall,
+    // the worker numbers are the six routed lanes' own read walls.
+    stage.shared_main_ns = u64::try_from(shared_probe_mlp_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
+    stage.shared_read_workers = shared_probe_workers;
+    stage.shared_read_worker_sum_ns =
+        u64::try_from(shared_probe_worker_sum_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
+    stage.shared_read_worker_max_ns =
+        u64::try_from(shared_probe_worker_max_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
     if shared_probe {
         let window_us = u128::from(stage.shared_ns) / 1_000;
         eprintln!(

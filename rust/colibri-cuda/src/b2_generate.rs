@@ -587,7 +587,22 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
             "wo_a_decode_gpu_sync": {"wall_ns": wo_a_decode_sync_ns},
             "attention": {"wall_ns": attention_wall_ns, "execution_ns": stage.attention_ns, "commit_ns": stage.commit_ns},
             "router": {"wall_ns": stage.router_ns},
-            "shared": {"wall_ns": stage.shared_ns},
+            "shared": {
+                "wall_ns": stage.shared_ns,
+                // The shared window runs the shared MLP on the main thread and
+                // the routed read workers alongside it, so its wall is whichever
+                // finishes last. These fields split it: `main_ns` is the MLP,
+                // the worker numbers are the routed lanes' own reads (already
+                // counted under routed.diagnostics.read_ns when summed over the
+                // request). `join_tail_ns` is the wait after the MLP returned.
+                "diagnostics": {
+                    "main_ns": stage.shared_main_ns,
+                    "read_workers": stage.shared_read_workers,
+                    "read_worker_sum_ns": stage.shared_read_worker_sum_ns,
+                    "read_worker_max_ns": stage.shared_read_worker_max_ns,
+                    "join_tail_ns": stage.shared_ns.saturating_sub(stage.shared_main_ns),
+                },
+            },
             "routed": {
                 "wall_ns": stage.routed_ns,
                 "host_prefetched": stage.routed_prefetched,

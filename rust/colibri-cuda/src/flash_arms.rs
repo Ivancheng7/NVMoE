@@ -565,6 +565,15 @@ pub(crate) struct LayerStageTelemetry {
     pub(crate) router_d2h_sync_ns: u64,
     pub(crate) router_other_ns: u64,
     pub(crate) shared_ns: u64,
+    /// Time from the shared window's start until the shared MLP returned on the
+    /// main thread. The window also covers the routed read workers, so
+    /// `shared_ns - shared_main_ns` is the tail spent joining them (normally the
+    /// slowest reader). Kept so the shared row can carry its own breakdown
+    /// instead of the phase table attributing the reads to `shared`.
+    pub(crate) shared_main_ns: u64,
+    pub(crate) shared_read_workers: usize,
+    pub(crate) shared_read_worker_sum_ns: u64,
+    pub(crate) shared_read_worker_max_ns: u64,
     pub(crate) routed_ns: u64,
     pub(crate) routed_prefetched: bool,
     pub(crate) routed_read_ns: u64,
@@ -642,6 +651,10 @@ impl std::ops::AddAssign for LayerStageTelemetry {
             router_d2h_sync_ns,
             router_other_ns,
             shared_ns,
+            shared_main_ns,
+            shared_read_workers,
+            shared_read_worker_sum_ns,
+            shared_read_worker_max_ns,
             routed_ns,
             routed_read_ns,
             routed_alloc_ns,
