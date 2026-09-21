@@ -217,6 +217,7 @@ pub(crate) fn stationary_layer_phase_profile_json(
                 "setup_ns": stage.routed_setup_ns,
                 "source_bytes": stage.routed_source_bytes,
                 "h2d_bytes": stage.routed_h2d_bytes,
+                "cache_hits": stage.routed_cache_hits,
             },
         })
     } else {
@@ -230,6 +231,7 @@ pub(crate) fn stationary_layer_phase_profile_json(
                 "kernel_ns": stage.routed_kernel_ns,
                 "source_bytes": stage.routed_source_bytes,
                 "h2d_bytes": stage.routed_h2d_bytes,
+                "cache_hits": stage.routed_cache_hits,
             },
         })
     };

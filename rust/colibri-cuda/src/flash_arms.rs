@@ -585,6 +585,9 @@ pub(crate) struct LayerStageTelemetry {
     pub(crate) routed_source_bytes: usize,
     pub(crate) routed_h2d_bytes: usize,
     pub(crate) routed_expert_loads: usize,
+    /// Route slots served from the identity cache instead of a disk read, when
+    /// `COLIBRI_V4_ROUTED_EXPERT_CACHE` is on. 0 on every other path.
+    pub(crate) routed_cache_hits: usize,
     pub(crate) routed_parallel_batch_wall_ns: Option<u64>,
     pub(crate) routed_parallel_read_horizon_ns: Option<u64>,
 }
@@ -665,6 +668,7 @@ impl std::ops::AddAssign for LayerStageTelemetry {
             routed_source_bytes,
             routed_h2d_bytes,
             routed_expert_loads,
+            routed_cache_hits,
         );
         self.routed_prefetched = self.routed_prefetched && other.routed_prefetched;
         if other.attention_profile.is_some() {

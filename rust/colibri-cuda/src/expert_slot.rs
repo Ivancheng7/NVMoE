@@ -49,6 +49,7 @@ pub(crate) struct ExpertSlot<'a> {
 pub(crate) struct RoutedSlotScratch<'a> {
     slot: Option<ExpertSlot<'a>>,
     pool: Option<RoutedReadPool>,
+    cache: Option<RoutedExpertCache>,
 }
 
 impl<'a> RoutedSlotScratch<'a> {
@@ -56,6 +57,7 @@ impl<'a> RoutedSlotScratch<'a> {
         Self {
             slot: None,
             pool: None,
+            cache: None,
         }
     }
 
@@ -77,6 +79,51 @@ impl<'a> RoutedSlotScratch<'a> {
     /// Takes the pool back after the layer's routed block drained it.
     pub(crate) fn put_pool(&mut self, pool: RoutedReadPool) {
         self.pool = Some(pool);
+    }
+
+    /// Builds the identity cache on first use, so page-locking its lanes is a
+    /// once-per-request cost like the pool's.
+    pub(crate) fn ensure_cache(
+        &mut self,
+        context: &std::sync::Arc<CudaContext>,
+        spec: &'static v4_spec::V4Spec,
+        capacity: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.cache.as_ref().map(|cache| cache.capacity) != Some(capacity)
+            || !self
+                .cache
+                .as_ref()
+                .map(|cache| cache.shapes_match(spec))
+                .unwrap_or(false)
+        {
+            self.cache = Some(RoutedExpertCache::new(context, spec, capacity)?);
+        }
+        Ok(())
+    }
+
+    /// One lane per route slot from the identity cache, with a `true` flag where
+    /// the lane already holds the expert (skip the read).
+    pub(crate) fn take_cache_lanes(
+        &mut self,
+        layer: usize,
+        route_ids: &[i32],
+    ) -> Result<(Vec<RoutedReadLane>, Vec<bool>), Box<dyn Error>> {
+        self.cache
+            .as_mut()
+            .ok_or("routed expert cache is not built")?
+            .take_lanes(layer, route_ids)
+    }
+
+    /// Returns this layer's lanes to the identity cache so a later token can hit.
+    pub(crate) fn give_cache_lanes(
+        &mut self,
+        layer: usize,
+        route_ids: &[i32],
+        lanes: Vec<RoutedReadLane>,
+    ) {
+        if let Some(cache) = self.cache.as_mut() {
+            cache.give_back(layer, route_ids, lanes);
+        }
     }
 }
 
@@ -207,12 +254,158 @@ impl RoutedReadPool {
         !self.lanes.is_empty() && self.lanes.iter().all(|lane| lane.shapes_match(spec))
     }
 
-    pub(crate) fn lanes_mut(&mut self) -> &mut [RoutedReadLane] {
-        &mut self.lanes
+    /// Hands the lanes out by value so the read workers own them and the drain
+    /// can carry them straight to the H2D (and, when the identity cache is on,
+    /// back into it). Callers return them with [`Self::give_lanes`].
+    pub(crate) fn take_lanes(&mut self) -> Vec<RoutedReadLane> {
+        std::mem::take(&mut self.lanes)
     }
 
-    pub(crate) fn lane(&self, index: usize) -> &RoutedReadLane {
-        &self.lanes[index]
+    pub(crate) fn give_lanes(&mut self, lanes: Vec<RoutedReadLane>) {
+        self.lanes = lanes;
+    }
+}
+
+/// Request-scoped cache of routed experts keyed by identity `(layer, expert)`,
+/// not by route position.
+///
+/// The bytes a lane holds after `read_into` are exactly what the range plan
+/// reads from disk, so serving a hit from a retained lane produces the same
+/// device weights a fresh read would: the numeric path is untouched, only
+/// *whether* a read happens changes. The cache owns every lane — `entries` for
+/// the cached experts and `spares` for the checked-out/evicted ones — so a hit
+/// hands its lane straight to the H2D with no copy at all.
+///
+/// Reuse distance is a full layer sweep (a token reads 43 layers before
+/// revisiting one), measured at ~63% consecutive-token overlap on a real
+/// prompt, so the payoff only appears once the capacity holds roughly a token's
+/// working set (~258 experts); below that it thrashes toward 0%.
+pub(crate) struct RoutedExpertCache {
+    entries: std::collections::HashMap<(usize, u16), (RoutedReadLane, u64)>,
+    spares: Vec<RoutedReadLane>,
+    context: std::sync::Arc<CudaContext>,
+    spec: &'static v4_spec::V4Spec,
+    clock: u64,
+    capacity: usize,
+    max_lanes: usize,
+    pub(crate) hits: usize,
+    pub(crate) misses: usize,
+}
+
+impl RoutedExpertCache {
+    pub(crate) fn new(
+        context: &std::sync::Arc<CudaContext>,
+        spec: &'static v4_spec::V4Spec,
+        capacity: usize,
+    ) -> Result<Self, Box<dyn Error>> {
+        // Lanes are page-locked lazily as misses arrive, so a short request never
+        // pays for the whole capacity. `experts_per_token` lanes are always kept
+        // around so a layer where every route misses can still draw one each.
+        Ok(Self {
+            entries: std::collections::HashMap::new(),
+            spares: Vec::new(),
+            context: context.clone(),
+            spec,
+            clock: 0,
+            capacity,
+            max_lanes: capacity.saturating_add(spec.experts_per_token),
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    pub(crate) fn shapes_match(&self, spec: &v4_spec::V4Spec) -> bool {
+        self.entries
+            .values()
+            .all(|(lane, _)| lane.shapes_match(spec))
+            && self.spares.iter().all(|lane| lane.shapes_match(spec))
+    }
+
+    /// A free lane, allocating one while under the cap and otherwise evicting the
+    /// least-recently-used cached expert.
+    fn acquire_lane(&mut self) -> Result<RoutedReadLane, Box<dyn Error>> {
+        if let Some(lane) = self.spares.pop() {
+            return Ok(lane);
+        }
+        if self.entries.len() + self.spares.len() < self.max_lanes {
+            return RoutedReadLane::new(&self.context, self.spec);
+        }
+        let victim = self
+            .entries
+            .iter()
+            .min_by_key(|(key, (_, tick))| (*tick, **key))
+            .map(|(key, _)| *key)
+            .ok_or("routed expert cache has no victim to evict")?;
+        let (lane, _) = self
+            .entries
+            .remove(&victim)
+            .ok_or("routed expert cache victim vanished")?;
+        Ok(lane)
+    }
+
+    /// Hands out one lane per route slot: a cached lane for a hit (bytes already
+    /// present), a free lane for a miss (to be read). The `true` flag tells the
+    /// read worker to skip the disk read for that slot.
+    pub(crate) fn take_lanes(
+        &mut self,
+        layer: usize,
+        route_ids: &[i32],
+    ) -> Result<(Vec<RoutedReadLane>, Vec<bool>), Box<dyn Error>> {
+        let mut lanes = Vec::with_capacity(route_ids.len());
+        let mut hits = Vec::with_capacity(route_ids.len());
+        for &raw in route_ids {
+            let expert = u16::try_from(raw).map_err(|error| error.to_string())?;
+            self.clock += 1;
+            match self.entries.remove(&(layer, expert)) {
+                Some((lane, _)) => {
+                    self.hits += 1;
+                    lanes.push(lane);
+                    hits.push(true);
+                }
+                None => {
+                    self.misses += 1;
+                    lanes.push(self.acquire_lane()?);
+                    hits.push(false);
+                }
+            }
+        }
+        Ok((lanes, hits))
+    }
+
+    /// Takes this layer's lanes back: each becomes the cache entry for its
+    /// `(layer, expert)` with a fresh use tick, and the least-recently-used
+    /// experts spill into the spare pool while the capacity is exceeded.
+    pub(crate) fn give_back(
+        &mut self,
+        layer: usize,
+        route_ids: &[i32],
+        lanes: Vec<RoutedReadLane>,
+    ) {
+        for (lane, &raw) in lanes.into_iter().zip(route_ids) {
+            let Ok(expert) = u16::try_from(raw) else {
+                self.spares.push(lane);
+                continue;
+            };
+            if self.capacity == 0 {
+                self.spares.push(lane);
+                continue;
+            }
+            self.clock += 1;
+            self.entries.insert((layer, expert), (lane, self.clock));
+            while self.entries.len() > self.capacity {
+                let Some(victim) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(key, (_, tick))| (*tick, **key))
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                if let Some((evicted, _)) = self.entries.remove(&victim) {
+                    self.spares.push(evicted);
+                }
+            }
+        }
     }
 }
 

@@ -16,6 +16,21 @@ pub(crate) fn routed_read_threads() -> usize {
         .unwrap_or(6)
 }
 
+/// How many routed experts the request-scoped identity cache retains, from
+/// `COLIBRI_V4_ROUTED_EXPERT_CACHE`. Off (0) when unset, so the pinned read pool
+/// behaves exactly as before. A hit skips the read and serves the H2D from the
+/// retained lane, so this trades host page-locked memory (12.75 MiB per expert)
+/// for reads. Measured reuse is ~63% between consecutive decode tokens, but the
+/// reuse distance is a full 43-layer sweep, so a useful capacity is about one
+/// token's working set (layers x experts_per_token); below that it thrashes and
+/// buys nothing.
+pub(crate) fn routed_expert_cache_capacity() -> usize {
+    std::env::var("COLIBRI_V4_ROUTED_EXPERT_CACHE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_real_layer_attention_rows(
     module: &kernels::LoadedModule,
@@ -980,19 +995,38 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     // `RoutedExpert` the streamed loader allocates. The pool only exists when
     // the caller kept a scratch; without one it stays empty and the block
     // below falls back to the old load, so the pool is never rebuilt per layer.
+    //
+    // When the identity cache is on it replaces the pool: it too owns the
+    // page-locked lanes, but keys them by `(layer, expert)` across layers, so a
+    // hit skips the read and the drain uploads from the retained lane. Off (the
+    // default) leaves the pool path exactly as it was.
+    let routed_cache_capacity = routed_expert_cache_capacity();
     let mut routed_read_pool = match routed_slot_scratch.as_deref_mut() {
         // Build the pool on first use and hand it back at the end of the
         // layer, so page-locking six lanes is a once-per-request cost and the
         // same pinned memory serves every layer. Skip it entirely when this
-        // layer does not route through the prefetch block.
-        Some(scratch) if flash_routed_prefetch => Some(match scratch.take_pool() {
-            Some(pool) if pool.shapes_match(spec) => pool,
-            _ => RoutedReadPool::new(context, spec)?,
-        }),
+        // layer does not route through the prefetch block, or when the identity
+        // cache owns the lanes instead.
+        Some(scratch) if flash_routed_prefetch && routed_cache_capacity == 0 => {
+            Some(match scratch.take_pool() {
+                Some(pool) if pool.shapes_match(spec) => pool,
+                _ => RoutedReadPool::new(context, spec)?,
+            })
+        }
         _ => None,
     };
+    if flash_routed_prefetch && routed_cache_capacity > 0 {
+        if let Some(scratch) = routed_slot_scratch.as_deref_mut() {
+            scratch.ensure_cache(context, spec, routed_cache_capacity)?;
+        }
+    }
     let mut prefetched_routed_experts = None;
     let mut prefetched_routed_lane_reads = None;
+    // The layer's lanes live here between being read and being drained, so the
+    // drain uploads them by route slot and the handback returns them to whoever
+    // lent them (the pool or the identity cache).
+    let mut routed_lane_batch: Vec<RoutedReadLane> = Vec::new();
+    let mut routed_lane_hits: Vec<bool> = Vec::new();
     // The shared window runs the shared MLP on this thread while the routed
     // read workers fetch this layer's experts, so its wall is whichever of the
     // two finishes last. Time both from the inside to tell them apart.
@@ -1008,41 +1042,66 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         }
         let route_ids = routes.ids.clone();
         let read_threads = routed_read_threads();
+        // Lanes come from the identity cache (which may mark slots as hits) or
+        // from the pool (every slot to be read). Both hand one owned lane per
+        // route slot; the drain uploads them by slot and the handback below
+        // returns them to their owner.
+        let (lanes, hits) = if let Some(scratch) =
+            routed_slot_scratch.as_deref_mut().filter(|_| routed_cache_capacity > 0)
+        {
+            scratch.take_cache_lanes(weights.layer, &route_ids)?
+        } else if let Some(pool) = routed_read_pool.as_mut() {
+            (pool.take_lanes(), vec![false; route_ids.len()])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let use_lanes = !lanes.is_empty();
+        routed_lane_hits = hits;
         let loaded = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
             // One worker per read thread; the chunk size keeps the experts in
             // their original order when the chunks are concatenated back.
             let chunk_size = route_ids.len().div_ceil(read_threads);
-            if let Some(pool) = routed_read_pool.as_mut() {
+            if use_lanes {
                 // Read straight into the pinned lanes. The workers split both
                 // the route slots and the lanes into equal chunks, so each
                 // worker owns whole lanes for the scope and the upload below
-                // never waits on a buffer: the lanes are handed out as
-                // disjoint `&mut` slices before any thread starts.
-                let mut lanes = pool.lanes_mut().iter_mut();
+                // never waits on a buffer: the lanes are handed out as disjoint
+                // owned slices before any thread starts. A slot the cache
+                // already holds is skipped, but its lane still travels through
+                // so the upload has every route slot in order.
+                let mut owned_lanes = lanes.into_iter();
                 let mut workers = Vec::with_capacity(read_threads);
-                for chunk in route_ids.chunks(chunk_size) {
-                    let owned = lanes.by_ref().take(chunk.len()).collect::<Vec<_>>();
+                for (chunk, hit_chunk) in route_ids
+                    .chunks(chunk_size)
+                    .zip(routed_lane_hits.chunks(chunk_size))
+                {
+                    let owned = owned_lanes.by_ref().take(chunk.len()).collect::<Vec<_>>();
                     if owned.len() != chunk.len() {
                         return Err("routed read pool does not cover the route slots".into());
                     }
+                    let hit_chunk = hit_chunk.to_vec();
                     let shard = &runtime.expert_shard;
                     let layer = weights.layer;
                     workers.push(scope.spawn(move || {
                         let worker_started = std::time::Instant::now();
                         let mut reads = Vec::with_capacity(chunk.len());
-                        for (lane, &expert_id) in owned.into_iter().zip(chunk) {
+                        for ((mut lane, &expert_id), hit) in
+                            owned.into_iter().zip(chunk).zip(hit_chunk)
+                        {
                             let expert_id =
                                 u16::try_from(expert_id).map_err(|error| error.to_string())?;
-                            lane.read_into(shard, layer, expert_id)
-                                .map_err(|error| error.to_string())?;
-                            reads.push((expert_id, lane.read_ns()));
+                            if !hit {
+                                lane.read_into(shard, layer, expert_id)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            reads.push((expert_id, lane.read_ns(), lane));
                         }
                         let worker_us = u128::try_from(worker_started.elapsed().as_micros())
                             .unwrap_or(u128::MAX);
                         Ok::<_, String>((reads, worker_us))
                     }));
                 }
-                if lanes.next().is_some() {
+                if owned_lanes.next().is_some() {
                     return Err("routed read pool has unused lanes for the route row".into());
                 }
                 // Run the shared MLP on this thread only after the readers are
@@ -1252,9 +1311,11 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             if rows != 1 || reads.len() != spec.experts_per_token {
                 return Err("Flash B1 routed prefetch returned an incomplete route row".into());
             }
-            let pool = routed_read_pool
-                .as_ref()
-                .ok_or("Flash B1 routed lane reads lost their pinned pool")?;
+            let cache_owns_lanes =
+                routed_slot_scratch.as_deref().is_some() && routed_cache_capacity > 0;
+            if !cache_owns_lanes && routed_read_pool.is_none() {
+                return Err("Flash B1 routed lane reads lost their pinned pool".into());
+            }
             stage.routed_prefetched = true;
             // The weights are already page-locked in the lanes, so the only
             // per-expert host cost left is the H2D. One execution slot is still
@@ -1268,16 +1329,28 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 Some(slot) => slot,
                 None => ExpertSlot::new_empty_for(spec, context, module, stream)?,
             };
-            for (route_slot, (expert_id, read_ns)) in reads.into_iter().enumerate() {
+            // Keep reading lanes empty so they can be handed straight back to
+            // the pool or cache after the drain.
+            for (route_slot, (expert_id, read_ns, lane)) in reads.into_iter().enumerate() {
                 if routes.ids[route_slot] != i32::from(expert_id) {
                     return Err("Flash B1 routed prefetch changed canonical route order".into());
                 }
-                stage.routed_read_ns = stage.routed_read_ns.saturating_add(read_ns);
-                let lane_bytes = pool.lane(route_slot).h2d_bytes();
-                stage.routed_source_bytes = stage.routed_source_bytes.saturating_add(lane_bytes);
-                stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
+                let hit = routed_lane_hits.get(route_slot).copied().unwrap_or(false);
+                if hit {
+                    stage.routed_cache_hits = stage.routed_cache_hits.saturating_add(1);
+                } else {
+                    stage.routed_read_ns = stage.routed_read_ns.saturating_add(read_ns);
+                }
+                let lane_bytes = lane.h2d_bytes();
+                // A cache hit did not read these bytes from disk, so it does not
+                // count as source; the H2D still happens for every slot.
+                if !hit {
+                    stage.routed_source_bytes =
+                        stage.routed_source_bytes.saturating_add(lane_bytes);
+                    stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
+                }
                 let setup_started = std::time::Instant::now();
-                slot.upload_lane(pool.lane(route_slot))?;
+                slot.upload_lane(&lane)?;
                 stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(
                     u64::try_from(setup_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 );
@@ -1285,6 +1358,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                     .routed_h2d_ns
                     .saturating_add((slot.weight_h2d_ms * 1_000_000.0) as u64);
                 stage.routed_h2d_bytes = stage.routed_h2d_bytes.saturating_add(lane_bytes);
+                routed_lane_batch.push(lane);
                 let input = &ffn_input[..spec.hidden];
                 let (output, kernel_ns, trace) = if parity_dump.is_some() {
                     let (output, kernel_ns, trace) =
@@ -1457,7 +1531,26 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             }
         }
         // Give the pinned lanes back so the next layer reads into the same
-        // page-locked memory instead of locking a fresh set.
+        // page-locked memory instead of locking a fresh set. When the identity
+        // cache owns them, they go back under this layer's keys so a later token
+        // can hit; otherwise they return to the pool.
+        if !routed_lane_batch.is_empty() {
+            let route_ids = routes.ids.clone();
+            match routed_slot_scratch.as_deref_mut() {
+                Some(scratch) if routed_cache_capacity > 0 => {
+                    scratch.give_cache_lanes(
+                        weights.layer,
+                        &route_ids,
+                        std::mem::take(&mut routed_lane_batch),
+                    );
+                }
+                _ => {
+                    if let Some(pool) = routed_read_pool.as_mut() {
+                        pool.give_lanes(std::mem::take(&mut routed_lane_batch));
+                    }
+                }
+            }
+        }
         if let (Some(scratch), Some(pool)) =
             (routed_slot_scratch.as_deref_mut(), routed_read_pool.take())
         {

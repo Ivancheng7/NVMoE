@@ -615,6 +615,7 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
                     "source_bytes": stage.routed_source_bytes,
                     "h2d_bytes": stage.routed_h2d_bytes,
                     "expert_loads": stage.routed_expert_loads,
+                    "cache_hits": stage.routed_cache_hits,
                 },
             },
         },
