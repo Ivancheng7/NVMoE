@@ -576,6 +576,16 @@ pub(crate) struct LayerStageTelemetry {
     pub(crate) shared_read_worker_max_ns: u64,
     pub(crate) routed_ns: u64,
     pub(crate) routed_prefetched: bool,
+    /// The routed fan-out ran: one execution slot and stream per route slot, so
+    /// the `routed_*` numbers below are six overlapping per-lane walls rather
+    /// than sub-intervals of one window. Read by the nested-scope guard, which
+    /// cannot require their sum to fit inside `routed_ns`.
+    pub(crate) routed_fanout: bool,
+    /// The fan-out's slowest lane this layer pass: read through expert kernels
+    /// for one route slot, the wall the other five hide behind. The lane starts
+    /// inside the shared window and ends inside the routed one, so it is the one
+    /// fan-out number the nested-scope guard can still bound by the layer wall.
+    pub(crate) routed_fanout_lane_max_ns: u64,
     pub(crate) routed_read_ns: u64,
     pub(crate) routed_alloc_ns: u64,
     pub(crate) routed_setup_ns: u64,
@@ -671,6 +681,10 @@ impl std::ops::AddAssign for LayerStageTelemetry {
             routed_cache_hits,
         );
         self.routed_prefetched = self.routed_prefetched && other.routed_prefetched;
+        self.routed_fanout = self.routed_fanout && other.routed_fanout;
+        self.routed_fanout_lane_max_ns = self
+            .routed_fanout_lane_max_ns
+            .max(other.routed_fanout_lane_max_ns);
         if other.attention_profile.is_some() {
             self.attention_profile = other.attention_profile;
         }

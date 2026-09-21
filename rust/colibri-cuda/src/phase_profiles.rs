@@ -310,7 +310,9 @@ pub(crate) fn stationary_layer_phase_profile_json(
                     // `main_ns` is the shared MLP on the main thread; the worker
                     // numbers are the routed lanes read alongside it. The window
                     // ends when the last reader joins, so join_tail_ns is the
-                    // wait after the MLP returned.
+                    // wait after the MLP returned — zero under the routed
+                    // fan-out, which closes this window the moment the MLP
+                    // returns and moves the lane tails into `routed`.
                     "diagnostics": {
                         "main_ns": stage.shared_main_ns,
                         "read_workers": stage.shared_read_workers,

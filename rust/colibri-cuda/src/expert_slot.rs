@@ -50,6 +50,10 @@ pub(crate) struct RoutedSlotScratch<'a> {
     slot: Option<ExpertSlot<'a>>,
     pool: Option<RoutedReadPool>,
     cache: Option<RoutedExpertCache>,
+    /// One execution slot per route slot for the fan-out drain, each on its own
+    /// stream. The single `slot` above stays the whole-request slot for the
+    /// pipelined drain; this set is only built when the fan-out asks for it.
+    fanout_lanes: Vec<ExpertSlot<'a>>,
 }
 
 impl<'a> RoutedSlotScratch<'a> {
@@ -58,6 +62,7 @@ impl<'a> RoutedSlotScratch<'a> {
             slot: None,
             pool: None,
             cache: None,
+            fanout_lanes: Vec::new(),
         }
     }
 
@@ -124,6 +129,37 @@ impl<'a> RoutedSlotScratch<'a> {
         if let Some(cache) = self.cache.as_mut() {
             cache.give_back(layer, route_ids, lanes);
         }
+    }
+
+    /// Hands out one execution slot per route slot, building the missing ones
+    /// (and their streams) on first use.
+    ///
+    /// Page-locking one slot's staging is the same once-per-request cost the
+    /// single slot pays, so the whole set is built on the request's first
+    /// fan-out layer and kept: later layers upload straight into it.
+    pub(crate) fn take_fanout_lanes(
+        &mut self,
+        count: usize,
+        spec: &'static v4_spec::V4Spec,
+        context: &std::sync::Arc<CudaContext>,
+        module: &'a kernels::LoadedModule,
+    ) -> Result<Vec<ExpertSlot<'a>>, Box<dyn Error>> {
+        while self.fanout_lanes.len() < count {
+            let lane_stream = context.new_stream()?;
+            self.fanout_lanes.push(ExpertSlot::new_empty_for(
+                spec,
+                context,
+                module,
+                &lane_stream,
+            )?);
+        }
+        Ok(self.fanout_lanes.drain(..count).collect())
+    }
+
+    /// Takes the fan-out lanes back after the layer's drain placed their
+    /// outputs, so the next layer reuses the same device weights and streams.
+    pub(crate) fn put_fanout_lanes(&mut self, lanes: Vec<ExpertSlot<'a>>) {
+        self.fanout_lanes = lanes;
     }
 }
 

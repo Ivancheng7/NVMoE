@@ -31,6 +31,38 @@ pub(crate) fn routed_expert_cache_capacity() -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the Flash B1 routed drain fans out over one thread per route slot,
+/// from `COLIBRI_V4_FLASH_ROUTED_FANOUT`. Off (the default) keeps the pipelined
+/// drain: six experts in route order through one execution slot on one stream,
+/// which spends the whole drain behind the weight H2D. On, each route slot's
+/// read, upload and kernels run in their own thread against their own slot and
+/// stream, so the six experts overlap each other and the reads.
+pub(crate) fn routed_fanout_enabled() -> bool {
+    std::env::var_os("COLIBRI_V4_FLASH_ROUTED_FANOUT").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+}
+
+/// One route slot's fan-out result: the expert has already run on its own slot
+/// and stream. The drain afterwards only places `output` and folds these
+/// counters, so the numbers it reports are the ones the pipelined drain would
+/// have produced for the same work.
+struct RoutedLaneOutcome<'a> {
+    route_slot: usize,
+    expert_id: u16,
+    hit: bool,
+    read_ns: u64,
+    h2d_ms: f64,
+    setup_ns: u64,
+    kernel_ns: u64,
+    /// This lane's whole wall: its read, upload and kernels. The fan-out's
+    /// critical path for the layer is the longest of the six.
+    lane_wall_ns: u64,
+    output: Vec<f32>,
+    trace: Option<FlashExpertTrace>,
+    lane: RoutedReadLane,
+    slot: ExpertSlot<'a>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_real_layer_attention_rows(
     module: &kernels::LoadedModule,
@@ -1022,6 +1054,13 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     }
     let mut prefetched_routed_experts = None;
     let mut prefetched_routed_lane_reads = None;
+    // The fan-out drain hands its six already-executed route slots back here,
+    // and closes its own two windows from inside the scope: `shared` when the
+    // MLP returns, `routed` when the last lane returns. Both stay `None` on
+    // every other path, which keeps their existing stamps.
+    let mut fanout_lane_outcomes: Option<Vec<RoutedLaneOutcome<'module>>> = None;
+    let mut fanout_shared_ns: Option<u64> = None;
+    let mut fanout_routed_started: Option<std::time::Instant> = None;
     // The layer's lanes live here between being read and being drained, so the
     // drain uploads them by route slot and the handback returns them to whoever
     // lent them (the pool or the identity cache).
@@ -1046,7 +1085,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         // from the pool (every slot to be read). Both hand one owned lane per
         // route slot; the drain uploads them by slot and the handback below
         // returns them to their owner.
-        let (lanes, hits) = if let Some(scratch) =
+        let (mut lanes, hits) = if let Some(scratch) =
             routed_slot_scratch.as_deref_mut().filter(|_| routed_cache_capacity > 0)
         {
             scratch.take_cache_lanes(weights.layer, &route_ids)?
@@ -1057,108 +1096,97 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         };
         let use_lanes = !lanes.is_empty();
         routed_lane_hits = hits;
-        let loaded = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
-            // One worker per read thread; the chunk size keeps the experts in
-            // their original order when the chunks are concatenated back.
-            let chunk_size = route_ids.len().div_ceil(read_threads);
-            if use_lanes {
-                // Read straight into the pinned lanes. The workers split both
-                // the route slots and the lanes into equal chunks, so each
-                // worker owns whole lanes for the scope and the upload below
-                // never waits on a buffer: the lanes are handed out as disjoint
-                // owned slices before any thread starts. A slot the cache
-                // already holds is skipped, but its lane still travels through
-                // so the upload has every route slot in order.
-                let mut owned_lanes = lanes.into_iter();
-                let mut workers = Vec::with_capacity(read_threads);
-                for (chunk, hit_chunk) in route_ids
-                    .chunks(chunk_size)
-                    .zip(routed_lane_hits.chunks(chunk_size))
+        // Fan-out drain: one thread per route slot, each reading its own lane and
+        // running its own expert on its own slot and stream. It replaces the
+        // pipelined prefetch below, and closes both windows from the inside.
+        let fanout_prefetch = if routed_fanout_enabled() && rows == 1 && use_lanes {
+            let parity_dir = parity_dump.as_deref();
+            let mut slots = match routed_slot_scratch.as_deref_mut() {
+                Some(scratch) => {
+                    scratch.take_fanout_lanes(lanes.len(), spec, context, module)?
+                }
+                None => {
+                    return Err("Flash B1 routed fan-out requires the request scratch".into());
+                }
+            };
+            if slots.len() != lanes.len() {
+                return Err("Flash B1 routed fan-out lost its execution lanes".into());
+            }
+            let lane_hits = std::mem::take(&mut routed_lane_hits);
+            // `mem::replace` rather than a move: the pipelined arm below
+            // borrows `lanes` from the same binding and only runs when this
+            // branch did not take them.
+            let lanes = std::mem::replace(&mut lanes, Vec::new());
+            let mut outcomes: Vec<RoutedLaneOutcome<'module>> = Vec::with_capacity(lanes.len());
+            let mut lane_slots = slots.drain(..);
+            let shared = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+                let mut workers = Vec::with_capacity(lanes.len());
+                for (route_slot, ((mut lane, hit), route)) in lanes
+                    .into_iter()
+                    .zip(lane_hits)
+                    .zip(route_ids.iter())
+                    .enumerate()
                 {
-                    let owned = owned_lanes.by_ref().take(chunk.len()).collect::<Vec<_>>();
-                    if owned.len() != chunk.len() {
-                        return Err("routed read pool does not cover the route slots".into());
-                    }
-                    let hit_chunk = hit_chunk.to_vec();
+                    let mut slot = lane_slots
+                        .next()
+                        .ok_or("Flash B1 routed fan-out lane count changed")?;
                     let shard = &runtime.expert_shard;
                     let layer = weights.layer;
-                    workers.push(scope.spawn(move || {
-                        let worker_started = std::time::Instant::now();
-                        let mut reads = Vec::with_capacity(chunk.len());
-                        for ((mut lane, &expert_id), hit) in
-                            owned.into_iter().zip(chunk).zip(hit_chunk)
-                        {
-                            let expert_id =
-                                u16::try_from(expert_id).map_err(|error| error.to_string())?;
+                    let input = &ffn_input[..spec.hidden];
+                    let weight = routes.weights[route_slot];
+                    let expert_id = u16::try_from(*route)?;
+                    workers.push(scope.spawn(
+                        move || -> Result<RoutedLaneOutcome<'module>, String> {
+                            let lane_started = std::time::Instant::now();
+                            slot.stream
+                                .context()
+                                .bind_to_thread()
+                                .map_err(|error| error.to_string())?;
+                            // A cache hit skips the read but keeps its lane, so
+                            // the upload below serves the retained weights.
                             if !hit {
                                 lane.read_into(shard, layer, expert_id)
                                     .map_err(|error| error.to_string())?;
                             }
-                            reads.push((expert_id, lane.read_ns(), lane));
-                        }
-                        let worker_us = u128::try_from(worker_started.elapsed().as_micros())
-                            .unwrap_or(u128::MAX);
-                        Ok::<_, String>((reads, worker_us))
-                    }));
-                }
-                if owned_lanes.next().is_some() {
-                    return Err("routed read pool has unused lanes for the route row".into());
-                }
-                // Run the shared MLP on this thread only after the readers are
-                // running, so its wall and theirs overlap instead of stacking.
-                let shared = if parity_dump.is_some() {
-                    run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
-                } else {
-                    (
-                        run_layer_shared_expert(module, stream, &ffn_input, weights)?,
-                        Vec::new(),
-                    )
-                };
-                shared_probe_mlp_us =
-                    u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
-                let mut reads = Vec::with_capacity(route_ids.len());
-                for worker in workers {
-                    let (loaded, worker_us) = worker
-                        .join()
-                        .map_err(|_| "Flash B1 routed prefetch worker panicked")?
-                        .map_err(|error| {
-                            format!("Flash B1 routed prefetch worker failed: {error}")
-                        })?;
-                    shared_probe_worker_sum_us =
-                        shared_probe_worker_sum_us.saturating_add(worker_us);
-                    shared_probe_worker_max_us = shared_probe_worker_max_us.max(worker_us);
-                    shared_probe_workers += 1;
-                    reads.extend(loaded);
-                }
-                prefetched_routed_lane_reads = Some(reads);
-                Ok(shared)
-            } else {
-                let workers = route_ids
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        scope.spawn(move || {
-                            let worker_started = std::time::Instant::now();
-                            let experts = chunk
-                                .iter()
-                                .map(|expert_id| {
-                                    let expert_id = u16::try_from(*expert_id)
-                                        .map_err(|error| error.to_string())?;
-                                    let expert = v4_expert::RoutedExpert::load_layer_for(
-                                        spec,
-                                        &runtime.expert_shard,
-                                        weights.layer,
-                                        expert_id,
-                                    )
+                            let read_ns = lane.read_ns();
+                            let setup_started = std::time::Instant::now();
+                            slot.upload_lane(&lane).map_err(|error| error.to_string())?;
+                            let setup_ns = u64::try_from(setup_started.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX);
+                            let (output, kernel_ns, trace) = if parity_dir.is_some() {
+                                let (output, kernel_ns, trace) = slot
+                                    .execute_with_flash_trace(input, weight)
                                     .map_err(|error| error.to_string())?;
-                                    Ok::<_, String>((expert_id, expert))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let worker_us = u128::try_from(worker_started.elapsed().as_micros())
-                                .unwrap_or(u128::MAX);
-                            Ok::<_, String>((experts, worker_us))
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                                (output, kernel_ns, Some(trace))
+                            } else {
+                                let (output, kernel_ns) = slot
+                                    .execute(input, weight)
+                                    .map_err(|error| error.to_string())?;
+                                (output, kernel_ns, None)
+                            };
+                            Ok(RoutedLaneOutcome {
+                                route_slot,
+                                expert_id,
+                                hit,
+                                read_ns,
+                                h2d_ms: slot.weight_h2d_ms,
+                                setup_ns,
+                                kernel_ns,
+                                lane_wall_ns: u64::try_from(lane_started.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                                output,
+                                trace,
+                                lane,
+                                slot,
+                            })
+                        },
+                    ));
+                }
+                // The shared MLP runs on this thread while the six lanes read
+                // and execute. Its window closes the moment it returns and the
+                // routed window opens there: the lane tails that outlive it are
+                // charged to routed, which is where their reads have always been
+                // charged.
                 let shared = if parity_dump.is_some() {
                     run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
                 } else {
@@ -1169,24 +1197,167 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 };
                 shared_probe_mlp_us =
                     u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
-                let mut experts = Vec::with_capacity(route_ids.len());
+                fanout_shared_ns =
+                    Some(u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                fanout_routed_started = Some(std::time::Instant::now());
                 for worker in workers {
-                    let (loaded, worker_us) = worker
+                    let outcome = worker
                         .join()
-                        .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                        .map_err(|_| "Flash B1 routed fan-out worker panicked")?
                         .map_err(|error| {
-                            format!("Flash B1 routed prefetch worker failed: {error}")
+                            format!("Flash B1 routed fan-out worker failed: {error}")
                         })?;
+                    // Feed the shared row's read columns from the same per-lane
+                    // read walls the pipelined drain's readers report.
+                    let read_us = u128::from(outcome.read_ns) / 1_000;
                     shared_probe_worker_sum_us =
-                        shared_probe_worker_sum_us.saturating_add(worker_us);
-                    shared_probe_worker_max_us = shared_probe_worker_max_us.max(worker_us);
+                        shared_probe_worker_sum_us.saturating_add(read_us);
+                    shared_probe_worker_max_us = shared_probe_worker_max_us.max(read_us);
                     shared_probe_workers += 1;
-                    experts.extend(loaded);
+                    outcomes.push(outcome);
                 }
-                prefetched_routed_experts = Some(experts);
                 Ok(shared)
+            })?;
+            fanout_lane_outcomes = Some(outcomes);
+            Some(shared)
+        } else {
+            None
+        };
+        let loaded = match fanout_prefetch {
+            Some(shared) => shared,
+            None => {
+                std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+                    // One worker per read thread; the chunk size keeps the experts in
+                    // their original order when the chunks are concatenated back.
+                    let chunk_size = route_ids.len().div_ceil(read_threads);
+                    if use_lanes {
+                        // Read straight into the pinned lanes. The workers split both
+                        // the route slots and the lanes into equal chunks, so each
+                        // worker owns whole lanes for the scope and the upload below
+                        // never waits on a buffer: the lanes are handed out as disjoint
+                        // owned slices before any thread starts. A slot the cache
+                        // already holds is skipped, but its lane still travels through
+                        // so the upload has every route slot in order.
+                        let mut owned_lanes = lanes.into_iter();
+                        let mut workers = Vec::with_capacity(read_threads);
+                        for (chunk, hit_chunk) in route_ids
+                            .chunks(chunk_size)
+                            .zip(routed_lane_hits.chunks(chunk_size))
+                        {
+                            let owned = owned_lanes.by_ref().take(chunk.len()).collect::<Vec<_>>();
+                            if owned.len() != chunk.len() {
+                                return Err("routed read pool does not cover the route slots".into());
+                            }
+                            let hit_chunk = hit_chunk.to_vec();
+                            let shard = &runtime.expert_shard;
+                            let layer = weights.layer;
+                            workers.push(scope.spawn(move || {
+                                let worker_started = std::time::Instant::now();
+                                let mut reads = Vec::with_capacity(chunk.len());
+                                for ((mut lane, &expert_id), hit) in
+                                    owned.into_iter().zip(chunk).zip(hit_chunk)
+                                {
+                                    let expert_id =
+                                        u16::try_from(expert_id).map_err(|error| error.to_string())?;
+                                    if !hit {
+                                        lane.read_into(shard, layer, expert_id)
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    reads.push((expert_id, lane.read_ns(), lane));
+                                }
+                                let worker_us = u128::try_from(worker_started.elapsed().as_micros())
+                                    .unwrap_or(u128::MAX);
+                                Ok::<_, String>((reads, worker_us))
+                            }));
+                        }
+                        if owned_lanes.next().is_some() {
+                            return Err("routed read pool has unused lanes for the route row".into());
+                        }
+                        // Run the shared MLP on this thread only after the readers are
+                        // running, so its wall and theirs overlap instead of stacking.
+                        let shared = if parity_dump.is_some() {
+                            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                        } else {
+                            (
+                                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                                Vec::new(),
+                            )
+                        };
+                        shared_probe_mlp_us =
+                            u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        let mut reads = Vec::with_capacity(route_ids.len());
+                        for worker in workers {
+                            let (loaded, worker_us) = worker
+                                .join()
+                                .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                                .map_err(|error| {
+                                    format!("Flash B1 routed prefetch worker failed: {error}")
+                                })?;
+                            shared_probe_worker_sum_us =
+                                shared_probe_worker_sum_us.saturating_add(worker_us);
+                            shared_probe_worker_max_us = shared_probe_worker_max_us.max(worker_us);
+                            shared_probe_workers += 1;
+                            reads.extend(loaded);
+                        }
+                        prefetched_routed_lane_reads = Some(reads);
+                        Ok(shared)
+                    } else {
+                        let workers = route_ids
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                scope.spawn(move || {
+                                    let worker_started = std::time::Instant::now();
+                                    let experts = chunk
+                                        .iter()
+                                        .map(|expert_id| {
+                                            let expert_id = u16::try_from(*expert_id)
+                                                .map_err(|error| error.to_string())?;
+                                            let expert = v4_expert::RoutedExpert::load_layer_for(
+                                                spec,
+                                                &runtime.expert_shard,
+                                                weights.layer,
+                                                expert_id,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                            Ok::<_, String>((expert_id, expert))
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    let worker_us = u128::try_from(worker_started.elapsed().as_micros())
+                                        .unwrap_or(u128::MAX);
+                                    Ok::<_, String>((experts, worker_us))
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let shared = if parity_dump.is_some() {
+                            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                        } else {
+                            (
+                                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                                Vec::new(),
+                            )
+                        };
+                        shared_probe_mlp_us =
+                            u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        let mut experts = Vec::with_capacity(route_ids.len());
+                        for worker in workers {
+                            let (loaded, worker_us) = worker
+                                .join()
+                                .map_err(|_| "Flash B1 routed prefetch worker panicked")?
+                                .map_err(|error| {
+                                    format!("Flash B1 routed prefetch worker failed: {error}")
+                                })?;
+                            shared_probe_worker_sum_us =
+                                shared_probe_worker_sum_us.saturating_add(worker_us);
+                            shared_probe_worker_max_us = shared_probe_worker_max_us.max(worker_us);
+                            shared_probe_workers += 1;
+                            experts.extend(loaded);
+                        }
+                        prefetched_routed_experts = Some(experts);
+                        Ok(shared)
+                    }
+                })?
             }
-        })?;
+        };
         loaded
     } else {
         let shared = if parity_dump.is_some() {
@@ -1204,7 +1375,8 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "shared_out_bf16", &[rows, spec.hidden], &shared_bf16)?;
     }
-    stage.shared_ns = u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    stage.shared_ns = fanout_shared_ns
+        .unwrap_or_else(|| u64::try_from(shared_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     // Carry the shared window's own breakdown so the phase table no longer has
     // to attribute the routed read to `shared`: `main` is the shared MLP wall,
     // the worker numbers are the six routed lanes' own read walls.
@@ -1243,7 +1415,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         &routes,
         &shared,
     )?;
-    let routed_started = std::time::Instant::now();
+    let routed_started = fanout_routed_started.unwrap_or_else(std::time::Instant::now);
     if let Some(timeline) = critical_path_timeline.as_mut() {
         timeline.routed_start_ns = timeline.now();
     }
@@ -1307,7 +1479,52 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 .map(|_| None)
                 .collect::<Vec<Option<FlashExpertTrace>>>()
         });
-        if let Some(reads) = prefetched_routed_lane_reads.take() {
+        if let Some(outcomes) = fanout_lane_outcomes.take() {
+            // The fan-out already ran every route slot on its own stream: this
+            // only places the outputs and folds their per-expert telemetry, so
+            // the routed row keeps the same terms as the pipelined drain.
+            if rows != 1 || outcomes.len() != spec.experts_per_token {
+                return Err("Flash B1 routed fan-out returned an incomplete route row".into());
+            }
+            stage.routed_prefetched = true;
+            stage.routed_fanout = true;
+            let mut slots = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                if routes.ids[outcome.route_slot] != i32::from(outcome.expert_id) {
+                    return Err("Flash B1 routed fan-out changed canonical route order".into());
+                }
+                let hit = outcome.hit;
+                if hit {
+                    stage.routed_cache_hits = stage.routed_cache_hits.saturating_add(1);
+                } else {
+                    stage.routed_read_ns = stage.routed_read_ns.saturating_add(outcome.read_ns);
+                }
+                let lane_bytes = outcome.lane.h2d_bytes();
+                if !hit {
+                    stage.routed_source_bytes =
+                        stage.routed_source_bytes.saturating_add(lane_bytes);
+                    stage.routed_expert_loads = stage.routed_expert_loads.saturating_add(1);
+                }
+                stage.routed_setup_ns = stage.routed_setup_ns.saturating_add(outcome.setup_ns);
+                stage.routed_h2d_ns = stage
+                    .routed_h2d_ns
+                    .saturating_add((outcome.h2d_ms * 1_000_000.0) as u64);
+                stage.routed_h2d_bytes = stage.routed_h2d_bytes.saturating_add(lane_bytes);
+                stage.routed_kernel_ns =
+                    stage.routed_kernel_ns.saturating_add(outcome.kernel_ns);
+                stage.routed_fanout_lane_max_ns =
+                    stage.routed_fanout_lane_max_ns.max(outcome.lane_wall_ns);
+                contributions[0][outcome.route_slot] = Some(outcome.output);
+                if let Some(traces) = flash_traces.as_mut() {
+                    traces[outcome.route_slot] = outcome.trace;
+                }
+                routed_lane_batch.push(outcome.lane);
+                slots.push(outcome.slot);
+            }
+            if let Some(scratch) = routed_slot_scratch.as_deref_mut() {
+                scratch.put_fanout_lanes(slots);
+            }
+        } else if let Some(reads) = prefetched_routed_lane_reads.take() {
             if rows != 1 || reads.len() != spec.experts_per_token {
                 return Err("Flash B1 routed prefetch returned an incomplete route row".into());
             }

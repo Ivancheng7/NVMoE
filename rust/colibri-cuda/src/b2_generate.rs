@@ -501,8 +501,16 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
         || stage.shared_ns > outer_wall_ns
         || stage.routed_ns > outer_wall_ns
         || (!stage.routed_prefetched && stage.routed_read_ns > stage.routed_ns)
-        || stage.routed_h2d_ns > stage.routed_ns
-        || stage.routed_kernel_ns > stage.routed_ns
+        // The fan-out runs one expert per stream, so its H2D and kernel numbers
+        // are six overlapping lane walls: each lane's window is inflated by the
+        // others' work on the same link and device, and their sum is bounded by
+        // nothing useful. The fan-out instead answers for its slowest lane, which
+        // is a real sub-interval of the layer.
+        || (if stage.routed_fanout {
+            stage.routed_fanout_lane_max_ns > outer_wall_ns
+        } else {
+            stage.routed_h2d_ns > stage.routed_ns || stage.routed_kernel_ns > stage.routed_ns
+        })
     {
         return Err("Flash B1 nested phase timing exceeds its parent scope".into());
     }
@@ -594,7 +602,9 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
                 // finishes last. These fields split it: `main_ns` is the MLP,
                 // the worker numbers are the routed lanes' own reads (already
                 // counted under routed.diagnostics.read_ns when summed over the
-                // request). `join_tail_ns` is the wait after the MLP returned.
+                // request). `join_tail_ns` is the wait after the MLP returned —
+                // zero under the routed fan-out, which closes this window the
+                // moment the MLP returns and moves the lane tails into `routed`.
                 "diagnostics": {
                     "main_ns": stage.shared_main_ns,
                     "read_workers": stage.shared_read_workers,
@@ -606,6 +616,11 @@ pub(crate) fn flash_b1_layer_phase_profile_json(
             "routed": {
                 "wall_ns": stage.routed_ns,
                 "host_prefetched": stage.routed_prefetched,
+                // One thread per route slot on its own stream: the six lanes
+                // overlap, so the numbers below are per-lane walls whose sum can
+                // exceed `wall_ns`.
+                "fanout": stage.routed_fanout,
+                "fanout_lane_max_ns": stage.routed_fanout_lane_max_ns,
                 "diagnostics": {
                     "read_ns": stage.routed_read_ns,
                     "alloc_ns": stage.routed_alloc_ns,
