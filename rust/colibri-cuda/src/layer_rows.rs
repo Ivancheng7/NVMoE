@@ -32,14 +32,19 @@ pub(crate) fn routed_expert_cache_capacity() -> usize {
 }
 
 /// Whether the Flash B1 routed drain fans out over one thread per route slot,
-/// from `COLIBRI_V4_FLASH_ROUTED_FANOUT`. Off (the default) keeps the pipelined
-/// drain: six experts in route order through one execution slot on one stream,
-/// which spends the whole drain behind the weight H2D. On, each route slot's
-/// read, upload and kernels run in their own thread against their own slot and
-/// stream, so the six experts overlap each other and the reads.
-pub(crate) fn routed_fanout_enabled() -> bool {
-    std::env::var_os("COLIBRI_V4_FLASH_ROUTED_FANOUT").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
+/// from `COLIBRI_V4_FLASH_ROUTED_FANOUT`. On by default: each route slot's read,
+/// upload and kernels run in their own thread against their own slot and stream,
+/// so the six experts overlap each other and the reads. The matched batch took
+/// the steady token from `1.913` to `1.581 s` on the real-prompt shape and from
+/// `2.240` to `1.805 s` on the single-token shape, with bit-identical outputs
+/// and `+64 MiB` of peak device memory; the serve surface repeats the same eight
+/// ids and reports `-0.464 s/char`. `=0` keeps the pipelined drain: six experts
+/// in route order through one execution slot on one stream, which spends the
+/// whole drain behind the weight H2D, so runs recorded against the old shape
+/// stay reproducible.
+pub(crate) fn routed_fanout_enabled() -> Result<bool, Box<dyn Error>> {
+    let value = std::env::var_os("COLIBRI_V4_FLASH_ROUTED_FANOUT");
+    parse_default_true_zero_one_flag("COLIBRI_V4_FLASH_ROUTED_FANOUT", value.as_deref())
 }
 
 /// One route slot's fan-out result: the expert has already run on its own slot
@@ -1099,7 +1104,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         // Fan-out drain: one thread per route slot, each reading its own lane and
         // running its own expert on its own slot and stream. It replaces the
         // pipelined prefetch below, and closes both windows from the inside.
-        let fanout_prefetch = if routed_fanout_enabled() && rows == 1 && use_lanes {
+        let fanout_prefetch = if routed_fanout_enabled()? && rows == 1 && use_lanes {
             let parity_dir = parity_dump.as_deref();
             let mut slots = match routed_slot_scratch.as_deref_mut() {
                 Some(scratch) => {
