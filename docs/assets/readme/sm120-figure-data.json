@@ -1,0 +1,195 @@
+{
+  "derived_chain_A_to_D": 5.586027337817313,
+  "derived_chain_A_to_E": 6.4965934897804685,
+  "fanout_cost": {
+    "peak_after_bytes": 8242397184,
+    "peak_before_bytes": 8175288320,
+    "peak_delta_bytes": 67108864,
+    "steady_saved_per_token": 0.41400000000000015
+  },
+  "machine": "WSL2, RTX 5060 Ti 16 GB, sm_120, CUDA 12.8",
+  "matched_fanout_ab": {
+    "batch_order": [
+      "ab-fanout-fanoutflip/8step-fanout-on.jsonl",
+      "ab-fanout-fanoutflip/8step-fanout-off.jsonl",
+      "ab-fanout-fanoutflip-off/8step-fanout-off.jsonl",
+      "ab-fanout-fanoutflip-off/8step-fanout-on.jsonl"
+    ],
+    "median_paired_e2e_ratio": 1.1218260556283846,
+    "median_paired_steady_ratio": 1.2089474576970507,
+    "paired_e2e_ratio": [
+      1.110655411324361,
+      1.1329966999324081
+    ],
+    "paired_steady_ratio": [
+      1.202416918429003,
+      1.2154779969650986
+    ]
+  },
+  "matched_residency_ab": {
+    "batch_order": [
+      "residentfill/r1-stream.jsonl",
+      "residentfill/r1-resident.jsonl",
+      "residentfill/r2-resident.jsonl",
+      "residentfill/r2-stream.jsonl",
+      "residentfill/r3-stream.jsonl",
+      "residentfill/r3-resident.jsonl",
+      "residentfill/r4-resident.jsonl",
+      "residentfill/r4-stream.jsonl"
+    ],
+    "median_paired_e2e_ratio": 1.2026151494142534,
+    "median_paired_steady_ratio": 1.378006028165509,
+    "paired_e2e_ratio": [
+      1.2810757625450968,
+      1.1964285714285714,
+      1.2064067694167422,
+      1.1988235294117646
+    ],
+    "paired_steady_ratio": [
+      1.3550243470562195,
+      1.3911130664320281,
+      1.3648989898989898,
+      1.4147186147186146
+    ]
+  },
+  "pinned_gate": "layers=43;argmax=55222;hidden_bf16=5ed8bf88beae3cfe;fp4_accum=block32;final_head=canonical_cpu_streamed_bf16",
+  "residency_cost": {
+    "peak_after_bytes": 8175288320,
+    "peak_before_bytes": 1825112064,
+    "peak_delta_bytes": 6350176256,
+    "steady_saved_per_token": 0.879
+  },
+  "result_files": [
+    "/srv/localmoe/targets/baseline-nonresident-8step.jsonl",
+    "/srv/localmoe/targets/deliver-merge-0918/8step-tele.jsonl",
+    "/srv/localmoe/targets/deliver-merge-0918/ab-all1.jsonl",
+    "/srv/localmoe/targets/deliver-merge-0918/ab-all2.jsonl",
+    "/srv/localmoe/targets/residentfill/r1-stream.jsonl",
+    "/srv/localmoe/targets/residentfill/r1-resident.jsonl",
+    "/srv/localmoe/targets/residentfill/r2-resident.jsonl",
+    "/srv/localmoe/targets/residentfill/r2-stream.jsonl",
+    "/srv/localmoe/targets/residentfill/r3-stream.jsonl",
+    "/srv/localmoe/targets/residentfill/r3-resident.jsonl",
+    "/srv/localmoe/targets/residentfill/r4-resident.jsonl",
+    "/srv/localmoe/targets/residentfill/r4-stream.jsonl",
+    "/srv/localmoe/targets/ab-fanout-fanoutflip/8step-fanout-on.jsonl",
+    "/srv/localmoe/targets/ab-fanout-fanoutflip/8step-fanout-off.jsonl",
+    "/srv/localmoe/targets/ab-fanout-fanoutflip-off/8step-fanout-off.jsonl",
+    "/srv/localmoe/targets/ab-fanout-fanoutflip-off/8step-fanout-on.jsonl"
+  ],
+  "rows": [
+    {
+      "arm": "A",
+      "commit": "04bcf43",
+      "label": "pinned baseline (anchor)",
+      "matched_ab": false,
+      "peak_device_bytes": 1466499072,
+      "request_e2e_s": [
+        103.381
+      ],
+      "sources": [
+        "/srv/localmoe/targets/baseline-nonresident-8step.jsonl"
+      ],
+      "steady_s_per_token": [
+        12.873
+      ]
+    },
+    {
+      "arm": "C",
+      "commit": "b620ef7 tree",
+      "label": "residency off",
+      "matched_ab": true,
+      "peak_device_bytes": 1825112064,
+      "request_e2e_s": [
+        39.06,
+        38.19,
+        39.92,
+        40.76
+      ],
+      "sources": [
+        "/srv/localmoe/targets/residentfill/r1-stream.jsonl",
+        "/srv/localmoe/targets/residentfill/r2-stream.jsonl",
+        "/srv/localmoe/targets/residentfill/r3-stream.jsonl",
+        "/srv/localmoe/targets/residentfill/r4-stream.jsonl"
+      ],
+      "steady_s_per_token": [
+        3.061,
+        3.162,
+        3.243,
+        3.268
+      ]
+    },
+    {
+      "arm": "D",
+      "commit": "b620ef7",
+      "label": "residency on",
+      "matched_ab": true,
+      "peak_device_bytes": 8175288320,
+      "request_e2e_s": [
+        30.49,
+        31.92,
+        33.09,
+        34.0
+      ],
+      "sources": [
+        "/srv/localmoe/targets/residentfill/r1-resident.jsonl",
+        "/srv/localmoe/targets/residentfill/r2-resident.jsonl",
+        "/srv/localmoe/targets/residentfill/r3-resident.jsonl",
+        "/srv/localmoe/targets/residentfill/r4-resident.jsonl"
+      ],
+      "steady_s_per_token": [
+        2.259,
+        2.273,
+        2.376,
+        2.31
+      ]
+    },
+    {
+      "arm": "E-off",
+      "commit": "9799a0c",
+      "label": "routed fanout off",
+      "matched_ab": true,
+      "peak_device_bytes": 8175288320,
+      "request_e2e_s": [
+        27.893,
+        28.496
+      ],
+      "sources": [
+        "/srv/localmoe/targets/ab-fanout-fanoutflip/8step-fanout-off.jsonl",
+        "/srv/localmoe/targets/ab-fanout-fanoutflip-off/8step-fanout-off.jsonl"
+      ],
+      "steady_s_per_token": [
+        2.388,
+        2.403
+      ]
+    },
+    {
+      "arm": "E",
+      "commit": "9799a0c",
+      "label": "routed fanout on (default)",
+      "matched_ab": true,
+      "peak_device_bytes": 8242397184,
+      "request_e2e_s": [
+        25.114,
+        25.151
+      ],
+      "sources": [
+        "/srv/localmoe/targets/ab-fanout-fanoutflip/8step-fanout-on.jsonl",
+        "/srv/localmoe/targets/ab-fanout-fanoutflip-off/8step-fanout-on.jsonl"
+      ],
+      "steady_s_per_token": [
+        1.986,
+        1.977
+      ]
+    }
+  ],
+  "schema": "localmoe-sm120-readme-figures-v1",
+  "steady_s_per_token": {
+    "A": 12.873,
+    "C": 3.1835,
+    "D": 2.3045,
+    "E": 1.9815,
+    "E-off": 2.3955
+  },
+  "workload": "8-token greedy request, token ID 0, drop_caches before each run; steady = generated tokens 1-7"
+}
