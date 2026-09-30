@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from serve_vs_cli_sum import serve_steady  # noqa: E402
 
 IDS = re.compile(r"ids=(\S+)")
-ARM_FILE = re.compile(r"^serve-(off|on)-r(\d+)\.log$")
+ARM_FILE = re.compile(r"^serve-(off|on|default)-r(\d+)\.log$")
 
 
 def id_string(path):
@@ -62,7 +62,7 @@ def main():
             print(f"  ids={value}")
 
     print()
-    for arm in ("off", "on"):
+    for arm in ("off", "on", "default"):
         values = [row[4] for row in rows if row[0] == arm]
         if values:
             print(f"{arm:<3} steady per char: {statistics.mean(values):.3f} s "

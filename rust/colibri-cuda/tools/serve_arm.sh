@@ -2,6 +2,7 @@
 # 服务面的换臂验证：同一个二进制、一个 flag 两臂交错，比生成 id 串与稳态每字。
 #
 #   usage: ARM=COLIBRI_V4_FLASH_ROUTED_FANOUT LABEL=fanout serve_arm.sh <commit-ish> [tag] [rounds]
+#          ARMS="default" ...      # 只跑"不设臂变量"的默认面（翻默认后确认发货形状）
 #
 # 服务面不带 digest，它的数值证据是引擎 `stats` 行里的 `ids=`。判据两条：
 #   1. 所有臂、所有轮次的 8 个 id 串逐字符相同（服务面唯一的数值闸门）。
@@ -58,21 +59,42 @@ sha256sum "$BIN"
 serve_arm() { # name value
   local name=$1 value=$2
   echo "################ serve $name  $ARM=$value  $(date +%H:%M:%S) ################"
-  env "$ARM=$value" COLIBRI_V4_FLASH_SERVE_PHASE_JSONL="$OUT/serve-$name-phase.jsonl" \
-    python3 "$TOOLS/flash_serve_client.py" \
-      --binary "$BIN" \
-      --model-dir "$MODEL" \
-      --cublas-lib "$CUBLAS" \
-      --prompt-json '"\u4f60\u597d\uff0c\u4f60\u662f\u8c01\uff1f"' \
-      --max-tokens 8 --repeat 1 \
-      > "$OUT/serve-$name.log" 2>&1
+  if [ "$value" = "default" ]; then
+    # No arm variable at all: this is the shipping default face.
+    env COLIBRI_V4_FLASH_SERVE_PHASE_JSONL="$OUT/serve-$name-phase.jsonl" \
+      python3 "$TOOLS/flash_serve_client.py" \
+        --binary "$BIN" \
+        --model-dir "$MODEL" \
+        --cublas-lib "$CUBLAS" \
+        --prompt-json '"\u4f60\u597d\uff0c\u4f60\u662f\u8c01\uff1f"' \
+        --max-tokens 8 --repeat 1 \
+        > "$OUT/serve-$name.log" 2>&1
+  else
+    env "$ARM=$value" COLIBRI_V4_FLASH_SERVE_PHASE_JSONL="$OUT/serve-$name-phase.jsonl" \
+      python3 "$TOOLS/flash_serve_client.py" \
+        --binary "$BIN" \
+        --model-dir "$MODEL" \
+        --cublas-lib "$CUBLAS" \
+        --prompt-json '"\u4f60\u597d\uff0c\u4f60\u662f\u8c01\uff1f"' \
+        --max-tokens 8 --repeat 1 \
+        > "$OUT/serve-$name.log" 2>&1
+  fi
   echo "exit=$?  $(date +%H:%M:%S)"
   grep -E "^stats" "$OUT/serve-$name.log" | head -1 | cut -c1-220
 }
 
+# `ARMS` picks which arms each round runs; `default` means "do not set the arm
+# variable at all", which is how the shipping default face gets measured.
+ARMS=${ARMS:-"off on"}
 for i in $(seq 1 "$ROUNDS"); do
-  serve_arm off-r$i 0
-  serve_arm on-r$i 1
+  for arm in $ARMS; do
+    case "$arm" in
+      off) serve_arm off-r$i 0 ;;
+      on) serve_arm on-r$i 1 ;;
+      default) serve_arm default-r$i default ;;
+      *) echo "unknown arm: $arm (use off, on or default)"; exit 9 ;;
+    esac
+  done
 done
 
 echo "################ 2/3 id strings and steady per arm ################"
