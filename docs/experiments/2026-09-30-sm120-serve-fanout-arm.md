@@ -95,6 +95,17 @@ on - off = -0.464 s/char
 - `/srv/localmoe/targets/servearm-fanout-servearm1/serve-{off,on}-r{1,2,3}-phase.jsonl`
   （6 个，各 1 条记录——**服务面相位账第一次有数据**，见未决事项 6）
 
+### ②b 翻默认之后补的两跑（同一棵树、翻默认后的二进制）
+
+翻完默认（`9799a0c`）之后又跑了两件事，用的是包含翻默认的二进制
+`ccf1f59dbd252829d4cd1b75d973fe11e360460cbe755cc719d751cc32990dd0`：
+
+1. **一轮交错（off/on）**：`2.182 → 1.777 s/字`，id 串与上表 6 跑相同。目录
+   `/srv/localmoe/targets/servearm-fanout-defaultface/`。
+2. **发货默认面**（不设任何 fan-out 变量，`ARMS=default`）：`1.756 s/字`、首字 `19.4 s`、
+   id 串仍然相同。目录 `/srv/localmoe/targets/servearm-fanout-defaultface2/`。
+   **这是交付面真正跑的形状**，所以"翻默认之后服务面等于开臂"这句话现在是量到的，不是推的。
+
 ### ③ 翻默认之后的命令行闸门（`9799a0c`）
 
 `tools/verify_delivery_arm.sh 9799a0c <tag>`，`ARM=COLIBRI_V4_FLASH_ROUTED_FANOUT LABEL=fanout`，
@@ -151,8 +162,9 @@ lane 自己的链子里，不是 MLP 变快）。
 
 1. **服务面多请求并发没验**。fan-out 每请求多占 `64 MiB` 显存 + `64 MiB` 锁页主机内存；服务面
    几路并发就乘几。常驻的预检只挡 OOM 不挡性能（`现状.md` §四.5），并发预算要重算。
-2. **`serve_vs_cli.sh` 与换臂现在是两件事**。要不要合成"每个臂都两面都跑"的一条批（那才是完整
-   的"翻默认之前两面都验"），没定。
+2. **`serve_vs_cli.sh` 与换臂现在是两件事**。`serve_arm.sh` 现在吃 `ARMS="off on default"`，
+   所以"某个臂在服务面"和"发货默认面在服务面"各自一条命令；但"两面同臂"（同一个臂同时在
+   命令行和服务面各跑一遍再对照）还不存在，要不要合成一条没定。
 3. **A2（`COLIBRI_V4_ROUTED_EXPERT_CACHE`）默认值仍待拍板**：叠在 fan-out 上只再省
    `0.07 s/token`，代价 `3.2 GiB` 锁页主机内存。本身逐位安全。
 4. **fan-out 的六套槽位里有一套是浪费的**（约 `60 MiB` 设备 + `60 MiB` 锁页），见
