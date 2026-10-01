@@ -521,7 +521,7 @@ pub(crate) fn run_certified_argmax_p0(
     })
 }
 
-pub(crate) fn run_id_only_final_head(
+pub(crate) fn step_id_only_final_head(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,

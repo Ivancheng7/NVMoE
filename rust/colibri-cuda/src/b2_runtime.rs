@@ -393,7 +393,7 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_with_weights(
     })
 }
 
-pub(crate) fn run_b2_layer<'module>(
+pub(crate) fn step_b2_layer<'module>(
     context: &std::sync::Arc<CudaContext>,
     module: &'module kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
@@ -413,7 +413,7 @@ pub(crate) fn run_b2_layer<'module>(
     let spec = runtime.weights.spec;
     let mut result = None;
     persistent.transaction(layer, |state| {
-        let run = run_real_layer_rows(
+        let run = step_real_layer_rows(
             context,
             module,
             stream,
@@ -478,7 +478,7 @@ pub(crate) fn prepare_b2_prefix(
         let mut next = None;
         persistent.transaction(layer, |state| {
             next = Some(
-                run_real_layer_rows(
+                step_real_layer_rows(
                     context,
                     module,
                     stream,
@@ -574,7 +574,7 @@ pub(crate) fn prepare_two_token_prefix(
             let mut next = None;
             persistent.transaction(layer, |state| {
                 next = Some(
-                    run_real_layer_rows(
+                    step_real_layer_rows(
                         context,
                         module,
                         stream,

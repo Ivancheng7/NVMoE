@@ -267,7 +267,7 @@ pub(crate) fn prepare_qd4_stationary_gate_inputs(
             let mut next = None;
             persistent.transaction(layer, |state| {
                 next = Some(
-                    run_real_layer_rows(
+                    step_real_layer_rows(
                         context,
                         module,
                         stream,

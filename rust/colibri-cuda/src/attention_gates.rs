@@ -99,7 +99,7 @@ pub(crate) fn commit_layer_attention_state(
                     .into_iter()
                     .map(v4_router::f32_to_bf16_rne)
                     .collect::<Vec<_>>();
-                let main = run_l0_rmsnorm(
+                let main = step_l0_rmsnorm(
                     module,
                     stream,
                     &main,
@@ -107,7 +107,7 @@ pub(crate) fn commit_layer_attention_state(
                     v4_state::Q_HEAD_DIM,
                 )?;
                 let position = absolute + 1 - ratio;
-                let main = run_l0_rope(
+                let main = step_l0_rope(
                     module,
                     stream,
                     &main,
@@ -115,7 +115,7 @@ pub(crate) fn commit_layer_attention_state(
                     1,
                     false,
                 )?;
-                let main = run_l0_kv_quantize(module, stream, &main)?;
+                let main = step_l0_kv_quantize(module, stream, &main)?;
                 state.append_compressed_kv_row(absolute / ratio, &main)?;
             }
             (Some(main), Some(index))
@@ -131,22 +131,22 @@ pub(crate) fn commit_layer_attention_state(
                     .into_iter()
                     .map(v4_router::f32_to_bf16_rne)
                     .collect::<Vec<_>>();
-                let main = run_l0_rmsnorm(
+                let main = step_l0_rmsnorm(
                     module,
                     stream,
                     &main,
                     &weights.compressor_norm,
                     v4_state::Q_HEAD_DIM,
                 )?;
-                let main = run_l0_rope(module, stream, &main, &freqs, 1, false)?;
-                let main = run_l0_kv_quantize(module, stream, &main)?;
+                let main = step_l0_rope(module, stream, &main, &freqs, 1, false)?;
+                let main = step_l0_kv_quantize(module, stream, &main)?;
                 state.append_compressed_kv_row(absolute / ratio, &main)?;
 
                 let index = index
                     .into_iter()
                     .map(v4_router::f32_to_bf16_rne)
                     .collect::<Vec<_>>();
-                let index = run_l0_rmsnorm(
+                let index = step_l0_rmsnorm(
                     module,
                     stream,
                     &index,
@@ -292,7 +292,7 @@ pub(crate) fn run_targeted_attention_audit(
     }
 
     let freqs = v4_state::compressed_rope_freqs(position);
-    let attn_hc = run_l0_mhc_pre(
+    let attn_hc = step_l0_mhc_pre(
         module,
         stream,
         hc_hidden,
@@ -308,25 +308,25 @@ pub(crate) fn run_targeted_attention_audit(
         targeted_stage_f32("input.hc_post", &attn_hc.post, &actual_post),
         targeted_stage_f32("input.hc_comb", &attn_hc.comb, &actual_comb),
     ]);
-    let attn_input = run_l0_rmsnorm(
+    let attn_input = step_l0_rmsnorm(
         module,
         stream,
         &attn_hc.collapsed,
         &weights.attn_norm,
         v4_state::HIDDEN,
     )?;
-    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
-    let q_lora = run_l0_rmsnorm(
+    let (_, q_lora_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let q_lora = step_l0_rmsnorm(
         module,
         stream,
         &q_lora_raw,
         &weights.q_norm,
         weights.wq_a.out_features,
     )?;
-    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let (_, q_raw) = step_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
     let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
-    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
-    let q_rope = run_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
+    let q_norm = step_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    let q_rope = step_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
     stages.extend([
         targeted_stage_u16(
             "input.attn_input",
@@ -362,7 +362,7 @@ pub(crate) fn run_targeted_attention_audit(
         compressed_per_row: 1,
     };
     let reference_sparse =
-        run_sparse_attention(module, stream, &q_rope, &cache, &weights.attn_sink, &topk)?;
+        step_sparse_attention(module, stream, &q_rope, &cache, &weights.attn_sink, &topk)?;
     let q_device = DeviceBuffer::from_host(stream, &q_rope)?;
     let cache_device = DeviceBuffer::from_host(stream, &cache)?;
     let topk_device = DeviceBuffer::from_host(stream, expected_topk)?;
@@ -412,7 +412,7 @@ pub(crate) fn run_targeted_attention_audit(
         ),
     ]);
 
-    let sparse_inverse = run_l0_rope(
+    let sparse_inverse = step_l0_rope(
         module,
         stream,
         &reference_sparse,
@@ -422,8 +422,8 @@ pub(crate) fn run_targeted_attention_audit(
     )?;
     let wo_a = run_l0_wo_a(module, stream, &sparse_inverse, &weights.wo_a)?;
     let (attention_f32, attention) =
-        run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
-    let attention_post = run_l0_hc_post(
+        step_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let attention_post = step_l0_hc_post(
         module,
         stream,
         &attention,
@@ -577,7 +577,7 @@ pub(crate) fn run_sparse_attention_topk_sweep(
             let mut candidate_state =
                 SparseAttentionScoreReuseScratch::new(stream, 1, topk_per_row)?;
             for _ in 0..2 {
-                run_sparse_attention_device_into(
+                step_sparse_attention_device_into(
                     module,
                     stream,
                     &q,
@@ -587,7 +587,7 @@ pub(crate) fn run_sparse_attention_topk_sweep(
                     &mut reference,
                     topk_per_row,
                 )?;
-                run_sparse_attention_score_reuse_device_into(
+                step_sparse_attention_score_reuse_device_into(
                     module,
                     stream,
                     &q,
@@ -620,7 +620,7 @@ pub(crate) fn run_sparse_attention_topk_sweep(
                 } {
                     start.record(stream)?;
                     match arm {
-                        SparseAttentionArm::Reference => run_sparse_attention_device_into(
+                        SparseAttentionArm::Reference => step_sparse_attention_device_into(
                             module,
                             stream,
                             &q,
@@ -631,7 +631,7 @@ pub(crate) fn run_sparse_attention_topk_sweep(
                             topk_per_row,
                         )?,
                         SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
-                            run_sparse_attention_score_reuse_device_into(
+                            step_sparse_attention_score_reuse_device_into(
                                 module,
                                 stream,
                                 &q,
@@ -1024,7 +1024,7 @@ pub(crate) fn run_pinned_fixed_worker_boundary_gate(
         let main = std::sync::Arc::clone(stream);
         let transfer_worker = std::sync::Arc::clone(&transfer);
         let mut worker = Some(scope.spawn(move || {
-            run_pinned_fixed_request_worker(
+            step_pinned_fixed_request_worker(
                 cache,
                 slots,
                 &model_dir,
@@ -1224,7 +1224,7 @@ pub(crate) fn run_pinned_fixed_worker_boundary_gate(
             "slot_count": 2,
             "request_channel_capacity": 2,
             "reply_channel_capacity": 2,
-            "production_worker_loop": "run_pinned_fixed_request_worker",
+            "production_worker_loop": "step_pinned_fixed_request_worker",
             "compute": "none; main records runtime_done immediately after ready",
             "host_origin_setup": {
                 "layer": LAYERS[2],
@@ -1678,7 +1678,7 @@ pub(crate) fn run_real_v4_device_token_state_gate(
         for position in 0..5 {
             let mut host_attention = None;
             canonical.transaction(layer, |state| {
-                let run = run_real_layer_attention_rows(
+                let run = step_real_layer_attention_rows(
                     module,
                     stream,
                     None,
@@ -1701,7 +1701,7 @@ pub(crate) fn run_real_v4_device_token_state_gate(
                     .layer(layer)
                     .ok_or("canonical token-state gate layer disappeared")?,
             );
-            run_device_token_state_commit_row(
+            step_device_token_state_commit_row(
                 module,
                 stream,
                 &runtime,
@@ -1721,7 +1721,7 @@ pub(crate) fn run_real_v4_device_token_state_gate(
                 require_compressor_state,
             )?;
             let attention = {
-                let (output, topk) = run_device_attention_after_commit(
+                let (output, topk) = step_device_attention_after_commit(
                     module, stream, &runtime, candidate, &rope_lut, position, true,
                 )?;
                 let (expected_output, expected_topk) =
@@ -1998,7 +1998,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
         SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW).unwrap();
     let mut candidate_state =
         SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW).unwrap();
-    run_sparse_attention_device_into(
+    step_sparse_attention_device_into(
         &module,
         &stream,
         &q,
@@ -2020,7 +2020,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
         v4_state::KV_WINDOW,
     )
     .unwrap();
-    run_sparse_attention_score_reuse_device_into(
+    step_sparse_attention_score_reuse_device_into(
         &module,
         &stream,
         &q,
@@ -2066,7 +2066,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     let mut candidate_129 = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
     let mut reference_state_130 = SparseAttentionScoreReuseScratch::new(&stream, 1, 130).unwrap();
     let mut candidate_state_130 = SparseAttentionScoreReuseScratch::new(&stream, 1, 130).unwrap();
-    run_sparse_attention_device_into(
+    step_sparse_attention_device_into(
         &module,
         &stream,
         &q,
@@ -2088,7 +2088,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
         129,
     )
     .unwrap();
-    run_sparse_attention_score_reuse_device_into(
+    step_sparse_attention_score_reuse_device_into(
         &module,
         &stream,
         &q,
@@ -2136,7 +2136,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     for sine in inverse_freqs_host.iter_mut().skip(1).step_by(2) {
         *sine = -*sine;
     }
-    let reference_inverse = run_l0_rope(
+    let reference_inverse = step_l0_rope(
         &module,
         &stream,
         &reference_sparse,
@@ -2147,7 +2147,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     .unwrap();
     let inverse_freqs = DeviceBuffer::from_host(&stream, &inverse_freqs_host).unwrap();
     let mut candidate_inverse = DeviceBuffer::<u16>::zeroed(&stream, q_host.len()).unwrap();
-    run_rope_device_into(
+    step_rope_device_into(
         &module,
         &stream,
         &candidate,
@@ -2174,7 +2174,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     drop(wo_a_host);
     let reference_wo_a = run_l0_wo_a(&module, &stream, &reference_inverse, &wo_a).unwrap();
     let mut candidate_wo_a = DeviceBuffer::<u16>::zeroed(&stream, wo_a_width).unwrap();
-    run_l0_wo_a_device_into(
+    step_l0_wo_a_device_into(
         &module,
         &stream,
         &candidate_inverse,
@@ -2216,8 +2216,8 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
         DeviceBuffer::<f32>::zeroed(&stream, v4_state::HIDDEN).unwrap();
     let mut candidate_attention = DeviceBuffer::<u16>::zeroed(&stream, v4_state::HIDDEN).unwrap();
     let (reference_attention_f32, reference_attention) =
-        run_l0_fp8_linear(&module, &stream, &reference_wo_a, &wo_b, false).unwrap();
-    run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear(&module, &stream, &reference_wo_a, &wo_b, false).unwrap();
+    step_l0_fp8_linear_device_into(
         &module,
         &stream,
         &candidate_wo_a,
@@ -2244,7 +2244,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     let residual_host = vec![0_u16; v4_state::HC * v4_state::HIDDEN];
     let post_host = [1.0_f32; v4_state::HC];
     let comb_host = [0.0_f32; v4_state::HC * v4_state::HC];
-    let reference_post = run_l0_hc_post(
+    let reference_post = step_l0_hc_post(
         &module,
         &stream,
         &reference_attention,
@@ -2258,7 +2258,7 @@ pub(crate) fn sparse_attention_score_reuse_k128_attention_post_microgate() {
     let comb = DeviceBuffer::from_host(&stream, &comb_host).unwrap();
     let mut candidate_post =
         DeviceBuffer::<u16>::zeroed(&stream, v4_state::HC * v4_state::HIDDEN).unwrap();
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         &module,
         &stream,
         &candidate_attention,

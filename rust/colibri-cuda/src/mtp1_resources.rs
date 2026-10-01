@@ -407,7 +407,7 @@ pub(crate) fn probe_mtp1_candidate_locals(
     probe: &mut StationaryMtpCapacityProbe,
     stream: &CudaStream,
 ) -> Result<(), Box<dyn Error>> {
-    // Keep this list in the same ownership shape as run_mtp1_draft_candidate.
+    // Keep this list in the same ownership shape as step_mtp1_draft_candidate.
     // `q`, cache, sparse, and score scratch remain live until after the head.
     probe.u16(stream, v4_state::HIDDEN)?; // enorm
     probe.u16(stream, v4_state::HIDDEN)?; // hnorm

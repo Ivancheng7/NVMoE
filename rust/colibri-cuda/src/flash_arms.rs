@@ -297,7 +297,7 @@ pub(crate) struct MhcCublasBuffers {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_flash_mhc_cublas_linear_device_into(
+pub(crate) fn step_flash_mhc_cublas_linear_device_into(
     session: &FlashCublasSession,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -404,7 +404,7 @@ pub(crate) struct RouterCublasBuffers {
     pub(crate) _gate_f32: DeviceBuffer<f32>,
 }
 
-pub(crate) fn run_flash_router_cublas_linear_device_into(
+pub(crate) fn step_flash_router_cublas_linear_device_into(
     session: &FlashCublasSession,
     module: &kernels::LoadedModule,
     stream: &CudaStream,

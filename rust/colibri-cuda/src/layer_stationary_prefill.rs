@@ -663,7 +663,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             manifest.layer,
                             &hidden[token_position],
                             |host_state, mirror_hidden| {
-                                run_real_layer_attention_rows(
+                                step_real_layer_attention_rows(
                                     module,
                                     stream,
                                     None,
@@ -725,7 +725,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             .as_mut()
                             .ok_or("generic stationary lifecycle disappeared")?;
                         lifecycle.begin_layer(manifest.layer, token_position)?;
-                        let run = run_real_layer_rows(
+                        let run = step_real_layer_rows(
                             context,
                             module,
                             stream,
@@ -759,7 +759,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                         lifecycle.commit_layer(manifest.layer, token_position)?;
                         completed = Some(run);
                     } else if device_attention && !device_attention_audit {
-                        completed = Some(run_real_layer_rows(
+                        completed = Some(step_real_layer_rows(
                             context,
                             module,
                             stream,
@@ -803,7 +803,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 .transpose()?;
                             let expected_attention = if device_attention {
                                 let oracle_started = std::time::Instant::now();
-                                let oracle = run_real_layer_attention_rows(
+                                let oracle = step_real_layer_attention_rows(
                                     module,
                                     stream,
                                     None,
@@ -824,7 +824,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             } else {
                                 None
                             };
-                            let mut run = run_real_layer_rows(
+                            let mut run = step_real_layer_rows(
                                 context,
                                 module,
                                 stream,
@@ -1458,7 +1458,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
     let final_weights = v4_state::load_final_head(root)?;
     let final_fixed_read_ns = final_load_started
         .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    let final_decision = run_id_only_final_head(
+    let final_decision = step_id_only_final_head(
         context,
         module,
         stream,
@@ -1472,8 +1472,8 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
         let position = prompt_len - 1;
         let alignment = mtp1_alignment(prompt_len, position)?;
         let Mtp1Qd4Attempt { result, loan } =
-            run_with_mtp1_qd4_loan(qd4_lanes.as_deref_mut(), true, |borrowed_qd4_lane| {
-                run_mtp1_draft_candidate(
+            step_with_mtp1_qd4_loan(qd4_lanes.as_deref_mut(), true, |borrowed_qd4_lane| {
+                step_mtp1_draft_candidate(
                     context,
                     module,
                     stream,
@@ -1638,7 +1638,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                 let main = std::sync::Arc::clone(stream);
                 let transfer_worker = std::sync::Arc::clone(&transfer);
                 let mut worker = Some(scope.spawn(move || {
-                    run_pinned_fixed_request_worker(
+                    step_pinned_fixed_request_worker(
                         pipeline_cache,
                         slots,
                         root,
@@ -1742,7 +1742,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 manifest.layer,
                                 &decode_hidden,
                                 |host_state, mirror_hidden| {
-                                    run_real_layer_attention_rows(
+                                    step_real_layer_attention_rows(
                                         module,
                                         stream,
                                         None,
@@ -1788,7 +1788,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             let before = state.committed_rows;
                             let run = {
                                 let runtime = prepared.runtime();
-                                run_real_layer_rows(
+                                step_real_layer_rows(
                                     context,
                                     module,
                                     stream,
@@ -1958,7 +1958,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                         };
                         let next_final_scope_started_ns =
                             phase_profile.then(|| timeline_elapsed_ns(request_started));
-                        let next = run_id_only_final_head(
+                        let next = step_id_only_final_head(
                             context,
                             module,
                             stream,
@@ -1993,11 +1993,11 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 .ok_or("stationary MTP lost lifecycle after worker drain")?
                                 .assert_drained()?;
                             let alignment = mtp1_alignment(prompt_len, token_position)?;
-                            let Mtp1Qd4Attempt { result, loan } = run_with_mtp1_qd4_loan(
+                            let Mtp1Qd4Attempt { result, loan } = step_with_mtp1_qd4_loan(
                                 qd4_lanes.as_deref_mut(),
                                 worker_drained,
                                 |borrowed_qd4_lane| {
-                                    run_mtp1_draft_candidate(
+                                    step_mtp1_draft_candidate(
                                         context,
                                         module,
                                         stream,
@@ -2295,7 +2295,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                         .ok_or("pinned fixed worker lost its transfer stream")?;
                     let main = std::sync::Arc::clone(stream);
                     Some(scope.spawn(move || {
-                        run_pinned_fixed_request_worker(
+                        step_pinned_fixed_request_worker(
                             cache,
                             pipeline_slots,
                             root,
@@ -2420,7 +2420,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                                 .as_mut()
                                 .ok_or("short device decode audit lost its host persistent state")?
                                 .transaction(manifest.layer, |host_state| {
-                                    let run = run_real_layer_rows(
+                                    let run = step_real_layer_rows(
                                         context,
                                         module,
                                         stream,
@@ -2464,7 +2464,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                             );
                         }
                         let kv_rows_before = state.committed_rows;
-                        let mut run = run_real_layer_rows(
+                        let mut run = step_real_layer_rows(
                             context,
                             module,
                             stream,
@@ -2654,7 +2654,7 @@ pub(crate) fn run_real_v4_layer_stationary_prefill(
                     }
                     let decode_final_scope_started_ns =
                         phase_profile.then(|| timeline_elapsed_ns(request_started));
-                    let decode_decision = run_id_only_final_head(
+                    let decode_decision = step_id_only_final_head(
                         context,
                         module,
                         stream,

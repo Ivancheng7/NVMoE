@@ -1,5 +1,24 @@
 # Rust 侧模块划分（2026-09-16 拆分完成记录）
 
+> 表里的行数是 2026-09-16 的快照，之后一直在漂；名字和职责是准的，行数只当量级看。
+
+## 命名规约（2026-10-01）
+
+顶层函数的前缀区分两件**不同**的事，不要再混：
+
+- **`run_*` = 一个可以单独跑的程序。** 它自己解析输入、跑完打印或写结果文件，入口挂在
+  `main.rs` 的 if 链上（受 `COLIBRI_V4_*` 开关控制）。
+- **`step_*` = 模型执行里的一步。** 它被执行路径调用，不自己解析参数。
+
+2026-10-01 之前两者都叫 `run_*`（140 个），引擎步骤和实验程序在名字上无法区分，
+读代码只能靠猜。改名只动标识符，不动行为。
+
+判断一个新函数该用哪边，**看调用者，不看名字**：只有 `main.rs` 或测试调它 → 程序；
+被执行路径（`layer_rows.rs`、`layer_ops.rs`、`generate.rs`、`device_attention.rs`、
+`attention_device_chain.rs`、`qd4.rs`、`layer_stationary_prefill.rs` 等）调它 → 步骤。
+`validate_*`、`*_gate`、`*_preflight`、`*_audit`、`*_bench`、`*_sweep` 一律算程序那一侧，
+**即使它被执行路径调用**（审计不是一步计算）。
+
 ## 现状
 
 `rust/colibri-cuda/src/main.rs` 原来是一个 45,540 行的单文件，现在 **559 行**：只剩 crate 属性、
@@ -16,7 +35,7 @@
 | `generate.rs` | B2/B4 生成、Flash base/serve/dspark、stationary 基准入口 | 2,518 |
 | `attention_gates.rs` | attention 门禁与审计入口：topk sweep、wavefront、device token-state 门禁、cache-off | 2,279 |
 | `mtp1_l0.rs` | mtp1 容量预检/草稿候选，L0 行与 compressor 检查 | 1,605 |
-| `layer_rows.rs` | `run_real_layer_rows` 与 `run_real_layer_attention_rows` | 1,417 |
+| `layer_rows.rs` | `step_real_layer_rows` 与 `step_real_layer_attention_rows` | 1,417 |
 | `slice_checks.rs` | 各格式原语自检入口（`run_real_v4_*_slice_if_available`） | 1,328 |
 | `qd4.rs` | QD4 常驻缓存、routed 复放与 stationary 门禁 | 1,284 |
 | `fixed_layer_cache.rs` | `FixedLayerCache` 结构体与两个 impl（residency、raw 快照、访问路径） | 1,264 |

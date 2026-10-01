@@ -501,7 +501,7 @@ pub(crate) fn run_attention_arm_a(
     let started = std::time::Instant::now();
     for position in 0..2 {
         persistent.transaction(runtime.weights.layer, |state| {
-            let run = run_real_layer_attention_rows(
+            let run = step_real_layer_attention_rows(
                 module,
                 stream,
                 None,

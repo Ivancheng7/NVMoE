@@ -48,7 +48,7 @@ pub(crate) fn run_b2_serial_request(
         launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
         stream.synchronize()?;
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
-        let run = run_b2_layer(
+        let run = step_b2_layer(
             context,
             module,
             stream,
@@ -216,7 +216,7 @@ pub(crate) fn run_b2_layer_stationary_requests<const REQUESTS: usize>(
                 service_started_ns[request] =
                     Some(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
             }
-            match run_b2_layer(
+            match step_b2_layer(
                 context,
                 module,
                 stream,
@@ -757,7 +757,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                                 .position
                                 .checked_add(offset)
                                 .ok_or("B2 token position overflow")?;
-                            let (next, digest, stage) = run_b2_layer(
+                            let (next, digest, stage) = step_b2_layer(
                                 context,
                                 module,
                                 stream,
@@ -888,7 +888,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                         }
                         FlashFinalHeadArm::GpuExact => {
                             let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu {
-                                (workspace.run_runtime(&state.hidden)?, None)
+                                (workspace.step_runtime(&state.hidden)?, None)
                             } else {
                                 let output_dir = flash_final_head_gpu_production_dir()?;
                                 // Production execution must not require an unrelated
@@ -899,7 +899,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                                 )
                                 .map(|_| serde_json::json!({"config": final_head_capture_config()}));
                                 (
-                                    run_flash_final_head_gpu_exact(
+                                    step_flash_final_head_gpu_exact(
                                         &output_dir,
                                         verification_manifest.as_ref(),
                                         &state.hidden,
@@ -1668,7 +1668,7 @@ pub(crate) fn run_flash_base_input(
         launch_e4m3fn_to_bf16(module, stream, &loaded.raw.wo_a_raw, scratch)?;
         stream.synchronize()?;
         std::mem::swap(&mut loaded.raw.runtime.weights.wo_a, scratch);
-        let result = run_b2_layer(
+        let result = step_b2_layer(
             context,
             module,
             stream,
@@ -1693,7 +1693,7 @@ pub(crate) fn run_flash_base_input(
     if captures.len() != 3 * spec.hidden {
         return Err("Flash-0731 did not capture layers 40/41/42".into());
     }
-    let target = gpu_exact.run_runtime(&hidden)?.output.argmax[0];
+    let target = gpu_exact.step_runtime(&hidden)?.output.argmax[0];
     Ok((captures, u32::try_from(target)?))
 }
 
@@ -1953,7 +1953,7 @@ pub(crate) fn run_real_v4_flash_dspark(
         }
         let mut draft_states = base_before.mtp_swa.clone();
         for (stage, stage_state) in stages.iter().zip(&mut draft_states) {
-            draft_hidden = run_flash_dspark_stage(
+            draft_hidden = step_flash_dspark_stage(
                 context,
                 module,
                 stream,

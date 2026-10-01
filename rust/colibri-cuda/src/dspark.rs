@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn run_device_attention_row(
+pub(crate) fn step_device_attention_row(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     runtime: &LoadedLayerRuntime,
@@ -11,11 +11,11 @@ pub(crate) fn run_device_attention_row(
     observe_topk: bool,
 ) -> Result<RealAttentionRun, Box<dyn Error>> {
     let started = std::time::Instant::now();
-    let rope_lut_d2d_count = run_device_token_state_commit_row(
+    let rope_lut_d2d_count = step_device_token_state_commit_row(
         module, stream, runtime, state, rope_lut, hc_hidden, start_pos,
     )?;
     let commit_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let (output, topk) = run_device_attention_after_commit(
+    let (output, topk) = step_device_attention_after_commit(
         module,
         stream,
         runtime,
@@ -71,8 +71,8 @@ pub(crate) fn flash_dspark_main_x(
         .main_norm
         .as_ref()
         .ok_or("Flash-0731 stage 0 main_norm is missing")?;
-    let projected = run_l0_fp8_linear(module, stream, main_hidden, projection, false)?.1;
-    run_l0_rmsnorm(module, stream, &projected, norm, spec.hidden)
+    let projected = step_l0_fp8_linear(module, stream, main_hidden, projection, false)?.1;
+    step_l0_rmsnorm(module, stream, &projected, norm, spec.hidden)
 }
 
 pub(crate) fn flash_dspark_context_kv(
@@ -86,9 +86,9 @@ pub(crate) fn flash_dspark_context_kv(
     if main_x.len() != spec.hidden {
         return Err("Flash-0731 DSpark main_x contract mismatch".into());
     }
-    let kv = run_l0_fp8_linear(module, stream, main_x, &stage.weights.wkv, false)?.1;
-    let kv = run_l0_rmsnorm(module, stream, &kv, &stage.weights.kv_norm, spec.q_head_dim)?;
-    let kv = run_l0_rope(
+    let kv = step_l0_fp8_linear(module, stream, main_x, &stage.weights.wkv, false)?.1;
+    let kv = step_l0_rmsnorm(module, stream, &kv, &stage.weights.kv_norm, spec.q_head_dim)?;
+    let kv = step_l0_rope(
         module,
         stream,
         &kv,
@@ -96,7 +96,7 @@ pub(crate) fn flash_dspark_context_kv(
         1,
         false,
     )?;
-    run_l0_kv_quantize(module, stream, &kv)
+    step_l0_kv_quantize(module, stream, &kv)
 }
 
 pub(crate) fn advance_flash_dspark_context(
@@ -126,7 +126,7 @@ pub(crate) fn flash_dspark_moe(
     if rows != v4_state::DSPARK_B5_DRAFT_TOKENS {
         return Err("Flash-0731 DSpark MoE requires exactly five rows".into());
     }
-    let ffn_hc = run_l0_mhc_pre(
+    let ffn_hc = step_l0_mhc_pre(
         module,
         stream,
         after_attention,
@@ -134,7 +134,7 @@ pub(crate) fn flash_dspark_moe(
         &stage.weights.hc_ffn_scale,
         &stage.weights.hc_ffn_base,
     )?;
-    let router = run_layer_router(
+    let router = step_layer_router(
         module,
         stream,
         None,
@@ -143,7 +143,7 @@ pub(crate) fn flash_dspark_moe(
         &[],
         false,
     )?;
-    let shared = run_layer_shared_expert(module, stream, &router.input, &stage.weights)?;
+    let shared = step_layer_shared_expert(module, stream, &router.input, &stage.weights)?;
     let mut contributions = (0..rows)
         .map(|_| {
             (0..spec.experts_per_token)
@@ -198,7 +198,7 @@ pub(crate) fn flash_dspark_moe(
             &shared[row * spec.hidden..(row + 1) * spec.hidden],
         )?);
     }
-    run_l0_hc_post(
+    step_l0_hc_post(
         module,
         stream,
         &moe,
@@ -208,7 +208,7 @@ pub(crate) fn flash_dspark_moe(
     )
 }
 
-pub(crate) fn run_flash_dspark_stage(
+pub(crate) fn step_flash_dspark_stage(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
@@ -226,7 +226,7 @@ pub(crate) fn run_flash_dspark_stage(
     {
         return Err("Flash-0731 DSpark stage state/input contract mismatch".into());
     }
-    let attn_hc = run_l0_mhc_pre(
+    let attn_hc = step_l0_mhc_pre(
         module,
         stream,
         x,
@@ -234,24 +234,24 @@ pub(crate) fn run_flash_dspark_stage(
         &stage.weights.hc_attn_scale,
         &stage.weights.hc_attn_base,
     )?;
-    let attn_input = run_l0_rmsnorm(
+    let attn_input = step_l0_rmsnorm(
         module,
         stream,
         &attn_hc.collapsed,
         &stage.weights.attn_norm,
         spec.hidden,
     )?;
-    let q_lora = run_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wq_a, false)?.1;
-    let q_lora = run_l0_rmsnorm(
+    let q_lora = step_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wq_a, false)?.1;
+    let q_lora = step_l0_rmsnorm(
         module,
         stream,
         &q_lora,
         &stage.weights.q_norm,
         spec.q_lora_rank,
     )?;
-    let q = run_l0_fp8_linear(module, stream, &q_lora, &stage.weights.wq_b, true)?.1;
+    let q = step_l0_fp8_linear(module, stream, &q_lora, &stage.weights.wq_b, true)?.1;
     let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
-    let q = run_l0_rmsnorm(module, stream, &q, &unit_norm, spec.q_head_dim)?;
+    let q = step_l0_rmsnorm(module, stream, &q, &unit_norm, spec.q_head_dim)?;
     let mut query_freqs = Vec::with_capacity(rows * v4_state::Q_ROPE_DIM);
     for offset in 1..=rows {
         query_freqs.extend(v4_state::attention_rope_freqs(
@@ -260,29 +260,29 @@ pub(crate) fn run_flash_dspark_stage(
             start_pos + offset,
         )?);
     }
-    let q = run_l0_rope(module, stream, &q, &query_freqs, spec.q_heads, false)?;
-    let query_kv = run_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wkv, false)?.1;
-    let query_kv = run_l0_rmsnorm(
+    let q = step_l0_rope(module, stream, &q, &query_freqs, spec.q_heads, false)?;
+    let query_kv = step_l0_fp8_linear(module, stream, &attn_input, &stage.weights.wkv, false)?.1;
+    let query_kv = step_l0_rmsnorm(
         module,
         stream,
         &query_kv,
         &stage.weights.kv_norm,
         spec.q_head_dim,
     )?;
-    let query_kv = run_l0_rope(module, stream, &query_kv, &query_freqs, 1, false)?;
-    let query_kv = run_l0_kv_quantize(module, stream, &query_kv)?;
+    let query_kv = step_l0_rope(module, stream, &query_kv, &query_freqs, 1, false)?;
+    let query_kv = step_l0_kv_quantize(module, stream, &query_kv)?;
     let main_kv = flash_dspark_context_kv(module, stream, stage, main_x, start_pos)?;
     let mut cache = state.attention_cache_bf16();
     let slot = start_pos % v4_state::KV_WINDOW;
     cache[slot * spec.q_head_dim..(slot + 1) * spec.q_head_dim].copy_from_slice(&main_kv);
     cache.extend_from_slice(&query_kv);
     let topk = v4_state::flash_dspark_b5_topk(start_pos)?;
-    let sparse = run_sparse_attention(module, stream, &q, &cache, &stage.weights.attn_sink, &topk)?;
-    let sparse = run_l0_rope(module, stream, &sparse, &query_freqs, spec.q_heads, true)?;
-    let wo_a = run_l0_wo_a_for(spec, module, stream, &sparse, &stage.weights.wo_a)?;
-    let attention = run_l0_fp8_linear(module, stream, &wo_a, &stage.weights.wo_b, false)?.1;
+    let sparse = step_sparse_attention(module, stream, &q, &cache, &stage.weights.attn_sink, &topk)?;
+    let sparse = step_l0_rope(module, stream, &sparse, &query_freqs, spec.q_heads, true)?;
+    let wo_a = step_l0_wo_a_for(spec, module, stream, &sparse, &stage.weights.wo_a)?;
+    let attention = step_l0_fp8_linear(module, stream, &wo_a, &stage.weights.wo_b, false)?.1;
     let after_attention =
-        run_l0_hc_post(module, stream, &attention, x, &attn_hc.post, &attn_hc.comb)?;
+        step_l0_hc_post(module, stream, &attention, x, &attn_hc.post, &attn_hc.comb)?;
     let output = flash_dspark_moe(context, module, stream, stage, &after_attention)?;
     state.append_kv_row(start_pos, &main_kv)?;
     Ok(output)

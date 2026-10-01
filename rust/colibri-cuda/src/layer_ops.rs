@@ -26,7 +26,7 @@ impl MhcTelemetry {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_l0_mhc_pre_device_into(
+pub(crate) fn step_l0_mhc_pre_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -112,7 +112,7 @@ pub(crate) fn run_l0_mhc_pre_device_into(
     Ok(())
 }
 
-pub(crate) fn run_l0_mhc_pre(
+pub(crate) fn step_l0_mhc_pre(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -120,7 +120,7 @@ pub(crate) fn run_l0_mhc_pre(
     hc_scale: &DeviceBuffer<f32>,
     hc_base: &DeviceBuffer<f32>,
 ) -> Result<MhcGpuOutput, Box<dyn Error>> {
-    run_l0_mhc_pre_with_arm(
+    step_l0_mhc_pre_with_arm(
         module,
         stream,
         input,
@@ -133,7 +133,7 @@ pub(crate) fn run_l0_mhc_pre(
     )
 }
 
-pub(crate) fn run_l0_mhc_pre_with_arm(
+pub(crate) fn step_l0_mhc_pre_with_arm(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -196,7 +196,7 @@ pub(crate) fn run_l0_mhc_pre_with_arm(
         .transpose()?;
     let session = session.or(owned_session.as_ref());
     let cublas_buffers = if linear_arm == FlashMhcLinearArm::Canonical {
-        run_l0_mhc_pre_device_into(
+        step_l0_mhc_pre_device_into(
             module,
             stream,
             &input,
@@ -230,7 +230,7 @@ pub(crate) fn run_l0_mhc_pre_with_arm(
         if let Some((start, _)) = linear_events.as_ref() {
             start.record(stream)?;
         }
-        let buffers = run_flash_mhc_cublas_linear_device_into(
+        let buffers = step_flash_mhc_cublas_linear_device_into(
             session,
             module,
             stream,
@@ -335,7 +335,7 @@ pub(crate) fn run_l0_mhc_pre_with_arm(
     })
 }
 
-pub(crate) fn run_l0_rmsnorm_device_into(
+pub(crate) fn step_l0_rmsnorm_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -364,7 +364,7 @@ pub(crate) fn run_l0_rmsnorm_device_into(
     Ok(())
 }
 
-pub(crate) fn run_flash_learned_rmsnorm_4096_device_into(
+pub(crate) fn step_flash_learned_rmsnorm_4096_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -416,7 +416,7 @@ pub(crate) fn run_flash_learned_rmsnorm_4096_device_into(
     Ok(traced_squares)
 }
 
-pub(crate) fn run_l0_rmsnorm(
+pub(crate) fn step_l0_rmsnorm(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -428,12 +428,12 @@ pub(crate) fn run_l0_rmsnorm(
     }
     let input = DeviceBuffer::from_host(stream, input)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
-    run_l0_rmsnorm_device_into(module, stream, &input, norm, &mut output, width)?;
+    step_l0_rmsnorm_device_into(module, stream, &input, norm, &mut output, width)?;
     Ok(output.to_host_vec(stream)?)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_l0_fp8_linear_device_into(
+pub(crate) fn step_l0_fp8_linear_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -490,7 +490,7 @@ pub(crate) fn run_l0_fp8_linear_device_into(
     Ok(())
 }
 
-pub(crate) fn run_l0_fp8_linear(
+pub(crate) fn step_l0_fp8_linear(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -511,7 +511,7 @@ pub(crate) fn run_l0_fp8_linear(
     let mut dequantized = DeviceBuffer::<u16>::zeroed(stream, 0)?;
     let mut output_f32 = DeviceBuffer::<f32>::zeroed(stream, rows * matrix.out_features)?;
     let mut output_bf16 = DeviceBuffer::<u16>::zeroed(stream, rows * matrix.out_features)?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &input,
@@ -807,7 +807,7 @@ pub(crate) fn flash_parity_dump_u8(
     flash_parity_dump_bytes(dir, name, FlashParityDtype::U8, shape, values)
 }
 
-pub(crate) fn run_l0_rope(
+pub(crate) fn step_l0_rope(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -853,11 +853,11 @@ pub(crate) fn run_rope(
     let input = DeviceBuffer::from_host(stream, input)?;
     let freqs = DeviceBuffer::from_host(stream, &freqs)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len())?;
-    run_rope_device_into(module, stream, &input, &freqs, &mut output, heads, head_dim)?;
+    step_rope_device_into(module, stream, &input, &freqs, &mut output, heads, head_dim)?;
     Ok(output.to_host_vec(stream)?)
 }
 
-pub(crate) fn run_rope_device_into(
+pub(crate) fn step_rope_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -890,7 +890,7 @@ pub(crate) fn run_rope_device_into(
     Ok(())
 }
 
-pub(crate) fn run_l0_kv_quantize_device_into(
+pub(crate) fn step_l0_kv_quantize_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -930,7 +930,7 @@ pub(crate) fn run_l0_kv_quantize_device_into(
     Ok(())
 }
 
-pub(crate) fn run_l0_kv_quantize(
+pub(crate) fn step_l0_kv_quantize(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -943,11 +943,11 @@ pub(crate) fn run_l0_kv_quantize(
     let input = DeviceBuffer::from_host(stream, input)?;
     let mut empty = DeviceBuffer::<u8>::zeroed(stream, 0)?;
     let mut scales = DeviceBuffer::<u8>::zeroed(stream, rows * 7)?;
-    run_l0_kv_quantize_device_into(module, stream, &input, &mut empty, &mut scales, &mut output)?;
+    step_l0_kv_quantize_device_into(module, stream, &input, &mut empty, &mut scales, &mut output)?;
     Ok(output.to_host_vec(stream)?)
 }
 
-pub(crate) fn run_layer_compressor(
+pub(crate) fn step_layer_compressor(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
@@ -1065,7 +1065,7 @@ pub(crate) fn run_compressor(
     let mut kv = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
     let mut score = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
     let mut score_plus_ape = DeviceBuffer::<f32>::zeroed(stream, rows * outputs)?;
-    run_compressor_device_into(
+    step_compressor_device_into(
         module,
         stream,
         &input,
@@ -1586,7 +1586,7 @@ pub(crate) fn run_compressor_official_cublas_host(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_compressor_device_into(
+pub(crate) fn step_compressor_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -1659,7 +1659,7 @@ pub(crate) fn compressor_workspace_contract_matches(
         && score_plus_ape_elements == kv_elements
 }
 
-pub(crate) fn run_generic_main_compressor_device(
+pub(crate) fn step_generic_main_compressor_device(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     scratch: &mut DeviceRequestScratch,
@@ -1685,7 +1685,7 @@ pub(crate) fn run_generic_main_compressor_device(
         return match path {
             GenericStationaryPath::Csa4 => {
                 let refresh_weights = strict.begin_main_refresh(path, weights.layer);
-                let result = run_exact_compressor_buffers_device_into(
+                let result = step_exact_compressor_buffers_device_into(
                     module,
                     stream,
                     attn_input,
@@ -1713,7 +1713,7 @@ pub(crate) fn run_generic_main_compressor_device(
             }
             GenericStationaryPath::Hca128 => {
                 let refresh_weights = strict.begin_main_refresh(path, weights.layer);
-                let result = run_exact_compressor_buffers_device_into(
+                let result = step_exact_compressor_buffers_device_into(
                     module,
                     stream,
                     attn_input,
@@ -1742,7 +1742,7 @@ pub(crate) fn run_generic_main_compressor_device(
         };
     }
     match path {
-        GenericStationaryPath::Csa4 => run_compressor_device_into(
+        GenericStationaryPath::Csa4 => step_compressor_device_into(
             module,
             stream,
             &scratch.attn_input,
@@ -1756,7 +1756,7 @@ pub(crate) fn run_generic_main_compressor_device(
             path.ratio(),
             position,
         ),
-        GenericStationaryPath::Hca128 => run_compressor_device_into(
+        GenericStationaryPath::Hca128 => step_compressor_device_into(
             module,
             stream,
             &scratch.attn_input,
@@ -1773,14 +1773,14 @@ pub(crate) fn run_generic_main_compressor_device(
     }
 }
 
-pub(crate) fn run_generic_compressor_pool_device(
+pub(crate) fn step_generic_compressor_pool_device(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     scratch: &mut DeviceRequestScratch,
     path: GenericStationaryPath,
 ) -> Result<(), Box<dyn Error>> {
     match path {
-        GenericStationaryPath::Csa4 => run_compressor_pool_ratio4_device_into(
+        GenericStationaryPath::Csa4 => step_compressor_pool_ratio4_device_into(
             module,
             stream,
             &scratch.candidate_tail_kv,
@@ -1788,7 +1788,7 @@ pub(crate) fn run_generic_compressor_pool_device(
             &mut scratch.compressed_pool,
             v4_state::Q_HEAD_DIM,
         ),
-        GenericStationaryPath::Hca128 => run_compressor_pool_ratio128_device_into(
+        GenericStationaryPath::Hca128 => step_compressor_pool_ratio128_device_into(
             module,
             stream,
             &scratch.candidate_hca_tail_kv,
@@ -1798,7 +1798,7 @@ pub(crate) fn run_generic_compressor_pool_device(
     }
 }
 
-pub(crate) fn run_generic_indexer_compressor_device(
+pub(crate) fn step_generic_indexer_compressor_device(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     scratch: &mut DeviceRequestScratch,
@@ -1825,7 +1825,7 @@ pub(crate) fn run_generic_indexer_compressor_device(
         .ok_or("generic CSA indexer scratch disappeared")?;
     if let Some(strict) = exact_compressor.as_mut() {
         let refresh_weights = strict.begin_indexer_refresh(layer);
-        let result = run_exact_compressor_buffers_device_into(
+        let result = step_exact_compressor_buffers_device_into(
             module,
             stream,
             attn_input,
@@ -1851,7 +1851,7 @@ pub(crate) fn run_generic_indexer_compressor_device(
         }
         return result;
     }
-    run_compressor_device_into(
+    step_compressor_device_into(
         module,
         stream,
         attn_input,
@@ -1969,7 +1969,7 @@ pub(crate) struct CsaIndexerPrepared {
     pub(crate) compressor: v4_state::CompressorPrepared,
 }
 
-pub(crate) fn run_csa_indexer_projections(
+pub(crate) fn step_csa_indexer_projections(
     spec: &'static v4_spec::V4Spec,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -1989,7 +1989,7 @@ pub(crate) fn run_csa_indexer_projections(
     {
         return Err("CSA indexer projection input contract mismatch".into());
     }
-    let (_, q) = run_l0_fp8_linear(module, stream, q_lora, &indexer.wq_b, true)?;
+    let (_, q) = step_l0_fp8_linear(module, stream, q_lora, &indexer.wq_b, true)?;
     let q = run_rope(module, stream, &q, freqs, 64, 128, false)?;
     let q_f32 = v4_state::rotate_fp4_sim_bf16(&q, rows * 64, 128)?;
     let mut weights_f32 = run_bf16_linear_f32(
@@ -2150,10 +2150,10 @@ pub(crate) fn run_l0_sparse_attention(
     }
     let rows = q.len() / row_width;
     let topk = v4_state::build_hca_sparse_topk(rows, start_pos, v4_state::KV_WINDOW, 128)?;
-    run_sparse_attention(module, stream, q, kv, attn_sink, &topk)
+    step_sparse_attention(module, stream, q, kv, attn_sink, &topk)
 }
 
-pub(crate) fn run_sparse_attention(
+pub(crate) fn step_sparse_attention(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     q: &[u16],
@@ -2175,7 +2175,7 @@ pub(crate) fn run_sparse_attention(
     let kv = DeviceBuffer::from_host(stream, kv)?;
     let topk_device = DeviceBuffer::from_host(stream, &topk.indices)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, q.len())?;
-    run_sparse_attention_device_into(
+    step_sparse_attention_device_into(
         module,
         stream,
         &q,
@@ -2200,7 +2200,7 @@ pub(crate) fn sparse_attention_arm_from_env() -> Result<SparseAttentionArm, Box<
     }
 }
 
-pub(crate) fn run_sparse_attention_score_reuse(
+pub(crate) fn step_sparse_attention_score_reuse(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     q: &[u16],
@@ -2225,7 +2225,7 @@ pub(crate) fn run_sparse_attention_score_reuse(
     let mut output = DeviceBuffer::<u16>::zeroed(stream, q.len())?;
     let mut scratch =
         SparseAttentionScoreReuseScratch::new_for_heads(stream, rows, heads, topk.per_row)?;
-    run_sparse_attention_score_reuse_device_into(
+    step_sparse_attention_score_reuse_device_into(
         module,
         stream,
         &q,
@@ -2240,7 +2240,7 @@ pub(crate) fn run_sparse_attention_score_reuse(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_sparse_attention_device_into(
+pub(crate) fn step_sparse_attention_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     q: &DeviceBuffer<u16>,
@@ -2377,7 +2377,7 @@ pub(crate) fn run_sparse_attention_reference_state_device_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_sparse_attention_score_reuse_device_into(
+pub(crate) fn step_sparse_attention_score_reuse_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     q: &DeviceBuffer<u16>,
@@ -2500,17 +2500,17 @@ pub(crate) fn sparse_attention_score_reuse_workspace_matches(
         && valid_count_elements == head_elements
 }
 
-pub(crate) fn run_l0_wo_a_device_into(
+pub(crate) fn step_l0_wo_a_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
     weight: &DeviceBuffer<u16>,
     output: &mut DeviceBuffer<u16>,
 ) -> Result<(), Box<dyn Error>> {
-    run_l0_wo_a_device_into_for(&v4_spec::PRO, module, stream, input, weight, output)
+    step_l0_wo_a_device_into_for(&v4_spec::PRO, module, stream, input, weight, output)
 }
 
-pub(crate) fn run_l0_wo_a_device_into_for(
+pub(crate) fn step_l0_wo_a_device_into_for(
     spec: &v4_spec::V4Spec,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -2551,10 +2551,10 @@ pub(crate) fn run_l0_wo_a(
     input: &[u16],
     weight: &DeviceBuffer<u16>,
 ) -> Result<Vec<u16>, Box<dyn Error>> {
-    run_l0_wo_a_for(&v4_spec::PRO, module, stream, input, weight)
+    step_l0_wo_a_for(&v4_spec::PRO, module, stream, input, weight)
 }
 
-pub(crate) fn run_l0_wo_a_for(
+pub(crate) fn step_l0_wo_a_for(
     spec: &v4_spec::V4Spec,
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -2568,12 +2568,12 @@ pub(crate) fn run_l0_wo_a_for(
     }
     let input = DeviceBuffer::from_host(stream, input)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, input.len() / input_width * output_width)?;
-    run_l0_wo_a_device_into_for(spec, module, stream, &input, weight, &mut output)?;
+    step_l0_wo_a_device_into_for(spec, module, stream, &input, weight, &mut output)?;
     Ok(output.to_host_vec(stream)?)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_l0_hc_post_device_into(
+pub(crate) fn step_l0_hc_post_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     branch: &DeviceBuffer<u16>,
@@ -2612,7 +2612,7 @@ pub(crate) fn run_l0_hc_post_device_into(
     Ok(())
 }
 
-pub(crate) fn run_l0_hc_post(
+pub(crate) fn step_l0_hc_post(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     branch: &[u16],
@@ -2636,7 +2636,7 @@ pub(crate) fn run_l0_hc_post(
     let post = DeviceBuffer::from_host(stream, post)?;
     let comb = DeviceBuffer::from_host(stream, comb)?;
     let mut output = DeviceBuffer::<u16>::zeroed(stream, residual.len())?;
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         module,
         stream,
         &branch,
@@ -2648,7 +2648,7 @@ pub(crate) fn run_l0_hc_post(
     Ok(output.to_host_vec(stream)?)
 }
 
-pub(crate) fn run_l0_hc_post_trace(
+pub(crate) fn step_l0_hc_post_trace(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     branch: &[u16],
@@ -2682,7 +2682,7 @@ pub(crate) fn run_l0_hc_post_trace(
     Ok(audit.to_host_vec(stream)?)
 }
 
-pub(crate) fn run_layer_router(
+pub(crate) fn step_layer_router(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     session: Option<&FlashCublasSession>,
@@ -2887,7 +2887,7 @@ pub(crate) fn run_layer_router_device_into(
         && spec.hidden == 4_096
         && weights.ffn_norm.len() == 4_096
     {
-        *trace_rmsnorm_squares = run_flash_learned_rmsnorm_4096_device_into(
+        *trace_rmsnorm_squares = step_flash_learned_rmsnorm_4096_device_into(
             module,
             stream,
             input,
@@ -2896,7 +2896,7 @@ pub(crate) fn run_layer_router_device_into(
             trace_rmsnorm,
         )?;
     } else {
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             module,
             stream,
             input,
@@ -2922,7 +2922,7 @@ pub(crate) fn run_layer_router_device_into(
             }
             None
         }
-        FlashMhcLinearArm::Cublas => Some(run_flash_router_cublas_linear_device_into(
+        FlashMhcLinearArm::Cublas => Some(step_flash_router_cublas_linear_device_into(
             session.ok_or("Flash cuBLAS router session is missing")?,
             module,
             stream,
@@ -2958,29 +2958,29 @@ pub(crate) fn run_layer_router_device_into(
     Ok(())
 }
 
-pub(crate) fn run_layer_shared_expert(
+pub(crate) fn step_layer_shared_expert(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
     weights: &LayerDeviceWeights,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
-    Ok(run_layer_shared_expert_with_bf16(module, stream, input, weights)?.0)
+    Ok(step_layer_shared_expert_with_bf16(module, stream, input, weights)?.0)
 }
 
-pub(crate) fn run_layer_shared_expert_with_bf16(
+pub(crate) fn step_layer_shared_expert_with_bf16(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &[u16],
     weights: &LayerDeviceWeights,
 ) -> Result<(Vec<f32>, Vec<u16>), Box<dyn Error>> {
-    let (_, gate) = run_l0_fp8_linear(module, stream, input, &weights.shared_w1, false)?;
-    let (_, up) = run_l0_fp8_linear(module, stream, input, &weights.shared_w3, false)?;
+    let (_, gate) = step_l0_fp8_linear(module, stream, input, &weights.shared_w1, false)?;
+    let (_, up) = step_l0_fp8_linear(module, stream, input, &weights.shared_w3, false)?;
     let gate = DeviceBuffer::from_host(stream, &gate)?;
     let up = DeviceBuffer::from_host(stream, &up)?;
     let mut activated = DeviceBuffer::<u16>::zeroed(stream, gate.len())?;
     launch_v4_swiglu_route(module, stream, &gate, &up, &mut activated, 1.0)?;
     let activated = activated.to_host_vec(stream)?;
-    let (_, output) = run_l0_fp8_linear(module, stream, &activated, &weights.shared_w2, false)?;
+    let (_, output) = step_l0_fp8_linear(module, stream, &activated, &weights.shared_w2, false)?;
     Ok((
         output.iter().copied().map(v4_router::bf16_to_f32).collect(),
         output,

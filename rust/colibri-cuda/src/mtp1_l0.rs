@@ -261,7 +261,7 @@ pub(crate) fn run_stationary_mtp1_capacity_preflight() -> Result<bool, Box<dyn E
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_mtp1_draft_candidate(
+pub(crate) fn step_mtp1_draft_candidate(
     context: &std::sync::Arc<CudaContext>,
     module: &kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
@@ -289,7 +289,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         .saturating_add(u64::try_from(embedding_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     let enorm = DeviceBuffer::from_host(stream, &host.enorm)?;
     let hnorm = DeviceBuffer::from_host(stream, &host.hnorm)?;
-    let e_input = run_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
+    let e_input = step_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
     let (e, e_projection_bytes) = {
         let projection_read_started = std::time::Instant::now();
         let projection = host.e_proj.load(&host.shard)?;
@@ -305,11 +305,11 @@ pub(crate) fn run_mtp1_draft_candidate(
         let bytes = projection.num_bytes();
         h2d_bytes = h2d_bytes.saturating_add(bytes);
         (
-            run_l0_fp8_linear(module, stream, &e_input, &projection, false)?.1,
+            step_l0_fp8_linear(module, stream, &e_input, &projection, false)?.1,
             bytes,
         )
     };
-    let h_input = run_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
+    let h_input = step_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
     let (h, h_projection_bytes) = {
         let projection_read_started = std::time::Instant::now();
         let projection = host.h_proj.load(&host.shard)?;
@@ -325,7 +325,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         let bytes = projection.num_bytes();
         h2d_bytes = h2d_bytes.saturating_add(bytes);
         (
-            run_l0_fp8_linear(module, stream, &h_input, &projection, false)?.1,
+            step_l0_fp8_linear(module, stream, &h_input, &projection, false)?.1,
             bytes,
         )
     };
@@ -357,7 +357,7 @@ pub(crate) fn run_mtp1_draft_candidate(
             v4_router::f32_to_bf16_rne(v4_router::bf16_to_f32(h) + v4_router::bf16_to_f32(e))
         }));
     }
-    let attn_hc = run_l0_mhc_pre(
+    let attn_hc = step_l0_mhc_pre(
         module,
         stream,
         &residual,
@@ -365,36 +365,36 @@ pub(crate) fn run_mtp1_draft_candidate(
         &weights.hc_attn_scale,
         &weights.hc_attn_base,
     )?;
-    let attn_input = run_l0_rmsnorm(
+    let attn_input = step_l0_rmsnorm(
         module,
         stream,
         &attn_hc.collapsed,
         &weights.attn_norm,
         v4_state::HIDDEN,
     )?;
-    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
-    let q_lora = run_l0_rmsnorm(
+    let (_, q_lora_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let q_lora = step_l0_rmsnorm(
         module,
         stream,
         &q_lora_raw,
         &weights.q_norm,
         weights.wq_a.out_features,
     )?;
-    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let (_, q_raw) = step_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
     let empty_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
-    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &empty_norm, v4_state::Q_HEAD_DIM)?;
+    let q_norm = step_l0_rmsnorm(module, stream, &q_raw, &empty_norm, v4_state::Q_HEAD_DIM)?;
     let freqs = v4_state::attention_rope_freqs(&v4_spec::PRO, v4_state::V4_LAYER_COUNT, start_pos)?;
-    let q = run_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
-    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
-    let kv_norm = run_l0_rmsnorm(
+    let q = step_l0_rope(module, stream, &q_norm, &freqs, v4_state::Q_HEADS, false)?;
+    let (_, kv_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = step_l0_rmsnorm(
         module,
         stream,
         &kv_raw,
         &weights.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    let kv_rope = run_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
-    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let kv_rope = step_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
+    let kv = step_l0_kv_quantize(module, stream, &kv_rope)?;
     let kv_ready = DeviceBuffer::from_host(stream, &kv)?;
     let q = DeviceBuffer::from_host(stream, &q)?;
     let cache = DeviceBuffer::zeroed(stream, v4_state::KV_WINDOW * v4_state::Q_HEAD_DIM)?;
@@ -430,10 +430,10 @@ pub(crate) fn run_mtp1_draft_candidate(
         &mut sparse_scratch,
     )?;
     let sparse = sparse.to_host_vec(stream)?;
-    let sparse = run_l0_rope(module, stream, &sparse, &freqs, v4_state::Q_HEADS, true)?;
+    let sparse = step_l0_rope(module, stream, &sparse, &freqs, v4_state::Q_HEADS, true)?;
     let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
-    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
-    let after_attention = run_l0_hc_post(
+    let (_, attention) = step_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let after_attention = step_l0_hc_post(
         module,
         stream,
         &attention,
@@ -441,7 +441,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         &attn_hc.post,
         &attn_hc.comb,
     )?;
-    let ffn_hc = run_l0_mhc_pre(
+    let ffn_hc = step_l0_mhc_pre(
         module,
         stream,
         &after_attention,
@@ -449,7 +449,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         &weights.hc_ffn_scale,
         &weights.hc_ffn_base,
     )?;
-    let router = run_layer_router(
+    let router = step_layer_router(
         module,
         stream,
         None,
@@ -458,7 +458,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         &[],
         false,
     )?;
-    let shared = run_layer_shared_expert(module, stream, &router.input, &weights)?;
+    let shared = step_layer_shared_expert(module, stream, &router.input, &weights)?;
     let mut contributions = Vec::with_capacity(v4_router::V4_TOPK);
     let mut expert_bytes = 0_usize;
     let mut expert_ids = router
@@ -511,7 +511,7 @@ pub(crate) fn run_mtp1_draft_candidate(
         .map(|(expert, output)| (*expert, output.as_slice()))
         .collect::<Vec<_>>();
     let moe = v4_expert::reduce_moe_canonical(&routed, &shared)?;
-    let output = run_l0_hc_post(
+    let output = step_l0_hc_post(
         module,
         stream,
         &moe,
@@ -643,7 +643,7 @@ pub(crate) fn run_real_l0_rows(
         }
     }
 
-    let attn_hc = run_l0_mhc_pre(
+    let attn_hc = step_l0_mhc_pre(
         module,
         stream,
         &residual,
@@ -651,7 +651,7 @@ pub(crate) fn run_real_l0_rows(
         &weights.hc_attn_scale,
         &weights.hc_attn_base,
     )?;
-    let attn_input = run_l0_rmsnorm(
+    let attn_input = step_l0_rmsnorm(
         module,
         stream,
         &attn_hc.collapsed,
@@ -659,34 +659,34 @@ pub(crate) fn run_real_l0_rows(
         v4_state::HIDDEN,
     )?;
 
-    let (_, q_lora_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
+    let (_, q_lora_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)?;
     maybe_write_v4_audit_u16(weights.layer, "q_lora_raw", &q_lora_raw)?;
-    let q_lora = run_l0_rmsnorm(
+    let q_lora = step_l0_rmsnorm(
         module,
         stream,
         &q_lora_raw,
         &weights.q_norm,
         weights.wq_a.out_features,
     )?;
-    let (_, q_raw) = run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
+    let (_, q_raw) = step_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)?;
     maybe_write_v4_audit_u16(weights.layer, "q_raw", &q_raw)?;
     let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
-    let q_norm = run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
+    let q_norm = step_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)?;
     maybe_write_v4_audit_u16(weights.layer, "q_norm", &q_norm)?;
-    let q = run_l0_rope(module, stream, &q_norm, freqs, v4_state::Q_HEADS, false)?;
+    let q = step_l0_rope(module, stream, &q_norm, freqs, v4_state::Q_HEADS, false)?;
 
-    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
-    let kv_norm = run_l0_rmsnorm(
+    let (_, kv_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = step_l0_rmsnorm(
         module,
         stream,
         &kv_raw,
         &weights.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    let kv_rope = run_l0_rope(module, stream, &kv_norm, freqs, 1, false)?;
-    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let kv_rope = step_l0_rope(module, stream, &kv_norm, freqs, 1, false)?;
+    let kv = step_l0_kv_quantize(module, stream, &kv_rope)?;
     let compressor =
-        run_layer_compressor(module, stream, &attn_input, weights, start_pos, None, None)?;
+        step_layer_compressor(module, stream, &attn_input, weights, start_pos, None, None)?;
 
     let mut persistent = base.clone();
     let mut prefixes = Vec::with_capacity(rows);
@@ -713,12 +713,12 @@ pub(crate) fn run_real_l0_rows(
         &weights.attn_sink,
         start_pos,
     )?;
-    let sparse = run_l0_rope(module, stream, &sparse, freqs, v4_state::Q_HEADS, true)?;
+    let sparse = step_l0_rope(module, stream, &sparse, freqs, v4_state::Q_HEADS, true)?;
     let wo_a = run_l0_wo_a(module, stream, &sparse, &weights.wo_a)?;
     maybe_write_v4_audit_u16(weights.layer, "wo_a", &wo_a)?;
-    let (_, attention) = run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
+    let (_, attention) = step_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)?;
     maybe_write_v4_audit_u16(weights.layer, "attention", &attention)?;
-    let after_attention = run_l0_hc_post(
+    let after_attention = step_l0_hc_post(
         module,
         stream,
         &attention,
@@ -728,7 +728,7 @@ pub(crate) fn run_real_l0_rows(
     )?;
     maybe_write_v4_audit_u16(weights.layer, "attention_post", &after_attention)?;
 
-    let ffn_hc = run_l0_mhc_pre(
+    let ffn_hc = step_l0_mhc_pre(
         module,
         stream,
         &after_attention,
@@ -736,7 +736,7 @@ pub(crate) fn run_real_l0_rows(
         &weights.hc_ffn_scale,
         &weights.hc_ffn_base,
     )?;
-    let router = run_layer_router(
+    let router = step_layer_router(
         module,
         stream,
         None,
@@ -748,7 +748,7 @@ pub(crate) fn run_real_l0_rows(
     let ffn_input = router.input;
     let routes = router.routes;
     maybe_write_v4_audit_u16(weights.layer, "ffn_input", &ffn_input)?;
-    let shared = run_layer_shared_expert(module, stream, &ffn_input, weights)?;
+    let shared = step_layer_shared_expert(module, stream, &ffn_input, weights)?;
 
     let mut expert_union = routes
         .ids
@@ -808,7 +808,7 @@ pub(crate) fn run_real_l0_rows(
             &shared[row * v4_state::HIDDEN..][..v4_state::HIDDEN],
         )?);
     }
-    let output = run_l0_hc_post(
+    let output = step_l0_hc_post(
         module,
         stream,
         &moe,
@@ -1260,8 +1260,8 @@ pub(crate) fn run_real_l0_compressor_cublas_exact_if_available(
     let hc_scale = DeviceBuffer::from_host(stream, &state.hc_scale)?;
     let hc_base = DeviceBuffer::from_host(stream, &state.hc_base)?;
     let norm = DeviceBuffer::from_host(stream, &state.attn_norm)?;
-    let hc = run_l0_mhc_pre(module, stream, &residual, &hc_fn, &hc_scale, &hc_base)?;
-    let input = run_l0_rmsnorm(module, stream, &hc.collapsed, &norm, v4_state::HIDDEN)?;
+    let hc = step_l0_mhc_pre(module, stream, &residual, &hc_fn, &hc_scale, &hc_base)?;
+    let input = step_l0_rmsnorm(module, stream, &hc.collapsed, &norm, v4_state::HIDDEN)?;
 
     let wkv = DeviceBuffer::from_host(stream, &compressor_weights.wkv_bf16)?;
     let wgate = DeviceBuffer::from_host(stream, &compressor_weights.wgate_bf16)?;

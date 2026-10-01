@@ -300,7 +300,7 @@ pub(crate) type PinnedFixedRequest = (
 );
 pub(crate) type PinnedFixedReply = Result<Option<PinnedFixedPrepared>, String>;
 
-pub(crate) fn run_pinned_fixed_request_worker(
+pub(crate) fn step_pinned_fixed_request_worker(
     mut cache: FixedLayerCache,
     mut slots: Vec<PinnedFixedSlot>,
     root: &std::path::Path,

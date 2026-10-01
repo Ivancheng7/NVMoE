@@ -69,7 +69,7 @@ struct RoutedLaneOutcome<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_real_layer_attention_rows(
+pub(crate) fn step_real_layer_attention_rows(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     flash_cublas: Option<&FlashCublasSession>,
@@ -179,7 +179,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let attn_hc = profile_step!(
         mhc,
-        run_l0_mhc_pre_with_arm(
+        step_l0_mhc_pre_with_arm(
             module,
             stream,
             hc_hidden,
@@ -270,7 +270,7 @@ pub(crate) fn run_real_layer_attention_rows(
             let mut trace = DeviceBuffer::<f32>::zeroed(stream, 0)?;
             profile_step!(
                 attn_norm,
-                run_flash_learned_rmsnorm_4096_device_into(
+                step_flash_learned_rmsnorm_4096_device_into(
                     module,
                     stream,
                     &input,
@@ -283,7 +283,7 @@ pub(crate) fn run_real_layer_attention_rows(
         } else {
             profile_step!(
                 attn_norm,
-                run_l0_rmsnorm(
+                step_l0_rmsnorm(
                     module,
                     stream,
                     &attn_hc.collapsed,
@@ -300,7 +300,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let (_, q_lora_raw) = profile_step!(
         q_a_projection,
-        run_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)
+        step_l0_fp8_linear(module, stream, &attn_input, &weights.wq_a, false)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -316,7 +316,7 @@ pub(crate) fn run_real_layer_attention_rows(
     maybe_write_v4_audit_u16(weights.layer, "q_lora_raw", &q_lora_raw)?;
     let q_lora = profile_step!(
         q_a_norm,
-        run_l0_rmsnorm(
+        step_l0_rmsnorm(
             module,
             stream,
             &q_lora_raw,
@@ -332,7 +332,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let (_, q_raw) = profile_step!(
         q_b_projection,
-        run_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)
+        step_l0_fp8_linear(module, stream, &q_lora, &weights.wq_b, true)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -349,7 +349,7 @@ pub(crate) fn run_real_layer_attention_rows(
     let unit_norm = DeviceBuffer::<u16>::zeroed(stream, 0)?;
     let q = profile_step!(
         q_b_norm,
-        run_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)
+        step_l0_rmsnorm(module, stream, &q_raw, &unit_norm, v4_state::Q_HEAD_DIM)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -365,7 +365,7 @@ pub(crate) fn run_real_layer_attention_rows(
     maybe_write_v4_audit_u16(weights.layer, "q_norm", &q)?;
     let q = profile_step!(
         q_rope,
-        run_l0_rope(module, stream, &q, &freqs, spec.q_heads, false)
+        step_l0_rope(module, stream, &q, &freqs, spec.q_heads, false)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -380,7 +380,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let (_, kv) = profile_step!(
         kv_projection,
-        run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)
+        step_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "wkv_linear_bf16", &[rows, spec.q_head_dim], &kv)?;
@@ -390,7 +390,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let kv = profile_step!(
         kv_norm,
-        run_l0_rmsnorm(module, stream, &kv, &weights.kv_norm, v4_state::Q_HEAD_DIM)
+        step_l0_rmsnorm(module, stream, &kv, &weights.kv_norm, v4_state::Q_HEAD_DIM)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "kv_norm_bf16", &[rows, spec.q_head_dim], &kv)?;
@@ -400,7 +400,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let kv = profile_step!(
         kv_rope_quantize,
-        run_l0_rope(module, stream, &kv, &freqs, 1, false)
+        step_l0_rope(module, stream, &kv, &freqs, 1, false)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "k_rope_bf16", &[rows, 1, spec.q_head_dim], &kv)?;
@@ -408,7 +408,7 @@ pub(crate) fn run_real_layer_attention_rows(
     if capture_stages {
         stage_digests.push(("kv_rope", fnv1a_u16(&kv)));
     }
-    let kv = profile_step!(kv_rope_quantize, run_l0_kv_quantize(module, stream, &kv));
+    let kv = profile_step!(kv_rope_quantize, step_l0_kv_quantize(module, stream, &kv));
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "cache_kv_row_bf16", &[rows, spec.q_head_dim], &kv)?;
     }
@@ -420,7 +420,7 @@ pub(crate) fn run_real_layer_attention_rows(
     } else {
         Some(profile_step!(
             compressor,
-            run_layer_compressor(
+            step_layer_compressor(
                 module,
                 stream,
                 &attn_input,
@@ -475,7 +475,7 @@ pub(crate) fn run_real_layer_attention_rows(
     let indexer = if let Some(indexer) = weights.indexer.as_ref() {
         Some(profile_step!(
             indexer,
-            run_csa_indexer_projections(
+            step_csa_indexer_projections(
                 spec,
                 module,
                 stream,
@@ -552,13 +552,13 @@ pub(crate) fn run_real_layer_attention_rows(
         SparseAttentionArm::Reference => {
             profile_step!(
                 sparse_score,
-                run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
+                step_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
             )
         }
         SparseAttentionArm::ScoreReuse => {
             profile_step!(
                 sparse_score,
-                run_sparse_attention_score_reuse(
+                step_sparse_attention_score_reuse(
                     module,
                     stream,
                     &q,
@@ -571,7 +571,7 @@ pub(crate) fn run_real_layer_attention_rows(
         SparseAttentionArm::Sm89Crossover if topk.per_row >= SM89_SCORE_REUSE_MIN_TOPK => {
             profile_step!(
                 sparse_score,
-                run_sparse_attention_score_reuse(
+                step_sparse_attention_score_reuse(
                     module,
                     stream,
                     &q,
@@ -584,7 +584,7 @@ pub(crate) fn run_real_layer_attention_rows(
         SparseAttentionArm::Sm89Crossover => {
             profile_step!(
                 sparse_score,
-                run_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
+                step_sparse_attention(module, stream, &q, &cache, &weights.attn_sink, &topk)
             )
         }
     };
@@ -601,7 +601,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let sparse = profile_step!(
         sparse_inverse_rope,
-        run_l0_rope(module, stream, &sparse, &freqs, spec.q_heads, true)
+        step_l0_rope(module, stream, &sparse, &freqs, spec.q_heads, true)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -616,7 +616,7 @@ pub(crate) fn run_real_layer_attention_rows(
     }
     let wo_a = profile_step!(
         wo_a,
-        run_l0_wo_a_for(spec, module, stream, &sparse, &weights.wo_a)
+        step_l0_wo_a_for(spec, module, stream, &sparse, &weights.wo_a)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(
@@ -632,7 +632,7 @@ pub(crate) fn run_real_layer_attention_rows(
     maybe_write_v4_audit_u16(weights.layer, "wo_a", &wo_a)?;
     let (_, attention) = profile_step!(
         wo_b,
-        run_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)
+        step_l0_fp8_linear(module, stream, &wo_a, &weights.wo_b, false)
     );
     if let Some(dir) = parity_dump.as_deref() {
         flash_parity_dump_u16(dir, "wo_b_hidden_bf16", &[rows, spec.hidden], &attention)?;
@@ -641,7 +641,7 @@ pub(crate) fn run_real_layer_attention_rows(
         stage_digests.push(("attention", fnv1a_u16(&attention)));
     }
     if let Some(dir) = parity_dump.as_deref() {
-        let audit = run_l0_hc_post_trace(
+        let audit = step_l0_hc_post_trace(
             module,
             stream,
             &attention,
@@ -655,7 +655,7 @@ pub(crate) fn run_real_layer_attention_rows(
     maybe_write_v4_audit_u16(weights.layer, "attention", &attention)?;
     let output = profile_step!(
         hc_post,
-        run_l0_hc_post(
+        step_l0_hc_post(
             module,
             stream,
             &attention,
@@ -693,7 +693,7 @@ pub(crate) fn run_real_layer_attention_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
+pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
     context: &std::sync::Arc<CudaContext>,
     module: &'module kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
@@ -776,7 +776,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         generic_prepared = Some((state, scratch, prepared, audit_expected_compressed_prefix));
         attention
     } else if let Some(device_state) = device_state {
-        run_device_attention_row(
+        step_device_attention_row(
             module,
             stream,
             runtime,
@@ -790,7 +790,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         .as_mut()
         .zip(attention_scratch.as_deref_mut())
     {
-        run_real_layer_attention_rows_device(
+        step_real_layer_attention_rows_device(
             module,
             stream,
             flash_cublas,
@@ -803,7 +803,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             attention_scratch,
         )?
     } else {
-        run_real_layer_attention_rows(
+        step_real_layer_attention_rows(
             module,
             stream,
             flash_cublas,
@@ -841,7 +841,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         timeline.router_start_ns = timeline.now();
     }
     let router_started = std::time::Instant::now();
-    let ffn_hc = run_l0_mhc_pre_with_arm(
+    let ffn_hc = step_l0_mhc_pre_with_arm(
         module,
         stream,
         &after_attention,
@@ -904,7 +904,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
     stage.router_host_prep_ns =
         u64::try_from(router_host_prep_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let router_parity_dump = flash_router_trace_dump_dir(spec, weights.layer, start_pos, rows)?;
-    let router = run_layer_router(
+    let router = step_layer_router(
         module,
         stream,
         flash_cublas,
@@ -1193,10 +1193,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                 // charged to routed, which is where their reads have always been
                 // charged.
                 let shared = if parity_dump.is_some() {
-                    run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                    step_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
                 } else {
                     (
-                        run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                        step_layer_shared_expert(module, stream, &ffn_input, weights)?,
                         Vec::new(),
                     )
                 };
@@ -1281,10 +1281,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                         // Run the shared MLP on this thread only after the readers are
                         // running, so its wall and theirs overlap instead of stacking.
                         let shared = if parity_dump.is_some() {
-                            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                            step_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
                         } else {
                             (
-                                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                                step_layer_shared_expert(module, stream, &ffn_input, weights)?,
                                 Vec::new(),
                             )
                         };
@@ -1334,10 +1334,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
                             })
                             .collect::<Vec<_>>();
                         let shared = if parity_dump.is_some() {
-                            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+                            step_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
                         } else {
                             (
-                                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                                step_layer_shared_expert(module, stream, &ffn_input, weights)?,
                                 Vec::new(),
                             )
                         };
@@ -1366,10 +1366,10 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         loaded
     } else {
         let shared = if parity_dump.is_some() {
-            run_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
+            step_layer_shared_expert_with_bf16(module, stream, &ffn_input, weights)?
         } else {
             (
-                run_layer_shared_expert(module, stream, &ffn_input, weights)?,
+                step_layer_shared_expert(module, stream, &ffn_input, weights)?,
                 Vec::new(),
             )
         };
@@ -1442,7 +1442,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
             .collect::<Result<Vec<_>, Box<dyn Error>>>()?
             .try_into()
             .map_err(|_| "QD4 route plan count changed")?;
-        let qd4 = run_qd4_routed_once(
+        let qd4 = step_qd4_routed_once(
             lanes,
             qd4_immutable_cache,
             &runtime.expert_shard,
@@ -1925,7 +1925,7 @@ pub(crate) fn run_real_layer_rows<'module, 'slots, 'lane>(
         timeline.routed_end_ns = timeline.now();
         timeline.hc_post_start_ns = timeline.now();
     }
-    let output = run_l0_hc_post(
+    let output = step_l0_hc_post(
         module,
         stream,
         &moe,

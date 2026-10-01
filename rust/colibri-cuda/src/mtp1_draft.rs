@@ -175,7 +175,7 @@ pub(crate) fn mtp1_can_borrow_qd4_lane(worker_drained: bool, qd4_lanes: usize) -
     worker_drained && qd4_lanes == V4_QD4_LANES
 }
 
-pub(crate) fn run_with_mtp1_qd4_loan<T>(
+pub(crate) fn step_with_mtp1_qd4_loan<T>(
     mut qd4_lanes: Option<&mut [ExpertSlot<'_>]>,
     worker_drained: bool,
     run: impl FnOnce(Option<&mut ExpertSlot<'_>>) -> Result<T, Box<dyn Error>>,
@@ -235,21 +235,21 @@ pub(crate) fn advance_mtp1_draft_state(
     let embedding = load_mtp_embedding_row(model_dir, input_id)?;
     let enorm = DeviceBuffer::from_host(stream, &host.enorm)?;
     let hnorm = DeviceBuffer::from_host(stream, &host.hnorm)?;
-    let e_input = run_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
+    let e_input = step_l0_rmsnorm(module, stream, &embedding, &enorm, v4_state::HIDDEN)?;
     let e_projection = host.e_proj.load(&host.shard)?;
     let e_projection = DeviceFp8Matrix::new(stream, &e_projection)?;
-    let e = run_l0_fp8_linear(module, stream, &e_input, &e_projection, false)?.1;
-    let h_input = run_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
+    let e = step_l0_fp8_linear(module, stream, &e_input, &e_projection, false)?.1;
+    let h_input = step_l0_rmsnorm(module, stream, teacher_hc_hidden, &hnorm, v4_state::HIDDEN)?;
     let h_projection = host.h_proj.load(&host.shard)?;
     let h_projection = DeviceFp8Matrix::new(stream, &h_projection)?;
-    let h = run_l0_fp8_linear(module, stream, &h_input, &h_projection, false)?.1;
+    let h = step_l0_fp8_linear(module, stream, &h_input, &h_projection, false)?.1;
     let mut residual = Vec::with_capacity(teacher_hc_hidden.len());
     for h_row in h.chunks_exact(v4_state::HIDDEN) {
         residual.extend(h_row.iter().zip(&e).map(|(&h, &e)| {
             v4_router::f32_to_bf16_rne(v4_router::bf16_to_f32(h) + v4_router::bf16_to_f32(e))
         }));
     }
-    let attn_hc = run_l0_mhc_pre(
+    let attn_hc = step_l0_mhc_pre(
         module,
         stream,
         &residual,
@@ -257,15 +257,15 @@ pub(crate) fn advance_mtp1_draft_state(
         &weights.hc_attn_scale,
         &weights.hc_attn_base,
     )?;
-    let attn_input = run_l0_rmsnorm(
+    let attn_input = step_l0_rmsnorm(
         module,
         stream,
         &attn_hc.collapsed,
         &weights.attn_norm,
         v4_state::HIDDEN,
     )?;
-    let (_, kv_raw) = run_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
-    let kv_norm = run_l0_rmsnorm(
+    let (_, kv_raw) = step_l0_fp8_linear(module, stream, &attn_input, &weights.wkv, false)?;
+    let kv_norm = step_l0_rmsnorm(
         module,
         stream,
         &kv_raw,
@@ -273,8 +273,8 @@ pub(crate) fn advance_mtp1_draft_state(
         v4_state::Q_HEAD_DIM,
     )?;
     let freqs = v4_state::attention_rope_freqs(&v4_spec::PRO, v4_state::V4_LAYER_COUNT, start_pos)?;
-    let kv_rope = run_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
-    let kv = run_l0_kv_quantize(module, stream, &kv_rope)?;
+    let kv_rope = step_l0_rope(module, stream, &kv_norm, &freqs, 1, false)?;
+    let kv = step_l0_kv_quantize(module, stream, &kv_rope)?;
     let kv_ready = DeviceBuffer::from_host(stream, &kv)?;
     state.commit_kv_row(stream, &kv_ready)?;
     Ok(MtpDraftPrefixRun {

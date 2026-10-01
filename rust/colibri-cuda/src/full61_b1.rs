@@ -295,7 +295,7 @@ pub(crate) fn run_real_v4_full61_b1(
                     stream,
                     |runtime| {
                         let qd4 = qd4_lanes.as_deref_mut();
-                        run_real_layer_rows(
+                        step_real_layer_rows(
                             context,
                             module,
                             stream,
@@ -480,7 +480,7 @@ pub(crate) fn run_real_v4_full61_b1(
             let teacher_digest_before = fnv1a_u16(&last_hidden);
             let draft = match mtp1_draft_state.as_mut() {
                 Some(state) if mtp1_requires_full_candidate(prompt_len, token_position) => {
-                    MtpDraftStep::Candidate(run_mtp1_draft_candidate(
+                    MtpDraftStep::Candidate(step_mtp1_draft_candidate(
                         context,
                         module,
                         stream,

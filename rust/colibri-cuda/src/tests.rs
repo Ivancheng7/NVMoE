@@ -572,7 +572,7 @@ fn flash_l1_rmsnorm_direct_rsqrt_preserves_raw_bits() {
     assert_eq!(debug[0], 42_009_416.0_f32.to_bits());
     assert_eq!(debug[FLASH_MHC_RSQRT_COMMITTED_CANDIDATE], 0x3c21_c7d9);
 
-    let output = run_l0_rmsnorm(
+    let output = step_l0_rmsnorm(
         &module,
         &stream,
         &input,
@@ -793,7 +793,7 @@ fn flash_l17_attention_rmsnorm_preserves_raw_bits() {
     let norm = DeviceBuffer::from_host(&stream, &norm).expect("upload L17 RMSNorm weight");
     let mut output = DeviceBuffer::<u16>::zeroed(&stream, 4_096).expect("allocate output");
     let mut trace = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("allocate raw trace");
-    let squares = run_flash_learned_rmsnorm_4096_device_into(
+    let squares = step_flash_learned_rmsnorm_4096_device_into(
         &module,
         &stream,
         &input,
@@ -2436,7 +2436,7 @@ fn sparse_attention_p0_ignores_physical_topk_and_kv_suffix_at_logical_width_one(
         let mut output = DeviceBuffer::<u16>::zeroed(&stream, q.len()).expect("allocate output");
         let mut scratch = SparseAttentionScoreReuseScratch::new(&stream, 1, v4_state::KV_WINDOW)
             .expect("allocate score-reuse scratch");
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             &module,
             &stream,
             &q,
@@ -3541,7 +3541,7 @@ fn canonical_compressor_pool_gpu_matches_host_bits_for_csa_main_indexer_and_hca(
         let score = DeviceBuffer::from_host(stream, &fixture_score)?;
         let mut actual = DeviceBuffer::<f32>::zeroed(stream, width)?;
         if overlap {
-            run_compressor_pool_ratio4_device_into(
+            step_compressor_pool_ratio4_device_into(
                 module,
                 stream,
                 &kv,
@@ -3550,7 +3550,7 @@ fn canonical_compressor_pool_gpu_matches_host_bits_for_csa_main_indexer_and_hca(
                 width,
             )?;
         } else {
-            run_compressor_pool_ratio128_device_into(module, stream, &kv, &score, &mut actual)?;
+            step_compressor_pool_ratio128_device_into(module, stream, &kv, &score, &mut actual)?;
         }
         let actual = actual.to_host_vec(stream)?;
         assert_eq!(
@@ -3671,7 +3671,7 @@ fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and
                 ratio,
                 position,
             )?;
-            run_exact_compressor_buffers_device_into(
+            step_exact_compressor_buffers_device_into(
                 module,
                 stream,
                 &input,
@@ -3694,7 +3694,7 @@ fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and
                 let mut custom_kv = DeviceBuffer::<f32>::zeroed(stream, width)?;
                 let mut custom_score = DeviceBuffer::<f32>::zeroed(stream, width)?;
                 let mut custom_score_plus_ape = DeviceBuffer::<f32>::zeroed(stream, width)?;
-                run_compressor_device_into(
+                step_compressor_device_into(
                     module,
                     stream,
                     &input,
@@ -3736,7 +3736,7 @@ fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and
             }
             if let Some(expected_pool) = expected_pool {
                 if ratio == 4 {
-                    run_compressor_pool_ratio4_device_into(
+                    step_compressor_pool_ratio4_device_into(
                         module,
                         stream,
                         &tail_kv,
@@ -3758,7 +3758,7 @@ fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and
                         )?;
                     }
                 } else {
-                    run_compressor_pool_ratio128_device_into(
+                    step_compressor_pool_ratio128_device_into(
                         module,
                         stream,
                         &tail_kv,
@@ -3894,7 +3894,7 @@ fn generic_strict_compressor_owner_refreshes_across_hca_csa_and_indexer_layers()
                 .copy_from_host(&stream, &host_input)
                 .expect("upload input");
             let refresh = strict.begin_main_refresh($path, $layer);
-            run_exact_compressor_buffers_device_into(
+            step_exact_compressor_buffers_device_into(
                 &module,
                 &stream,
                 &input,
@@ -4024,7 +4024,7 @@ fn generic_strict_compressor_owner_refreshes_across_hca_csa_and_indexer_layers()
             .copy_from_host(&stream, &host_input)
             .expect("upload indexer input");
         let refresh = strict.begin_indexer_refresh(11);
-        run_exact_compressor_buffers_device_into(
+        step_exact_compressor_buffers_device_into(
             &module,
             &stream,
             &input,
@@ -4390,7 +4390,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
             SparseAttentionScoreReuseScratch::new(&stream, 1, topk.per_row).unwrap();
         let mut candidate_state =
             SparseAttentionScoreReuseScratch::new(&stream, 1, topk.per_row).unwrap();
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             &module,
             &stream,
             &q,
@@ -4412,7 +4412,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
             topk.per_row,
         )
         .unwrap();
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             &module,
             &stream,
             &q,
@@ -4463,7 +4463,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
         .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
         .unwrap();
     for _ in 0..2 {
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             &module,
             &stream,
             &q,
@@ -4474,7 +4474,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
             l3_128.per_row,
         )
         .unwrap();
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             &module,
             &stream,
             &q,
@@ -4493,7 +4493,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
     let mut candidate_ns = Vec::new();
     for _ in 0..7 {
         start.record(&stream).unwrap();
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             &module,
             &stream,
             &q,
@@ -4508,7 +4508,7 @@ fn sparse_attention_score_reuse_is_bit_exact_at_l3_l4_boundaries_and_faster_loca
         end.synchronize().unwrap();
         reference_ns.push((start.elapsed_ms(&end).unwrap() as f64 * 1_000_000.0) as u64);
         start.record(&stream).unwrap();
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             &module,
             &stream,
             &q,

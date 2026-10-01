@@ -200,7 +200,7 @@ impl AttentionDeviceScratch {
 
 /// Enqueues the mHC + attention projections with device-resident buffers.
 ///
-/// Mirrors `run_real_layer_attention_rows`'s first eleven steps exactly (same
+/// Mirrors `step_real_layer_attention_rows`'s first eleven steps exactly (same
 /// kernels, same argument order), minus the per-step allocations, host
 /// round-trips, and their stream synchronizations. Returns nothing: every
 /// intermediate stays in `scratch` until the commit boundary reads them.
@@ -244,7 +244,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
         } else {
             let session =
                 cublas_session.ok_or("Flash cuBLAS mHC session is missing for the device chain")?;
-            run_flash_mhc_cublas_linear_device_into(
+            step_flash_mhc_cublas_linear_device_into(
                 session,
                 self.module,
                 self.stream,
@@ -281,7 +281,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
     fn projections(&mut self) -> Result<(), Box<dyn Error>> {
         let spec = self.spec;
         let scratch = &mut *self.scratch;
-        run_flash_learned_rmsnorm_4096_device_into(
+        step_flash_learned_rmsnorm_4096_device_into(
             self.module,
             self.stream,
             &scratch.collapsed,
@@ -290,7 +290,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.attn_norm_trace,
         )?;
         // q_a projection: quantize attn_input then fp8 matvec, device-resident.
-        run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear_device_into(
             self.module,
             self.stream,
             &scratch.attn_input,
@@ -302,7 +302,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.q_lora_raw,
             false,
         )?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             self.module,
             self.stream,
             &scratch.q_lora_raw,
@@ -310,7 +310,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.q_lora,
             self.weights.wq_a.out_features,
         )?;
-        run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear_device_into(
             self.module,
             self.stream,
             &scratch.q_lora,
@@ -322,7 +322,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.q_raw,
             true,
         )?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             self.module,
             self.stream,
             &scratch.q_raw,
@@ -330,7 +330,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.q_norm,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             self.module,
             self.stream,
             &scratch.q_norm,
@@ -339,7 +339,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             spec.q_heads,
             spec.q_head_dim,
         )?;
-        run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear_device_into(
             self.module,
             self.stream,
             &scratch.attn_input,
@@ -351,7 +351,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.kv_raw,
             false,
         )?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             self.module,
             self.stream,
             &scratch.kv_raw,
@@ -359,7 +359,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             &mut scratch.kv_norm,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             self.module,
             self.stream,
             &scratch.kv_norm,
@@ -368,7 +368,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
             1,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_l0_kv_quantize_device_into(
+        step_l0_kv_quantize_device_into(
             self.module,
             self.stream,
             &scratch.kv_rope,
@@ -380,7 +380,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
     }
 }
 
-/// Device-resident replacement for `run_real_layer_attention_rows` on the
+/// Device-resident replacement for `step_real_layer_attention_rows` on the
 /// delivery decode path. Same kernels in the same order as the host path;
 /// the only structural differences are the preallocated scratch (no per-step
 /// `malloc` + `from_host`/`to_host_vec` pairs) and where host values are
@@ -390,7 +390,7 @@ impl<'scratch, 'weights> AttentionDeviceChainRun<'scratch, 'weights> {
 /// — the step split no longer exists on this path, and the phase JSON keeps
 /// rendering the totals (`attention_ns`, `commit_ns`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_real_layer_attention_rows_device(
+pub(crate) fn step_real_layer_attention_rows_device(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     flash_cublas: Option<&FlashCublasSession>,
@@ -484,7 +484,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
     let compressor = if weights.compression_ratio == v4_state::CompressionRatio::WindowOnly {
         None
     } else {
-        Some(run_layer_compressor(
+        Some(step_layer_compressor(
             module,
             stream,
             &attn_input,
@@ -495,7 +495,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
         )?)
     };
     let indexer = if let Some(indexer) = weights.indexer.as_ref() {
-        Some(run_csa_indexer_projections(
+        Some(step_csa_indexer_projections(
             spec,
             module,
             stream,
@@ -565,7 +565,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
     // device, consuming the cache/topk just uploaded.
     let arm = sparse_attention_arm_from_env()?;
     match arm {
-        SparseAttentionArm::Reference => run_sparse_attention_device_into(
+        SparseAttentionArm::Reference => step_sparse_attention_device_into(
             module,
             stream,
             &scratch.q_rope,
@@ -576,7 +576,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
             topk.per_row,
         )?,
         SparseAttentionArm::ScoreReuse | SparseAttentionArm::Sm89Crossover => {
-            run_sparse_attention_score_reuse_device_into(
+            step_sparse_attention_score_reuse_device_into(
                 module,
                 stream,
                 &scratch.q_rope,
@@ -589,7 +589,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
             )?
         }
     }
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &scratch.sparse,
@@ -598,7 +598,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
         spec.q_heads,
         spec.q_head_dim,
     )?;
-    run_l0_wo_a_device_into_for(
+    step_l0_wo_a_device_into_for(
         spec,
         module,
         stream,
@@ -606,7 +606,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
         &weights.wo_a,
         &mut scratch.wo_a,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &scratch.wo_a,
@@ -620,7 +620,7 @@ pub(crate) fn run_real_layer_attention_rows_device(
     )?;
     // Step 17: hc_post consumes the device-resident post/comb from step 1 and
     // the scratch's own residual copy of the row input.
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         module,
         stream,
         &scratch.attention,

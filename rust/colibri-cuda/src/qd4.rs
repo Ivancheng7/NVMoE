@@ -369,7 +369,7 @@ pub(crate) fn run_qd4_routed_replays(
     Ok((startup_setup_ns, samples))
 }
 
-pub(crate) fn run_qd4_routed_once<'module>(
+pub(crate) fn step_qd4_routed_once<'module>(
     lanes: &mut [ExpertSlot<'module>],
     mut immutable_cache: Option<&mut Qd4ImmutableExpertCache<'module>>,
     shard: &safetensors::ShardFile,
@@ -734,7 +734,7 @@ pub(crate) fn run_qd4_stationary_gate_arm(
         };
         let mut completed = None;
         persistent.transaction(runtime.weights.layer, |state| {
-            let run = run_real_layer_rows(
+            let run = step_real_layer_rows(
                 context,
                 module,
                 stream,
@@ -863,10 +863,10 @@ pub(crate) fn run_qd4_immutable_cache_targeted_gate(
     let mut persistent = v4_state::V4SerialPersistentState::new(token_ids.len())?;
     let mut prepared = None;
     persistent.transaction(LAYER, |state| {
-        let attention = run_real_layer_attention_rows(
+        let attention = step_real_layer_attention_rows(
             module, stream, None, &runtime, input, 0, state, None, None,
         )?;
-        let ffn_hc = run_l0_mhc_pre(
+        let ffn_hc = step_l0_mhc_pre(
             module,
             stream,
             &attention.output,
@@ -879,7 +879,7 @@ pub(crate) fn run_qd4_immutable_cache_targeted_gate(
         } else {
             &[]
         };
-        let router = run_layer_router(
+        let router = step_layer_router(
             module,
             stream,
             None,
@@ -888,7 +888,7 @@ pub(crate) fn run_qd4_immutable_cache_targeted_gate(
             row_hash_ids,
             false,
         )?;
-        let shared = run_layer_shared_expert(module, stream, &router.input, &runtime.weights)?;
+        let shared = step_layer_shared_expert(module, stream, &router.input, &runtime.weights)?;
         prepared = Some((router.input, router.routes, shared));
         Ok(())
     })?;
@@ -925,7 +925,7 @@ pub(crate) fn run_qd4_immutable_cache_targeted_gate(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let mut cache = Qd4ImmutableExpertCache::new(context, module)?;
     cache.begin_layer(LAYER)?;
-    let first = run_qd4_routed_once(
+    let first = step_qd4_routed_once(
         &mut lanes,
         Some(&mut cache),
         &runtime.expert_shard,
@@ -937,7 +937,7 @@ pub(crate) fn run_qd4_immutable_cache_targeted_gate(
         None,
         true,
     )?;
-    let second = run_qd4_routed_once(
+    let second = step_qd4_routed_once(
         &mut lanes,
         Some(&mut cache),
         &runtime.expert_shard,

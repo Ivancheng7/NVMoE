@@ -510,7 +510,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         )?;
     }
     upload_request_rope_row(stream, position, false, &scratch.freqs)?;
-    run_l0_mhc_pre_device_into(
+    step_l0_mhc_pre_device_into(
         module,
         stream,
         &scratch.hc_hidden,
@@ -525,7 +525,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.trace,
         None,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &scratch.collapsed,
@@ -533,7 +533,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.attn_input,
         v4_state::HIDDEN,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &scratch.attn_input,
@@ -545,7 +545,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.kv_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &scratch.kv_raw,
@@ -553,7 +553,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &scratch.kv_norm,
@@ -562,7 +562,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         1,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_kv_quantize_device_into(
+    step_l0_kv_quantize_device_into(
         module,
         stream,
         &scratch.kv_rope,
@@ -570,7 +570,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.kv_scales,
         &mut scratch.kv_ready,
     )?;
-    run_generic_main_compressor_device(module, stream, scratch, weights, path, position)?;
+    step_generic_main_compressor_device(module, stream, scratch, weights, path, position)?;
     // Candidate tails are complete scratch copies.  Persistent tails are not
     // touched until all subsequent attention work and terminal D2H succeed.
     unsafe {
@@ -618,7 +618,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         return Err("generic stationary composite cache geometry mismatch".into());
     }
     if boundary {
-        run_generic_compressor_pool_device(module, stream, scratch, path)?;
+        step_generic_compressor_pool_device(module, stream, scratch, path)?;
         run_f32_to_bf16_device_into(
             module,
             stream,
@@ -631,7 +631,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             false,
             &scratch.compressed_freqs,
         )?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             module,
             stream,
             &scratch.compressed_bf16,
@@ -639,7 +639,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             &mut scratch.compressed_norm,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             module,
             stream,
             &scratch.compressed_norm,
@@ -648,7 +648,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             1,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_l0_kv_quantize_device_into(
+        step_l0_kv_quantize_device_into(
             module,
             stream,
             &scratch.compressed_rope,
@@ -704,7 +704,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             .indexer
             .as_ref()
             .ok_or("generic CSA indexer weights disappeared")?;
-        run_generic_indexer_compressor_device(
+        step_generic_indexer_compressor_device(
             module,
             stream,
             scratch,
@@ -768,7 +768,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             )?;
         }
         if boundary {
-            run_compressor_pool_ratio4_device_into(
+            step_compressor_pool_ratio4_device_into(
                 module,
                 stream,
                 candidate_kv,
@@ -782,7 +782,7 @@ pub(crate) fn prepare_generic_device_attention_row(
                 &scratch.indexer_pool,
                 &mut scratch.indexer_bf16,
             )?;
-            run_l0_rmsnorm_device_into(
+            step_l0_rmsnorm_device_into(
                 module,
                 stream,
                 &scratch.indexer_bf16,
@@ -790,7 +790,7 @@ pub(crate) fn prepare_generic_device_attention_row(
                 &mut scratch.indexer_norm,
                 128,
             )?;
-            run_rope_device_into(
+            step_rope_device_into(
                 module,
                 stream,
                 &scratch.indexer_norm,
@@ -820,7 +820,7 @@ pub(crate) fn prepare_generic_device_attention_row(
     }
     // Query projection and the composite raw/compressed cache are also scratch
     // only.  The raw ring keeps physical p % 128 indices, matching top-k.
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &scratch.attn_input,
@@ -832,7 +832,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.q_lora_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &scratch.q_lora_raw,
@@ -840,7 +840,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.q_lora,
         weights.wq_a.out_features,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &scratch.q_lora,
@@ -852,7 +852,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.q_raw,
         true,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &scratch.q_raw,
@@ -860,7 +860,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.q_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &scratch.q_norm,
@@ -921,7 +921,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             .indexer
             .as_ref()
             .ok_or("generic CSA indexer weights disappeared")?;
-        run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear_device_into(
             module,
             stream,
             &scratch.q_lora,
@@ -933,7 +933,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             &mut scratch.indexer_query_raw,
             true,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             module,
             stream,
             &scratch.indexer_query_raw,
@@ -1061,7 +1061,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         raw_topk_per_row
     };
     if sparse_attention_arm_from_env()?.uses_score_reuse(topk_per_row) {
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             module,
             stream,
             &scratch.q_rope,
@@ -1073,7 +1073,7 @@ pub(crate) fn prepare_generic_device_attention_row(
             topk_per_row,
         )?;
     } else {
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             module,
             stream,
             &scratch.q_rope,
@@ -1085,7 +1085,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         )?;
     }
     upload_request_rope_row(stream, position, true, &scratch.inverse_freqs)?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &scratch.sparse,
@@ -1094,14 +1094,14 @@ pub(crate) fn prepare_generic_device_attention_row(
         v4_state::Q_HEADS,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_wo_a_device_into(
+    step_l0_wo_a_device_into(
         module,
         stream,
         &scratch.sparse_inverse,
         &weights.wo_a,
         &mut scratch.wo_a,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &scratch.wo_a,
@@ -1113,7 +1113,7 @@ pub(crate) fn prepare_generic_device_attention_row(
         &mut scratch.attention,
         false,
     )?;
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         module,
         stream,
         &scratch.attention,
@@ -1794,7 +1794,7 @@ pub(crate) unsafe fn copy_device_range<T>(
     Ok(())
 }
 
-pub(crate) fn run_compressor_pool_ratio4_device_into(
+pub(crate) fn step_compressor_pool_ratio4_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     persistent_kv: &DeviceBuffer<f32>,
@@ -1824,7 +1824,7 @@ pub(crate) fn run_compressor_pool_ratio4_device_into(
     Ok(())
 }
 
-pub(crate) fn run_compressor_pool_ratio128_device_into(
+pub(crate) fn step_compressor_pool_ratio128_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     persistent_kv: &DeviceBuffer<f32>,
@@ -1963,7 +1963,7 @@ pub(crate) fn run_exact_compressor_device_into(
     ratio: usize,
     start_pos: usize,
 ) -> Result<(), Box<dyn Error>> {
-    run_exact_compressor_buffers_device_into(
+    step_exact_compressor_buffers_device_into(
         module,
         stream,
         input,
@@ -1988,7 +1988,7 @@ pub(crate) fn run_exact_compressor_device_into(
 /// path.  Both persist the same three FP32 row buffers, so the pinned cuBLAS
 /// reduction must be selected before either path writes its rolling tail.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_exact_compressor_buffers_device_into(
+pub(crate) fn step_exact_compressor_buffers_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     input: &DeviceBuffer<u16>,
@@ -2065,7 +2065,7 @@ pub(crate) fn run_exact_compressor_buffers_device_into(
 /// Candidate-only persistent-state update for the first CSA boundary.  This
 /// deliberately stops before sparse attention: exact commit parity is the
 /// gate, while pos3's CSA query/top-k path remains a separate follow-up.
-pub(crate) fn run_device_token_state_commit_row(
+pub(crate) fn step_device_token_state_commit_row(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     runtime: &LoadedLayerRuntime,
@@ -2093,7 +2093,7 @@ pub(crate) fn run_device_token_state_commit_row(
         )?;
     }
     rope_lut.copy_forward_row(stream, start_pos, &state.freqs)?;
-    run_l0_mhc_pre_device_into(
+    step_l0_mhc_pre_device_into(
         module,
         stream,
         &state.hc_hidden,
@@ -2108,7 +2108,7 @@ pub(crate) fn run_device_token_state_commit_row(
         &mut state.trace,
         None,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.collapsed,
@@ -2116,7 +2116,7 @@ pub(crate) fn run_device_token_state_commit_row(
         &mut state.attn_input,
         v4_state::HIDDEN,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.attn_input,
@@ -2128,7 +2128,7 @@ pub(crate) fn run_device_token_state_commit_row(
         &mut state.kv_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.kv_raw,
@@ -2136,7 +2136,7 @@ pub(crate) fn run_device_token_state_commit_row(
         &mut state.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.kv_norm,
@@ -2145,7 +2145,7 @@ pub(crate) fn run_device_token_state_commit_row(
         1,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_kv_quantize_device_into(
+    step_l0_kv_quantize_device_into(
         module,
         stream,
         &state.kv_rope,
@@ -2179,7 +2179,7 @@ pub(crate) fn run_device_token_state_commit_row(
             start_pos,
         )?;
     } else {
-        run_compressor_device_into(
+        step_compressor_device_into(
             module,
             stream,
             &state.attn_input,
@@ -2233,7 +2233,7 @@ pub(crate) fn run_device_token_state_commit_row(
                 start_pos,
             )?;
         } else {
-            run_compressor_device_into(
+            step_compressor_device_into(
                 module,
                 stream,
                 &state.attn_input,
@@ -2289,7 +2289,7 @@ pub(crate) fn run_device_token_state_commit_row(
         if state.compressed_rows >= 2 {
             return Err("short CSA decode exceeds its two-compressed-entry ceiling".into());
         }
-        run_compressor_pool_ratio4_device_into(
+        step_compressor_pool_ratio4_device_into(
             module,
             stream,
             &state.compressor.persistent_kv,
@@ -2308,7 +2308,7 @@ pub(crate) fn run_device_token_state_commit_row(
             start_pos + 1 - weights.compression_ratio.get(),
             &state.compressed_freqs,
         )?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             module,
             stream,
             &state.compressed_bf16,
@@ -2316,7 +2316,7 @@ pub(crate) fn run_device_token_state_commit_row(
             &mut state.compressed_norm,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             module,
             stream,
             &state.compressed_norm,
@@ -2325,7 +2325,7 @@ pub(crate) fn run_device_token_state_commit_row(
             1,
             v4_state::Q_HEAD_DIM,
         )?;
-        run_l0_kv_quantize_device_into(
+        step_l0_kv_quantize_device_into(
             module,
             stream,
             &state.compressed_rope,
@@ -2341,7 +2341,7 @@ pub(crate) fn run_device_token_state_commit_row(
             .indexer_compressor
             .as_ref()
             .ok_or("CSA indexer candidate state disappeared at pool boundary")?;
-        run_compressor_pool_ratio4_device_into(
+        step_compressor_pool_ratio4_device_into(
             module,
             stream,
             &indexer_state.persistent_kv,
@@ -2350,7 +2350,7 @@ pub(crate) fn run_device_token_state_commit_row(
             128,
         )?;
         run_f32_to_bf16_device_into(module, stream, &state.indexer_pool, &mut state.indexer_bf16)?;
-        run_l0_rmsnorm_device_into(
+        step_l0_rmsnorm_device_into(
             module,
             stream,
             &state.indexer_bf16,
@@ -2358,7 +2358,7 @@ pub(crate) fn run_device_token_state_commit_row(
             &mut state.indexer_norm,
             128,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             module,
             stream,
             &state.indexer_norm,
@@ -2435,7 +2435,7 @@ pub(crate) fn run_device_token_state_commit_row(
 
 /// Complete one attention row after its device-authoritative state commit for
 /// both pinned compression layouts in the five-token stationary gate.
-pub(crate) fn run_device_attention_after_commit(
+pub(crate) fn step_device_attention_after_commit(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
     runtime: &LoadedLayerRuntime,
@@ -2460,7 +2460,7 @@ pub(crate) fn run_device_attention_after_commit(
     {
         return Err("device attention-after-commit contract mismatch".into());
     }
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.attn_input,
@@ -2472,7 +2472,7 @@ pub(crate) fn run_device_attention_after_commit(
         &mut state.q_lora_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.q_lora_raw,
@@ -2480,7 +2480,7 @@ pub(crate) fn run_device_attention_after_commit(
         &mut state.q_lora,
         weights.wq_a.out_features,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.q_lora,
@@ -2492,7 +2492,7 @@ pub(crate) fn run_device_attention_after_commit(
         &mut state.q_raw,
         true,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.q_raw,
@@ -2500,7 +2500,7 @@ pub(crate) fn run_device_attention_after_commit(
         &mut state.q_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.q_norm,
@@ -2514,7 +2514,7 @@ pub(crate) fn run_device_attention_after_commit(
             .indexer
             .as_ref()
             .ok_or("device CSA indexer weights disappeared")?;
-        run_l0_fp8_linear_device_into(
+        step_l0_fp8_linear_device_into(
             module,
             stream,
             &state.q_lora,
@@ -2526,7 +2526,7 @@ pub(crate) fn run_device_attention_after_commit(
             &mut state.indexer_query_raw,
             true,
         )?;
-        run_rope_device_into(
+        step_rope_device_into(
             module,
             stream,
             &state.indexer_query_raw,
@@ -2661,7 +2661,7 @@ pub(crate) fn run_device_attention_after_commit(
         sparse_scratch,
     )?;
     rope_lut.copy_inverse_row(stream, position, &state.inverse_freqs)?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.sparse,
@@ -2670,14 +2670,14 @@ pub(crate) fn run_device_attention_after_commit(
         v4_state::Q_HEADS,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_wo_a_device_into(
+    step_l0_wo_a_device_into(
         module,
         stream,
         &state.sparse_inverse,
         &weights.wo_a,
         &mut state.wo_a,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.wo_a,
@@ -2689,7 +2689,7 @@ pub(crate) fn run_device_attention_after_commit(
         &mut state.attention,
         false,
     )?;
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         module,
         stream,
         &state.attention,
@@ -2718,7 +2718,7 @@ pub(crate) fn run_device_raw_window_attention(
 ) -> Result<(), Box<dyn Error>> {
     let sparse_arm = sparse_attention_arm_from_env()?;
     if sparse_arm.uses_score_reuse(topk.len()) {
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             module,
             stream,
             q_rope,
@@ -2730,7 +2730,7 @@ pub(crate) fn run_device_raw_window_attention(
             topk.len(),
         )
     } else {
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             module,
             stream,
             q_rope,
@@ -2785,7 +2785,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
     }
     rope_lut.copy_forward_row(stream, start_pos, &state.freqs)?;
     rope_lut.copy_inverse_row(stream, start_pos, &state.inverse_freqs)?;
-    run_l0_mhc_pre_device_into(
+    step_l0_mhc_pre_device_into(
         module,
         stream,
         &state.hc_hidden,
@@ -2800,7 +2800,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.trace,
         None,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.collapsed,
@@ -2808,7 +2808,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.attn_input,
         v4_state::HIDDEN,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.attn_input,
@@ -2820,7 +2820,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.q_lora_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.q_lora_raw,
@@ -2828,7 +2828,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.q_lora,
         weights.wq_a.out_features,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.q_lora,
@@ -2840,7 +2840,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.q_raw,
         true,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.q_raw,
@@ -2848,7 +2848,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.q_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.q_norm,
@@ -2857,7 +2857,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         v4_state::Q_HEADS,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.attn_input,
@@ -2869,7 +2869,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.kv_raw,
         false,
     )?;
-    run_l0_rmsnorm_device_into(
+    step_l0_rmsnorm_device_into(
         module,
         stream,
         &state.kv_raw,
@@ -2877,7 +2877,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.kv_norm,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.kv_norm,
@@ -2886,7 +2886,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         1,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_kv_quantize_device_into(
+    step_l0_kv_quantize_device_into(
         module,
         stream,
         &state.kv_rope,
@@ -2894,7 +2894,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.kv_scales,
         &mut state.kv_ready,
     )?;
-    run_compressor_device_into(
+    step_compressor_device_into(
         module,
         stream,
         &state.attn_input,
@@ -2911,7 +2911,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
     if let (Some(indexer), Some(indexer_state)) =
         (weights.indexer.as_ref(), state.indexer_compressor.as_mut())
     {
-        run_compressor_device_into(
+        step_compressor_device_into(
             module,
             stream,
             &state.attn_input,
@@ -2968,7 +2968,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         .get(start_pos)
         .ok_or("device attention gate top-k position is outside short-decode storage")?;
     if !sparse_arm.uses_score_reuse(topk.len()) {
-        run_sparse_attention_device_into(
+        step_sparse_attention_device_into(
             module,
             stream,
             &state.q_rope,
@@ -2979,7 +2979,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
             topk.len(),
         )?;
     } else if start_pos == 0 {
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             module,
             stream,
             &state.q_rope,
@@ -2991,7 +2991,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
             topk.len(),
         )?;
     } else {
-        run_sparse_attention_score_reuse_device_into(
+        step_sparse_attention_score_reuse_device_into(
             module,
             stream,
             &state.q_rope,
@@ -3003,7 +3003,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
             topk.len(),
         )?;
     }
-    run_rope_device_into(
+    step_rope_device_into(
         module,
         stream,
         &state.sparse,
@@ -3012,14 +3012,14 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         v4_state::Q_HEADS,
         v4_state::Q_HEAD_DIM,
     )?;
-    run_l0_wo_a_device_into(
+    step_l0_wo_a_device_into(
         module,
         stream,
         &state.sparse_inverse,
         &weights.wo_a,
         &mut state.wo_a,
     )?;
-    run_l0_fp8_linear_device_into(
+    step_l0_fp8_linear_device_into(
         module,
         stream,
         &state.wo_a,
@@ -3031,7 +3031,7 @@ pub(crate) fn run_wavefront_l3_l4_attention_row(
         &mut state.attention,
         false,
     )?;
-    run_l0_hc_post_device_into(
+    step_l0_hc_post_device_into(
         module,
         stream,
         &state.attention,

@@ -387,7 +387,7 @@ pub(crate) struct FlashFinalHeadGpuExactRun {
     pub(crate) memory: serde_json::Value,
 }
 
-pub(crate) fn run_flash_final_head_gpu_exact(
+pub(crate) fn step_flash_final_head_gpu_exact(
     output_dir: &std::path::Path,
     verification_manifest: Option<&serde_json::Value>,
     hidden: &[u16],
@@ -553,7 +553,7 @@ pub(crate) fn run_flash_final_head_gpu_exact(
     final_head_candidate_observe_device_free(&mut device_free_min)?;
     let norm_h2d_ms = norm_h2d_started.elapsed().as_secs_f64() * 1_000.0;
     let norm_kernel_started = std::time::Instant::now();
-    run_flash_learned_rmsnorm_4096_device_into(
+    step_flash_learned_rmsnorm_4096_device_into(
         &module,
         &stream,
         &collapsed_device,
@@ -815,7 +815,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
 
     // The serving and DSpark paths need the same exact arithmetic, but no
     // per-token artifacts or capture-only provenance contract.
-    pub(crate) fn run_runtime(
+    pub(crate) fn step_runtime(
         &self,
         hidden: &[u16],
     ) -> Result<FlashFinalHeadGpuExactRun, Box<dyn Error>> {
@@ -920,7 +920,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
         let mut normalized_device =
             DeviceBuffer::<u16>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
         let mut norm_trace = DeviceBuffer::<f32>::zeroed(&self.stream, 0)?;
-        run_flash_learned_rmsnorm_4096_device_into(
+        step_flash_learned_rmsnorm_4096_device_into(
             &self.module,
             &self.stream,
             &collapsed_device,

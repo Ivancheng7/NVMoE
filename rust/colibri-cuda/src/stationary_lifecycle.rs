@@ -2,7 +2,7 @@ use super::*;
 
 /// Request-scoped bookkeeping for the generic stationary device path.  It is
 /// deliberately data-only: the worker/cache remain the existing
-/// `FixedLayerCache` and `run_pinned_fixed_request_worker` implementation.
+/// `FixedLayerCache` and `step_pinned_fixed_request_worker` implementation.
 /// Keeping this boundary small makes the failure rule observable without
 /// inventing a second scheduler.
 #[derive(Debug)]
