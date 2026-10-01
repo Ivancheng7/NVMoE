@@ -63,7 +63,6 @@ mod b2_runtime;
 mod device_attention;
 mod device_geometry;
 mod device_weights;
-mod dspark;
 mod env_flags;
 mod expert_slices;
 mod expert_slot;
@@ -107,7 +106,6 @@ use b2_runtime::*;
 use device_attention::*;
 use device_geometry::*;
 use device_weights::*;
-use dspark::*;
 use env_flags::*;
 use expert_slices::*;
 use expert_slot::*;
@@ -221,11 +219,23 @@ fn main() {
         return;
     }
     validate_flash_parity_stop_mode().expect("validate Flash parity L0 stop mode");
+    // The DSpark speculative-decoding arm was removed on 2026-10-01. Even with its
+    // first defect fixed the draft accepted 0 of 20 proposals and the whole path ran
+    // about 16x slower than plain decoding — and it could not have paid for itself
+    // anyway: one round spends one anchor plus five row-by-row base forwards to
+    // commit at most six tokens. The flag stays a hard error so an old script cannot
+    // silently fall through to the plain smoke test.
+    // Evidence: docs/experiments/2026-09-18-sm120-dspark-acceptance.md
+    if std::env::var_os("COLIBRI_V4_FLASH_DSPARK").is_some() {
+        panic!(
+            "COLIBRI_V4_FLASH_DSPARK was removed; use COLIBRI_V4_FLASH_BASE=1 or \
+             COLIBRI_V4_FLASH_SERVE=1 instead"
+        );
+    }
     if optional_one_flag("COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY")
         .expect("validate Flash final-head replay flag")
     {
         if std::env::var_os("COLIBRI_V4_FLASH_BASE").is_some()
-            || std::env::var_os("COLIBRI_V4_FLASH_DSPARK").is_some()
             || std::env::var_os("COLIBRI_V4_FLASH_SERVE").is_some()
         {
             panic!("Flash final-head replay cannot be combined with a runtime mode");
@@ -248,12 +258,6 @@ fn main() {
     if optional_one_flag("COLIBRI_V4_FLASH_SERVE").expect("validate Flash-0731 serve flag") {
         run_real_v4_flash_serve(&context, &module, &stream)
             .expect("run DeepSeek V4 Flash-0731 local service");
-        return;
-    }
-
-    if optional_one_flag("COLIBRI_V4_FLASH_DSPARK").expect("validate Flash-0731 DSpark flag") {
-        run_real_v4_flash_dspark(&context, &module, &stream)
-            .expect("run DeepSeek V4 Flash-0731 full DSpark generation");
         return;
     }
 

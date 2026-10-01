@@ -474,6 +474,62 @@ pub(crate) struct GenericDeviceAttentionPrepared {
     pub(crate) path: GenericStationaryPath,
 }
 
+/// Commit the device token-state row and then read attention for it, returning
+/// the run with its commit/attention phase timings. This is the decode loop's
+/// entry point in `layer_rows.rs`.
+pub(crate) fn step_device_attention_row(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    runtime: &LoadedLayerRuntime,
+    state: &mut DeviceTokenState,
+    rope_lut: &DeviceRequestRopeLut,
+    hc_hidden: &[u16],
+    start_pos: usize,
+    observe_topk: bool,
+) -> Result<RealAttentionRun, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let rope_lut_d2d_count = step_device_token_state_commit_row(
+        module, stream, runtime, state, rope_lut, hc_hidden, start_pos,
+    )?;
+    let commit_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let (output, topk) = step_device_attention_after_commit(
+        module,
+        stream,
+        runtime,
+        state,
+        rope_lut,
+        start_pos,
+        observe_topk,
+    )?;
+    let attention_topk_digest = topk.as_deref().map_or(0, fnv1a_i32);
+    let attention_topk_per_row = topk.as_ref().map_or(0, Vec::len);
+    let audit_topk_bytes = topk.as_ref().map_or(0, Vec::len) * std::mem::size_of::<i32>();
+    let attention_ns = u64::try_from(started.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(commit_ns);
+    Ok(RealAttentionRun {
+        output,
+        topk,
+        stage_digests: Vec::new(),
+        attention_topk_digest,
+        attention_topk_per_row,
+        indexer_topk_gpu_ns: 0,
+        attention_ns,
+        commit_ns,
+        device_transfer: Some(DeviceAttentionTransfer {
+            h2d_count: 1,
+            h2d_bytes: state.hc_hidden.num_bytes(),
+            rope_lut_d2d_count: rope_lut_d2d_count + 1,
+            rope_lut_d2d_bytes: (rope_lut_d2d_count + 1) * state.freqs.num_bytes(),
+            terminal_d2h_count: 1,
+            terminal_d2h_bytes: state.after_attention.num_bytes(),
+            intermediate_or_audit_d2h_count: usize::from(observe_topk),
+            intermediate_or_audit_d2h_bytes: audit_topk_bytes,
+        }),
+        profile: None,
+    })
+}
+
 pub(crate) fn prepare_generic_device_attention_row(
     module: &kernels::LoadedModule,
     stream: &CudaStream,

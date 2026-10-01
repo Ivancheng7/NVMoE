@@ -393,18 +393,6 @@ pub(crate) fn host_available_bytes() -> Result<usize, Box<dyn Error>> {
         .ok_or_else(|| "MemAvailable byte count overflow".into())
 }
 
-pub(crate) fn process_rss_bytes() -> Result<usize, Box<dyn Error>> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|value| value.split_whitespace().next())
-        .ok_or("VmRSS is missing from /proc/self/status")?
-        .parse::<usize>()?;
-    kib.checked_mul(1024)
-        .ok_or_else(|| "VmRSS byte count overflow".into())
-}
-
 pub(crate) fn device_available_bytes() -> Result<usize, Box<dyn Error>> {
     let (mut free, mut total) = (0_usize, 0_usize);
     let result = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };

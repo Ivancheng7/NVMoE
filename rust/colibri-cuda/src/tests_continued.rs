@@ -1,33 +1,6 @@
 use super::*;
 
 #[test]
-fn flash_dspark_greedy_mode_rejects_sampling() {
-    validate_flash_dspark_greedy_mode(0.0).unwrap();
-    validate_flash_dspark_greedy_mode(-0.0).unwrap();
-    assert!(validate_flash_dspark_greedy_mode(0.01).is_err());
-    assert!(validate_flash_dspark_greedy_mode(f32::NAN).is_err());
-}
-
-#[test]
-fn flash_dspark_b5_capacity_includes_validation_scratch() {
-    assert_eq!(flash_dspark_state_capacity(2, 1).unwrap(), (7, 8));
-    assert_eq!(flash_dspark_state_capacity(128, 64).unwrap(), (70, 197));
-    assert!(flash_dspark_state_capacity(0, 1).is_err());
-    assert!(flash_dspark_state_capacity(2, 0).is_err());
-}
-
-#[test]
-fn flash_dspark_markov_is_sequential() {
-    let bf16 = |value| v4_router::f32_to_bf16_rne(value);
-    let w1 = [bf16(1.0), bf16(-1.0), bf16(2.0)];
-    let w2 = [bf16(0.0), bf16(1.0), bf16(-1.0)];
-    let (tokens, embeds) = flash_dspark_markov_greedy(&[0.0; 15], &w1, &w2, 3, 1, 0)
-        .expect("fixed sequential Markov chain");
-    assert_eq!(tokens, [1, 2, 1, 2, 1]);
-    assert_eq!(embeds, vec![w1[0], w1[1], w1[2], w1[1], w1[2]]);
-}
-
-#[test]
 fn csa_indexer_scores_match_cpu_oracle_and_select_causal_topk() {
     let (rows, heads, head_dim, keys, key_capacity) = (2_usize, 3_usize, 4_usize, 5_usize, 7_usize);
     let q = (0..rows * heads * head_dim)

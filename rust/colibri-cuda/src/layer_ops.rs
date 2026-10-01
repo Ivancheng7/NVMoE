@@ -857,6 +857,11 @@ pub(crate) fn run_rope(
     Ok(output.to_host_vec(stream)?)
 }
 
+/// Row cap of the `rope_v4_bf16` kernel (`kernels_module.rs`). The kernel returns
+/// silently once the row count exceeds it, leaving the output zeroed, so the host
+/// has to refuse the launch itself.
+pub(crate) const ROPE_MAX_ROWS: usize = 4;
+
 pub(crate) fn step_rope_device_into(
     module: &kernels::LoadedModule,
     stream: &CudaStream,
@@ -874,6 +879,14 @@ pub(crate) fn step_rope_device_into(
         || output.len() != input.len()
     {
         return Err("device RoPE workspace contract mismatch".into());
+    }
+    let rows = input.len() / row_width;
+    if rows > ROPE_MAX_ROWS {
+        return Err(format!(
+            "rope_v4_bf16 supports at most {ROPE_MAX_ROWS} rows, got {rows}; \
+             the kernel would return with the output left zeroed"
+        )
+        .into());
     }
     // SAFETY: kernel checks the same fixed head and frequency geometry.
     unsafe {
@@ -1879,8 +1892,6 @@ pub(crate) fn strict_compressor_enabled() -> bool {
         std::env::var_os(name).as_deref() == Some(std::ffi::OsStr::new("1"))
     }) || flash_runtime_strict_compressor_enabled(
         std::env::var_os("COLIBRI_V4_FLASH_BASE").as_deref() == Some(std::ffi::OsStr::new("1"))
-            || std::env::var_os("COLIBRI_V4_FLASH_DSPARK").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
             || std::env::var_os("COLIBRI_V4_FLASH_SERVE").as_deref()
                 == Some(std::ffi::OsStr::new("1")),
         std::env::var_os("COLIBRI_V4_FLASH_MHC_LINEAR_ARM").as_deref()

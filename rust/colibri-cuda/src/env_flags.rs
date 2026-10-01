@@ -22,8 +22,7 @@ pub(crate) fn validate_flash_parity_stop_mode() -> Result<(), Box<dyn Error>> {
     }
     let base = optional_one_flag("COLIBRI_V4_FLASH_BASE")?;
     let serve = optional_one_flag("COLIBRI_V4_FLASH_SERVE")?;
-    let dspark = optional_one_flag("COLIBRI_V4_FLASH_DSPARK")?;
-    if !base || serve || dspark {
+    if !base || serve {
         return Err(
             "COLIBRI_V4_FLASH_PARITY_STOP_AFTER_LAYER is only valid when Flash base mode is the selected execution"
                 .into(),

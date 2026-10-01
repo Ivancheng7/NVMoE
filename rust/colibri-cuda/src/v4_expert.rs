@@ -5,7 +5,7 @@ use std::error::Error;
 use crate::safetensors::{ShardFile, TensorDtype};
 use crate::v4_fp4::{PackedFp4E2M1x2, decode_e8m0, decode_fp4};
 use crate::v4_router::{bf16_to_f32, f32_to_bf16_rne};
-use crate::v4_spec::{FLASH_0731, PRO, V4Spec};
+use crate::v4_spec::{PRO, V4Spec};
 
 pub const V4_HIDDEN: usize = 7_168;
 pub const V4_EXPERT_INTERMEDIATE: usize = 3_072;
@@ -110,15 +110,6 @@ impl RoutedExpertRangePlan {
     pub fn new_mtp(shard: &ShardFile, expert_id: u16) -> Result<Self, Box<dyn Error>> {
         let prefix = mtp_routed_expert_prefix(expert_id)?;
         Self::new_with_prefix(&PRO, shard, expert_id, &prefix)
-    }
-
-    pub fn new_dspark(
-        shard: &ShardFile,
-        stage: usize,
-        expert_id: u16,
-    ) -> Result<Self, Box<dyn Error>> {
-        let prefix = dspark_routed_expert_prefix(stage, expert_id)?;
-        Self::new_with_prefix(&FLASH_0731, shard, expert_id, &prefix)
     }
 
     fn new_with_prefix(
@@ -289,15 +280,6 @@ impl RoutedExpert {
         Self::load_with_prefix(&PRO, shard, &prefix)
     }
 
-    pub fn load_dspark(
-        shard: &ShardFile,
-        stage: usize,
-        expert_id: u16,
-    ) -> Result<Self, Box<dyn Error>> {
-        let prefix = dspark_routed_expert_prefix(stage, expert_id)?;
-        Self::load_with_prefix(&FLASH_0731, shard, &prefix)
-    }
-
     fn load_with_prefix(
         spec: &'static V4Spec,
         shard: &ShardFile,
@@ -402,20 +384,6 @@ fn mtp_routed_expert_prefix(expert_id: u16) -> Result<String, ExpertError> {
         )));
     }
     Ok(format!("mtp.0.ffn.experts.{expert_id}"))
-}
-
-fn dspark_routed_expert_prefix(stage: usize, expert_id: u16) -> Result<String, ExpertError> {
-    if stage >= 3 {
-        return Err(ExpertError::Tensor(format!(
-            "invalid Flash-0731 DSpark stage {stage}"
-        )));
-    }
-    if expert_id as usize >= FLASH_0731.routed_experts {
-        return Err(ExpertError::Tensor(format!(
-            "invalid routed expert id {expert_id}"
-        )));
-    }
-    Ok(format!("mtp.{stage}.ffn.experts.{expert_id}"))
 }
 
 struct ReadBuffer {

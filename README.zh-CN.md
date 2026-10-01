@@ -59,13 +59,13 @@ b970da7913a57a1c, 12c6b45cecf9d53b, e0f441542fa53991, 69ed859929ee9042
 
 有一条要如实说清：`sm_120`上官方TileLang FP4核不可复现。同一份权重和输入，两次跑的`routed_sum_f32`有`510/4096`个元素不同（其中`440`个相对误差超1%，最大`30.7倍`）；一个`M=1, N=2048, K=4096`的最小复现例报`2048/2048`个元素错误，跑间差`6.912e+01`。猜的原因是TileLang 0.1.8发出的是`sm_100`代码，而消费级`sm_120`缺它面向的那条tensor core指令——这个猜测没有验证。所以上面那组钉死值是**本引擎自己的回归门**，不是"在`sm_120`上对上了官方reference"的证书。把官方oracle钉到稳定的TileLang版本之后两边的token都到`55222`，但两个实现仍在第8层的`route_weight_bits`首次分叉，谁对谁错都还没判。[归档的sm_89 README](docs/archive/README.sm89-12gb-rtx4080.md)里那张`43/43`对上reference的证书是在另一张卡上测的，不能当成这里也过了。
 
-## DSpark提交经过验证的前缀
+## DSpark臂已移除（2026-10-01）
 
-DSpark先提出一个block，再算base target，随后提交被接受的前缀。状态transaction在提交前携带base和3个MTP状态digest。
+早先的版本带一条投机解码臂：DSpark先提出一个block，再算base target，随后提交被接受的前缀，状态transaction在提交前携带base和3个MTP状态digest。它被移除了，因为实测说明它付不起自己的开销。
 
-`sm_120`上第一次真跑DSpark，整条路都执行到了——权重、状态transaction、三个MTP阶段——结果是`30`个proposal里接受`0`个，输出与base greedy逐位相同，但比直接解码慢大约`16倍`。排查抓到一个真bug：`rope_v4_bf16`这个核超过4行就静默返回，而DSpark的draft是5行，所以`q`和`query_kv`一直被清零。把上限抬高之后`q_nz`从`0`变成`163840`，可是接受率仍是`0`，说明还有第二处缺陷。现在的卡点是修完那条之后`confidence`的幅值从约`1`跳到`10^3..10^4`，指向`collapsed`的量级。
+`sm_120`上草稿在`30`个proposal里接受`0`个；把第一处缺陷修好之后再测，`20`个里仍然接受`0`个——同时输出与base greedy逐位相同，却比直接解码慢大约`16倍`。排查过程中确实抓到一个真bug：`rope_v4_bf16`这个核超过4行就静默返回，5行的草稿于是拿到被清零的`q`和`query_kv`。现在主机侧会直接拒绝这种发射并报错，而不是把清零的张量交回去。第二处缺陷始终没解决：草稿的`confidence`落在`10^3..10^4`，而合同要求的是`O(1)`。
 
-独立的官方DSpark oracle在这里跑不起来：它的生成脚本要合并过的`model{i}-mp{mp}.safetensors`分片，而本地是48分片的HF布局，166GB本来也塞不进16GB的卡。草稿没跑对之前，谈"一趟验证N行"还早。
+移除而不是继续修的算术理由：一轮花掉1次anchor加5次逐行的base前向，最多只能提交6个token——5个草稿全接受也只是打平，再加上草稿那3个stage就是净亏。真正能改变这个账的工作是"一趟验N行"，而那件事本身就利好base路径，所以这条臂没有可加的东西。`COLIBRI_V4_FLASH_DSPARK`现在是硬报错，不再静默穿透。整个调查、已排除的嫌疑和未解决的`confidence`入口都留在[`docs/experiments/2026-09-18-sm120-dspark-acceptance.md`](docs/experiments/2026-09-18-sm120-dspark-acceptance.md)。
 
 ## 现在一个token花在哪
 

@@ -318,45 +318,6 @@ pub(crate) struct LoadedLayerRuntime {
     pub(crate) expert_shard: safetensors::ShardFile,
 }
 
-pub(crate) struct LoadedDsparkStage {
-    pub(crate) stage: usize,
-    pub(crate) weights: LayerDeviceWeights,
-    pub(crate) expert_shard: safetensors::ShardFile,
-    pub(crate) main_proj: Option<DeviceFp8Matrix>,
-    pub(crate) main_norm: Option<DeviceBuffer<u16>>,
-    pub(crate) head: Option<v4_state::DsparkHeadWeights>,
-}
-
-pub(crate) fn load_flash_dspark_stage(
-    module: &kernels::LoadedModule,
-    stream: &CudaStream,
-    model_dir: &std::path::Path,
-    stage: usize,
-) -> Result<LoadedDsparkStage, Box<dyn Error>> {
-    let host = v4_state::load_flash_dspark_stage(model_dir, stage)?;
-    let weights =
-        LayerDeviceWeights::new_layer(stream, &host.state, &host.projections, &host.tail)?;
-    let main_proj = host
-        .main_proj
-        .as_ref()
-        .map(|matrix| DeviceFp8Matrix::new(stream, matrix))
-        .transpose()?;
-    let main_norm = host
-        .main_norm
-        .as_ref()
-        .map(|norm| DeviceBuffer::from_host(stream, norm))
-        .transpose()?;
-    let _ = module;
-    Ok(LoadedDsparkStage {
-        stage,
-        weights,
-        expert_shard: host.shard,
-        main_proj,
-        main_norm,
-        head: host.head,
-    })
-}
-
 pub(crate) struct RawLoadedLayerRuntime {
     pub(crate) runtime: LoadedLayerRuntime,
     pub(crate) wo_a_raw: DeviceBuffer<u8>,
