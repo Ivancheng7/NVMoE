@@ -68,6 +68,45 @@ struct RoutedLaneOutcome<'a> {
     slot: ExpertSlot<'a>,
 }
 
+/// Counted gate over the fan-out lanes' GPU phase (upload + kernels on their
+/// own streams). Reads are taken before the gate on purpose: the one resource
+/// six-way concurrency is known to help is the disk. Width 0 means no gate is
+/// built at all and the lanes keep the shipped unlimited overlap.
+struct FanoutGpuWindow {
+    free: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl FanoutGpuWindow {
+    fn new(width: usize) -> Self {
+        Self {
+            free: std::sync::Mutex::new(width),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> FanoutGpuWindowGuard<'_> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.released.wait(free).unwrap();
+        }
+        *free -= 1;
+        FanoutGpuWindowGuard { window: self }
+    }
+}
+
+struct FanoutGpuWindowGuard<'a> {
+    window: &'a FanoutGpuWindow,
+}
+
+impl Drop for FanoutGpuWindowGuard<'_> {
+    fn drop(&mut self) {
+        let mut free = self.window.free.lock().unwrap();
+        *free += 1;
+        self.window.released.notify_one();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_real_layer_attention_rows(
     module: &kernels::LoadedModule,
@@ -1122,6 +1161,13 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
             // borrows `lanes` from the same binding and only runs when this
             // branch did not take them.
             let lanes = std::mem::replace(&mut lanes, Vec::new());
+            let gpu_window_width = fanout_gpu_window()?;
+            let gpu_window =
+                (gpu_window_width > 0).then(|| FanoutGpuWindow::new(gpu_window_width));
+            // The workers capture the gate through a shared reference, the same
+            // way they take `shard` and `input`; a `move` closure would try to
+            // take the gate itself.
+            let gpu_window = &gpu_window;
             let mut outcomes: Vec<RoutedLaneOutcome<'module>> = Vec::with_capacity(lanes.len());
             let mut lane_slots = slots.drain(..);
             let shared = std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
@@ -1154,6 +1200,12 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                                     .map_err(|error| error.to_string())?;
                             }
                             let read_ns = lane.read_ns();
+                            // The gate, when built, bounds how many lanes
+                            // upload and execute at once; the read above is
+                            // never gated. Dropped at the closure's end, after
+                            // `execute` has synchronized its own event.
+                            let _gpu_gate =
+                                gpu_window.as_ref().map(FanoutGpuWindow::acquire);
                             let setup_started = std::time::Instant::now();
                             slot.upload_lane(&lane).map_err(|error| error.to_string())?;
                             let setup_ns = u64::try_from(setup_started.elapsed().as_nanos())

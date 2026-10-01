@@ -45,6 +45,23 @@ pub(crate) fn mtp1_draft_max_scored_transitions() -> Result<usize, Box<dyn Error
     }
 }
 
+/// Fan-out GPU-phase window: how many lanes may be inside their upload +
+/// kernel section at the same time. Unset or 0 means unlimited, which is the
+/// shipped shape; 1-6 bounds the six lanes. Reads are never gated by this.
+pub(crate) fn fanout_gpu_window() -> Result<usize, Box<dyn Error>> {
+    match std::env::var("COLIBRI_V4_FLASH_FANOUT_GPU_WINDOW") {
+        Ok(value) => {
+            let window = value.parse::<usize>()?;
+            if window > 6 {
+                return Err("COLIBRI_V4_FLASH_FANOUT_GPU_WINDOW must be at most 6 when set".into());
+            }
+            Ok(window)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn parse_default_true_zero_one_flag(
     name: &str,
     value: Option<&std::ffi::OsStr>,
