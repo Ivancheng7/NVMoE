@@ -374,10 +374,10 @@ fn b2_prompt_chunk_span(chunk_enabled: bool, request: &B2GenerateRequest) -> usi
     }
 }
 
-pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
+pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
     spec: &'static v4_spec::V4Spec,
     context: &std::sync::Arc<CudaContext>,
-    module: &kernels::LoadedModule,
+    module: &'module kernels::LoadedModule,
     stream: &std::sync::Arc<CudaStream>,
     flash_cublas: Option<&FlashCublasSession>,
     model_dir: &std::path::Path,
@@ -386,7 +386,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     lanes: &mut [ExpertSlot<'_>],
     scratch: &mut DeviceBuffer<u16>,
     resident: &mut Vec<Option<B2RawRuntime>>,
-    routed_slot_scratch: &mut RoutedSlotScratch<'_>,
+    routed_slot_scratch: &mut RoutedSlotScratch<'module>,
     prompts: [Vec<i64>; REQUESTS],
     greedy_steps: usize,
     forward_tokens: [usize; REQUESTS],
