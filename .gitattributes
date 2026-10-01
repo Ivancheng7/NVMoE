@@ -1,0 +1,16 @@
+# 行尾钉死：下面这几类文件会在 Windows 和 WSL 之间来回搬，必须是 LF。
+#
+# *.sh —— 从 Windows 侧拷贝进 WSL 会带 CRLF，脚本直接失效。症状是
+#   `env: $'bash\r': No such file or directory`；改用 `bash 脚本名` 绕过
+#   shebang 也没用，正文里的 `set -euo pipefail` 同样被打坏，报
+#   `set: pipefail\r: invalid option name`。
+#
+# *.rs —— Windows 侧检出 CRLF、WSL 侧检出 LF，同一份源码两边字节不同；
+#   工具重写文件之后 `git status` 会虚报一批“已修改”（实测一次虚报 60 个，
+#   真实内容差异只有 23 个）。
+#
+# core.autocrlf 仍是 true，但 .gitattributes 优先级更高，所以这两类文件
+# 在 Windows 上也会检出 LF。仓库里已提交的内容本来就是 LF，所以加这条
+# 规则不产生重归一化 diff，只影响以后的检出。
+*.sh text eol=lf
+*.rs text eol=lf
