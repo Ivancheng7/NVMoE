@@ -14,3 +14,4 @@
 # 规则不产生重归一化 diff，只影响以后的检出。
 *.sh text eol=lf
 *.rs text eol=lf
+.gitattributes text eol=lf
