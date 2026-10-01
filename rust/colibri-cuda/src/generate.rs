@@ -384,7 +384,7 @@ pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
     final_weights: Option<&v4_state::FinalHeadWeights>,
     flash_final_head_gpu: Option<&FlashDsparkFinalHeadGpuWorkspace>,
     lanes: &mut [ExpertSlot<'_>],
-    scratch: &mut DeviceBuffer<u16>,
+    mut scratch: &mut DeviceBuffer<u16>,
     resident: &mut Vec<Option<B2RawRuntime>>,
     routed_slot_scratch: &mut RoutedSlotScratch<'module>,
     prompts: [Vec<i64>; REQUESTS],
