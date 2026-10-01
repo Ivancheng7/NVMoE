@@ -83,5 +83,11 @@ fan-out 车道重新锁页一遍。相位账里看得清清楚楚：旧代码三
    构造保证）。两者都要拆 `step_real_layer_rows` 的层内顺序，是下一场硬仗。
 2. **引擎启动时先填常驻再 READY**：把第 1 个请求那 ~2 s 填充也挪出 TTFT（服务面启动多 ~2 s）。
 3. 服务面多请求并发的显存预算要按"常驻池常驻不释放"重算（现状 §五已挂的那条，现在更实际）。
-4. 本改动在 `exp/lane-contention`（`2a49dbb`），数值三闸门全过，**可合并交付**；合并时按
-   老规矩跑一次 `verify_delivery_arm.sh` 的换序批。
+4. ~~本改动在 `exp/lane-contention`（`2a49dbb`），数值三闸门全过，**可合并交付**；合并时按
+   老规矩跑一次 `verify_delivery_arm.sh` 的换序批。~~
+   → **2026-10-02 已合并交付**（`codex/business-restart` 合并提交 `9dc963a`，--no-ff 带入
+   lane 争用关闭的两份记录与默认关的窗口探针）。合并闸门 `/srv/localmoe/targets/merge-gate-9dc963a/`：
+   合并树构建 0 error、二进制 sha256 `4efa4a7a…` 与本记录 A/B 的 new 臂**完全一致**、
+   1 步 `baseline reproduces`、8 步对 `defaulton` 参照只有峰值差异、服务冒烟（一个引擎 3 请求）
+   TTFT `17.7 → 14.8 → 14.1 s`、第 2/3 请求 `344 layer-visits served from VRAM`。
+   换序 A/B 已由本记录主批承担（新旧二进制、两轮交错），合并树与 new 臂同码同 sha，未重跑。
