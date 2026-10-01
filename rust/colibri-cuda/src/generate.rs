@@ -384,7 +384,9 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     final_weights: Option<&v4_state::FinalHeadWeights>,
     flash_final_head_gpu: Option<&FlashDsparkFinalHeadGpuWorkspace>,
     lanes: &mut [ExpertSlot<'_>],
-    mut scratch: &mut DeviceBuffer<u16>,
+    scratch: &mut DeviceBuffer<u16>,
+    resident: &mut Vec<Option<B2RawRuntime>>,
+    routed_slot_scratch: &mut RoutedSlotScratch<'_>,
     prompts: [Vec<i64>; REQUESTS],
     greedy_steps: usize,
     forward_tokens: [usize; REQUESTS],
@@ -457,8 +459,17 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     // device memory, bit-identical outputs. `COLIBRI_V4_FIXED_RESIDENT_GIB=0`
     // streams as before; the budget is preflighted against free device memory.
     let resident_budget_bytes = flash_b1_resident_budget_bytes(spec, REQUESTS)?;
-    let resident_enabled = resident_budget_bytes > 0;
-    let mut resident: Vec<Option<B2RawRuntime>> = (0..spec.layers).map(|_| None).collect();
+    // The pool comes from the caller's scope. The serve face hands the same one
+    // back for every request, so only its first request pays the fill and the
+    // later ones start every layer from VRAM; a fresh caller passes an empty
+    // pool and the fill happens exactly as before. The capture budget below
+    // still counts only bytes captured by this call — the carried entries are
+    // already allocated and their cost was paid by whichever call filled them.
+    if resident.len() != spec.layers {
+        *resident = (0..spec.layers).map(|_| None).collect();
+    }
+    let resident_enabled =
+        resident_budget_bytes > 0 || resident.iter().any(Option::is_some);
     let mut resident_bytes = 0usize;
     let mut resident_hits = 0usize;
     // A resident layer has nothing to preload, and its captured buffer *is* the
@@ -488,8 +499,10 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
         fixed_host_cache::FixedHostCache::from_env(spec.layers)?,
     ));
     // Same scope argument for the routed expert slot: page-locking its staging
-    // costs 17 ms, so it lives as long as the run instead of one layer.
-    let mut routed_slot_scratch = RoutedSlotScratch::new();
+    // costs 17 ms, so it lives as long as the run instead of one layer. The
+    // serve face hands the same scratch back for every request, so the fan-out
+    // lanes and their page-locked staging are built once per engine process
+    // instead of once per request.
     // The fixed-layer slot gets the same lifetime as the host cache: one device
     // slot per layer type, restaged every layer instead of rebuilt.
     let mut fixed_layer_slot = fixed_layer_slot::FixedLayerSlot::new();
@@ -770,7 +783,7 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
                                 absolute,
                                 &mut state.persistent,
                                 compressor_scratch.as_mut(),
-                                Some(&mut routed_slot_scratch),
+                                Some(&mut *routed_slot_scratch),
                                 attention_device_scratch.as_mut(),
                             )?;
                             physical.routed_source_bytes += stage.routed_source_bytes;
@@ -1020,8 +1033,13 @@ pub(crate) fn run_v4_b2_generate_arm<const REQUESTS: usize>(
     let duration_ns = u64::try_from(request_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if resident_enabled {
         let layers_resident = resident.iter().filter(|slot| slot.is_some()).count();
+        let pool_bytes: usize = resident
+            .iter()
+            .flatten()
+            .map(|entry| entry.raw.resident_bytes)
+            .sum();
         eprintln!(
-            "fixed residency: {layers_resident} layers resident ({resident_bytes} bytes), \
+            "fixed residency: {layers_resident} layers resident ({pool_bytes} bytes), \
              {resident_hits} layer-visits served from VRAM"
         );
     }
@@ -1059,6 +1077,8 @@ pub(crate) fn run_real_v4_b2_generate<const REQUESTS: usize>(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let mut scratch =
         DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
+    let mut resident = Vec::new();
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     let arm = run_v4_b2_generate_arm(
         &v4_spec::PRO,
         context,
@@ -1070,6 +1090,8 @@ pub(crate) fn run_real_v4_b2_generate<const REQUESTS: usize>(
         None,
         &mut lanes,
         &mut scratch,
+        &mut resident,
+        &mut routed_slot_scratch,
         prompts,
         greedy_steps,
         forward_tokens,
@@ -1156,6 +1178,8 @@ pub(crate) fn run_real_v4_flash_base(
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
     let wo_a_elements = spec.q_heads * spec.q_head_dim * spec.o_lora_rank;
     let mut scratch = DeviceBuffer::<u16>::zeroed(stream, wo_a_elements)?;
+    let mut resident = Vec::new();
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     let arm = match run_v4_b2_generate_arm(
         spec,
         context,
@@ -1167,6 +1191,8 @@ pub(crate) fn run_real_v4_flash_base(
         flash_final_head_gpu.as_ref(),
         &mut lanes,
         &mut scratch,
+        &mut resident,
+        &mut routed_slot_scratch,
         prompts,
         greedy_steps,
         forward_tokens,
@@ -1313,6 +1339,13 @@ pub(crate) fn run_real_v4_flash_serve(
     let wo_a_elements = spec.q_heads * spec.q_head_dim * spec.o_lora_rank;
     let mut scratch = DeviceBuffer::<u16>::zeroed(stream, wo_a_elements)?;
     let mut lanes = Vec::<ExpertSlot<'_>>::new();
+    // Both pools outlive the request loop: the fixed-weight residency would
+    // otherwise be rebuilt (6.25 GiB re-read and re-uploaded) and the fan-out
+    // lanes re-page-locked by every request, all for buffers whose contents
+    // never depend on the request. The KV and per-request state stay inside
+    // the arm as before.
+    let mut resident = Vec::new();
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     let flash_cublas = (flash_mhc_linear_arm(spec)? == FlashMhcLinearArm::Cublas
         || flash_router_linear_arm(spec)? == FlashMhcLinearArm::Cublas)
         .then(|| FlashCublasSession::new(stream))
@@ -1433,6 +1466,8 @@ pub(crate) fn run_real_v4_flash_serve(
             flash_final_head_gpu.as_ref(),
             &mut lanes,
             &mut scratch,
+            &mut resident,
+            &mut routed_slot_scratch,
             [prompt_ids.clone()],
             submit.max_tokens,
             [forward_tokens],
@@ -1544,6 +1579,8 @@ pub(crate) fn run_real_v4_b4_greedy_abba_bench(
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let mut scratch =
         DeviceBuffer::<u16>::zeroed(stream, (128 * 1024 * 1024) / std::mem::size_of::<u16>())?;
+    let mut resident = Vec::new();
+    let mut routed_slot_scratch = RoutedSlotScratch::new();
     writeln!(
         output.file_mut(),
         "{}",
@@ -1570,6 +1607,8 @@ pub(crate) fn run_real_v4_b4_greedy_abba_bench(
             None,
             &mut lanes,
             &mut scratch,
+            &mut resident,
+            &mut routed_slot_scratch,
             [prompts[0].clone(), prompts[1].clone()],
             greedy_steps,
             [forward_tokens[0], forward_tokens[1]],
@@ -1590,6 +1629,8 @@ pub(crate) fn run_real_v4_b4_greedy_abba_bench(
             None,
             &mut lanes,
             &mut scratch,
+            &mut resident,
+            &mut routed_slot_scratch,
             [prompts[2].clone(), prompts[3].clone()],
             greedy_steps,
             [forward_tokens[2], forward_tokens[3]],
@@ -1622,6 +1663,8 @@ pub(crate) fn run_real_v4_b4_greedy_abba_bench(
             None,
             &mut lanes,
             &mut scratch,
+            &mut resident,
+            &mut routed_slot_scratch,
             prompts,
             greedy_steps,
             forward_tokens,
