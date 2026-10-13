@@ -1509,7 +1509,7 @@ pub(crate) fn run_compressor_official_cublas_host(
     let mut kv_f32 = Vec::with_capacity(rows * outputs);
     let mut score_f32 = Vec::with_capacity(rows * outputs);
     let mut probe_row_upload_ns = 0_u128;
-    let mut probe_row_alloc_ns = 0_u128;
+    let probe_row_alloc_ns = 0_u128;
     let mut probe_gemm1_ns = 0_u128;
     let mut probe_gemm2_ns = 0_u128;
     let mut probe_row_d2h_ns = 0_u128;

@@ -856,7 +856,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
         let input = DeviceBuffer::from_host(&self.stream, hidden)?;
         let mut input_f32 = DeviceBuffer::<f32>::zeroed(&self.stream, hidden.len())?;
         let mut squares = DeviceBuffer::<f32>::zeroed(&self.stream, hidden.len())?;
-        let mut raw_dot = DeviceBuffer::<f32>::zeroed(&self.stream, v4_state::HC)?;
+        let raw_dot = DeviceBuffer::<f32>::zeroed(&self.stream, v4_state::HC)?;
         let mut rsqrt = DeviceBuffer::<f32>::zeroed(&self.stream, 1)?;
         let mut rms_debug =
             DeviceBuffer::<u32>::zeroed(&self.stream, FLASH_MHC_RSQRT_DEBUG_FIELDS)?;
@@ -935,7 +935,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
         let logits_started = std::time::Instant::now();
         let mut normalized_f32 =
             DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
-        let mut logits_device =
+        let logits_device =
             DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.vocab)?;
         launch_v4_bf16_to_f32(
             &self.module,

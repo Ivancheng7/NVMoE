@@ -1073,7 +1073,7 @@ fn flash_b1_phase_profile_closes_without_double_counting_nested_work() {
         routed_kernel_ns: 5,
         ..LayerStageTelemetry::default()
     };
-    let layer = flash_b1_layer_phase_profile_json(0, 100, 20, &fixed, 10, &stage).unwrap();
+    let layer = flash_b1_layer_phase_profile_json(0, 100, 20, &fixed, 10, &stage, 0).unwrap();
     assert_eq!(layer["top_level_attributed_ns"], 85);
     assert_eq!(layer["unattributed_gap_ns"], 15);
     let timing = FlashB1PhaseTiming {
@@ -1105,7 +1105,7 @@ fn flash_b1_phase_profile_marks_background_host_work_without_charging_it_twice()
         routed_read_ns: 50,
         ..LayerStageTelemetry::default()
     };
-    let layer = flash_b1_layer_phase_profile_json(1, 30, 5, &fixed, 5, &stage).unwrap();
+    let layer = flash_b1_layer_phase_profile_json(1, 30, 5, &fixed, 5, &stage, 0).unwrap();
     assert!(
         layer["top_level"]["fixed"]["host_prefetched"]
             .as_bool()
@@ -3655,7 +3655,7 @@ fn generic_strict_compressor_projection_tail_matches_pinned_cublas_at_csa_p3_and
         let mut pool = DeviceBuffer::<f32>::zeroed(stream, v4_state::Q_HEAD_DIM)?;
         let mut pool_bf16 = DeviceBuffer::<u16>::zeroed(stream, v4_state::Q_HEAD_DIM)?;
         let mut host = v4_state::V4CompressorState::new_decode(ratio, v4_state::Q_HEAD_DIM)?;
-        let mut host_oracle = StrictCompressorArena::new(stream, width, ratio)?;
+        let mut host_oracle = StrictCompressorArena::new(stream, v4_state::HIDDEN, width, ratio)?;
 
         for position in 0..=boundary {
             let host_input = input_for(position);
