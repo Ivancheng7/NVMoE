@@ -122,9 +122,17 @@ cargo check --locked -p colibri-cuda            # 要再加 --tests 才算覆盖
   必须套 `rustc-human-wrapper.sh`。`run-identified.sh` 已经自己设好，但 `cargo check`
   不会自动带上，要手动写。
 - **`wsl.exe -e bash -c` 里没有 `cargo`**：跑构建要用 `-lc`，否则报 `exit=127 command not found`。
-- 编译警告数必须保持 59（bin）/ 22（test）。搬走的死代码会让警告「换文件」——例如
-  `run_real_l0_rows` 那条从 `main.rs` 挪到 `mtp1_l0.rs`——所以判据是**警告集合去掉行号后
-  逐条相同**，不只是总数相同。
+- 编译警告数（2026-10-13 实测，交付线 `fa61748`）：**54（bin）/ 16（test）**。搬走的死代码会让
+  警告「换文件」——例如 `run_real_l0_rows` 那条从 `main.rs` 挪到 `mtp1_l0.rs`——所以判据是
+  **警告集合去掉行号后逐条相同**，不只是总数相同。
+- **判「谁没人用」必须带 `--tests`**：不带时 bin 构建报 57 条 `never used`，带上之后只剩 19 条。
+  差的那 38 个不是死代码，是被 191 个测试当 oracle 用的 CPU 参考实现（`route_layer_cpu`、
+  `indexer_scores_cpu`、`csa_compress_topk_cpu`、`compressor_initial_matches`、`run_cpu` 等）。
+  照 bin 那份清单删，测试构建立刻碎。**两个构建里都报 `never used` 的，才是真死代码。**
+- 2026-10-13 修好过一次测试构建：`93423d8` 删 DSpark 臂时，把 `v4_state.rs` 测试模块里两处引用
+  （`DSPARK_STAGES`、`DsparkB5PersistentState`、`flash_dspark_b5_topk` 等）留在了原地，
+  `cargo check --tests` 26 个 error、191 个测试整个跑不了，也就没人再看见 bin 那 57 条警告。
+  **合分支后跑一次 `--tests`**，它比跑一次推理便宜。
 - `cargo fmt --check` 在 HEAD 上本来就不通过，偏差多数是原码自带的。2026-09-16 逐文件量，
   整棵树 95 处（`v4_state.rs` 19、`tests.rs` 13、`mtp1_resources.rs` 8、`b2_generate.rs` 7、
   `state_audit.rs` 7 等），**main.rs 是 0 处**。判据是「不新增格式差异」：新文件里的偏差要么
