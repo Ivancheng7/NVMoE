@@ -469,7 +469,9 @@ pub(crate) fn phase1_predicted_p6_ns(
         .saturating_add(flow_shop_ns)
 }
 
-pub(crate) fn pinned_h2d_service_gate(context: &std::sync::Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+pub(crate) fn pinned_h2d_service_gate(
+    context: &std::sync::Arc<CudaContext>,
+) -> Result<(), Box<dyn Error>> {
     let pinned_capacity_bytes = PHASE1_CSA_PAYLOAD_BYTES
         .checked_mul(2)
         .ok_or("Phase1 pinned capacity overflow")?;
@@ -778,7 +780,10 @@ pub(crate) fn bounded_readahead_window_bytes(
     })
 }
 
-pub(crate) fn bounded_readahead_page_cap(source_bytes: u64, page_bytes: u64) -> Result<u64, Box<dyn Error>> {
+pub(crate) fn bounded_readahead_page_cap(
+    source_bytes: u64,
+    page_bytes: u64,
+) -> Result<u64, Box<dyn Error>> {
     if page_bytes == 0 {
         return Err("bounded readahead OS page size is zero".into());
     }
@@ -796,7 +801,9 @@ pub(crate) fn os_page_bytes() -> Result<u64, Box<dyn Error>> {
     u64::try_from(unsafe { getpagesize() }).map_err(Into::into)
 }
 
-pub(crate) fn bounded_readahead_metadata_page_cap(model_dir: &std::path::Path) -> Result<u64, Box<dyn Error>> {
+pub(crate) fn bounded_readahead_metadata_page_cap(
+    model_dir: &std::path::Path,
+) -> Result<u64, Box<dyn Error>> {
     let max_source_bytes = (0..v4_state::V4_LAYER_COUNT)
         .map(|layer| {
             fixed_layer_bounded_readahead_source(model_dir, layer).map(|plan| plan.source_bytes)

@@ -45,7 +45,7 @@ c/bench/
 stats*.txt
 *.log
 /docs/*.md
-!/docs/术语表.md
+!/docs/ARCHITECTURE.md
 /docs/research/
 /docs/assets/readme/data/
 
@@ -82,11 +82,7 @@ olmoe_i4/
 c/olmoe_merged/
 c/olmoe_i4/
 
-# ZCode 客户端遗物：临时探针/AB 脚本、hook、bundle、计划稿与 scratch 快照。
-# 判据脚本 verify_baseline.py / outputs_match.py 仍保存在本地 .zcode/ 下，
-# 2026-11-05 迁移时整目录备份到 Desktop\ZCode迁移-20261105\localmoe-zcode-目录备份.zip。
-# 若要入库，先把它改名成 tools/verify/ 这类中性目录，再解除这条忽略。
+# Local scratch scripts and reproducible benchmark dumps
 /.zcode/
-# 基准运行的数据转储（每份约 480 KB，可重跑生成）
 /base.jsonl
 /pin.jsonl

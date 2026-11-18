@@ -291,13 +291,18 @@ impl<const REQUESTS: usize> B2GenerateArm<REQUESTS> {
     }
 }
 
-pub(crate) fn b4_greedy_a_duration_ns(first_ns: u64, second_ns: u64) -> Result<u64, Box<dyn Error>> {
+pub(crate) fn b4_greedy_a_duration_ns(
+    first_ns: u64,
+    second_ns: u64,
+) -> Result<u64, Box<dyn Error>> {
     first_ns
         .checked_add(second_ns)
         .ok_or_else(|| "B4 greedy A duration overflow".into())
 }
 
-pub(crate) fn b2_generate_active_indices<const REQUESTS: usize>(active: &[bool; REQUESTS]) -> Vec<usize> {
+pub(crate) fn b2_generate_active_indices<const REQUESTS: usize>(
+    active: &[bool; REQUESTS],
+) -> Vec<usize> {
     active
         .iter()
         .enumerate()
@@ -312,7 +317,10 @@ pub(crate) fn b2_generate_stop_reason(reason: GreedyStopReason) -> &'static str 
     }
 }
 
-pub(crate) fn b2_generate_request_json(request: usize, state: &B2GenerateRequest) -> serde_json::Value {
+pub(crate) fn b2_generate_request_json(
+    request: usize,
+    state: &B2GenerateRequest,
+) -> serde_json::Value {
     serde_json::json!({
         "request": request,
         "prompt_ids": state.prompt_ids,
@@ -401,7 +409,10 @@ impl B2Physical {
         Ok(())
     }
 
-    pub(crate) fn record_initial_state_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn record_initial_state_source_bytes(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.initial_state_source_bytes = self
             .initial_state_source_bytes
             .checked_add(bytes)
@@ -409,7 +420,10 @@ impl B2Physical {
         Ok(())
     }
 
-    pub(crate) fn record_final_head_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn record_final_head_source_bytes(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.final_head_source_bytes = self
             .final_head_source_bytes
             .checked_add(bytes)
@@ -456,7 +470,10 @@ impl B2Physical {
 }
 
 impl B2RequestPhysical {
-    pub(crate) fn record_initial_state_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn record_initial_state_source_bytes(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.initial_state_source_bytes = self
             .initial_state_source_bytes
             .checked_add(bytes)
@@ -464,7 +481,10 @@ impl B2RequestPhysical {
         Ok(())
     }
 
-    pub(crate) fn record_final_head_source_bytes(&mut self, bytes: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn record_final_head_source_bytes(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.final_head_source_bytes = self
             .final_head_source_bytes
             .checked_add(bytes)

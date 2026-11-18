@@ -19,8 +19,7 @@
 #   4. 数值两臂都不动（在第 2 段里一起看）。
 #
 # 脚本刻意不删任何结果文件：引擎自己拒绝覆盖已存在的 COLIBRI_V4_RESULT_JSONL，
-# 重跑请换 tag。检查脚本在量测目录 .zcode/ 下（未跟踪，但它们是判据本身，别改；
-# 改它们等于改判据）。
+# 重跑请换 tag。检查脚本在 tools/verify/ 下。
 set -uo pipefail
 
 # 两个会话同时跑引擎会毁掉双方的计时，这条是双向的；构建也一样会污染。
@@ -36,21 +35,25 @@ TAG=${2:-$COMMIT}
 ARM=${ARM:-COLIBRI_V4_FLASH_FIXED_SLOT}
 LABEL=${LABEL:-slot}
 ORDER=${ORDER:-on-first}
-Z=/mnt/c/Users/27236/Desktop/localmoe-clean/.zcode
-TREE=/srv/localmoe/build/merged-prompt-chunk
-export CARGO_TARGET_DIR=/srv/localmoe/targets/merged-prompt-chunk-target
+TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$TOOLS/../../.." && pwd)
+Z=${VERIFY_DIR:-$TOOLS/verify}
+TREE=${TREE:-$REPO_ROOT}
+BRANCH=${BRANCH:-main}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$TREE/rust/target}
 BIN=$CARGO_TARGET_DIR/release/colibri-cuda
-MODEL=/srv/localmoe/models/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-CUBLAS=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
-OUT=/srv/localmoe/targets/ab-$LABEL-$TAG
-REF8=/srv/localmoe/targets/defaults-pc-8step.jsonl
+MODEL=${COLIBRI_DSV4_MODEL_DIR:?set COLIBRI_DSV4_MODEL_DIR to the Flash-0731 checkpoint on ext4}
+CUBLAS=${COLIBRI_CUBLAS_EXACT_LIB:-/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5}
+OUT_ROOT=${OUT_ROOT:-$CARGO_TARGET_DIR/bench-runs}
+OUT=$OUT_ROOT/ab-$LABEL-$TAG
+REF8=${REF8:-}
 mkdir -p "$OUT"
 exec > >(tee "$OUT/batch.log") 2>&1
 
 echo "arm=$ARM  label=$LABEL  order=$ORDER  out=$OUT"
 
 echo "################ 1/4 sync and build $COMMIT ################"
-git -C "$TREE" fetch --quiet origin codex/business-restart || exit 1
+git -C "$TREE" fetch --quiet origin "$BRANCH" 2>/dev/null || true
 git -C "$TREE" checkout --quiet --detach "$COMMIT" || exit 1
 git -C "$TREE" log --oneline -1 | cat
 git -C "$TREE" status --porcelain | head -3
@@ -103,8 +106,12 @@ fi
 echo "################ 2/4 pinned values (1 step) ################"
 python3 "$Z/verify_baseline.py" "$OUT/1step-$LABEL-on.jsonl" | tail -12
 
-echo "################ 3/4 bit-exact comparison (reference $REF8) ################"
-python3 "$Z/outputs_match.py" "$REF8" "$OUT/8step-$LABEL-on.jsonl" "$OUT/8step-$LABEL-off.jsonl"
+echo "################ 3/4 bit-exact comparison ################"
+if [[ -n "$REF8" && -f "$REF8" ]]; then
+  python3 "$Z/outputs_match.py" "$REF8" "$OUT/8step-$LABEL-on.jsonl" "$OUT/8step-$LABEL-off.jsonl"
+else
+  python3 "$Z/outputs_match.py" "$OUT/8step-$LABEL-on.jsonl" "$OUT/8step-$LABEL-off.jsonl"
+fi
 python3 "$Z/verify_baseline.py" "$OUT/8step-$LABEL-on.jsonl" | tail -12
 
 echo "################ 4/4 phase table: arm on vs off ################"

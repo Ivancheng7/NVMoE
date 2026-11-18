@@ -825,9 +825,8 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
             start_pos,
             device_observe_topk,
         )?
-    } else if let Some((state, attention_scratch)) = state
-        .as_mut()
-        .zip(attention_scratch.as_deref_mut())
+    } else if let Some((state, attention_scratch)) =
+        state.as_mut().zip(attention_scratch.as_deref_mut())
     {
         step_real_layer_attention_rows_device(
             module,
@@ -959,8 +958,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
             .ok_or("Flash parity dump did not retain GPU router debug buffers")?;
         let has_learned_router_rmsnorm = !weights.hash_router;
         if debug.rmsnorm.len() != rows * 3
-            || (has_learned_router_rmsnorm
-                && debug.rmsnorm_squares.len() != rows * spec.hidden)
+            || (has_learned_router_rmsnorm && debug.rmsnorm_squares.len() != rows * spec.hidden)
             || debug.logits.len() != rows * spec.routed_experts
             || debug.softplus.len() != debug.logits.len()
             || debug.post_scores.len() != debug.logits.len()
@@ -1129,8 +1127,9 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
         // from the pool (every slot to be read). Both hand one owned lane per
         // route slot; the drain uploads them by slot and the handback below
         // returns them to their owner.
-        let (mut lanes, hits) = if let Some(scratch) =
-            routed_slot_scratch.as_deref_mut().filter(|_| routed_cache_capacity > 0)
+        let (mut lanes, hits) = if let Some(scratch) = routed_slot_scratch
+            .as_deref_mut()
+            .filter(|_| routed_cache_capacity > 0)
         {
             scratch.take_cache_lanes(weights.layer, &route_ids)?
         } else if let Some(pool) = routed_read_pool.as_mut() {
@@ -1146,9 +1145,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
         let fanout_prefetch = if routed_fanout_enabled()? && rows == 1 && use_lanes {
             let parity_dir = parity_dump.as_deref();
             let mut slots = match routed_slot_scratch.as_deref_mut() {
-                Some(scratch) => {
-                    scratch.take_fanout_lanes(lanes.len(), spec, context, module)?
-                }
+                Some(scratch) => scratch.take_fanout_lanes(lanes.len(), spec, context, module)?,
                 None => {
                     return Err("Flash B1 routed fan-out requires the request scratch".into());
                 }
@@ -1162,8 +1159,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
             // branch did not take them.
             let lanes = std::mem::replace(&mut lanes, Vec::new());
             let gpu_window_width = fanout_gpu_window()?;
-            let gpu_window =
-                (gpu_window_width > 0).then(|| FanoutGpuWindow::new(gpu_window_width));
+            let gpu_window = (gpu_window_width > 0).then(|| FanoutGpuWindow::new(gpu_window_width));
             // The workers capture the gate through a shared reference, the same
             // way they take `shard` and `input`; a `move` closure would try to
             // take the gate itself.
@@ -1204,8 +1200,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                             // upload and execute at once; the read above is
                             // never gated. Dropped at the closure's end, after
                             // `execute` has synchronized its own event.
-                            let _gpu_gate =
-                                gpu_window.as_ref().map(FanoutGpuWindow::acquire);
+                            let _gpu_gate = gpu_window.as_ref().map(FanoutGpuWindow::acquire);
                             let setup_started = std::time::Instant::now();
                             slot.upload_lane(&lane).map_err(|error| error.to_string())?;
                             let setup_ns = u64::try_from(setup_started.elapsed().as_nanos())
@@ -1267,8 +1262,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                     // Feed the shared row's read columns from the same per-lane
                     // read walls the pipelined drain's readers report.
                     let read_us = u128::from(outcome.read_ns) / 1_000;
-                    shared_probe_worker_sum_us =
-                        shared_probe_worker_sum_us.saturating_add(read_us);
+                    shared_probe_worker_sum_us = shared_probe_worker_sum_us.saturating_add(read_us);
                     shared_probe_worker_max_us = shared_probe_worker_max_us.max(read_us);
                     shared_probe_workers += 1;
                     outcomes.push(outcome);
@@ -1303,7 +1297,9 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                         {
                             let owned = owned_lanes.by_ref().take(chunk.len()).collect::<Vec<_>>();
                             if owned.len() != chunk.len() {
-                                return Err("routed read pool does not cover the route slots".into());
+                                return Err(
+                                    "routed read pool does not cover the route slots".into()
+                                );
                             }
                             let hit_chunk = hit_chunk.to_vec();
                             let shard = &runtime.expert_shard;
@@ -1314,21 +1310,24 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                                 for ((mut lane, &expert_id), hit) in
                                     owned.into_iter().zip(chunk).zip(hit_chunk)
                                 {
-                                    let expert_id =
-                                        u16::try_from(expert_id).map_err(|error| error.to_string())?;
+                                    let expert_id = u16::try_from(expert_id)
+                                        .map_err(|error| error.to_string())?;
                                     if !hit {
                                         lane.read_into(shard, layer, expert_id)
                                             .map_err(|error| error.to_string())?;
                                     }
                                     reads.push((expert_id, lane.read_ns(), lane));
                                 }
-                                let worker_us = u128::try_from(worker_started.elapsed().as_micros())
-                                    .unwrap_or(u128::MAX);
+                                let worker_us =
+                                    u128::try_from(worker_started.elapsed().as_micros())
+                                        .unwrap_or(u128::MAX);
                                 Ok::<_, String>((reads, worker_us))
                             }));
                         }
                         if owned_lanes.next().is_some() {
-                            return Err("routed read pool has unused lanes for the route row".into());
+                            return Err(
+                                "routed read pool has unused lanes for the route row".into()
+                            );
                         }
                         // Run the shared MLP on this thread only after the readers are
                         // running, so its wall and theirs overlap instead of stacking.
@@ -1340,8 +1339,8 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                                 Vec::new(),
                             )
                         };
-                        shared_probe_mlp_us =
-                            u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        shared_probe_mlp_us = u128::try_from(shared_started.elapsed().as_micros())
+                            .unwrap_or(u128::MAX);
                         let mut reads = Vec::with_capacity(route_ids.len());
                         for worker in workers {
                             let (loaded, worker_us) = worker
@@ -1379,8 +1378,9 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                                             Ok::<_, String>((expert_id, expert))
                                         })
                                         .collect::<Result<Vec<_>, _>>()?;
-                                    let worker_us = u128::try_from(worker_started.elapsed().as_micros())
-                                        .unwrap_or(u128::MAX);
+                                    let worker_us =
+                                        u128::try_from(worker_started.elapsed().as_micros())
+                                            .unwrap_or(u128::MAX);
                                     Ok::<_, String>((experts, worker_us))
                                 })
                             })
@@ -1393,8 +1393,8 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                                 Vec::new(),
                             )
                         };
-                        shared_probe_mlp_us =
-                            u128::try_from(shared_started.elapsed().as_micros()).unwrap_or(u128::MAX);
+                        shared_probe_mlp_us = u128::try_from(shared_started.elapsed().as_micros())
+                            .unwrap_or(u128::MAX);
                         let mut experts = Vec::with_capacity(route_ids.len());
                         for worker in workers {
                             let (loaded, worker_us) = worker
@@ -1437,7 +1437,8 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
     // Carry the shared window's own breakdown so the phase table no longer has
     // to attribute the routed read to `shared`: `main` is the shared MLP wall,
     // the worker numbers are the six routed lanes' own read walls.
-    stage.shared_main_ns = u64::try_from(shared_probe_mlp_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
+    stage.shared_main_ns =
+        u64::try_from(shared_probe_mlp_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
     stage.shared_read_workers = shared_probe_workers;
     stage.shared_read_worker_sum_ns =
         u64::try_from(shared_probe_worker_sum_us.saturating_mul(1_000)).unwrap_or(u64::MAX);
@@ -1567,8 +1568,7 @@ pub(crate) fn step_real_layer_rows<'module, 'slots, 'lane>(
                     .routed_h2d_ns
                     .saturating_add((outcome.h2d_ms * 1_000_000.0) as u64);
                 stage.routed_h2d_bytes = stage.routed_h2d_bytes.saturating_add(lane_bytes);
-                stage.routed_kernel_ns =
-                    stage.routed_kernel_ns.saturating_add(outcome.kernel_ns);
+                stage.routed_kernel_ns = stage.routed_kernel_ns.saturating_add(outcome.kernel_ns);
                 stage.routed_fanout_lane_max_ns =
                     stage.routed_fanout_lane_max_ns.max(outcome.lane_wall_ns);
                 contributions[0][outcome.route_slot] = Some(outcome.output);

@@ -28,10 +28,11 @@ jobs:
         working-directory: rust
         run: |
           cargo fmt --check
-          cargo check --locked -p colibri-cuda
+          RUSTC_WRAPPER="$PWD/rustc-human-wrapper.sh" cargo check --locked -p colibri-cuda --all-targets
           ./run-identified.sh --version
       - name: Check README evidence files
         run: |
-          python3 -m json.tool docs/assets/readme/data/qd4-full61/confirmatory/summary.json >/dev/null
-          python3 -m json.tool docs/assets/readme/data/qd4-stationary-gate/review-boundary.json >/dev/null
+          python3 -m json.tool docs/assets/readme/sm120-figure-data.json >/dev/null
+          python3 -m json.tool docs/assets/readme/flash-0731-figure-data.json >/dev/null
+          python3 -m json.tool docs/assets/readme/cost-figures-provenance.json >/dev/null
           python3 -c 'import xml.etree.ElementTree as E, pathlib; [E.parse(p) for p in pathlib.Path("docs/assets/readme").glob("[0-9][0-9]-*.svg")]'

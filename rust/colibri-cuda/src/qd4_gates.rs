@@ -14,7 +14,10 @@ pub(crate) fn validate_qd4_lane_reserve(
     Ok(())
 }
 
-pub(crate) fn qd4_expected_routed_loads(layers: usize, prompt_len: usize) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn qd4_expected_routed_loads(
+    layers: usize,
+    prompt_len: usize,
+) -> Result<usize, Box<dyn Error>> {
     layers
         .checked_mul(prompt_len)
         .and_then(|rows| rows.checked_mul(v4_router::V4_TOPK))
@@ -288,8 +291,8 @@ pub(crate) fn prepare_qd4_stationary_gate_inputs(
                         false,
                         None,
                         None,
-                    None,
-                    None, // attention device chain (not this path)
+                        None,
+                        None, // attention device chain (not this path)
                     )?
                     .output,
                 );

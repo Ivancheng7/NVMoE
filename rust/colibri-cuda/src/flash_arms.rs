@@ -63,7 +63,9 @@ pub(crate) fn flash_mhc_linear_arm_for(
     }
 }
 
-pub(crate) fn flash_mhc_linear_arm(spec: &v4_spec::V4Spec) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+pub(crate) fn flash_mhc_linear_arm(
+    spec: &v4_spec::V4Spec,
+) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
     let value = std::env::var_os("COLIBRI_V4_FLASH_MHC_LINEAR_ARM");
     flash_mhc_linear_arm_for(spec, value.as_deref())
 }
@@ -85,7 +87,9 @@ pub(crate) fn flash_router_linear_arm_for(
     }
 }
 
-pub(crate) fn flash_router_linear_arm(spec: &v4_spec::V4Spec) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
+pub(crate) fn flash_router_linear_arm(
+    spec: &v4_spec::V4Spec,
+) -> Result<FlashMhcLinearArm, Box<dyn Error>> {
     let value = std::env::var_os("COLIBRI_V4_FLASH_ROUTER_LINEAR_ARM");
     flash_router_linear_arm_for(spec, value.as_deref())
 }
@@ -141,7 +145,9 @@ pub(crate) fn flash_fp4_accum_arm_for(
     }
 }
 
-pub(crate) fn flash_fp4_accum_arm(spec: &v4_spec::V4Spec) -> Result<FlashFp4AccumArm, Box<dyn Error>> {
+pub(crate) fn flash_fp4_accum_arm(
+    spec: &v4_spec::V4Spec,
+) -> Result<FlashFp4AccumArm, Box<dyn Error>> {
     let value = std::env::var_os("COLIBRI_V4_FLASH_FP4_ACCUM_ARM");
     flash_fp4_accum_arm_for(spec, value.as_deref())
 }
@@ -180,7 +186,9 @@ pub(crate) fn flash_router_score_arm_for(
     }
 }
 
-pub(crate) fn flash_router_score_arm(spec: &v4_spec::V4Spec) -> Result<FlashRouterScoreArm, Box<dyn Error>> {
+pub(crate) fn flash_router_score_arm(
+    spec: &v4_spec::V4Spec,
+) -> Result<FlashRouterScoreArm, Box<dyn Error>> {
     let value = std::env::var_os("COLIBRI_V4_FLASH_ROUTER_SCORE_ARM");
     flash_router_score_arm_for(spec, value.as_deref())
 }

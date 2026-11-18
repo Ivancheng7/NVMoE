@@ -23,7 +23,9 @@ pub(crate) struct PersistentStateAudit {
     pub(crate) indexer_main_score: Option<Vec<f32>>,
 }
 
-pub(crate) fn host_persistent_state_audit(state: &v4_state::V4LayerPersistentState) -> PersistentStateAudit {
+pub(crate) fn host_persistent_state_audit(
+    state: &v4_state::V4LayerPersistentState,
+) -> PersistentStateAudit {
     let main = state.compressor();
     let indexer = state.indexer();
     PersistentStateAudit {
@@ -63,7 +65,9 @@ pub(crate) fn device_persistent_state_audit(
 
 /// The audit reads each listed device allocation in full before trimming the
 /// logical cache prefix, so this is the physical D2H transfer ledger.
-pub(crate) fn device_persistent_state_audit_d2h_transfer(state: &DeviceTokenState) -> (usize, usize) {
+pub(crate) fn device_persistent_state_audit_d2h_transfer(
+    state: &DeviceTokenState,
+) -> (usize, usize) {
     let mut count = 5;
     let mut bytes = state.kv_cache.num_bytes()
         + state.compressed_cache.num_bytes()
@@ -266,7 +270,11 @@ pub(crate) fn first_f32_bits_mismatch(left: &[f32], right: &[f32]) -> Option<usi
 /// Diagnostic only: persistent Compressor state remains a strict FP32-bit
 /// gate.  When it fails, record enough numerics to distinguish a slot/layout
 /// fault from a bounded reduction-order difference before changing policy.
-pub(crate) fn f32_state_mismatch_diagnostic(expected: &[f32], actual: &[f32], index: usize) -> String {
+pub(crate) fn f32_state_mismatch_diagnostic(
+    expected: &[f32],
+    actual: &[f32],
+    index: usize,
+) -> String {
     let expected_value = expected.get(index).copied();
     let actual_value = actual.get(index).copied();
     let (mut max_abs, mut max_rel, mut max_ulp) = (0.0_f32, 0.0_f32, 0_u32);
@@ -717,7 +725,11 @@ pub(crate) fn check_compressed_boundary_bf16(
     Ok(())
 }
 
-pub(crate) fn targeted_stage_u16(name: &str, expected: &[u16], actual: &[u16]) -> serde_json::Value {
+pub(crate) fn targeted_stage_u16(
+    name: &str,
+    expected: &[u16],
+    actual: &[u16],
+) -> serde_json::Value {
     let mismatch = first_mismatch(expected, actual);
     serde_json::json!({
         "stage": name,
@@ -734,7 +746,11 @@ pub(crate) fn targeted_stage_u16(name: &str, expected: &[u16], actual: &[u16]) -
     })
 }
 
-pub(crate) fn targeted_stage_f32(name: &str, expected: &[f32], actual: &[f32]) -> serde_json::Value {
+pub(crate) fn targeted_stage_f32(
+    name: &str,
+    expected: &[f32],
+    actual: &[f32],
+) -> serde_json::Value {
     let mismatch = expected
         .iter()
         .zip(actual)
@@ -755,7 +771,11 @@ pub(crate) fn targeted_stage_f32(name: &str, expected: &[f32], actual: &[f32]) -
     })
 }
 
-pub(crate) fn targeted_stage_i32(name: &str, expected: &[i32], actual: &[i32]) -> serde_json::Value {
+pub(crate) fn targeted_stage_i32(
+    name: &str,
+    expected: &[i32],
+    actual: &[i32],
+) -> serde_json::Value {
     let mismatch = first_mismatch(expected, actual);
     serde_json::json!({
         "stage": name,
@@ -770,7 +790,11 @@ pub(crate) fn targeted_stage_i32(name: &str, expected: &[i32], actual: &[i32]) -
     })
 }
 
-pub(crate) fn targeted_stage_u32(name: &str, expected: &[u32], actual: &[u32]) -> serde_json::Value {
+pub(crate) fn targeted_stage_u32(
+    name: &str,
+    expected: &[u32],
+    actual: &[u32],
+) -> serde_json::Value {
     let expected_i32 = expected
         .iter()
         .map(|&value| value as i32)

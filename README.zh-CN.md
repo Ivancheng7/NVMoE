@@ -22,7 +22,7 @@ localMoE让单张消费级显卡跑起全量权重的DeepSeek-V4-Flash-0731检�
 
 有两对是真匹配区块——常驻那一对和fan-out那一对——所以它们的比值是量出来的。`6.50倍`这个头条数字把它们和更早树上的基线接在一起；每段各自都立得住，但端到端那个比值是派生的，不是在单次运行里观测到的。下面那张图画的是常驻那条链，所以它最后一根柱子是常驻默认，不是今天的默认。
 
-精简的[运行台账](docs/assets/readme/sm120-steady-ab.csv)记录了每一次跑的值、峰值显存和对应的结果文件。常驻那批跑在`codex/business-restart`的`8e162a6`上；结果文件按惯例不带二进制指纹，所以那些数字是从`/srv/localmoe/targets/residentfill/`下的文件重新推出来的，不是仓库里的某个校验和。
+精简的[运行台账](docs/assets/readme/sm120-steady-ab.csv)记录了每一次跑的值、峰值显存和对应的结果文件。常驻那批跑在`codex/business-restart`的`8e162a6`上；结果文件按惯例不带二进制指纹，所以那些数字是从仓库外保存的原始JSONL运行日志重新推出来的，不是仓库里的某个校验和。
 
 ![sm_120常驻显存的取舍](docs/assets/readme/26-sm120-residency-tradeoff.svg)
 
@@ -100,9 +100,24 @@ b970da7913a57a1c, 12c6b45cecf9d53b, e0f441542fa53991, 69ed859929ee9042
 
 还剩两个已知的天花板。输入上限是128个token（`prompt + 生成 − 1`），超过121个token的prompt直接被拒（`CONTEXT_WINDOW_EXCEEDED`），首字还按每个prompt token约`2.6s`涨。另外服务面只在显式开`COLIBRI_V4_FLASH_SERVE_PHASE_JSONL`时才写相位账，所以它的逐相位拆分目前只有**一个prompt**的实测，不是普遍结论——不过两个面在稳态上已经量到一样快。
 
+## 仓库结构
+
+| 路径 | 职责说明 |
+| --- | --- |
+| [`rust/colibri-cuda/`](rust/colibri-cuda/) | 面向 `sm_120` 的 `DeepSeek-V4-Flash-0731` Rust + `cuda-oxide` 主推理引擎（模块划分见 [`MODULE_LAYOUT.md`](rust/colibri-cuda/MODULE_LAYOUT.md)） |
+| [`rust/colibri-cuda/tools/`](rust/colibri-cuda/tools/) | CLI 与服务启动脚本（`run_flash_cli.sh`、`run_flash_serve.sh`）、A/B 测试脚本及数值校验工具（`verify/`） |
+| [`c/`](c/) | 上游 Colibri C/CUDA 引擎与 [`openai_server.py`](c/openai_server.py) OpenAI 兼容 HTTP 网关 |
+| [`tools/download_modelscope_0731.py`](tools/download_modelscope_0731.py) | 支持断点续传与 SHA-256 校验的 `Flash-0731` ModelScope 权重下载脚本 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 端到端调用链、16GB 显存预算与数据搬运架构说明 |
+| [`docs/experiments/`](docs/experiments/) | RTX 5060 Ti（`sm_120`）上的全套实测优化记录与消融实验数据 |
+
 ## 运行
 
-Flash路径面向WSL2/Linux、CUDA 12.8、Blackwell`sm_120`，模型目录必须在WSL原生ext4块设备上。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
+Flash路径面向WSL2/Linux、CUDA 12.8+、Blackwell`sm_120`，模型目录必须在WSL原生ext4块设备上。运行时会拒绝`/mnt/c`和`/mnt/d`下的模型路径。
+
+### 1. 准备权重与编译
+
+将官方 `deepseek-ai/DeepSeek-V4-Flash-0731`（revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`）下载到 WSL 原生 ext4 目录（可从 Hugging Face 获取，或运行 `python3 tools/download_modelscope_0731.py`），随后构建 `sm_120` release 二进制：
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
@@ -116,7 +131,16 @@ cargo oxide doctor
 ./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
-在`sm_120`上跑真实的Flash base路径。`FP4_ACCUM_ARM`和`FINAL_HEAD_ARM`故意不设，用来确认默认臂仍是`block32`与`canonical_cpu_streamed_bf16`。
+### 2. CLI 生成与数值基线校验
+
+使用默认启动脚本执行 8 步贪婪解码并校验基线：
+
+```bash
+COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" ./colibri-cuda/tools/run_flash_cli.sh
+python3 colibri-cuda/tools/verify/verify_baseline.py "$PWD/flash-result.jsonl"
+```
+
+也可以显式传入全部环境变量直接调用二进制（故意不设`FP4_ACCUM_ARM`和`FINAL_HEAD_ARM`，用来确认默认臂仍是`block32`与`canonical_cpu_streamed_bf16`）：
 
 ```bash
 env \
@@ -132,7 +156,30 @@ env \
   "$PWD/target/release/colibri-cuda"
 ```
 
-检查`flash-result.jsonl`里的`layers: 43`、`hidden_bf16_digest: 5ed8bf88beae3cfe`，以及`generated_ids`开头是`55222, 33832, ...`。`status: PASS`只表示43层跑完，不表示任何oracle gate通过。整模型常驻显存默认开；设`COLIBRI_V4_FIXED_RESIDENT_GIB=0`回到流式，峰值回到`1,825MB`。这些数字背后的结果文件在仓库之外，放在`/srv/localmoe/targets/`，所以计时数字无法只从受版本控制的文件重新推导。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
+检查`flash-result.jsonl`里的`layers: 43`、`hidden_bf16_digest: 5ed8bf88beae3cfe`，以及`generated_ids`开头是`55222, 33832, ...`。`status: PASS`只表示43层跑完，不表示任何oracle gate通过。整模型常驻显存默认开；设`COLIBRI_V4_FIXED_RESIDENT_GIB=0`回到流式，峰值回到`1,825MB`。
+
+### 3. 启动 OpenAI 兼容 HTTP 服务
+
+启动本地 `/v1/chat/completions` 接口服务（固定权重跨请求常驻显存，第 2 个请求起免重读）：
+
+```bash
+./colibri-cuda/tools/run_flash_serve.sh
+```
+
+在另一个终端发起流式对话请求：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-flash-0731",
+    "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
+    "max_tokens": 32,
+    "stream": true
+  }'
+```
+
+计时表背后的原始运行日志保存在仓库之外，因此计时数字无法只从受版本控制的文件重新推导。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
 
 ## 灵感
 

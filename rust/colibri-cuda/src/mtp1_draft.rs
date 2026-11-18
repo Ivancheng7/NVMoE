@@ -164,7 +164,10 @@ pub(crate) fn mtp1_alignment(
     })
 }
 
-pub(crate) fn stationary_mtp1_enabled(generic_stationary: bool, flag: bool) -> Result<bool, Box<dyn Error>> {
+pub(crate) fn stationary_mtp1_enabled(
+    generic_stationary: bool,
+    flag: bool,
+) -> Result<bool, Box<dyn Error>> {
     if flag && !generic_stationary {
         return Err("COLIBRI_V4_STATIONARY_MTP1_DRAFT requires generic device stationary".into());
     }

@@ -1930,7 +1930,12 @@ pub(crate) fn flash_exact_runtime_requires_strict_compressor(
     flash_runtime && (mhc_cublas || router_cublas)
 }
 
-pub(crate) fn print_l0_pos0_compressor_probe(source: &str, kv: &[f32], score: &[f32], score_plus_ape: &[f32]) {
+pub(crate) fn print_l0_pos0_compressor_probe(
+    source: &str,
+    kv: &[f32],
+    score: &[f32],
+    score_plus_ape: &[f32],
+) {
     let digests = (fnv1a_f32(kv), fnv1a_f32(score), fnv1a_f32(score_plus_ape));
     println!(
         "COLIBRI_L0_POS0_COMPRESSOR_PRECOMMIT={}",
@@ -2298,7 +2303,11 @@ pub(crate) struct SparseAttentionScoreReuseScratch {
 }
 
 impl SparseAttentionScoreReuseScratch {
-    pub(crate) fn new(stream: &CudaStream, rows: usize, topk_per_row: usize) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(
+        stream: &CudaStream,
+        rows: usize,
+        topk_per_row: usize,
+    ) -> Result<Self, Box<dyn Error>> {
         Self::new_for_heads(stream, rows, v4_state::Q_HEADS, topk_per_row)
     }
 
@@ -2997,4 +3006,3 @@ pub(crate) fn step_layer_shared_expert_with_bf16(
         output,
     ))
 }
-

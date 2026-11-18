@@ -169,8 +169,7 @@ python3 layer_averages.py /srv/localmoe/targets/slotreuse-8step.jsonl
 python3 token_breakdown.py /srv/localmoe/targets/slotreuse-8step.jsonl
 ```
 
-工具源码：`/srv/localmoe/targets/io-ceiling/src/`（同时留在 Windows 侧
-`C:\Users\27236\Desktop\localmoe-clean\.zcode\io-ceiling\`）。
+工具源码：`docs/assets/io-ceiling/`。
 
 ## 代码变更
 

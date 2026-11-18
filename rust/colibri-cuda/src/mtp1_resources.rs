@@ -10,8 +10,10 @@ pub(crate) const MTP1_DRAFT_PERSISTENT_BYTES: usize = 131_072;
 // fixed tensor ledger: the candidate keeps its sliding-KV input, raw-window
 // attention cache, Q, sparse output, and score-reuse scratch live while the
 // fixed block is resident and while the final head is streamed.
-pub(crate) const MTP1_DRAFT_ENORM_HNORM_BYTES: usize = 2 * v4_state::HIDDEN * std::mem::size_of::<u16>();
-pub(crate) const MTP1_DRAFT_KV_READY_BYTES: usize = v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
+pub(crate) const MTP1_DRAFT_ENORM_HNORM_BYTES: usize =
+    2 * v4_state::HIDDEN * std::mem::size_of::<u16>();
+pub(crate) const MTP1_DRAFT_KV_READY_BYTES: usize =
+    v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
 pub(crate) const MTP1_DRAFT_Q_BYTES: usize =
     v4_state::Q_HEADS * v4_state::Q_HEAD_DIM * std::mem::size_of::<u16>();
 pub(crate) const MTP1_DRAFT_CACHE_BYTES: usize =
@@ -253,7 +255,8 @@ pub(crate) struct StationaryMtpCapacityProbe {
     pub(crate) generic_scratch: Option<DeviceRequestScratch>,
 }
 
-pub(crate) const STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA: &str = "colibri-v4-stationary-mtp1-capacity-v2";
+pub(crate) const STATIONARY_MTP1_CAPACITY_PREFLIGHT_SCHEMA: &str =
+    "colibri-v4-stationary-mtp1-capacity-v2";
 pub(crate) const STATIONARY_MTP1_CAPACITY_PREFLIGHT_TARGET_STRICT: bool = true;
 
 impl StationaryMtpCapacityProbe {
@@ -313,30 +316,50 @@ impl StationaryMtpCapacityProbe {
         self.host.iter().map(Vec::len).sum()
     }
 
-    pub(crate) fn u8(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn u8(
+        &mut self,
+        stream: &CudaStream,
+        elements: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.device_u8.push(DeviceBuffer::zeroed(stream, elements)?);
         Ok(())
     }
 
-    pub(crate) fn u16(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn u16(
+        &mut self,
+        stream: &CudaStream,
+        elements: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.device_u16
             .push(DeviceBuffer::zeroed(stream, elements)?);
         Ok(())
     }
 
-    pub(crate) fn f32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn f32(
+        &mut self,
+        stream: &CudaStream,
+        elements: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.device_f32
             .push(DeviceBuffer::zeroed(stream, elements)?);
         Ok(())
     }
 
-    pub(crate) fn i32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn i32(
+        &mut self,
+        stream: &CudaStream,
+        elements: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.device_i32
             .push(DeviceBuffer::zeroed(stream, elements)?);
         Ok(())
     }
 
-    pub(crate) fn u32(&mut self, stream: &CudaStream, elements: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn u32(
+        &mut self,
+        stream: &CudaStream,
+        elements: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.device_u32
             .push(DeviceBuffer::zeroed(stream, elements)?);
         Ok(())
@@ -432,7 +455,8 @@ pub(crate) fn probe_mtp1_candidate_locals(
     Ok(())
 }
 
-pub(crate) fn stationary_mtp1_capacity_preflight_rejects_execution_flags() -> Result<(), Box<dyn Error>> {
+pub(crate) fn stationary_mtp1_capacity_preflight_rejects_execution_flags()
+-> Result<(), Box<dyn Error>> {
     for name in [
         "COLIBRI_V4_FULL61_B1",
         "COLIBRI_V4_LAYER_STATIONARY_PREFILL",

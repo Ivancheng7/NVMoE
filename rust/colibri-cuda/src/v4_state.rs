@@ -1354,8 +1354,8 @@ pub fn final_checkpoint_head_cpu_timed(
             let last_chunk = ((worker + 1) * chunks_per_worker).min(chunk_count) - 1;
             handles.push(scope.spawn(move || -> Result<FinalHeadSegmentRun, String> {
                 let first_token = first_chunk * CHUNK_ROWS;
-                let span_tokens =
-                    (weights.spec.vocab - first_token).min((last_chunk + 1 - first_chunk) * CHUNK_ROWS);
+                let span_tokens = (weights.spec.vocab - first_token)
+                    .min((last_chunk + 1 - first_chunk) * CHUNK_ROWS);
                 let mut logits = vec![0.0_f32; rows * span_tokens];
                 let mut bytes = vec![0_u8; CHUNK_ROWS * weights.spec.hidden * 2];
                 let mut row_bf16 = vec![0_u16; weights.spec.hidden];
@@ -1385,11 +1385,12 @@ pub fn final_checkpoint_head_cpu_timed(
                                 *weight = u16::from_le_bytes([bytes[0], bytes[1]]);
                             }
                             let logit = canonical_final_head_row_dot(
-                                &normalized[row * weights.spec.hidden
-                                    ..(row + 1) * weights.spec.hidden],
+                                &normalized
+                                    [row * weights.spec.hidden..(row + 1) * weights.spec.hidden],
                                 &row_bf16,
                             );
-                            logits[row * span_tokens + (token_start + token_offset - first_token)] =
+                            logits
+                                [row * span_tokens + (token_start + token_offset - first_token)] =
                                 logit;
                         }
                     }

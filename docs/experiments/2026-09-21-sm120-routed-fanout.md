@@ -78,10 +78,9 @@ Flash B1 预取那条路的 routed 段原来是**六个专家排成一队过一�
 
 数值判据：
 
-- `python3 /mnt/c/Users/27236/Desktop/localmoe-clean/.zcode/verify_baseline.py
-  /srv/localmoe/targets/a1-ab/pin-on-1step.jsonl` → **baseline reproduces**
+- `python3 rust/colibri-cuda/tools/verify/verify_baseline.py
+  pin-on-1step.jsonl` → **baseline reproduces**
   （argmax `55222`、`hidden_bf16_digest 5ed8bf88beae3cfe`、43 层、`block32`、`canonical_cpu_streamed_bf16`）。
-  判据脚本本身 `.zcode/` 是 gitignore 的，在会话工作树 `localmoe-clean` 里，不在交付树。
 - 三个交错轮次各比一次 off/on：8 个 `hidden_bf16_digest`、8 个 `ordered_layer_digest_sha256`、
   8 个 argmax、层数 **全部 IDENTICAL**，只有峰值显存差 `+67108864` 字节
 

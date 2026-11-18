@@ -935,8 +935,7 @@ impl FlashDsparkFinalHeadGpuWorkspace {
         let logits_started = std::time::Instant::now();
         let mut normalized_f32 =
             DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.hidden)?;
-        let logits_device =
-            DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.vocab)?;
+        let logits_device = DeviceBuffer::<f32>::zeroed(&self.stream, v4_spec::FLASH_0731.vocab)?;
         launch_v4_bf16_to_f32(
             &self.module,
             &self.stream,

@@ -1325,4 +1325,3 @@ pub(crate) unsafe fn launch_v4_fp8_matvec(
     }?;
     Ok(())
 }
-

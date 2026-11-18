@@ -26,7 +26,8 @@ pub(crate) fn csa_compressed_rows_after(position: usize) -> usize {
 }
 pub(crate) const V4_REQUEST_ROPE_LUT_BYTES: usize =
     2 * V4_REQUEST_ROPE_LUT_ROWS * v4_state::Q_ROPE_DIM * std::mem::size_of::<f32>();
-pub(crate) const V4_TID2EID_TRANSIENT_MAX_BYTES: usize = v4_router::V4_TOPK * std::mem::size_of::<i64>();
+pub(crate) const V4_TID2EID_TRANSIENT_MAX_BYTES: usize =
+    v4_router::V4_TOPK * std::mem::size_of::<i64>();
 
 pub(crate) fn device_attention_expected_h2d_bytes(
     rope_lut_bytes: usize,
@@ -53,18 +54,20 @@ pub(crate) const V4_QD4_DEVICE_BYTES: usize = V4_QD4_LANES
         + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
         + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
 pub(crate) const V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS: usize = 32;
-pub(crate) const V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES: usize = V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
-    * (v4_expert::V4_ROUTED_EXPERT_BYTES
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
-pub(crate) const V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES: usize = V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
-    * (v4_expert::V4_ROUTED_EXPERT_BYTES
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>()
-        + 3 * v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<u16>()
-        + v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<f32>()
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
-        + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+pub(crate) const V4_QD4_IMMUTABLE_EXPERT_CACHE_HOST_BYTES: usize =
+    V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        * (v4_expert::V4_ROUTED_EXPERT_BYTES
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
+pub(crate) const V4_QD4_IMMUTABLE_EXPERT_CACHE_DEVICE_BYTES: usize =
+    V4_QD4_IMMUTABLE_EXPERT_CACHE_SLOTS
+        * (v4_expert::V4_ROUTED_EXPERT_BYTES
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>()
+            + 3 * v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<u16>()
+            + v4_expert::V4_EXPERT_INTERMEDIATE * std::mem::size_of::<f32>()
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<u16>()
+            + v4_expert::V4_HIDDEN * std::mem::size_of::<f32>());
 
 impl DeviceRequestScratchGeometry {
     pub(crate) fn new(
@@ -86,7 +89,9 @@ impl DeviceRequestScratchGeometry {
         v4_state::HIDDEN
     }
 
-    pub(crate) fn byte_breakdown(self) -> Result<DeviceRequestScratchByteBreakdown, Box<dyn Error>> {
+    pub(crate) fn byte_breakdown(
+        self,
+    ) -> Result<DeviceRequestScratchByteBreakdown, Box<dyn Error>> {
         let bytes = |elements: usize, element_bytes: usize| {
             elements
                 .checked_mul(element_bytes)

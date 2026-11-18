@@ -19,13 +19,16 @@ COMMIT=${1:?commit required}
 TAG=${2:-$COMMIT}
 ROUNDS=${3:-3}
 TOOLS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-Z=/mnt/c/Users/27236/Desktop/localmoe-clean/.zcode
-TREE=/srv/localmoe/build/merged-prompt-chunk
-export CARGO_TARGET_DIR=/srv/localmoe/targets/merged-prompt-chunk-target
+REPO_ROOT=$(cd "$TOOLS/../../.." && pwd)
+Z=${VERIFY_DIR:-$TOOLS/verify}
+TREE=${TREE:-$REPO_ROOT}
+BRANCH=${BRANCH:-main}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$TREE/rust/target}
 BIN=$CARGO_TARGET_DIR/release/colibri-cuda
-MODEL=/srv/localmoe/models/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-CUBLAS=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
-OUT=/srv/localmoe/targets/servevscli-$TAG
+MODEL=${COLIBRI_DSV4_MODEL_DIR:?set COLIBRI_DSV4_MODEL_DIR to the Flash-0731 checkpoint on ext4}
+CUBLAS=${COLIBRI_CUBLAS_EXACT_LIB:-/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5}
+OUT_ROOT=${OUT_ROOT:-$CARGO_TARGET_DIR/bench-runs}
+OUT=$OUT_ROOT/servevscli-$TAG
 mkdir -p "$OUT"
 if ls "$OUT"/*.log >/dev/null 2>&1; then
   echo "refusing to run: $OUT already holds logs, pick another tag"
@@ -36,7 +39,7 @@ exec > >(tee "$OUT/batch.log") 2>&1
 echo "commit=$COMMIT  tag=$TAG  rounds=$ROUNDS  out=$OUT"
 
 echo "################ 1/3 sync and build ################"
-git -C "$TREE" fetch --quiet origin codex/business-restart || exit 1
+git -C "$TREE" fetch --quiet origin "$BRANCH" 2>/dev/null || true
 git -C "$TREE" checkout --quiet --detach "$COMMIT" || exit 1
 git -C "$TREE" log --oneline -1 | cat
 git -C "$TREE" status --porcelain | head -3

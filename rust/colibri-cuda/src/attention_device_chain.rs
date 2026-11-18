@@ -646,3 +646,228 @@ pub(crate) fn step_real_layer_attention_rows_device(
         profile: None,
     })
 }
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_layer_attention_state(
+    module: &kernels::LoadedModule,
+    stream: &CudaStream,
+    weights: &LayerDeviceWeights,
+    state: &mut v4_state::V4LayerPersistentState,
+    kv: &[u16],
+    compressor: Option<&v4_state::CompressorPrepared>,
+    indexer: Option<&CsaIndexerPrepared>,
+    start_pos: usize,
+) -> Result<(v4_state::SparseTopk, u64), Box<dyn Error>> {
+    let rows = kv.len() / v4_state::Q_HEAD_DIM;
+    if weights.compression_ratio == v4_state::CompressionRatio::WindowOnly {
+        if rows == 0
+            || kv.len() != rows * v4_state::Q_HEAD_DIM
+            || indexer.is_some()
+            || compressor.is_some()
+        {
+            return Err(format!(
+                "layer {} window-only attention state input contract mismatch",
+                weights.layer
+            )
+            .into());
+        }
+        for row in 0..rows {
+            state.append_kv_row(
+                start_pos + row,
+                &kv[row * v4_state::Q_HEAD_DIM..(row + 1) * v4_state::Q_HEAD_DIM],
+            )?;
+        }
+        let (indices, per_row) = v4_state::window_topk_cpu(rows, start_pos, v4_state::KV_WINDOW)?;
+        return Ok((
+            v4_state::SparseTopk {
+                indices,
+                rows,
+                per_row,
+                window_per_row: per_row,
+                compressed_per_row: 0,
+            },
+            0,
+        ));
+    }
+    let compressor = compressor.ok_or("compressed attention omitted compressor projections")?;
+    let compressor_width = if weights.compression_ratio == v4_state::CompressionRatio::Csa4 {
+        1_024
+    } else {
+        v4_state::Q_HEAD_DIM
+    };
+    if rows == 0
+        || kv.len() != rows * v4_state::Q_HEAD_DIM
+        || compressor.kv_f32.len() != rows * compressor_width
+        || compressor.score_f32.len() != rows * compressor_width
+        || compressor.score_plus_ape_f32.len() != rows * compressor_width
+        || (weights.compression_ratio == v4_state::CompressionRatio::Csa4) != indexer.is_some()
+    {
+        return Err(format!(
+            "layer {} attention state input contract mismatch",
+            weights.layer
+        )
+        .into());
+    }
+    let ratio = weights.compression_ratio.get();
+    for row in 0..rows {
+        let absolute = start_pos + row;
+        state.append_kv_row(
+            absolute,
+            &kv[row * v4_state::Q_HEAD_DIM..(row + 1) * v4_state::Q_HEAD_DIM],
+        )?;
+        let main_range = row * compressor_width..(row + 1) * compressor_width;
+        let main_pool = state.commit_compressor_row_and_pool(
+            absolute,
+            &v4_state::CompressorPrepared {
+                kv_f32: compressor.kv_f32[main_range.clone()].to_vec(),
+                score_f32: compressor.score_f32[main_range.clone()].to_vec(),
+                score_plus_ape_f32: compressor.score_plus_ape_f32[main_range].to_vec(),
+            },
+        )?;
+        let index_pool = if let Some(indexer) = indexer {
+            let range = row * 256..(row + 1) * 256;
+            state.commit_indexer_row_and_pool(
+                absolute,
+                &v4_state::CompressorPrepared {
+                    kv_f32: indexer.compressor.kv_f32[range.clone()].to_vec(),
+                    score_f32: indexer.compressor.score_f32[range.clone()].to_vec(),
+                    score_plus_ape_f32: indexer.compressor.score_plus_ape_f32[range].to_vec(),
+                },
+            )?
+        } else {
+            None
+        };
+        match (main_pool, index_pool) {
+            (None, None) => {}
+            (Some(main), None)
+                if weights.compression_ratio == v4_state::CompressionRatio::Hca128 =>
+            {
+                let main = main
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let main = step_l0_rmsnorm(
+                    module,
+                    stream,
+                    &main,
+                    &weights.compressor_norm,
+                    v4_state::Q_HEAD_DIM,
+                )?;
+                let position = absolute + 1 - ratio;
+                let main = step_l0_rope(
+                    module,
+                    stream,
+                    &main,
+                    &v4_state::compressed_rope_freqs(position),
+                    1,
+                    false,
+                )?;
+                let main = step_l0_kv_quantize(module, stream, &main)?;
+                state.append_compressed_kv_row(absolute / ratio, &main)?;
+            }
+            (Some(main), Some(index))
+                if weights.compression_ratio == v4_state::CompressionRatio::Csa4 =>
+            {
+                let indexer_weights = weights
+                    .indexer
+                    .as_ref()
+                    .ok_or("CSA indexer device weights disappeared")?;
+                let position = absolute + 1 - ratio;
+                let freqs = v4_state::compressed_rope_freqs(position);
+                let main = main
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let main = step_l0_rmsnorm(
+                    module,
+                    stream,
+                    &main,
+                    &weights.compressor_norm,
+                    v4_state::Q_HEAD_DIM,
+                )?;
+                let main = step_l0_rope(module, stream, &main, &freqs, 1, false)?;
+                let main = step_l0_kv_quantize(module, stream, &main)?;
+                state.append_compressed_kv_row(absolute / ratio, &main)?;
+
+                let index = index
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                let index = step_l0_rmsnorm(
+                    module,
+                    stream,
+                    &index,
+                    &indexer_weights.compressor_norm,
+                    128,
+                )?;
+                let index = run_rope(module, stream, &index, &freqs, 1, 128, false)?;
+                let index = v4_state::rotate_fp4_sim_bf16(&index, 1, 128)?
+                    .into_iter()
+                    .map(v4_router::f32_to_bf16_rne)
+                    .collect::<Vec<_>>();
+                state.append_indexer_kv_row(absolute / ratio, &index)?;
+            }
+            _ => {
+                return Err(format!(
+                    "layer {} compressor/indexer boundary commit diverged",
+                    weights.layer
+                )
+                .into());
+            }
+        }
+    }
+
+    if weights.compression_ratio == v4_state::CompressionRatio::Hca128 {
+        return Ok((
+            v4_state::build_hca_sparse_topk(rows, start_pos, v4_state::KV_WINDOW, ratio)?,
+            0,
+        ));
+    }
+    let (window, window_per_row) = v4_state::window_topk_cpu(rows, start_pos, v4_state::KV_WINDOW)?;
+    let keys = state.indexer_kv_bf16().len() / 128;
+    if keys == 0 {
+        return Ok((
+            v4_state::SparseTopk {
+                indices: window,
+                rows,
+                per_row: window_per_row,
+                window_per_row,
+                compressed_per_row: 0,
+            },
+            0,
+        ));
+    }
+    let indexer = indexer.ok_or("CSA indexer projection result disappeared")?;
+    let valid_keys = (0..rows)
+        .map(|row| (start_pos + row + 1) / ratio)
+        .collect::<Vec<_>>();
+    let (compressed, indexer_topk_gpu_ns) = run_indexer_topk_gpu(
+        weights.spec,
+        module,
+        stream,
+        &indexer.q_f32,
+        &indexer.weights_f32,
+        state.indexer_kv_bf16(),
+        rows,
+        &valid_keys,
+        v4_state::KV_WINDOW,
+    )?;
+    let compressed_per_row = compressed.len() / rows;
+    let mut indices = Vec::with_capacity(rows * (window_per_row + compressed_per_row));
+    for row in 0..rows {
+        indices.extend_from_slice(&window[row * window_per_row..(row + 1) * window_per_row]);
+        indices.extend_from_slice(
+            &compressed[row * compressed_per_row..(row + 1) * compressed_per_row],
+        );
+    }
+    Ok((
+        v4_state::SparseTopk {
+            indices,
+            rows,
+            per_row: window_per_row + compressed_per_row,
+            window_per_row,
+            compressed_per_row,
+        },
+        indexer_topk_gpu_ns,
+    ))
+}

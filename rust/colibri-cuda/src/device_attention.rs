@@ -1431,7 +1431,12 @@ impl GenericExactCompressorScratch {
         refresh
     }
 
-    pub(crate) fn finish_main_refresh(&mut self, path: GenericStationaryPath, layer: usize, refresh: bool) {
+    pub(crate) fn finish_main_refresh(
+        &mut self,
+        path: GenericStationaryPath,
+        layer: usize,
+        refresh: bool,
+    ) {
         self.active_layer = Some(layer);
         if refresh {
             match path {
@@ -1485,7 +1490,10 @@ impl GenericExactCompressorScratch {
 }
 
 impl DeviceExactCompressorScratch {
-    pub(crate) fn new(stream: &CudaStream, weights: &LayerDeviceWeights) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(
+        stream: &CudaStream,
+        weights: &LayerDeviceWeights,
+    ) -> Result<Self, Box<dyn Error>> {
         let width = weights.compressor_ape.len() / weights.compression_ratio.get();
         if width == 0
             || weights.compressor_wkv.len() != width * v4_state::HIDDEN
@@ -1526,7 +1534,10 @@ impl DeviceExactCompressorScratch {
 }
 
 impl DeviceTokenState {
-    pub(crate) fn new(stream: &CudaStream, weights: &LayerDeviceWeights) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(
+        stream: &CudaStream,
+        weights: &LayerDeviceWeights,
+    ) -> Result<Self, Box<dyn Error>> {
         let csa = weights.compression_ratio == v4_state::CompressionRatio::Csa4;
         if weights.wq_a.out_features != V4_Q_LORA_RANK {
             return Err("device token-state Q-LoRA rank differs from its capacity ledger".into());

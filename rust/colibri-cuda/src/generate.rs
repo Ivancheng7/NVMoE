@@ -344,8 +344,7 @@ fn load_flash_b1_layer_from_host(
         stream,
         restaged,
     )?;
-    loaded.fixed.fixed_h2d_ns =
-        u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    loaded.fixed.fixed_h2d_ns = u64::try_from(h2d_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let released_bytes = if std::sync::Arc::strong_count(&host) == 1 {
         host.bytes()
     } else {
@@ -468,8 +467,7 @@ pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
     if resident.len() != spec.layers {
         *resident = (0..spec.layers).map(|_| None).collect();
     }
-    let resident_enabled =
-        resident_budget_bytes > 0 || resident.iter().any(Option::is_some);
+    let resident_enabled = resident_budget_bytes > 0 || resident.iter().any(Option::is_some);
     let mut resident_bytes = 0usize;
     let mut resident_hits = 0usize;
     // A resident layer has nothing to preload, and its captured buffer *is* the
@@ -552,13 +550,9 @@ pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
                             .position
                             .checked_add(offset)
                             .ok_or("B2 token position overflow")?;
-                        state
-                            .input_ids
-                            .get(absolute)
-                            .copied()
-                            .ok_or_else(|| {
-                                "B2 request has no input token at its active position".into()
-                            })
+                        state.input_ids.get(absolute).copied().ok_or_else(|| {
+                            "B2 request has no input token at its active position".into()
+                        })
                     })
                     .collect::<Result<Vec<i64>, Box<dyn Error>>>()
             })
@@ -896,11 +890,14 @@ pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
                     }
                     let mut gpu_exact_telemetry = None;
                     let cpu = match final_head_arm {
-                        FlashFinalHeadArm::Cpu => {
-                            v4_state::final_checkpoint_head_cpu_timed(final_weights, &state.hidden, 1)?
-                        }
+                        FlashFinalHeadArm::Cpu => v4_state::final_checkpoint_head_cpu_timed(
+                            final_weights,
+                            &state.hidden,
+                            1,
+                        )?,
                         FlashFinalHeadArm::GpuExact => {
-                            let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu {
+                            let (gpu, artifact_dir) = if let Some(workspace) = flash_final_head_gpu
+                            {
                                 (workspace.step_runtime(&state.hidden)?, None)
                             } else {
                                 let output_dir = flash_final_head_gpu_production_dir()?;
@@ -910,7 +907,9 @@ pub(crate) fn run_v4_b2_generate_arm<'module, const REQUESTS: usize>(
                                 let verification_manifest = std::env::var_os(
                                     "COLIBRI_V4_FLASH_FINAL_HEAD_OFFICIAL_DIR",
                                 )
-                                .map(|_| serde_json::json!({"config": final_head_capture_config()}));
+                                .map(
+                                    |_| serde_json::json!({"config": final_head_capture_config()}),
+                                );
                                 (
                                     step_flash_final_head_gpu_exact(
                                         &output_dir,
@@ -2356,4 +2355,3 @@ pub(crate) fn run_real_v4_b4_layer_stationary(
     );
     Ok(())
 }
-

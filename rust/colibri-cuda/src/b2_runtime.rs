@@ -62,9 +62,7 @@ pub(crate) fn flash_b1_prompt_chunk_enabled(
         None => Ok(true),
         Some(value) if value == "1" => Ok(true),
         Some(value) if value == "0" => Ok(false),
-        Some(_) => {
-            Err("COLIBRI_V4_FLASH_PROMPT_CHUNK must be 1 or 0 when set".into())
-        }
+        Some(_) => Err("COLIBRI_V4_FLASH_PROMPT_CHUNK must be 1 or 0 when set".into()),
     }
 }
 
@@ -206,8 +204,7 @@ pub(crate) fn flash_b1_resident_budget_bytes(
 /// prints one `SHAREDPROBE` line per layer. Numbers do not move; only stderr
 /// grows.
 pub(crate) fn flash_shared_probe_enabled() -> bool {
-    std::env::var_os("COLIBRI_V4_FLASH_SHARED_PROBE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
+    std::env::var_os("COLIBRI_V4_FLASH_SHARED_PROBE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 /// Pure diagnostic, off by default: print the inside of one Compressor call.
@@ -279,13 +276,7 @@ pub(crate) fn load_b2_raw_runtime_for(
         .take()
         .ok_or("B2 raw layer host omitted wo_a")?;
     load_b2_raw_runtime_from_host_ref_for(
-        spec,
-        model_dir,
-        layer,
-        &host,
-        &raw_wo_a,
-        telemetry,
-        stream,
+        spec, model_dir, layer, &host, &raw_wo_a, telemetry, stream,
     )
 }
 
@@ -354,7 +345,9 @@ pub(crate) fn load_b2_raw_runtime_from_host_ref_with_weights(
             weights,
             // The slot restages the weights but not the expert shard handle,
             // which each layer pass opens for the routed read.
-            expert_shard: safetensors::ShardFile::open(model_dir.join(spec.shard_name(layer + 2)?))?,
+            expert_shard: safetensors::ShardFile::open(
+                model_dir.join(spec.shard_name(layer + 2)?),
+            )?,
         },
         None => upload_layer_runtime_for(spec, model_dir, layer, host, stream)?,
     };
@@ -499,8 +492,8 @@ pub(crate) fn prepare_b2_prefix(
                     false,
                     None,
                     None,
-                None,
-                None, // attention device chain (not this path)
+                    None,
+                    None, // attention device chain (not this path)
                 )?
                 .output,
             );
@@ -595,8 +588,8 @@ pub(crate) fn prepare_two_token_prefix(
                         false,
                         None,
                         None,
-                    None,
-                    None, // attention device chain (not this path)
+                        None,
+                        None, // attention device chain (not this path)
                     )?
                     .output,
                 );

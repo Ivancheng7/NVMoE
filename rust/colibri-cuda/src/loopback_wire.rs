@@ -398,7 +398,9 @@ pub(crate) fn run_v4_recovery_audit(
     })
 }
 
-pub(crate) fn connect_recovery_endpoint(address: std::net::SocketAddr) -> Result<std::net::TcpStream, String> {
+pub(crate) fn connect_recovery_endpoint(
+    address: std::net::SocketAddr,
+) -> Result<std::net::TcpStream, String> {
     let socket = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
     let timeout = std::time::Duration::from_secs(30);
     socket

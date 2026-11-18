@@ -24,11 +24,9 @@ impl FixedHostCache {
     pub(crate) fn from_env(layer_count: usize) -> Result<Self, Box<dyn Error>> {
         let budget_gib = match std::env::var_os(FIXED_HOST_RESIDENT_GIB_ENV) {
             None => FIXED_HOST_RESIDENT_DEFAULT_GIB,
-            Some(raw) => raw
-                .to_string_lossy()
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("{FIXED_HOST_RESIDENT_GIB_ENV} must be a whole number of GiB"))?,
+            Some(raw) => raw.to_string_lossy().trim().parse::<u64>().map_err(|_| {
+                format!("{FIXED_HOST_RESIDENT_GIB_ENV} must be a whole number of GiB")
+            })?,
         };
         let budget_bytes = usize::try_from(budget_gib)
             .ok()
@@ -127,8 +125,7 @@ pub(crate) fn resolve_host_layer(
 /// `FixedPrefetchTask`; this loop does not touch it.
 pub(crate) struct ResidentPrefetch<'scope> {
     pub(crate) layer: usize,
-    pub(crate) worker:
-        std::thread::ScopedJoinHandle<'scope, Result<ResidentPrefetched, String>>,
+    pub(crate) worker: std::thread::ScopedJoinHandle<'scope, Result<ResidentPrefetched, String>>,
 }
 
 pub(crate) struct ResidentPrefetched {
@@ -138,4 +135,3 @@ pub(crate) struct ResidentPrefetched {
     pub(crate) worker_start_ns: u64,
     pub(crate) worker_end_ns: u64,
 }
-

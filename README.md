@@ -22,7 +22,7 @@ Everything below was measured on one machine: an RTX 5060 Ti with 16GB, compute 
 
 Two pairs are real matched blocks — the residency pair and the fan-out pair — so their ratios are measurements. The `6.50x` headline joins them to a baseline measured on an earlier tree; each stage is solid on its own, but the end-to-end ratio is derived, not observed in a single run. The figure below plots the residency chain, so its last bar is the residency default rather than today's.
 
-The compact [run ledger](docs/assets/readme/sm120-steady-ab.csv) lists every run value, its peak device bytes, and the source result file behind it. The residency batch ran on `codex/business-restart` at `8e162a6`; result files carry no binary fingerprint, so those numbers are re-derived from the files under `/srv/localmoe/targets/residentfill/`, not from a checksum in the repository.
+The compact [run ledger](docs/assets/readme/sm120-steady-ab.csv) lists every run value, its peak device bytes, and the source result file behind it. The residency batch ran on `codex/business-restart` at `8e162a6`; result files carry no binary fingerprint, so those numbers are re-derived from raw JSONL run logs recorded outside the repository rather than from a tracked checksum.
 
 ![sm_120 residency tradeoff](docs/assets/readme/26-sm120-residency-tradeoff.svg)
 
@@ -100,9 +100,24 @@ The two fan-out rows are from one 2026-09-30 batch (single-token prompt, both or
 
 Two known ceilings bound what is left. The input cap is 128 total tokens (`prompt + generated − 1`), so a prompt longer than 121 tokens is rejected with `CONTEXT_WINDOW_EXCEEDED`, and time to first token still grows by roughly `2.6s` per prompt token. And the service surface writes a per-phase split only when you opt in (`COLIBRI_V4_FLASH_SERVE_PHASE_JSONL`), so its per-phase split is measured for one prompt rather than in general — though the two surfaces have been checked at the same speed on steady state.
 
+## Repository layout
+
+| Path | Role |
+| --- | --- |
+| [`rust/colibri-cuda/`](rust/colibri-cuda/) | Primary Rust + `cuda-oxide` engine for `DeepSeek-V4-Flash-0731` on `sm_120` (see [`MODULE_LAYOUT.md`](rust/colibri-cuda/MODULE_LAYOUT.md)) |
+| [`rust/colibri-cuda/tools/`](rust/colibri-cuda/tools/) | CLI & server launchers (`run_flash_cli.sh`, `run_flash_serve.sh`), A/B harnesses, and golden-value checks (`verify/`) |
+| [`c/`](c/) | Upstream Colibri C/CUDA engine and [`openai_server.py`](c/openai_server.py) OpenAI-compatible HTTP gateway |
+| [`tools/download_modelscope_0731.py`](tools/download_modelscope_0731.py) | Resumable, SHA-256-verified downloader for the pinned `Flash-0731` checkpoint |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | End-to-end execution path, VRAM budget, and design notes |
+| [`docs/experiments/`](docs/experiments/) | Hardware-verified optimization logs and ablation records on RTX 5060 Ti (`sm_120`) |
+
 ## Run it
 
-The Flash path targets WSL2/Linux, CUDA 12.8, Blackwell `sm_120`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
+The Flash path targets WSL2/Linux, CUDA 12.8+, Blackwell `sm_120`, and a model directory on a WSL-native ext4 block device. The runtime rejects model paths under `/mnt/c` and `/mnt/d`.
+
+### 1. Prepare weights & build
+
+Download the pinned `deepseek-ai/DeepSeek-V4-Flash-0731` (`9e165c30e2704aec5d9d593cce3eebd58bbef1cb`) checkpoint onto a native ext4 volume (from Hugging Face or via `python3 tools/download_modelscope_0731.py`), then build the `sm_120` release binary:
 
 ```bash
 git clone https://github.com/andyzpb/localMoE.git
@@ -116,7 +131,16 @@ cargo oxide doctor
 ./run-identified.sh build --arch sm_120 -- --release -p colibri-cuda
 ```
 
-Run the real Flash base path on `sm_120`. Leave `FP4_ACCUM_ARM` and `FINAL_HEAD_ARM` unset: that confirms the default arms are still `block32` and `canonical_cpu_streamed_bf16`.
+### 2. CLI generation & golden-value verification
+
+Run an 8-step greedy decode with the default launcher:
+
+```bash
+COLIBRI_V4_RESULT_JSONL="$PWD/flash-result.jsonl" ./colibri-cuda/tools/run_flash_cli.sh
+python3 colibri-cuda/tools/verify/verify_baseline.py "$PWD/flash-result.jsonl"
+```
+
+Or invoke the binary directly with explicit environment flags (leaving `FP4_ACCUM_ARM` and `FINAL_HEAD_ARM` unset to confirm the defaults remain `block32` and `canonical_cpu_streamed_bf16`):
 
 ```bash
 env \
@@ -132,7 +156,30 @@ env \
   "$PWD/target/release/colibri-cuda"
 ```
 
-Inspect `flash-result.jsonl` for `layers: 43`, `hidden_bf16_digest: 5ed8bf88beae3cfe`, and `generated_ids` starting `55222, 33832, ...`. The `status: PASS` field means the 43-layer run completed, not that any oracle gate passed. Whole-model VRAM residency is on by default; set `COLIBRI_V4_FIXED_RESIDENT_GIB=0` to fall back to streaming and to recover the `1,825MB` peak. Result files from the runs behind these numbers live outside the repository under `/srv/localmoe/targets/`, so the timing figures cannot be re-derived from tracked files alone. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
+Inspect `flash-result.jsonl` for `layers: 43`, `hidden_bf16_digest: 5ed8bf88beae3cfe`, and `generated_ids` starting `55222, 33832, ...`. The `status: PASS` field means the 43-layer run completed, not that any oracle gate passed. Whole-model VRAM residency is on by default; set `COLIBRI_V4_FIXED_RESIDENT_GIB=0` to fall back to streaming and recover the `1,825MB` peak.
+
+### 3. OpenAI-compatible HTTP server
+
+Start the local `/v1/chat/completions` endpoint (fixed weights stay resident in VRAM across requests):
+
+```bash
+./colibri-cuda/tools/run_flash_serve.sh
+```
+
+Query it from another terminal:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-flash-0731",
+    "messages": [{"role": "user", "content": "Hello! Introduce yourself in one sentence."}],
+    "max_tokens": 32,
+    "stream": true
+  }'
+```
+
+Raw run logs behind the timing tables live outside the repository, so timing figures cannot be re-derived from tracked files alone. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
 
 ## Inspiration
 

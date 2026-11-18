@@ -71,7 +71,11 @@ impl GenericStationaryLifecycle {
 
     /// The sole semantic commit point.  Call only after attention, FFN, and
     /// the terminal hidden row have all succeeded.
-    pub(crate) fn commit_layer(&mut self, layer: usize, position: usize) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn commit_layer(
+        &mut self,
+        layer: usize,
+        position: usize,
+    ) -> Result<(), Box<dyn Error>> {
         self.begin_layer(layer, position)?;
         let next = position
             .checked_add(1)
@@ -164,7 +168,10 @@ pub(crate) fn chat_input_conflict(
     chat_user_present && (raw_prompt_present || id_input_present)
 }
 
-pub(crate) fn greedy_forward_tokens(prompt_len: usize, greedy_steps: usize) -> Result<usize, Box<dyn Error>> {
+pub(crate) fn greedy_forward_tokens(
+    prompt_len: usize,
+    greedy_steps: usize,
+) -> Result<usize, Box<dyn Error>> {
     if prompt_len == 0 {
         return Err("greedy decoding requires at least one prompt token".into());
     }

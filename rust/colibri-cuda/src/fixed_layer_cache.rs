@@ -430,7 +430,10 @@ impl FixedLayerCache {
         })
     }
 
-    pub(crate) fn validate_stationary_key(&self, model_dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn validate_stationary_key(
+        &self,
+        model_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn Error>> {
         if self.stationary_model_dir.as_deref() != Some(model_dir)
             || self.stationary_layout != Some(STATIONARY_RAW_LAYOUT)
         {

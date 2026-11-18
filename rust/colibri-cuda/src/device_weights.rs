@@ -8,7 +8,10 @@ pub(crate) struct DeviceFp8Matrix {
 }
 
 impl DeviceFp8Matrix {
-    pub(crate) fn new(stream: &CudaStream, matrix: &v4_state::Fp8Matrix) -> Result<Self, Box<dyn Error>> {
+    pub(crate) fn new(
+        stream: &CudaStream,
+        matrix: &v4_state::Fp8Matrix,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             weight: DeviceBuffer::from_host(stream, &matrix.weight)?,
             scale: DeviceBuffer::from_host(stream, &matrix.scale)?,
@@ -407,13 +410,21 @@ impl DeviceLayerIndexer {
     ) -> Result<(), Box<dyn Error>> {
         self.wq_b.restage_from(stream, &indexer.wq_b)?;
         restage_copy(&mut self.weights_proj, stream, &indexer.weights_proj_bf16)?;
-        restage_copy(&mut self.compressor_wkv, stream, &indexer.compressor.wkv_bf16)?;
+        restage_copy(
+            &mut self.compressor_wkv,
+            stream,
+            &indexer.compressor.wkv_bf16,
+        )?;
         restage_copy(
             &mut self.compressor_wgate,
             stream,
             &indexer.compressor.wgate_bf16,
         )?;
-        restage_copy(&mut self.compressor_ape, stream, &indexer.compressor.ape_f32)?;
+        restage_copy(
+            &mut self.compressor_ape,
+            stream,
+            &indexer.compressor.ape_f32,
+        )?;
         restage_copy(
             &mut self.compressor_norm,
             stream,
@@ -457,7 +468,11 @@ impl LayerDeviceWeights {
             &state.compressor.wgate_bf16,
         )?;
         restage_copy(&mut self.compressor_ape, stream, &state.compressor.ape_f32)?;
-        restage_copy(&mut self.compressor_norm, stream, &state.compressor.norm_bf16)?;
+        restage_copy(
+            &mut self.compressor_norm,
+            stream,
+            &state.compressor.norm_bf16,
+        )?;
         // indexer 只在 Csa4 层存在，其余层型要把缓冲交出来存着：三个槽位里只有
         // 一个带 indexer 缓冲，不存就会在层型交替时被丢掉。
         if let Some(indexer) = state.indexer.as_ref() {

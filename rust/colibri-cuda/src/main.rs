@@ -54,10 +54,10 @@ macro_rules! tilelang_sum4 {
 
 // Business modules extracted from this file. Keep them after the
 // tilelang_sum4 macro so its textual scope still covers them.
+#[allow(dead_code)]
 mod argmax_records;
 mod artifacts;
 mod attention_device_chain;
-mod attention_gates;
 mod b2_generate;
 mod b2_runtime;
 mod device_attention;
@@ -68,39 +68,49 @@ mod expert_slices;
 mod expert_slot;
 mod final_head;
 mod fixed_host_cache;
+#[allow(dead_code)]
 mod fixed_layer_cache;
+#[allow(dead_code)]
 mod fixed_layer_planning;
 mod fixed_layer_slot;
 mod fixed_prefetch;
 mod flash_arms;
-mod full61_b1;
 mod generate;
+#[allow(dead_code)]
 mod host_provenance;
 mod l0_bench;
 mod launch_wrappers;
 mod layer_loading;
 mod layer_ops;
 mod layer_rows;
-mod layer_stationary_prefill;
 mod loopback_wire;
+#[allow(dead_code)]
 mod mtp1_draft;
+#[allow(dead_code)]
 mod mtp1_l0;
+#[allow(dead_code)]
 mod mtp1_resources;
 mod phase_profiles;
+#[allow(dead_code)]
 mod qd4;
+#[allow(dead_code)]
 mod qd4_gates;
+#[allow(dead_code)]
 mod qd4_routed;
 mod run_records;
 mod slice_checks;
+#[allow(dead_code)]
 mod state_audit;
+#[allow(dead_code)]
 mod stationary_lifecycle;
+#[allow(dead_code)]
 mod v4_loopback;
 
 // Keep the existing call sites in this file working after the moves.
+#[allow(unused_imports)]
 use argmax_records::*;
 use artifacts::*;
 use attention_device_chain::*;
-use attention_gates::*;
 use b2_generate::*;
 use b2_runtime::*;
 use device_attention::*;
@@ -110,31 +120,41 @@ use env_flags::*;
 use expert_slices::*;
 use expert_slot::*;
 use final_head::*;
+#[allow(unused_imports)]
 use fixed_layer_cache::*;
+#[allow(unused_imports)]
 use fixed_layer_planning::*;
 use fixed_prefetch::*;
 use flash_arms::*;
-use full61_b1::*;
 use generate::*;
+#[allow(unused_imports)]
 use host_provenance::*;
 use l0_bench::*;
 use launch_wrappers::*;
 use layer_loading::*;
 use layer_ops::*;
 use layer_rows::*;
-use layer_stationary_prefill::*;
 use loopback_wire::*;
+#[allow(unused_imports)]
 use mtp1_draft::*;
+#[allow(unused_imports)]
 use mtp1_l0::*;
+#[allow(unused_imports)]
 use mtp1_resources::*;
 use phase_profiles::*;
+#[allow(unused_imports)]
 use qd4::*;
+#[allow(unused_imports)]
 use qd4_gates::*;
+#[allow(unused_imports)]
 use qd4_routed::*;
 use run_records::*;
 use slice_checks::*;
+#[allow(unused_imports)]
 use state_audit::*;
+#[allow(unused_imports)]
 use stationary_lifecycle::*;
+#[allow(unused_imports)]
 use v4_loopback::*;
 
 // DeepSeek-V4-Flash E2M1 nibbles converted exactly to raw E4M3 bytes.
@@ -163,68 +183,9 @@ const fn v4_fp4_pair_to_e4m3x2(packed: u8) -> u16 {
 include!("kernels_module.rs");
 
 fn main() {
-    if run_frozen_alpaca_tokenizer_preflight().expect("run frozen Alpaca tokenizer-only preflight")
-    {
-        return;
-    }
-    if run_stationary_mtp1_scratch_constructor_preflight()
-        .expect("run stationary MTP1 scratch constructor preflight")
-    {
-        return;
-    }
-    if run_stationary_mtp1_capacity_preflight().expect("run stationary MTP1 capacity preflight") {
-        return;
-    }
-    let benchmark_requested = std::env::var_os("COLIBRI_V4_B2_LAYER_STATIONARY_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_B4_LAYER_STATIONARY_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_B4_FULL61_PROMOTION").is_some()
-        || std::env::var_os("COLIBRI_V4_B4_GREEDY_ABBA_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
-        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
-        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some()
-        || std::env::var_os("COLIBRI_V4_FINAL_HEAD_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_DEVICE_TOKEN_STATE_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_SPARSE_TOPK_SWEEP").is_some()
-        || std::env::var_os("COLIBRI_V4_CACHE_OFF_BENCH").is_some()
-        || std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_SPARSE_K128_MICROGATE").is_some()
-        || std::env::var_os("COLIBRI_V4_TARGETED_ATTENTION_AUDIT").is_some()
-        || std::env::var_os("COLIBRI_V4_PINNED_H2D_SERVICE_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_GATE").is_some()
-        || std::env::var_os("COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT").is_some()
-        || std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some();
-    let mut full61_preflight = (std::env::var_os("COLIBRI_V4_FULL61_B1").is_some()
-        || std::env::var_os("COLIBRI_V4_PHASE_PROFILE").is_some()
-        || std::env::var_os("COLIBRI_V4_LAYER_STATIONARY_FIXED_PREFETCH").is_some()
-        || std::env::var_os("COLIBRI_V4_CERTIFIED_ARGMAX_AUDIT").is_some())
-    .then(Full61Preflight::from_env)
-    .transpose()
-    .expect("validate V4 full61 configuration");
-    if optional_one_flag("COLIBRI_V4_SHORT_DECODE_STATIC_CHECK")
-        .expect("validate short decode static-check flag")
-    {
-        short_device_decode_static_check().expect("validate short decode static contract");
-        return;
-    }
-    if benchmark_requested {
-        benchmark_provenance().expect("validate benchmark source identity");
-    }
-    if optional_one_flag("COLIBRI_V4_SPARSE_K128_MICROGATE")
-        .expect("validate sparse K128 microgate flag")
-    {
-        sparse_attention_score_reuse_k128_attention_post_microgate();
-        return;
-    }
     validate_flash_parity_stop_mode().expect("validate Flash parity L0 stop mode");
-    // The DSpark speculative-decoding arm was removed on 2026-10-01. Even with its
-    // first defect fixed the draft accepted 0 of 20 proposals and the whole path ran
-    // about 16x slower than plain decoding — and it could not have paid for itself
-    // anyway: one round spends one anchor plus five row-by-row base forwards to
-    // commit at most six tokens. The flag stays a hard error so an old script cannot
-    // silently fall through to the plain smoke test.
+    // The DSpark speculative-decoding arm was removed on 2026-10-01; keep an explicit
+    // hard error so stale scripts never silently fall through to the self-test smoke.
     // Evidence: docs/experiments/2026-09-18-sm120-dspark-acceptance.md
     if std::env::var_os("COLIBRI_V4_FLASH_DSPARK").is_some() {
         panic!(
@@ -232,26 +193,8 @@ fn main() {
              COLIBRI_V4_FLASH_SERVE=1 instead"
         );
     }
-    if optional_one_flag("COLIBRI_V4_FLASH_FINAL_HEAD_REPLAY")
-        .expect("validate Flash final-head replay flag")
-    {
-        if std::env::var_os("COLIBRI_V4_FLASH_BASE").is_some()
-            || std::env::var_os("COLIBRI_V4_FLASH_SERVE").is_some()
-        {
-            panic!("Flash final-head replay cannot be combined with a runtime mode");
-        }
-        run_flash_final_head_replay().expect("run Flash final-head replay");
-        return;
-    }
-    // ponytail: this smoke uses synchronous safe copies for a terminal parity
-    // check; switch to event-owned async buffers when production dispatch lands.
+
     let context = CudaContext::new(0).expect("create CUDA context");
-    if optional_one_flag("COLIBRI_V4_PINNED_H2D_SERVICE_GATE")
-        .expect("validate pinned H2D service-gate flag")
-    {
-        pinned_h2d_service_gate(&context).expect("run pinned H2D service gate");
-        return;
-    }
     let stream = context.default_stream();
     let module = kernels::load(&context).expect("load embedded Rust PTX");
 
@@ -264,155 +207,6 @@ fn main() {
     if optional_one_flag("COLIBRI_V4_FLASH_BASE").expect("validate Flash-0731 base flag") {
         run_real_v4_flash_base(&context, &module, &stream)
             .expect("run DeepSeek V4 Flash-0731 base-only generation");
-        return;
-    }
-
-    if optional_one_flag("COLIBRI_V4_PINNED_FIXED_WORKER_BOUNDARY_GATE")
-        .expect("validate pinned fixed worker boundary-gate flag")
-    {
-        run_pinned_fixed_worker_boundary_gate(&context, &module, &stream)
-            .expect("run pinned fixed worker boundary gate");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_FINAL_HEAD_BENCH").as_deref() == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_final_head_bench(&context, &module, &stream)
-            .expect("run real V4 final-head Stage1 benchmark");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_WAVEFRONT_ATTENTION_BENCH").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_wavefront_attention_bench(&context, &module, &stream)
-            .expect("run real V4 CDQW attention benchmark");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_DEVICE_ATTENTION_PREFLIGHT_GATE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_device_attention_preflight_gate(&context, &module, &stream)
-            .expect("run device-attention capacity preflight gate");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_DEVICE_TOKEN_STATE_GATE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_device_token_state_gate(&context, &module, &stream)
-            .expect("run real V4 device token-state pos3 gate");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_QD4_STATIONARY_GATE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_qd4_stationary_gate(&context, &module, &stream).expect("run V4 QD4 stationary gate");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_QD4_IMMUTABLE_CACHE_TARGETED_GATE").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_qd4_immutable_cache_targeted_gate(&context, &module, &stream)
-            .expect("run V4 QD4 immutable-cache targeted gate");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_SPARSE_TOPK_SWEEP").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_sparse_attention_topk_sweep(&context, &module, &stream)
-            .expect("run sparse-attention top-k crossover sweep");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_CACHE_OFF_BENCH").as_deref() == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_cache_off_bench().expect("run real V4 cache-off Stage0 benchmark");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_B2_LAYER_STATIONARY_BENCH").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_b2_layer_stationary(&context, &module, &stream)
-            .expect("run real V4 B2 layer-stationary benchmark");
-        return;
-    }
-
-    if optional_one_flag("COLIBRI_V4_B2_GENERATE").expect("validate V4 B2 generate flag") {
-        run_real_v4_b2_generate::<2>(
-            &context,
-            &module,
-            &stream,
-            "COLIBRI_V4_B2_TOKEN_IDS",
-            "v4-b2-greedy-rowset",
-            "colibri-v4-b2-greedy-rowset-v1",
-        )
-        .expect("run real V4 B2 greedy generation");
-        return;
-    }
-
-    if optional_one_flag("COLIBRI_V4_B4_GREEDY_ABBA_BENCH")
-        .expect("validate V4 B4 greedy ABBA flag")
-    {
-        run_real_v4_b4_greedy_abba_bench(&context, &module, &stream)
-            .expect("run real V4 B4 greedy ABBA benchmark");
-        return;
-    }
-
-    if optional_one_flag("COLIBRI_V4_B4_GENERATE").expect("validate V4 B4 generate flag") {
-        run_real_v4_b2_generate::<4>(
-            &context,
-            &module,
-            &stream,
-            "COLIBRI_V4_B4_TOKEN_IDS",
-            "v4-b4-greedy-rowset",
-            "colibri-v4-b4-greedy-rowset-v1",
-        )
-        .expect("run real V4 B4 greedy generation");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_B4_LAYER_STATIONARY_BENCH").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_b4_layer_stationary(&context, &module, &stream, false)
-            .expect("run real V4 B4 layer-stationary benchmark");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_B4_FULL61_PROMOTION").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        run_real_v4_b4_layer_stationary(&context, &module, &stream, true)
-            .expect("run real V4 B4 full61 layer-stationary promotion benchmark");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_FULL61_B1").is_some() {
-        run_real_v4_full61_b1(
-            &context,
-            &module,
-            &stream,
-            full61_preflight
-                .take()
-                .expect("V4 full61 preflight disappeared"),
-        )
-        .expect("run real V4 full61 B=1 inference");
-        return;
-    }
-
-    if std::env::var_os("COLIBRI_V4_DUAL_BENCH_ONLY").is_some() {
-        let config = DualBenchConfig::from_env().expect("validate netem benchmark configuration");
-        let path = v4_expert_shard().expect("validate pinned V4 expert shard");
-        let shard = safetensors::ShardFile::open(&path).expect("open V4 expert shard");
-        run_v4_two_worker_loopback(&context, &module, &shard, &path, Some(&config))
-            .expect("run V4 dual-worker benchmark");
-        println!("PASS: V4 dual-worker benchmark-only entry");
         return;
     }
 
