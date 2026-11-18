@@ -1,5 +1,37 @@
 # localMoE 开发规则
 
+## Code Exploration — 代码图谱优先（仅当 MCP 已接入）
+
+若当前客户端接入了 `codebase-memory-mcp`，任何读或改本仓库代码的任务都必须先用图谱查询，
+Grep/Glob/Read 不是第一步。图谱已建索引，是主要导航来源。
+
+若没有接入（例如 DSH 未配置该 MCP，或只是普通 shell），一句话说明「图谱不可用，走文本检索」，
+再用 `grep` / `glob` / `read`，不要把没跑过的图查询写进结论。
+（2026-11-05：ZCode 已卸载，随它一起失效的还有项目 hook 和 `.zcode/config.json`；
+本文件不再假设任何客户端特有的搜索工具名。）
+
+- Project identifier: run `list_projects` and use the dash-form name it returns
+  for this repo's absolute path. If a query errors or returns nothing, re-read
+  that value before falling back.
+- Symbol / implementation lookup: `search_graph` (`query=`) or `search_code`.
+- Callers, callees, impact: `trace_path`, `detect_changes`.
+- Repo-level shape: `get_architecture`.
+- Exact source: `get_code_snippet`, only after the graph has narrowed scope.
+
+Grep/Glob are permitted ONLY when one of these holds, and you must say which:
+
+  (a) a graph query with the verified project name returned nothing;
+  (b) `check_index_coverage` shows the file unindexed or `parse_partial`;
+  (c) cross-checking a known graph false negative. Two classes are
+      documented: closure-internal call edges (e.g. `advanceAutomated`),
+      and method calls whose receiver is not `this` — capture there is
+      unpredictable (in one measured repo only 538 of 1169 Method nodes had
+      any inbound CALLS edge). The direction itself is fine; the gap is edge
+      coverage. So treat every `x.method()` conclusion as unverified —
+      including `get_code_snippet(include_neighbors)`'s `callers`/`callee_names`
+      and `search_code(mode="full")`'s `in`/`out` columns — and confirm it by
+      grep before reporting it as fact.
+
 ## 项目目标
 
 localMoE 在消费级 NVIDIA GPU 上跑真实的 MoE 模型，对外提供命令行或
@@ -22,7 +54,7 @@ OpenAI 兼容服务。进度只看一件事：真实推理路径能跑到哪一�
 
 这条链没跑通之前：
 
-- 不加门禁、manifest、oracle 或实验框架；
+- 不加 gate、manifest、oracle 或实验框架；
 - 不为还不存在的第二个调用方设计抽象、工厂或通用框架；
 - 不为了“更完整的防御”推迟能跑的代码。
 
@@ -53,3 +85,11 @@ OpenAI 兼容服务。进度只看一件事：真实推理路径能跑到哪一�
 
 用户能用真实输入生成多个 token，并且结果从 CLI 或服务返回，才算做完。
 单 token fixture、合成 kernel、哈希通过、脚本 PASS，单独都不算。
+
+## 记忆：`docs/zcode-memory/`
+
+2026-11-05 从 ZCode 迁入 63 篇记忆（`flash-0731-*` 的实验结论与 recipe、带宽/盘速/带宽墙、
+分支纪律、AB 口径等）。入口是 `docs/zcode-memory/README.md`。
+
+- 它们是**历史结论**，不是当前事实：数字以 `现状.md` 和实验记录为准，配置以仓库为准。
+- 要动手改性能路径之前先 grep 这里，很多坑（restage、final head、compressor 池）已经踩过并写了结论。

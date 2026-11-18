@@ -1,0 +1,64 @@
+- [WSL 运行环境布局](wsl-run-environment.md) — 模型路径、CUDA 12.8 cuBLAS、CARGO_TARGET_DIR、真源码是 WSL 的 git clone（origin 必须指向主仓库 localmoe，不是 localmoe-clean）
+- [用大白话汇报](plain-language-reporting.md) — 用户看不懂测试术语，必须用日常类比解释
+- [要真跑不要代理证据](real-runs-over-proxy-verification.md) — 改完就真构建真推理，别用 stub/脚本 PASS 代替，也别把"没跑真构建"写进汇报当免责声明
+- [中文文档要工程师口吻](docs-plain-register.md) — 用户嫌管理腔（垂直业务路径/门禁/完成标准/基线）"很难受"，改腔调时事实一律原样保留
+- [工作树上的并发会话](concurrent-agent-sessions.md) — 多个 ZCode 会话同改 localmoe-clean；拆 main.rs 期间用户要求只动文档
+- [代码是形状失控不是水平低](localmoe-code-shape-not-quality.md) — 用户说代码"被落后 AI 污染"时别顺着清理，先摆证据区分水平与形状
+- [交付目标是 Flash-0731](flash-0731-is-the-delivery-target.md) — 认 9e165c30…；文档里长期写的 60d8d707… 是另一份 checkpoint，代码里从没出现过
+- [单词写回雅思项目](jargon-vocab-writeback.md) — jargon-decoder 讲的词落到 IELTS/.ielts/vocab，复习用 --list；payload 每条必须带 schemaVersion:1
+- [开发机瞬时断电](hardware-instant-power-loss.md) — 平均两三周一次硬件级断电，非蓝屏，长任务和未提交改动有丢失风险
+- [codebase-memory-mcp 安装位置](codebase-memory-mcp-install.md) — 装在 C:\cbm，必须带 CBM_RUNTIME_DIR / CBM_CACHE_DIR，因 Codex 沙箱 ACL 不能用默认目录
+- [官方 FP4 oracle 在 sm_120 不稳定](flash-0731-official-oracle-unstable.md) — 根因是钉死的 tilelang 0.1.8，换 0.1.14 已实测修好（torch 无关）；README 招牌证书是 sm_89 的；台账卡点是 base JSON 不记峰值 host RSS
+- [main.rs 拆分交接](main-rs-split-handoff.md) — 拆分已全部完成（45,540→559 行，40 个模块，kernels 走 include!）、**模块地图在仓库 rust/colibri-cuda/MODULE_LAYOUT.md，读代码前先读它**、证据文件位置、三个坑
+- [run_/step_ 命名规约](run-step-naming-convention.md) — run_ = 可单独跑的程序（89 个），step_ = 模型执行里的一步（52 个）；判定看调用者不看名字；审计/门禁一律算程序侧
+- [Flash-0731 基线运行配方](flash-0731-baseline-run-recipe.md) — 复现 token 55222 / digest 5ed8bf88beae3cfe 的完整环境变量与命令
+- [cargo check 的 ICE 与 wrapper](cargo-check-ice-wrapper.md) — 普通 cargo check 在钉住的 nightly 上必崩，原始树也一样；用 rustc-human-wrapper.sh 当门槛（执行位已提交进 git），fmt 在 HEAD 上本就不干净
+- [DeepSeek-V4.1-Flash 事实与纠正](deepseek-v41-flash-facts.md) — CED 架构、reference 从来没下载到本地、decoder 是共享槽位最后写入者生效；2026-09-16 决定暂不移植
+- [v4_state.rs 硬编码几何](v4-state-hardcoded-geometry.md) — 常量块整块是 Pro profile 副本；"多分配不出错"只对缓冲成立，拿 Pro 常量做**相等判据**会静默杀死分支（复用池就这么白付了 0.55 s/token）
+- [ZCode 项目级 hook 的信任闸门](zcode-project-hook-trust.md) — 项目 hook 默认 blocked 直到在 设置→钩子 点信任；这客户端没有 Grep/Glob 工具，matcher 要带 Bash
+- [2026 算子库外部指针](kernel-landscape-2026.md) — TileKernels（mHC/Engram 唯一公开参考实现，只支持 SM90/100）、0xSero 的 sm120 SGLang 补丁（进度标尺）、CUDA Rust 的两条路；sm_120 无 tcgen05/wgmma/cluster
+- [实验代码要放 exp 分支](experiment-branch-hygiene.md) — 用户要求：性能/机制类实验不占交付分支历史；回滚用追加式 revert（多会话共享分支，不许改写历史）
+- [相位账怎么读才对](flash-0731-phase-profile-reading.md) — 顶层是互不重叠的墙、diagnostics 会重复、shared 四分之一是 MLP；**final_heads 在层循环外、别把 head_read 当整步**；层内 gap 就是 wo_a_decode_gpu_sync
+- [attention 的 compressor 是权重搬运](flash-0731-attention-compressor.md) — **两档根因已找到（权重主机展开），9efd662 修好死开关，attention 1.34→0.79**；现在 attention 里 64% 是那 16 个小步（0.50 s），不是 compressor
+- [routed 专家槽位的 14 ms](flash-0731-expert-slot-cost.md) — 90% 是锁页不是拷贝；槽位复用已合并进交付分支（67e80c3，8 步 103.38→70.06 s、数值零变化），残留 setup 24.8 ms/层；nsys 在本机 WSL2 用不了
+- [routed 读盘的天花板](flash-0731-routed-read-ceiling.md) — 盘不是瓶颈：6 条并发流 3.79 GB/s vs 单线程 0.8–1.4；另加"每次读进新申请缓冲"值 1.3 s/token；一层一分片、专家 12 MiB 连续
+- [锁页读盘已亮绿灯](flash-0731-pinned-read-green-light.md) — 读进 cuMemHostAlloc vs 复用缓冲无差异（交错三轮、digest 逐位同），省 restage 可以直接做；工具与记录在 exp/routed-pinned-replay（不是 -read，那被并发会话占了）
+- [读盘直接进锁页已落地实验分支](flash-0731-pinned-lane-read-landed.md) — routed 窗口 22.9→18.5 ms/层、alloc=0、8 digest 逐位同；收益全额上墙（outer 省 319 ms/token，不是被谁吃掉）；重叠坑与 A/B 吞错坑都记了
+- [attention+读锁页叠加已验](flash-0731-attention-plus-pinned-stack.md) — 两改动同层不同相位，合并后各自增益不互扰（attn 16.99→13.33、routed 22.63→18.44 ms/层），18 跑 digest 逐位同；合并树 52433f4，都还没进交付
+- [稳态 vs 首 token](flash-0731-steady-state-vs-first-token.md) — 8 步总时长 ~40% 是 token0 建常驻库的一次性 14 s；判收益必须用稳态 s/token（两个都带 3.03 vs 3.39）；稳态四相位无单块过半
+- [瓶颈地图（实测上限）](flash-0731-bottleneck-map.md) — PCIe 实测 14.27 GB/s（Gen4 x8）=712 ms/token 结构下限、传输占稳态 25%；**fixed.h2d_ns 曾经的超链路数是漏了 restage 计时（2026-09-20 已修）**；到顶=routed 读/H2D+shared MLP 被藏；fixed 显存常驻已完成
+- [whole-model 常驻显存已默认开](flash-0731-fixed-resident-vram.md) — 2026-09-20 `b620ef7`（两个交付面默认开，`=0` 回退）：稳态 3.183→2.305 s/token（−28%）、峰值 1.83→8.18 GB、数值逐位不变；单步钉死峰值随之改；预检按空闲显存夹
+- [服务面逐相位落盘口](flash-0731-serve-phase-sink.md) — 2026-09-20 `fd4a864`（默认关 COLIBRI_V4_FLASH_SERVE_PHASE_JSONL）；根因是网关 `openai_server.py:1736` 删了 RESULT_JSONL；首字拆解仍待做
+- [DSpark 臂的真实状态](flash-0731-dspark-arm-state.md) — 2026-09-18 真跑：接受 0，根因是自写 rope kernel >4 行静默清零（10f3daf 抬上限但仍是 PROBE ONLY）；官方参考实现就在模型目录，不需要外部开源支持
+- [对照一律用常驻开](resident-on-is-the-comparison-baseline.md) — 性能 A/B 以常驻开为基线；2026-09-17 起常驻(8 GiB)与 prompt chunk 都是代码默认开，"常驻关"要显式 =0；chunk 的增量还没量到
+- [服务路径的速度与门卫](flash-0731-serve-path-speed.md) — **已同批量过：服务 3.94 s/字 vs 命令行 4.04 s/token，一样快**；4.81 只是提交旧了；服务仍不写相位账
+- [每 token 的地板在哪](flash-0731-per-token-floor.md) — 09-21 实况：默认 1.943、开 fan-out 1.581 s/token；表里的 3.25 是 09-17 形状，只剩历史价值
+- [routed 六专家并行下发](flash-0731-routed-fanout.md) — 默认关的 A1：−17~19% 稳态；收尾是最慢那条 lane（MLP 被顶起来但不卡人，09-23 消融拆开：上传 4.5 + 内核 5.4）；诊断不能再相加；A2 叠上去只再省 0.07；8 步 e2e 单 token 34.1→30.8、真 32 token 81.9→67.6（两种 prompt 别混）；**10-01 压 lane 争用线已关：main_ns 那笔不卡墙、GPU 窗口闸门 K=3/K=2 无收益，真绑定是最慢 lane 的读**
+- [routed 专家身份缓存](flash-0731-routed-expert-cache.md) — A2（默认关）：复用 63% 可从结果 JSONL 的 route_ids 离线数（不用重跑）；命中要 258 槽/3.2 GiB，低于它=0%；读盘 −57~79% 但墙只 −3.6%（读藏在 shared 窗口）；同步源码进 WSL 树要按 git status 带齐全部改动文件
+- [固定权重的 H2D 带宽与缓存分工](flash-0731-fixed-h2d-bandwidth.md) — 槽位已落地交付（7cdd0b1：fixed 1.02→0.73、+216 MB、逐位不变）；"账本会虚报"更正为不成立；老 FixedLayerCache 只服务 full61/prefill/门禁
+- [final head 切 6 线程](flash-0731-final-head-parallel.md) — 已实测 468→110 ms/token（省 358 ms）、三方逐位一致；代码在 exp/final-head-parallel（42d94e0）**还没合并交付**，合并后期望 3.70→3.34 s/token
+- [自己排下一步](own-the-roadmap.md) — 用户不想一步步给约束；照 handoff 自己排序、自己拍板、真跑收口，只在真取舍上专门给结论
+- [要优化的是优化流程本身](optimize-the-optimization-loop.md) — 22h/20 会话的审计：51 笔文档对 11 笔落地；四条规矩**同日已执行**（现状.md 上线、范本 verify_delivery_arm.sh、两件未搬改动都落地）；三条偏差：跑序、只在同一批内比、别把某一次快读成改动生效（要报主题相位的状态指标）
+- [构建必须走 run-identified.sh](cuda-anchor-symbol-requires-run-identified.md) — 直接 cargo build 会报 cuda_oxide_artifact_anchor undefined（后端没跑），干净树也复现
+- [并发会话会劫持当前分支](concurrent-branch-hijack-during-commit.md) — 创建分支后被切走，commit 落到错分支；commit 前必查 git branch --show-current
+- [attention 18 个同步点已搬设备侧](flash-0731-attention-device-chain.md) — exp/attention-device-chain：数值逐位不变、attention 相位 19.54→13.34 ms/层；compressor/indexer 仍主机
+- [三件改动已合进交付分支](flash-0731-three-arms-merged.md) — attention 设备链+routed 读锁页+final head 并行已进 codex/business-restart（dc22c8e）；合并树真跑 8 token 数值逐位同、同批 A/B 增益叠加；峰值显存 +2 MiB；服务面未重验
+- [localmoe 主仓库里的废弃工作](localmoe-abandoned-worktree.md) — Desktop\localmoe 是主仓库、落后交付 135 提交；工作区有一坨从未提交的 stage 阶梯+manifest/oracle 大教堂（48.9k+15.5k 行），钉错 60d8d707，交付一行没要；索引要拷到 scratch 树
+- [盘速有两档（晃 25%）](disk-speed-two-tier.md) — 快 3.54–3.75 / 慢 2.69–2.80 GB/s，宿主机侧竞争、客户机查不到；跑性能前先量一次，落 2.7 档就作废本批；我 2026-09-20 因此写错过一篇记录
+
+- [c/ 就是 colibri 引擎快照](colibri-is-our-c-engine.md) — 仓库根 c/ 是上游 JustVugg/colibri 快照（V4 路径是另写的 Rust）；colibri 快的机制清单与"别当同机对比"的量测口径
+- [prefill 逐行成本是 B 线主目标](flash-0731-prefill-row-cost.md) — **10-02 出钱了：整层一条不空转的专家池（6 宽从一根游标取活）让预填充趟 393.69→334.65 ms/层（−15%）、8 步 e2e 29.78→27.50 s，四臂逐位相同**；拆开=池子 −37.4 + 去重 −26.5；**盘上字节一字未变（20.5 GB），全是"不再空转"**；宽度 6≈10 最好不用改；开关 CHUNK_MLP_BATCH/EXPERT_GROUP/EXPERT_DEDUP 都默认关；教训：**改结构有钱、调参数不值钱**（前六笔单侧改动全白干）、引擎"请求账"不是盘流量（页缓存）、`capture_layer_trace` 在 CLI 恒为真
+- [服务面常驻曾每请求重建已修](flash-0731-fixed-resident-vram.md) — **已合并交付（2026-10-02 合并提交 `9dc963a`）**：常驻池/routed scratch 提升到服务循环外，第 2 请求起每请求省 4.6–5.2 s、fixed 墙归零；常驻池现跨请求占住显存，并发预算待重算
+
+- [用户想更深学 AI infra](ai-infra-learning-direction.md) — 2026-10-03 用户拍板：**走 nano-vLLM 框架内核、目标工业界标准**；**Qwen3.8-27B 是真实模型**（2026-08 发布，我原先「Qwen3 没有 27B」的判词已作废）；两条线分工=学内核用 0.6B、跑新模型用 llama.cpp；10-06 补算子线——**用户已接 Auto Kernel 任务、自认算子零基础**，品味框架=三问+七套路+matmul 四步曲，昇腾按类比读；**10-27 用户否掉「读代码+跑实验」的学法，要系统学习：先给约束让技术可推导，一次一个模块，别抢跑**
+- [算子课进度：第 1–3 节讲完](kernel-course-progress.md) — 交接文档 `Desktop/ai-infra-lab/交接-算子课.md`（**自包含，先读它**）；本机常数=36SM/L2 32MiB/smem 100KiB/DRAM 337GB/s/L2 1108GB/s/bf16 42.3TFLOPS/平衡点 126；**两个陷阱=测带宽数据要≥4×L2、测精度参照物要用 fp64**；下节=延迟隐藏，讲完就停
+- [nano-vLLM 实验室已跑通](nano-vllm-lab-wsl.md) — WSL `/srv/localmoe/lab`；**CUDA graph 关→开 1083→4676 tok/s（4.3×）**；四个坑=Python 3.14 不兼容、flash-attn 必须用 torch2.8 预编译轮子、HF 不通走 ModelScope、oracle 工具链只能复制
+- [优化值不值看贴在哪面墙](bandwidth-wall-decides-what-optimization-pays.md) — 判据是带宽墙（每 token 字节÷带宽）不是模型大小；27B@3bit 贴显存带宽墙（要压到 3bit 才免分层）、0.6B 常驻+批量才离开墙；**分页 KV/连续批处理在单用户场景失效**，多轮 prefix caching 是唯一例外
+- [术语表：方言↔行业标准词](terms-glossary-industry-alignment.md) — 2026-10-03 建 `docs/术语表.md`；**2026-10-09 全库清完自造方言**（35 个 md、约 600 处：墙/臂/相位账→wall time/arm/phase profile…，正文 0 残留；代码块与工具脚本不动）；§一是「旧写法→现在怎么写」解码表，新文档照约定写
+- [我们对照 vLLM 五步走到哪](flash-0731-vs-vllm-five-stage-map.md) — 前向/KV/prefill-decode 已做透（但 attention 是 **MLA 不是 GQA**、KV 无分页是 MLA 压缩 latent）；调度只做了排队（`GenerationScheduler` capacity=1）没做连续批处理；prefix caching 与 CUDA graph 全无；页缓存 ≠ prefix caching
+- [AI Infra 六层地图](ai-infra-layer-map.md) — 定位文档 `ai-infra-lab/AI-Infra-地图.md`；**AI Infra ≠ 算子优化**（六层：算子/量化/显存缓存/调度/模型结构/服务，性能测量横切）；两处挂钩——**MTP 就是用户仓库里的 DSpark/`mtp1_*`**、**NVFP4 ≈ `v4_fp4.rs` 的 E2M1 block32**（只差块16+二级缩放）；社区量化是两套不通用的命名体系
+- [DeepSeek 线收尾拍板](deepseek-line-scope-decision.md) — 2026-10-03：第4条不做（单用户 batch 恒为 1）；CUDA graph 对我们 ~0.1% **且录不进去**（compressor 主机 cuBLAS + 每层 D2H 同步、`expert_group_issue/take` 已是手工异步）；同开关在 nano-vLLM 值 **4.3×**，差别是"贴哪面墙"；prefix caching（多轮上文）是唯一还有价值的；128 输入上限属"能不能用"不属于"优化"
+- [llama.cpp WSL 构建配方](llamacpp-wsl-build-recipe.md) — gcc-14 必须走 CUDAHOSTCXX、glibc 2.42 需给 CUDA 头补 noexcept、**投机解码"draft 加载崩"已更正为 `-np>1` 才崩（`--spec-type` 用环境变量绕开解析坑）**、输出要落 WSL 文件
+- [Qwen3.8-27B 实测基线](qwen38-27b-lab-baseline.md) — **27.32B/混合 GDN（48 线性+16 全注意力，只有 16 层有 KV）**；Q3_K_XL 26 t/s、TTFT 0.72s、Q4_K_S 起装不下、WSL 慢 2%；**MTP 能跑但默认深度是负收益（n-max=1 才 +39%）**；解剖+学习清单在 `ai-infra-lab\Qwen3.8-27B-变种解剖.md`
+- [NInfer 融合引擎 5060Ti 全套实测](ninfer-fusion-kvmem-5060ti.md) — 普通 54-69/代码 205-207/数数 347-517 tok/s;三值训练底座+Hadamard 分级装箱+DLL 全套坑(BtbN shared 解 FFmpeg-63)+分片必须拼后验 SHA256;256K 大池 65536 可跑但深超池中段针 miss(B05/B08),超池 max_tokens≤2048(B01);draft-tokens A/B:代码保 12、中文没差;三猜头判词:DFlash2>MTP>DSpark,不换
+- [交付 bin 里编着实验模式](delivery-binary-embeds-experiment-modes.md) — 单 bin 里 ~30 个实验模式 / 129 个 COLIBRI_V4_ 开关；19 个模块在交付文件里零引用（1.9 万行）但混着共享 helper，**清理要按函数切不是按文件搬**；TODO/FIXME 全库 0 条
