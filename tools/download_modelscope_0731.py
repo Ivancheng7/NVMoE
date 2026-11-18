@@ -89,7 +89,7 @@ def fetch_one(file_record: dict[str, object], partial: Path) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path("/srv/localmoe/models"))
+    parser.add_argument("--root", type=Path, default=Path("/mnt/colibri-native"))
     parser.add_argument(
         "--directory",
         default=f"deepseek-v4-flash-0731-{UPSTREAM_REVISION}",
@@ -113,7 +113,7 @@ def main() -> None:
         raise SystemExit(f"目标目录已存在，不覆盖: {final}")
     partial.mkdir(parents=True, exist_ok=True)
 
-    request = urllib.request.Request(API, headers={"User-Agent": "localmoe-model-fetch/1.0"})
+    request = urllib.request.Request(API, headers={"User-Agent": "nvmoe-model-fetch/1.0"})
     with urllib.request.urlopen(request, timeout=60) as response:
         records = json.load(response)["Data"]["Files"]
     records = sorted((record for record in records if record.get("Type") == "blob"), key=lambda x: x["Path"])

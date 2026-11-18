@@ -10,7 +10,7 @@ Does Your Next LLM Infrastructure Really Need to Be an H100?
 
 ![sm_120 steady per-token chain](docs/assets/readme/25-sm120-steady-chain.svg)
 
-localMoE runs the full-weight DeepSeek-V4-Flash-0731 checkpoint on a single consumer card by treating memory movement as inference work. The model stays on a WSL-native ext4 volume. Each layer brings fixed tensors and six routed experts into a bounded working set, then releases the lease after CUDA finishes with it.
+**NVMoE** (**NV**Me streaming + **NV**IDIA consumer silicon + **MoE**) runs the full-weight DeepSeek-V4-Flash-0731 checkpoint on a single consumer card by treating memory movement as inference work. The model stays on a WSL-native ext4 volume. Each layer brings fixed tensors and six routed experts into a bounded working set, then releases the lease after CUDA finishes with it.
 
 Everything below was measured on one machine: an RTX 5060 Ti with 16GB, compute capability `sm_120`, under WSL2 with CUDA 12.8. A steady token fell from `12.873s` at the pinned baseline to `2.304s` under whole-model residency, and to `1.98s` once the routed fan-out became the default. That is a `6.50x` reduction, derived across three stages measured at different times rather than from one matched block. At the current default it is about `0.505tok/s`.
 
@@ -120,8 +120,8 @@ The Flash path targets WSL2/Linux, CUDA 12.8+, Blackwell `sm_120`, and a model d
 Download the pinned `deepseek-ai/DeepSeek-V4-Flash-0731` (`9e165c30e2704aec5d9d593cce3eebd58bbef1cb`) checkpoint onto a native ext4 volume (from Hugging Face or via `python3 tools/download_modelscope_0731.py`), then build the `sm_120` release binary:
 
 ```bash
-git clone https://github.com/andyzpb/localMoE.git
-cd localMoE/rust
+git clone https://github.com/Ivancheng7/NVMoE.git
+cd NVMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
 export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
@@ -179,8 +179,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Raw run logs behind the timing tables live outside the repository, so timing figures cannot be re-derived from tracked files alone. The checkpoint license governs model use. localMoE code is available under the [Apache License 2.0](LICENSE).
+Raw run logs behind the timing tables live outside the repository, so timing figures cannot be re-derived from tracked files alone. The checkpoint license governs model use. NVMoE code is available under the [Apache License 2.0](LICENSE).
 
 ## Inspiration
 
-localMoE was inspired by [JustVugg/colibri](https://github.com/JustVugg/colibri) and continues toward usable full-weight MoE inference on home hardware. The `sm_89` measurements on a 12GB RTX 4080 Laptop are kept in [docs/archive](docs/archive/README.sm89-12gb-rtx4080.md).
+NVMoE builds upon [andyzpb/localMoE](https://github.com/andyzpb/localMoE) and [JustVugg/colibri](https://github.com/JustVugg/colibri), continuing toward usable full-weight MoE inference on consumer Blackwell (`sm_120`) hardware. The earlier `sm_89` measurements on a 12GB RTX 4080 Laptop are kept in [docs/archive](docs/archive/README.sm89-12gb-rtx4080.md).

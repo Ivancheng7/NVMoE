@@ -1,4 +1,4 @@
-# localMoE 架构与执行路径说明
+# NVMoE 架构与执行路径说明
 
 本文档说明 `DeepSeek-V4-Flash-0731`（revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`）在消费级单卡（RTX 5060 Ti 16 GB，Blackwell `sm_120`，WSL2 + CUDA 12.8+）上的真实推理链路、显存与磁盘所有权，以及代码目录职责。
 

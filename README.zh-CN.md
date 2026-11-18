@@ -10,7 +10,7 @@
 
 ![sm_120稳态每token链路](docs/assets/readme/25-sm120-steady-chain.svg)
 
-localMoE让单张消费级显卡跑起全量权重的DeepSeek-V4-Flash-0731检查点，把内存移动当成推理工作。模型放在WSL原生ext4卷上。每一层把固定tensor与6个routed专家带进一个有界工作集，CUDA用完才释放lease。
+**NVMoE**（**NV**Me 直读流式 + **NV**IDIA 消费级显卡 + **MoE**）让单张消费级显卡跑起全量权重的DeepSeek-V4-Flash-0731检查点，把内存移动当成推理工作。模型放在WSL原生ext4卷上。每一层把固定tensor与6个routed专家带进一个有界工作集，CUDA用完才释放lease。
 
 下面所有数字都来自同一台机器：16GB的RTX 5060 Ti，计算能力`sm_120`，WSL2 + CUDA 12.8。稳态每token从钉死基线的`12.873s`降到整模型常驻的`2.304s`，再降到routed fan-out成为默认之后的`1.98s`。这是`6.50倍`的降幅，由**在不同时间分别测量的三段**派生而来，不是单个匹配区块。按当前默认约`0.505tok/s`。
 
@@ -120,8 +120,8 @@ Flash路径面向WSL2/Linux、CUDA 12.8+、Blackwell`sm_120`，模型目录必�
 将官方 `deepseek-ai/DeepSeek-V4-Flash-0731`（revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`）下载到 WSL 原生 ext4 目录（可从 Hugging Face 获取，或运行 `python3 tools/download_modelscope_0731.py`），随后构建 `sm_120` release 二进制：
 
 ```bash
-git clone https://github.com/andyzpb/localMoE.git
-cd localMoE/rust
+git clone https://github.com/Ivancheng7/NVMoE.git
+cd NVMoE/rust
 
 export COLIBRI_DSV4_MODEL_DIR=/mnt/colibri-native/deepseek-v4-flash-0731-9e165c30e2704aec5d9d593cce3eebd58bbef1cb
 export COLIBRI_CUBLAS_EXACT_LIB=/usr/local/cuda-12.8/targets/x86_64-linux/lib/libcublas.so.12.8.5.5
@@ -179,8 +179,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-计时表背后的原始运行日志保存在仓库之外，因此计时数字无法只从受版本控制的文件重新推导。模型使用遵循检查点许可证，localMoE代码采用[Apache License 2.0](LICENSE)。
+计时表背后的原始运行日志保存在仓库之外，因此计时数字无法只从受版本控制的文件重新推导。模型使用遵循检查点许可证，NVMoE代码采用[Apache License 2.0](LICENSE)。
 
 ## 灵感
 
-localMoE受[JustVugg/colibri](https://github.com/JustVugg/colibri)启发，并继续推进家用硬件上的可用全量权重MoE推理。12GB RTX 4080 Laptop上那套`sm_89`测量保存在[docs/archive](docs/archive/README.sm89-12gb-rtx4080.zh-CN.md)。
+NVMoE基于[andyzpb/localMoE](https://github.com/andyzpb/localMoE)与[JustVugg/colibri](https://github.com/JustVugg/colibri)演进，继续推进消费级Blackwell（`sm_120`）硬件上的可用全量权重MoE推理。早期12GB RTX 4080 Laptop上那套`sm_89`测量保存在[docs/archive](docs/archive/README.sm89-12gb-rtx4080.zh-CN.md)。

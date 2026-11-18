@@ -1,4 +1,4 @@
-# localMoE 开发规则
+# NVMoE 开发规则
 
 ## Code Exploration — 代码图谱优先（仅当 MCP 已接入）
 
@@ -32,7 +32,7 @@ Grep/Glob are permitted ONLY when one of these holds, and you must say which:
 
 ## 项目目标
 
-localMoE 在消费级 NVIDIA GPU 上跑真实的 MoE 模型，对外提供命令行或
+NVMoE 在消费级 NVIDIA GPU 上跑真实的 MoE 模型，对外提供命令行或
 OpenAI 兼容服务。进度只看一件事：真实推理路径能跑到哪一步。文档数量、
 校验数量、实验记录数量都不算数。
 
